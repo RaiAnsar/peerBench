@@ -2,6 +2,7 @@
 Run a code review of the git changes below from the repository at the current working directory.
 Challenge correctness, second-order failures, empty-state behavior, and design tradeoffs.
 Untracked files listed below are part of the change set — review their full content.
+Base your verdict ONLY on the content below — do NOT use any tools or explore the filesystem.
 Do NOT implement anything or modify files. Review only.
 </task>
 
