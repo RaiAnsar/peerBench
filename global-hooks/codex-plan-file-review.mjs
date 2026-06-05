@@ -174,11 +174,10 @@ async function main() {
     } catch {
       // best-effort
     }
-    emit({
-      decision: "block",
-      reason: `Review panel blocked the plan file ${filePath}:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address ALL findings, then save it as ONE complete rewrite using a single Write call. Do NOT apply fixes as multiple incremental Edits — every individual save of this file triggers another full multi-minute review.`
-    });
-    return;
+    // asyncRewake: write findings to stdout and exit 2 so the harness WAKES
+    // Claude with them (visible, non-frozen) instead of blocking the turn.
+    process.stdout.write(`Review panel blocked the plan file ${filePath}:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address ALL findings, then save it as ONE complete rewrite using a single Write call. Do NOT apply fixes as multiple incremental Edits — each save triggers another background review.`);
+    process.exit(2);
   }
 
   try {
