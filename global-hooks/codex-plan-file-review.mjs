@@ -174,9 +174,10 @@ async function main() {
     } catch {
       // best-effort
     }
-    // asyncRewake: write findings to stdout and exit 2 so the harness WAKES
-    // Claude with them (visible, non-frozen) instead of blocking the turn.
-    process.stdout.write(`Review panel blocked the plan file ${filePath}:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address ALL findings, then save it as ONE complete rewrite using a single Write call. Do NOT apply fixes as multiple incremental Edits — each save triggers another background review.`);
+    // asyncRewake: write findings to STDERR and exit 2 so the harness WAKES
+    // Claude with them (exit-2 blocking feedback is read from stderr, not
+    // stdout) instead of blocking the turn.
+    process.stderr.write(`Review panel blocked the plan file ${filePath}:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address ALL findings, then save it as ONE complete rewrite using a single Write call. Do NOT apply fixes as multiple incremental Edits — each save triggers another background review.`);
     process.exit(2);
   }
 
