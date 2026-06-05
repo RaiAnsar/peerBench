@@ -1,0 +1,5 @@
+{
+  "name": "grok-companion",
+  "description": "Grok Build CLI companion: second-reviewer panel, delegation tasks, and review commands driven by headless grok.",
+  "version": "0.1.0"
+}
