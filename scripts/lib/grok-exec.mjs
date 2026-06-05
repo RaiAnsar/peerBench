@@ -15,8 +15,9 @@ const TIMEOUT_MS = 13 * 60 * 1000;
 // discoverable). Set it in ~/.claude/settings.json env once a valid profile
 // name for the installed grok version is known; unset = flag omitted and the
 // permission-mode/deny-list/mutation-check layers carry enforcement.
-export function buildGrokArgs({ mode, prompt, cwd, effort = "medium", maxTurns }, env = process.env) {
-  const args = ["-p", prompt, "--output-format", "json", "--cwd", cwd, "--effort", effort];
+export function buildGrokArgs({ mode, prompt, cwd, maxTurns }, env = process.env) {
+  // NOTE: no --effort — the grok-build model rejects reasoningEffort (400).
+  const args = ["-p", prompt, "--output-format", "json", "--cwd", cwd];
   if (mode === "review") {
     args.push(
       "--permission-mode", "plan",

@@ -36,7 +36,7 @@ test("buildGrokArgs review mode includes full read-only stack", () => {
   assert.ok(s.includes("--no-subagents"));
   assert.ok(s.includes("--disable-web-search"));
   assert.ok(s.includes("--max-turns 8"));
-  assert.ok(s.includes("--effort medium"));
+  assert.ok(!s.includes("--effort")); // grok-build rejects reasoningEffort
   assert.ok(s.includes("--output-format json"));
   assert.ok(!s.includes("--sandbox"));
 });
