@@ -1,0 +1,16 @@
+{
+  "description": "Grok stop-gate panel: reviews each code-editing turn with Grok when /grok:panel is on for the workspace (instant no-op otherwise).",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/panel-stop-hook.mjs\"",
+            "timeout": 900
+          }
+        ]
+      }
+    ]
+  }
+}

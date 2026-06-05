@@ -17,7 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runGrok } from "./lib/grok-exec.mjs";
-import { appendJob, loadState, resolveStateDir } from "./lib/grok-state.mjs";
+import { appendJob, loadState, resolveStateDir, saveState } from "./lib/grok-state.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -191,7 +191,26 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup`);
+  if (sub === "panel") {
+    const ws = workspaceRoot(cwd);
+    const mode = prompt.trim().toLowerCase();
+    if (mode === "on" || mode === "off") {
+      const state = loadState(ws, {});
+      state.config.panelStops = mode === "on";
+      saveState(ws, state, {});
+      process.stdout.write(
+        mode === "on"
+          ? `Grok stop-gate panel: ON for this workspace.\nGrok now reviews every code-editing turn alongside Codex (takes effect next turn end).\n`
+          : `Grok stop-gate panel: off for this workspace.\nThe Codex stop gate (if enabled) is unaffected.\n`
+      );
+      return;
+    }
+    const on = loadState(ws, {}).config.panelStops;
+    process.stdout.write(`Grok stop-gate panel is ${on ? "ON" : "off"} for this workspace.\nToggle with \`/grok:panel on\` or \`/grok:panel off\`.\n`);
+    return;
+  }
+
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel`);
 }
 
 main().catch((error) => {

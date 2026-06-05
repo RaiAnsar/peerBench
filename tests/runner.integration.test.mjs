@@ -99,6 +99,18 @@ test("status prints recorded jobs", () => {
   assert.match(out, /completed/);
 });
 
+test("panel on/off/status toggles config.panelStops", () => {
+  const ws = freshWs();
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runner-"));
+  const env = { ...process.env, GROK_BIN: path.join(FIXTURES, "fake-grok"), CLAUDE_PLUGIN_DATA: dataRoot, FAKE_GROK_LOG: "/dev/null" };
+  const r = (a) => execFileSync(process.execPath, [RUNNER, ...a], { encoding: "utf8", cwd: ws, env });
+  assert.match(r(["panel"]), /off/i);
+  assert.match(r(["panel", "on"]), /ON/);
+  assert.match(r(["panel"]), /ON/);
+  assert.match(r(["panel", "off"]), /off/i);
+  assert.match(r(["panel"]), /off/i);
+});
+
 test("setup reports version or missing binary without throwing", () => {
   const { out } = run(["setup"]);
   assert.match(out, /grok|GROK/i);
