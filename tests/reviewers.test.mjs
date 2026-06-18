@@ -10,18 +10,18 @@ test("extractVerdict skips filler + code fences to find the verdict line", () =>
 test("run retries once on non-conforming output then succeeds", async () => {
   const calls = [];
   const reviewImpl = async ({ user }) => { calls.push(user); return calls.length === 1 ? { ok: true, text: "I think it's fine", usage: null } : { ok: true, text: "ALLOW: fine on retry", usage: null }; };
-  const [kimi] = resolveReviewers({ env: { MOONSHOT_API_KEY: "k" }, reviewImpl }).filter((r) => r.name === "kimi");
+  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl }).filter((r) => r.name === "kimi");
   const res = await kimi.run({ system: "s", user: "u" });
   assert.equal(res.verdict, "ALLOW");
   assert.equal(calls.length, 2);
   assert.match(calls[1], /ALLOW:|BLOCK:/);
 });
 test("no key → error, skipped not crashed", async () => {
-  const r = resolveReviewers({ env: {}, reviewImpl: async () => ({ ok: true, text: "ALLOW: x" }) });
+  const r = resolveReviewers({ env: { KIMI_API_KEY: "" }, reviewImpl: async () => ({ ok: true, text: "ALLOW: x" }) });
   assert.equal((await r.find((x) => x.name === "kimi").run({ system: "s", user: "u" })).error, "no api key");
 });
 test("hard error from client → error side", async () => {
-  const r = resolveReviewers({ env: { MOONSHOT_API_KEY: "k" }, reviewImpl: async () => ({ ok: false, error: { kind: "timeout", detail: "slow" } }) });
+  const r = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl: async () => ({ ok: false, error: { kind: "timeout", detail: "slow" } }) });
   const res = await r.find((x) => x.name === "kimi").run({ system: "s", user: "u" });
   assert.match(res.error, /timeout/);
 });
@@ -32,7 +32,7 @@ test("codex/grok resolve to named CLI adapters", () => {
   assert.equal(typeof r[0].run, "function");
 });
 test("kimi adapter run still accepts the extended params and ignores cwd/env", async () => {
-  const [kimi] = resolveReviewers({ env: { MOONSHOT_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: true, text: "ALLOW: ok" }) });
+  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: true, text: "ALLOW: ok" }) });
   const res = await kimi.run({ system: "s", user: "u", cwd: "/tmp", env: {} });
   assert.equal(res.verdict, "ALLOW");
 });

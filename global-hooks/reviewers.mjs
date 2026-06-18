@@ -57,7 +57,7 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
       name,
       async run({ system, user, cwd, env: runEnv }) {
         if (!p.apiKey) return { name: display, error: "no api key" };
-        const call = (u) => reviewImpl({ baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, system, user: u });
+        const call = (u) => reviewImpl({ baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, system, user: u, temperature: p.temperature, headers: p.headers });
         let r = await call(user);
         if (!r.ok) return { name: display, error: `${r.error.kind}: ${r.error.detail}` };
         let v = extractVerdict(r.text), raw = r.text;

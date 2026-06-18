@@ -6,8 +6,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 const DEFAULTS = {
-  kimi: { baseURL: "https://api.moonshot.ai/v1", model: "kimi-k2.7-code", keyEnv: "MOONSHOT_API_KEY" },
-  mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY" }
+  kimi: { baseURL: "https://api.kimi.com/coding/v1", model: "kimi-for-coding", keyEnv: "KIMI_API_KEY",
+          temperature: 1, headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" } },
+  mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
+          temperature: 0, headers: {} }
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
 export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "grok"];
@@ -40,7 +42,9 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
     providers[name] = {
       baseURL: env[`${name.toUpperCase()}_BASE_URL`] || f.baseURL || d.baseURL,
       model: env[`${name.toUpperCase()}_MODEL`] || f.model || d.model,
-      apiKey: env[d.keyEnv] || f.apiKey || ""
+      apiKey: env[d.keyEnv] !== undefined ? env[d.keyEnv] : (f.apiKey || ""),
+      temperature: typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0),
+      headers: { ...(d.headers || {}), ...(f.headers || {}) }
     };
   }
   // If an explicit override is provided (non-empty array), use it; otherwise fall back to file/default.

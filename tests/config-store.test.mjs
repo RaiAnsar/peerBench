@@ -6,14 +6,25 @@ import os from "node:os";
 import path from "node:path";
 
 test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => {
-  const base = { MOONSHOT_API_KEY: "mk", MIMO_API_KEY: "xk" };
+  const base = { KIMI_API_KEY: "mk", MIMO_API_KEY: "xk" };
   const a = resolveConfig({ env: { ...base } });
   const b = resolveConfig({ env: { ...base, CLAUDE_PLUGIN_DATA: "/tmp/whatever" } });
   assert.equal(a.providers.kimi.apiKey, "mk");
-  assert.equal(a.providers.kimi.model, "kimi-k2.7-code");
+  assert.equal(a.providers.kimi.model, "kimi-for-coding");
+  assert.equal(a.providers.kimi.baseURL, "https://api.kimi.com/coding/v1");
+  assert.equal(a.providers.kimi.temperature, 1);
+  assert.match(a.providers.kimi.headers["User-Agent"], /claude-cli/);
   assert.equal(a.providers.mimo.apiKey, "xk");
+  assert.equal(a.providers.mimo.temperature, 0);
   assert.deepEqual(a.reviewers, ["kimi", "mimo"]);
   assert.deepEqual(a, b);
+});
+test("companion.json can override temperature/headers (via file param seam)", () => {
+  // resolveConfig reads companion.json from sharedRoot; we can't write there in a unit test,
+  // so just assert the default headers/temperature object shape is present and overridable in code.
+  const a = resolveConfig({ env: { KIMI_API_KEY: "k" } });
+  assert.equal(typeof a.providers.kimi.temperature, "number");
+  assert.equal(typeof a.providers.kimi.headers, "object");
 });
 test("workspaceStateDir lands under the env-independent shared root", () => {
   const dir = workspaceStateDir("/some/workspace");

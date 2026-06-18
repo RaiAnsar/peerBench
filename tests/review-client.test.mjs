@@ -32,3 +32,12 @@ test("no api key → nokey error", async () => {
   assert.equal(res.ok, false);
   assert.equal(res.error.kind, "nokey");
 });
+test("sends provided temperature and merges extra headers", async () => {
+  const cap = {};
+  await review({ baseURL: "https://x/v1", apiKey: "k", model: "kimi-for-coding", system: "s", user: "u", timeoutMs: 5000,
+    temperature: 1, headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
+    fetchImpl: (url, opts) => { cap.body = JSON.parse(opts.body); cap.headers = opts.headers; return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
+  assert.equal(cap.body.temperature, 1);
+  assert.equal(cap.headers["User-Agent"], "claude-cli/1.0.83 (external, cli)");
+  assert.equal(cap.headers.Authorization, "Bearer k");
+});
