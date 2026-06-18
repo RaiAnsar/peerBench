@@ -13,7 +13,10 @@ const DEFAULTS = {
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
 export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "grok"];
-export function sharedRoot() { return path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared"); }
+export function sharedRoot() {
+  return process.env.GROK_COMPANION_ROOT
+    || path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared");
+}
 export function workspaceStateDir(ws) {
   let canonical = ws; try { canonical = fs.realpathSync.native(ws); } catch { canonical = ws; }
   const slug = (path.basename(ws) || "workspace").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
@@ -42,7 +45,7 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
     providers[name] = {
       baseURL: env[`${name.toUpperCase()}_BASE_URL`] || f.baseURL || d.baseURL,
       model: env[`${name.toUpperCase()}_MODEL`] || f.model || d.model,
-      apiKey: env[d.keyEnv] !== undefined ? env[d.keyEnv] : (f.apiKey || ""),
+      apiKey: env[d.keyEnv] || f.apiKey || "",
       temperature: typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0),
       headers: { ...(d.headers || {}), ...(f.headers || {}) }
     };

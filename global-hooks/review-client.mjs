@@ -10,6 +10,8 @@ export async function review({ baseURL, apiKey, model, system, user, timeoutMs =
   try {
     resp = await doFetch(`${baseURL}/chat/completions`, {
       method: "POST",
+      // NOTE: provider `headers` spread last and so could override Content-Type/Authorization —
+      // callers must only use it for additive headers (e.g. User-Agent), never auth.
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...headers },
       body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature, stream: false }),
       signal: controller.signal

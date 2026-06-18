@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs"; import os from "node:os"; import path from "node:path";
+process.env.GROK_COMPANION_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root-"));
 import { extractVerdict, resolveReviewers } from "../global-hooks/reviewers.mjs";
 
 test("extractVerdict skips filler + code fences to find the verdict line", () => {
@@ -17,7 +19,7 @@ test("run retries once on non-conforming output then succeeds", async () => {
   assert.match(calls[1], /ALLOW:|BLOCK:/);
 });
 test("no key → error, skipped not crashed", async () => {
-  const r = resolveReviewers({ env: { KIMI_API_KEY: "" }, reviewImpl: async () => ({ ok: true, text: "ALLOW: x" }) });
+  const r = resolveReviewers({ env: {}, reviewImpl: async () => ({ ok: true, text: "ALLOW: x" }) });
   assert.equal((await r.find((x) => x.name === "kimi").run({ system: "s", user: "u" })).error, "no api key");
 });
 test("hard error from client → error side", async () => {
