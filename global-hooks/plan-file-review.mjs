@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-// PostToolUse hook on Write|Edit: plan/spec markdown -> DUAL Codex+Grok panel
+// PostToolUse hook on Write|Edit: plan/spec markdown -> reviewer-registry panel
 // review (strict AND-pass). Preserves: path filter, revision dedupe lock,
 // single-Write revision instruction. ALLOW skip is CONTENT-keyed: only a save
 // whose content hash equals the last APPROVED hash skips review. Fails OPEN
-// only when BOTH reviewers error.
+// only when ALL reviewers error.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { combinePanel, runCodexReview, runGrokReview } from "./panel-lib.mjs";
+import { combinePanel } from "./panel-lib.mjs";
+import { resolveReviewers } from "./reviewers.mjs";
+import { writeTrace } from "./trace-store.mjs";
 
-const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");
-const CODEX_DATA = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex");
 const MAX_PLAN_BYTES = 64 * 1024;
 const PLAN_PATH_RE = /\/(plans|specs)\/[^/]*\.md$/i;
 
@@ -23,45 +23,13 @@ function failOpen(note) {
   emit({ systemMessage: `⛩ plan gate: review skipped — ${String(note).slice(0, 250)}` });
 }
 
-function latestCodexRoot() {
-  let entries;
-  try {
-    entries = fs.readdirSync(PLUGIN_CACHE).filter((d) => /^\d+\.\d+\.\d+/.test(d));
-  } catch {
-    return null;
-  }
-  entries.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  const latest = entries.at(-1);
-  return latest ? path.join(PLUGIN_CACHE, latest) : null;
-}
-
-function buildPrompt(filePath, content) {
-  return [
-    "<task>",
-    `Review the implementation plan/spec document below (file: ${filePath}).`,
-    "Claude Code is about to execute this plan in the repository at the current working directory.",
-    "You have read access to that repository. Verify the plan's claims and file references against the actual code where relevant.",
-    "Challenge correctness, completeness, missing edge cases, risky design choices, and anything that would force rework during implementation.",
-    "Do NOT implement anything or modify files. This is review only.",
-    "</task>",
-    "",
-    "<compact_output_contract>",
-    "Your first line must be exactly one of:",
-    "- ALLOW: <short reason>",
-    "- BLOCK: <short reason>",
-    "Do not put anything before that first line.",
-    "If you block, follow the first line with a concise bullet list of the specific problems Claude must fix in the plan.",
-    "</compact_output_contract>",
-    "",
-    "<policy>",
-    "Use ALLOW when the plan is sound enough to execute, even if not perfect; mention minor suggestions after the ALLOW line.",
-    "Use BLOCK only for issues that would cause wrong behavior, rework, or significant wasted effort if executed as written.",
-    "</policy>",
-    "",
-    "<plan_document>",
-    content,
-    "</plan_document>"
-  ].join("\n");
+export function buildPrompt(filePath, content) {
+  return {
+    system: "You are reviewing an implementation plan/spec document from ONLY the text provided. Do not assume filesystem access. " +
+      "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`. BLOCK only for issues that would cause wrong " +
+      "behavior or significant rework if executed as written; otherwise ALLOW.",
+    user: `<plan_document file="${filePath}">\n${content}\n</plan_document>`
+  };
 }
 
 async function main() {
@@ -95,7 +63,7 @@ async function main() {
   // when the review CONTEXT differs (different file path/workspace, hook kind,
   // or review policy/prompt version). Bump POLICY_VERSION whenever the review
   // prompt or panel logic changes so all prior approvals re-review.
-  const POLICY_VERSION = "2026-06-05.panel.1";
+  const POLICY_VERSION = "2026-06-19.kimi-mimo.1";
   const HOOK_KIND = "plan-file-panel";
   const approvalKey = createHash("sha256")
     .update(POLICY_VERSION).update("\0")
@@ -144,24 +112,24 @@ async function main() {
     }
   }
 
-  const codexRoot = latestCodexRoot();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const prompt = buildPrompt(filePath, content);
+  const { system, user } = buildPrompt(filePath, content);
 
-  const codexEnv = {
-    ...process.env,
-    CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA || CODEX_DATA,
-    ...(input.session_id ? { CODEX_COMPANION_SESSION_ID: input.session_id } : {})
-  };
+  const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user, cwd })));
+  const panel = combinePanel(results);
 
-  const [codex, grok] = await Promise.all([
-    codexRoot
-      ? runCodexReview({ companionPath: path.join(codexRoot, "scripts", "codex-companion.mjs"), prompt, cwd, env: codexEnv })
-      : Promise.resolve({ name: "Codex", error: "codex plugin not found" }),
-    runGrokReview({ prompt, cwd, env: process.env })
-  ]);
-
-  const panel = combinePanel(codex, grok);
+  try {
+    writeTrace(cwd, {
+      gate: "plan-file",
+      ws: cwd,
+      reviewers: results.map(({ raw, ...m }) => m),
+      systemPrompt: system,
+      userPrompt: user,
+      rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""]))
+    });
+  } catch {
+    // trace is best-effort
+  }
 
   if (panel.decision === "fail-open") {
     failOpen(panel.summary);
@@ -190,6 +158,6 @@ async function main() {
   emit({ systemMessage: `⛩ plan panel: ALLOW — ${panel.summary.slice(0, 220)}` });
 }
 
-main().catch((error) => {
+if (import.meta.url === `file://${process.argv[1]}`) main().catch((error) => {
   failOpen(error instanceof Error ? error.message : String(error));
 });
