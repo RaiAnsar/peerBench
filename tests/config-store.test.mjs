@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveConfig, workspaceStateDir, sharedRoot } from "../global-hooks/config-store.mjs";
+import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS } from "../global-hooks/config-store.mjs";
 
 test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => {
   const base = { MOONSHOT_API_KEY: "mk", MIMO_API_KEY: "xk" };
@@ -16,4 +16,12 @@ test("workspaceStateDir lands under the env-independent shared root", () => {
   const dir = workspaceStateDir("/some/workspace");
   assert.ok(dir.startsWith(sharedRoot()));
   assert.ok(/\/state\/workspace-[0-9a-f]{16}$/.test(dir));
+});
+test("reviewers override allows codex/grok selection", () => {
+  const cfg = resolveConfig({ env: {}, reviewers: ["codex", "grok"] });
+  assert.deepEqual(cfg.reviewers, ["codex", "grok"]);
+});
+test("unknown reviewer names are filtered out", () => {
+  const cfg = resolveConfig({ env: {}, reviewers: ["kimi", "bogus"] });
+  assert.deepEqual(cfg.reviewers, ["kimi"]);
 });

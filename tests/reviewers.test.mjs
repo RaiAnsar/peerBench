@@ -25,3 +25,14 @@ test("hard error from client → error side", async () => {
   const res = await r.find((x) => x.name === "kimi").run({ system: "s", user: "u" });
   assert.match(res.error, /timeout/);
 });
+test("codex/grok resolve to named CLI adapters", () => {
+  const r = resolveReviewers({ env: {}, reviewers: ["codex", "grok"] });
+  assert.deepEqual(r.map((x) => x.name), ["codex", "grok"]);
+  // both expose a run() function (CLI-backed; not exercised here)
+  assert.equal(typeof r[0].run, "function");
+});
+test("kimi adapter run still accepts the extended params and ignores cwd/env", async () => {
+  const [kimi] = resolveReviewers({ env: { MOONSHOT_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: true, text: "ALLOW: ok" }) });
+  const res = await kimi.run({ system: "s", user: "u", cwd: "/tmp", env: {} });
+  assert.equal(res.verdict, "ALLOW");
+});

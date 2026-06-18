@@ -1,9 +1,38 @@
 // global-hooks/reviewers.mjs
-import { parseVerdict } from "./panel-lib.mjs";
+import { parseVerdict, runCodexReview, runGrokReview } from "./panel-lib.mjs";
 import { resolveConfig } from "./config-store.mjs";
 import { review as defaultReview } from "./review-client.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 const NAMES = { kimi: "Kimi", mimo: "MiMo" };
 const STRICT = "\n\nIMPORTANT: respond with ONLY a first line of `ALLOW: <reason>` or `BLOCK: <reason>`. No preamble, no code fences.";
+
+const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");
+const CODEX_DATA = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex");
+
+function latestCodexRoot() {
+  let entries; try { entries = fs.readdirSync(PLUGIN_CACHE).filter((d) => /^\d+\.\d+\.\d+/.test(d)); } catch { return null; }
+  entries.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const latest = entries.at(-1);
+  return latest ? path.join(PLUGIN_CACHE, latest) : null;
+}
+
+function codexAdapter() {
+  return { name: "codex", async run({ system, user, cwd, env = process.env }) {
+    const codexRoot = latestCodexRoot();
+    if (!codexRoot) return { name: "Codex", error: "codex plugin not found" };
+    const codexEnv = { ...env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA || CODEX_DATA };
+    return runCodexReview({ companionPath: path.join(codexRoot, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${user}`, cwd, env: codexEnv });
+  } };
+}
+
+function grokAdapter() {
+  return { name: "grok", async run({ system, user, cwd, env = process.env }) {
+    return runGrokReview({ prompt: `${system}\n\n${user}`, cwd, env });
+  } };
+}
 
 // Scan EVERY line (skip filler / code-fence / blank) for the first ALLOW:/BLOCK: line.
 export function extractVerdict(text) {
@@ -17,14 +46,16 @@ export function extractVerdict(text) {
 }
 
 // NOTE (v1 limitation): parallel Kimi+MiMo calls fail-fast on rate limits; no backoff/retry beyond the one verdict-format retry below.
-export function resolveReviewers({ env = process.env, reviewImpl = defaultReview } = {}) {
-  const cfg = resolveConfig({ env });
+export function resolveReviewers({ env = process.env, reviewImpl = defaultReview, reviewers } = {}) {
+  const cfg = resolveConfig({ env, reviewers });
   return cfg.reviewers.map((name) => {
+    if (name === "codex") return codexAdapter();
+    if (name === "grok") return grokAdapter();
     const p = cfg.providers[name];
     const display = NAMES[name] || name;
     return {
       name,
-      async run({ system, user }) {
+      async run({ system, user, cwd, env: runEnv }) {
         if (!p.apiKey) return { name: display, error: "no api key" };
         const call = (u) => reviewImpl({ baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, system, user: u });
         let r = await call(user);

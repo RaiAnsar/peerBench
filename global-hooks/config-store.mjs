@@ -10,6 +10,7 @@ const DEFAULTS = {
   mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY" }
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
+export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "grok"];
 export function sharedRoot() { return path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared"); }
 export function workspaceStateDir(ws) {
   let canonical = ws; try { canonical = fs.realpathSync.native(ws); } catch { canonical = ws; }
@@ -18,7 +19,7 @@ export function workspaceStateDir(ws) {
   return path.join(sharedRoot(), "state", `${slug}-${hash}`);
 }
 function readFileConfig() { try { return JSON.parse(fs.readFileSync(path.join(sharedRoot(), "companion.json"), "utf8")); } catch { return {}; } }
-export function resolveConfig({ env = process.env } = {}) {
+export function resolveConfig({ env = process.env, reviewers: reviewersOverride } = {}) {
   const file = readFileConfig();
   const providers = {};
   for (const [name, d] of Object.entries(DEFAULTS)) {
@@ -29,7 +30,10 @@ export function resolveConfig({ env = process.env } = {}) {
       apiKey: env[d.keyEnv] || f.apiKey || ""
     };
   }
-  const sel = Array.isArray(file.reviewers) && file.reviewers.length ? file.reviewers : DEFAULT_REVIEWERS;
-  const reviewers = sel.filter((n) => n in providers);
+  // If an explicit override is provided (non-empty array), use it; otherwise fall back to file/default.
+  const sel = Array.isArray(reviewersOverride) && reviewersOverride.length
+    ? reviewersOverride
+    : (Array.isArray(file.reviewers) && file.reviewers.length ? file.reviewers : DEFAULT_REVIEWERS);
+  const reviewers = sel.filter((n) => KNOWN_REVIEWERS.includes(n));
   return { reviewers: reviewers.length ? reviewers : DEFAULT_REVIEWERS, providers };
 }
