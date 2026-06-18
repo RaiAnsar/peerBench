@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS } from "../global-hooks/config-store.mjs";
+import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers } from "../global-hooks/config-store.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => {
   const base = { MOONSHOT_API_KEY: "mk", MIMO_API_KEY: "xk" };
@@ -24,4 +27,15 @@ test("reviewers override allows codex/grok selection", () => {
 test("unknown reviewer names are filtered out", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["kimi", "bogus"] });
   assert.deepEqual(cfg.reviewers, ["kimi"]);
+});
+test("setReviewers writes companion.json and filters unknowns", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj-"));
+  const out = setReviewers(["codex", "grok", "bogus"], { root });
+  assert.deepEqual(out, ["codex", "grok"]);
+  const saved = JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8"));
+  assert.deepEqual(saved.reviewers, ["codex", "grok"]);
+});
+test("setReviewers throws on all-invalid", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj2-"));
+  assert.throws(() => setReviewers(["bogus"], { root }));
 });

@@ -18,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runGrok } from "./lib/grok-exec.mjs";
 import { appendJob, loadState, resolveStateDir, saveState } from "./lib/grok-state.mjs";
+import { resolveConfig, setReviewers } from "../global-hooks/config-store.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -210,10 +211,27 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel`);
+  if (sub === "reviewers") {
+    return reviewersCommand(rest);
+  }
+
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+export function reviewersCommand(args) {
+  const names = args.flatMap((a) => a.trim().split(/\s+/)).filter(Boolean);
+  if (!names.length) {
+    const current = resolveConfig().reviewers;
+    process.stdout.write(`Current reviewers: ${current.join(", ")}\n`);
+    return;
+  }
+  const saved = setReviewers(names);
+  process.stdout.write(`Reviewers set to: ${saved.join(", ")}\nTakes effect on the next gate run.\n`);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}
