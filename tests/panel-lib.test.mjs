@@ -28,37 +28,51 @@ test("parseVerdict extracts ALLOW/BLOCK/null", () => {
 });
 
 test("combinePanel: both allow", () => {
-  const r = combinePanel(
+  const r = combinePanel([
     { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
     { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: also ok", raw: "ALLOW: also ok" }
-  );
+  ]);
   assert.equal(r.decision, "allow");
   assert.match(r.summary, /Codex.*ok/);
   assert.match(r.summary, /Grok.*also ok/);
 });
 
 test("combinePanel: either blocks -> block with labeled findings", () => {
-  const r = combinePanel(
+  const r = combinePanel([
     { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
     { name: "Grok", verdict: "BLOCK", firstLine: "BLOCK: bad", raw: "BLOCK: bad\n- finding" }
-  );
+  ]);
   assert.equal(r.decision, "block");
   assert.match(r.findings, /\[Grok\]/);
   assert.doesNotMatch(r.findings, /\[Codex\]/);
 });
 
 test("combinePanel: one errored -> working reviewer decides, note attached", () => {
-  const r = combinePanel(
+  const r = combinePanel([
     { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
     { name: "Grok", error: "grok not on PATH" }
-  );
+  ]);
   assert.equal(r.decision, "allow");
   assert.match(r.summary, /Grok review skipped/);
 });
 
 test("combinePanel: both errored -> fail open", () => {
-  const r = combinePanel({ name: "Codex", error: "quota" }, { name: "Grok", error: "down" });
+  const r = combinePanel([{ name: "Codex", error: "quota" }, { name: "Grok", error: "down" }]);
   assert.equal(r.decision, "fail-open");
+});
+
+test("combinePanel: single reviewer (array of 1) allows", () => {
+  const r = combinePanel([{ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: fine", raw: "ALLOW: fine" }]);
+  assert.equal(r.decision, "allow");
+});
+test("combinePanel: N=3 with one error, one block -> block", () => {
+  const r = combinePanel([
+    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: a", raw: "ALLOW: a" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\n- x" },
+    { name: "Extra", error: "boom" }
+  ]);
+  assert.equal(r.decision, "block");
+  assert.match(r.summary, /MiMo: BLOCK/);
 });
 
 test("grokGateEnv strips codex plugin vars", () => {

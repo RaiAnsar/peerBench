@@ -162,30 +162,15 @@ export async function runGrokReview({ prompt, cwd, env }) {
   }
 }
 
-export function combinePanel(codex, grok) {
-  const sides = [codex, grok];
-  const errors = sides.filter((s) => s.error);
-  const verdicts = sides.filter((s) => !s.error);
+export function combinePanel(results) {
+  const sides = Array.isArray(results) ? results : [results];
+  const errors = sides.filter((s) => s && s.error);
+  const verdicts = sides.filter((s) => s && !s.error);
   const skipNotes = errors.map((s) => `${s.name} review skipped: ${s.error}`);
-
-  if (verdicts.length === 0) {
-    return { decision: "fail-open", summary: skipNotes.join(" | "), findings: "", skipNotes };
-  }
-
+  if (verdicts.length === 0) return { decision: "fail-open", summary: skipNotes.join(" | "), findings: "", skipNotes };
   const blockers = verdicts.filter((s) => s.verdict === "BLOCK");
-  if (blockers.length > 0) {
-    const findings = blockers.map((s) => `[${s.name}]\n${s.raw}`).join("\n\n");
-    return {
-      decision: "block",
-      summary: blockers.map((s) => `${s.name}: ${s.firstLine}`).join(" | "),
-      findings,
-      skipNotes
-    };
-  }
-
-  const summary = verdicts
-    .map((s) => `${s.name}: ${s.firstLine.slice("ALLOW:".length).trim().slice(0, 100)}`)
-    .concat(skipNotes)
-    .join(" · ");
+  if (blockers.length > 0) return { decision: "block", summary: blockers.map((s) => `${s.name}: ${s.firstLine}`).join(" | "),
+    findings: blockers.map((s) => `[${s.name}]\n${s.raw}`).join("\n\n"), skipNotes };
+  const summary = verdicts.map((s) => `${s.name}: ${s.firstLine.slice("ALLOW:".length).trim().slice(0, 100)}`).concat(skipNotes).join(" · ");
   return { decision: "allow", summary, findings: "", skipNotes };
 }
