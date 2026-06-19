@@ -116,3 +116,14 @@ test("report mode forces conclusion near the step cap (no infinite tool loop)", 
   const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, mode: "report", maxSteps: 4, tools, fetchImpl });
   assert.equal(res.ok, true); assert.match(res.report, /z\.js:1/);
 });
+test("per-round watchdog caps a slow exploration round, forcing conclusion", async () => {
+  let call = 0;
+  const fetchImpl = (url, opts) => new Promise((resolve, reject) => {
+    call++;
+    if (call === 1) { opts.signal.addEventListener("abort", () => { const e = new Error("aborted"); e.name = "AbortError"; reject(e); }); }
+    else resolve(sse([{ content: "Findings: bug at q.js:2" }]));
+  });
+  const tools = { schemas: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: {} } } }], execute: async () => "x" };
+  const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 10000, maxRoundMs: 50, mode: "report", maxSteps: 6, tools, fetchImpl });
+  assert.equal(res.ok, true); assert.match(res.report, /q\.js:2/);
+});

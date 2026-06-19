@@ -50,12 +50,13 @@ const TOOL_RESULT_CAP = 50_000;
 const CONCLUDE_BUDGET = 150_000;   // tool-output bytes after which we force the model to stop reading and conclude (kimi over-explores)
 const MAX_NET_RETRIES = 2;         // retry transient "fetch failed" (connection drops) — NOT genuine timeouts
 const RETRY_BACKOFF_MS = 750;
+const DEFAULT_ROUND_MS = 90_000;   // per-EXPLORATION-round cap: one runaway thinking round can't eat the whole budget
 
 export async function agenticReview({
   baseURL, apiKey, model, system, user,
   temperature = 0, headers = {}, tools,
   mode = "verdict",
-  maxSteps = DEFAULT_MAX_STEPS, timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl, debug = false
+  maxSteps = DEFAULT_MAX_STEPS, timeoutMs = DEFAULT_TIMEOUT_MS, maxRoundMs = DEFAULT_ROUND_MS, fetchImpl, debug = false
 }) {
   const zeroDiag = { steps: 0, filesRead: [], toolBytes: 0, lastReqBytes: 0, rounds: [] };
   if (!apiKey) return { ok: false, error: { kind: "nokey", detail: "no api key" }, diag: zeroDiag };
@@ -69,7 +70,7 @@ export async function agenticReview({
   const messages = [{ role: "system", content: system }, { role: "user", content: user }];
   const filesRead = [];
   const rounds = [];                              // per-round diagnostics
-  let nudges = 0, toolBytes = 0, lastReqBytes = 0, stepsRun = 0, concludeNudged = false;
+  let nudges = 0, toolBytes = 0, lastReqBytes = 0, stepsRun = 0, concludeNudged = false, roundConclude = false;
   const dlog = (...a) => { if (debug) console.error(`[agentic ${model}]`, ...a); };
   const diag = () => ({ steps: stepsRun, filesRead: filesRead.slice(), toolBytes, lastReqBytes, rounds: rounds.slice() });
 
@@ -78,7 +79,7 @@ export async function agenticReview({
       stepsRun = step + 1;
       // Force conclusion once enough context is gathered or we're near the cap — otherwise some
       // models (kimi) read files forever and hit maxSteps with no output. tool_choice:"none" makes it answer.
-      const force = toolBytes > CONCLUDE_BUDGET || step >= maxSteps - 2;
+      const force = roundConclude || toolBytes > CONCLUDE_BUDGET || step >= maxSteps - 2;
       if (force && !concludeNudged) {
         concludeNudged = true;
         messages.push({ role: "user", content: mode === "report"
@@ -88,25 +89,43 @@ export async function agenticReview({
       const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: force ? "none" : "auto", temperature, stream: true });
       lastReqBytes = body.length;
       dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);
-      let resp;
       const t0 = Date.now();
-      let netErr = null;
-      for (let attempt = 0; attempt <= MAX_NET_RETRIES; attempt++) {
-        try {
-          resp = await doFetch(`${baseURL}/chat/completions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
-            body, signal: controller.signal
-          });
-          netErr = null; break;
-        } catch (e) {
-          netErr = e;
-          if (e?.name === "AbortError") break;                 // genuine wall-clock timeout — don't retry
-          if (attempt < MAX_NET_RETRIES) {
-            dlog(`step ${step}: net attempt ${attempt + 1} failed (${e?.cause?.code || e?.message}); retry in ${RETRY_BACKOFF_MS}ms`);
-            await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
+      // Per-round watchdog on EXPLORATION rounds only — the conclude round gets the full remaining budget to synthesize.
+      const useWatchdog = !force;
+      const roundController = new AbortController();
+      const roundTimer = useWatchdog ? setTimeout(() => roundController.abort(), maxRoundMs) : null;
+      const signal = useWatchdog ? AbortSignal.any([controller.signal, roundController.signal]) : controller.signal;
+      let resp, parsed, netErr = null;
+      try {
+        for (let attempt = 0; attempt <= MAX_NET_RETRIES; attempt++) {
+          try {
+            resp = await doFetch(`${baseURL}/chat/completions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              body, signal
+            });
+            netErr = null; break;
+          } catch (e) {
+            netErr = e;
+            if (e?.name === "AbortError") break;                // timeout (round or total) — don't retry
+            if (attempt < MAX_NET_RETRIES) {
+              dlog(`step ${step}: net attempt ${attempt + 1} failed (${e?.cause?.code || e?.message}); retry in ${RETRY_BACKOFF_MS}ms`);
+              await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
+            }
           }
         }
+        if (!netErr && resp.ok) parsed = await readSSE(resp);   // may throw on mid-stream abort
+      } catch (e) {
+        netErr = e;
+      } finally {
+        if (roundTimer) clearTimeout(roundTimer);
+      }
+      // Watchdog tripped on THIS round (too slow) but total budget remains → force conclusion next round.
+      if (netErr?.name === "AbortError" && roundController.signal.aborted && !controller.signal.aborted) {
+        dlog(`step ${step}: ROUND EXCEEDED ${(maxRoundMs / 1000) | 0}s (${Date.now() - t0}ms) — forcing conclusion`);
+        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `round-timeout >${(maxRoundMs / 1000) | 0}s` });
+        roundConclude = true;
+        continue;
       }
       if (netErr) {
         const kind = netErr?.name === "AbortError" ? "timeout" : "network";
@@ -120,11 +139,6 @@ export async function agenticReview({
         dlog(`step ${step}: HTTP ${resp.status} reqKB=${(lastReqBytes / 1024) | 0}`);
         rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}` });
         return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${b.slice(0, 200)}` }, diag: diag() };
-      }
-      let parsed;
-      try { parsed = await readSSE(resp); } catch (e) {
-        const msg = String(e?.message || e).slice(0, 200);
-        return { ok: false, error: { kind: "network", detail: `stream read error: ${msg}` }, diag: diag() };
       }
       const msg = parsed.message;
 
