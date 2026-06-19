@@ -121,7 +121,10 @@ export async function runMain({
   const lastMsg = String(input.last_assistant_message ?? "").slice(0, 4000);
   const { system, user } = buildPrompt(status, diff, untracked, lastMsg);
 
-  const reviewers = resolveReviewersImpl({ env });
+  // (c) Codex reviews each turn via its OWN agentic gate (codex-plugin), where it scours files;
+  // this content-only gate adds just the cheap reviewers. To make this the sole per-turn gate
+  // (incl. Codex) later, drop this filter and disable Codex's own gate.
+  const reviewers = resolveReviewersImpl({ env }).filter((r) => String(r.name).toLowerCase() !== "codex");
   const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
   const panel = combinePanel(results);
 
