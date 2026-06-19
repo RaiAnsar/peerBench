@@ -6,7 +6,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
-import { isGangDisabled as defaultIsGangDisabled } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 
@@ -71,7 +71,7 @@ export function buildPrompt(status, diff, untracked, lastMsg) {
 export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
-  isGangDisabledImpl = defaultIsGangDisabled,
+  isBenchDisabledImpl = defaultIsBenchDisabled,
   env = process.env,
   input: inputOverride
 } = {}) {
@@ -85,7 +85,7 @@ export async function runMain({
   const cwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);
 
-  if (isGangDisabledImpl(ws)) {
+  if (isBenchDisabledImpl(ws)) {
     process.exit(0);
   }
 
@@ -107,7 +107,7 @@ export async function runMain({
   const reviewers = resolveReviewersImpl({ env }).filter((r) => String(r.name).toLowerCase() !== "codex");
   if (!reviewers.length) {
     // e.g. reviewers configured as codex-only — nothing left for this content-only gate to run.
-    emit({ systemMessage: "⛩ gang stop: no non-Codex reviewers configured — turn allowed (Codex runs its own gate)." });
+    emit({ systemMessage: "⛩ bench stop: no non-Codex reviewers configured — turn allowed (Codex runs its own gate)." });
     return;
   }
   const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
@@ -127,7 +127,7 @@ export async function runMain({
   }
 
   if (panel.decision === "fail-open") {
-    emit({ systemMessage: `⛩ gang stop: review failed (turn allowed) — ${panel.summary.slice(0, 250)}` });
+    emit({ systemMessage: `⛩ bench stop: review failed (turn allowed) — ${panel.summary.slice(0, 250)}` });
     return;
   }
 
@@ -143,12 +143,12 @@ export async function runMain({
   }
 
   // allow
-  emit({ systemMessage: `⛩ gang stop: ALLOW — ${panel.summary.slice(0, 220)}` });
+  emit({ systemMessage: `⛩ bench stop: ALLOW — ${panel.summary.slice(0, 220)}` });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   runMain().catch((error) => {
-    process.stderr.write(`⛩ gang stop: hook error (turn allowed) — ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`⛩ bench stop: hook error (turn allowed) — ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(0);
   });
 }

@@ -30,7 +30,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const hooksDir = path.join(os.homedir(), ".claude", "hooks");
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
-  const sharedRoot = path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared");
+  const sharedRoot = path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
   const backupDir = process.argv[2] || latestBackup(sharedRoot);
   if (!backupDir) { console.error("No backup dir found; pass one explicitly: node scripts/rollback.mjs <backupDir>"); process.exit(1); }
   let deployedNames = [];

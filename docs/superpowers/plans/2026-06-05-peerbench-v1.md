@@ -1,17 +1,17 @@
-# grok-companion v1 Implementation Plan
+# peerbench v1 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship grok-companion v1 — a lean Claude Code plugin wrapping headless `grok`, plus the dual Codex+Grok panel upgrade for the two global plan-gate hooks.
+**Goal:** Ship peerbench v1 — a lean Claude Code plugin wrapping headless `bench`, plus the dual Codex+Bench panel upgrade for the two global plan-gate hooks.
 
-**Architecture:** No persistent processes: every Grok call is one `grok -p <prompt> --output-format json` spawn with a read-only enforcement stack for reviews (permission-mode plan + tool deny-list + optional `--sandbox` profile + post-run workspace-mutation check that fingerprints CONTENT, not just status). Plugin-internal flows (commands) persist job records in a codex-shaped state dir; gate-side Grok runs are stateless. The global hooks in `~/.claude/hooks/` are version-controlled in this repo under `global-hooks/` and deployed by copy. `global-hooks/panel-lib.mjs` is deliberately self-contained (deployed outside the repo, no repo imports), so the workspace-integrity check appears both there and in `scripts/lib/grok-exec.mjs` — an accepted DRY exception.
+**Architecture:** No persistent processes: every Bench call is one `bench -p <prompt> --output-format json` spawn with a read-only enforcement stack for reviews (permission-mode plan + tool deny-list + optional `--sandbox` profile + post-run workspace-mutation check that fingerprints CONTENT, not just status). Plugin-internal flows (commands) persist job records in a codex-shaped state dir; gate-side Bench runs are stateless. The global hooks in `~/.claude/hooks/` are version-controlled in this repo under `global-hooks/` and deployed by copy. `global-hooks/panel-lib.mjs` is deliberately self-contained (deployed outside the repo, no repo imports), so the workspace-integrity check appears both there and in `scripts/lib/bench-exec.mjs` — an accepted DRY exception.
 
-**Tech Stack:** Node 20+ ESM (`.mjs`), `node:test` for unit tests, `grok` CLI v0.2.20+, Claude Code plugin system (local directory marketplace).
+**Tech Stack:** Node 20+ ESM (`.mjs`), `node:test` for unit tests, `bench` CLI v0.2.20+, Claude Code plugin system (local directory marketplace).
 
-**Spec:** `docs/superpowers/specs/2026-06-05-grok-companion-design.md` (Codex-approved 2026-06-05).
+**Spec:** `docs/superpowers/specs/2026-06-05-peerbench-design.md` (Codex-approved 2026-06-05).
 
 **Revision notes:**
-- *Codex round 1:* command args passed as ONE quoted string (injection fix); create-once backups; read-only contract completed with `--sandbox` opt-in + mutation-detection-as-failure in BOTH grok spawn paths; `/grok:review` includes untracked file contents.
+- *Codex round 1:* command args passed as ONE quoted string (injection fix); create-once backups; read-only contract completed with `--sandbox` opt-in + mutation-detection-as-failure in BOTH bench spawn paths; `/bench:review` includes untracked file contents.
 - *Codex round 2:* `parseArgs()` lifts leading flags from ANY argv element (real template shape is `["--json", "--write fix bug"]`); tests cover exact template shapes including `["review", "--json", "--base main"]`.
 - *Codex round 3:* mutation check now fingerprints CONTENT (status + `git diff HEAD` + untracked file content hashes), catching changes to already-dirty files — with "pre-dirty file modified during review" tests in both spawn paths; the ALLOW cooldown is keyed to the sha256 of the APPROVED content (identical re-save skips, ANY content change re-reviews; TTL removed).
 - *Codex round 4:* `workspaceFingerprint` enumerates untracked files via `git ls-files --others --exclude-standard -z` and hashes their CONTENT (catches a pre-existing untracked file rewritten during review — new tests in both spawn paths); the ALLOW skip is now a CONTEXT-COMPLETE key — `sha256(POLICY_VERSION \0 HOOK_KIND \0 filePath \0 content)` — so identical text under a different path/hook/policy version never auto-skips, and a `POLICY_VERSION` bump invalidates all prior approvals.
@@ -21,12 +21,12 @@
 ## File structure (locked)
 
 ```
-grok-companion/
+peerbench/
   .claude-plugin/plugin.json            Task 1
   .claude-plugin/marketplace.json       Task 1
-  scripts/lib/grok-state.mjs            Task 2   state dir + jobs (codex-shaped)
-  scripts/lib/grok-exec.mjs             Task 3   arg-building + spawn + parse + content-mutation check
-  scripts/grok-runner.mjs               Task 4   CLI: task|review|status|setup
+  scripts/lib/bench-state.mjs            Task 2   state dir + jobs (codex-shaped)
+  scripts/lib/bench-exec.mjs             Task 3   arg-building + spawn + parse + content-mutation check
+  scripts/bench-runner.mjs               Task 4   CLI: task|review|status|setup
   prompts/review.md                     Task 5
   prompts/plan-review.md                Task 5
   commands/setup.md                     Task 6
@@ -36,11 +36,11 @@ grok-companion/
   global-hooks/panel-lib.mjs            Task 8   shared panel logic (deployed copy, self-contained)
   global-hooks/codex-plan-file-review.mjs  Task 9   dual-panel version (deployed copy)
   global-hooks/codex-plan-review.mjs    Task 10  dual-panel version (deployed copy)
-  tests/grok-state.test.mjs             Task 2
-  tests/grok-exec.test.mjs              Task 3
+  tests/bench-state.test.mjs             Task 2
+  tests/bench-exec.test.mjs              Task 3
   tests/runner.integration.test.mjs     Task 4
   tests/panel-lib.test.mjs              Task 8
-  tests/fixtures/fake-grok              Task 3   PATH shim used by all non-live tests
+  tests/fixtures/fake-bench              Task 3   PATH shim used by all non-live tests
 ```
 
 Deployment targets owned by this repo from v1 on: `~/.claude/hooks/codex-plan-file-review.mjs`, `~/.claude/hooks/codex-plan-review.mjs`, `~/.claude/hooks/panel-lib.mjs` (copied by Task 11; originals backed up once to `*.pre-panel.bak`, never overwritten on rerun).
@@ -58,8 +58,8 @@ Deployment targets owned by this repo from v1 on: `~/.claude/hooks/codex-plan-fi
 
 ```json
 {
-  "name": "grok-companion",
-  "description": "Grok Build CLI companion: second-reviewer panel, delegation tasks, and review commands driven by headless grok.",
+  "name": "peerbench",
+  "description": "Bench Build CLI companion: second-reviewer panel, delegation tasks, and review commands driven by headless bench.",
   "version": "0.1.0"
 }
 ```
@@ -72,9 +72,9 @@ Deployment targets owned by this repo from v1 on: `~/.claude/hooks/codex-plan-fi
   "owner": { "name": "Rai Ansar" },
   "plugins": [
     {
-      "name": "grok-companion",
+      "name": "peerbench",
       "source": "./",
-      "description": "Grok second-reviewer panel + delegation for Claude Code"
+      "description": "Bench second-reviewer panel + delegation for Claude Code"
     }
   ]
 }
@@ -91,7 +91,7 @@ node_modules/
 - [ ] **Step 4: Validate JSON and commit**
 
 Run: `jq -e .name .claude-plugin/plugin.json && jq -e '.plugins[0].source' .claude-plugin/marketplace.json`
-Expected: `"grok-companion"` then `"./"`
+Expected: `"peerbench"` then `"./"`
 
 ```bash
 git add .claude-plugin .gitignore
@@ -103,22 +103,22 @@ git commit -m "feat: plugin + marketplace manifests"
 ### Task 2: State module (codex-shaped, panelStops key)
 
 **Files:**
-- Create: `scripts/lib/grok-state.mjs`
-- Test: `tests/grok-state.test.mjs`
+- Create: `scripts/lib/bench-state.mjs`
+- Test: `tests/bench-state.test.mjs`
 
 - [ ] **Step 1: Write the failing tests**
 
 ```js
-// tests/grok-state.test.mjs
+// tests/bench-state.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveStateDir, loadState, saveState, appendJob } from "../scripts/lib/grok-state.mjs";
+import { resolveStateDir, loadState, saveState, appendJob } from "../scripts/lib/bench-state.mjs";
 
 function tmpDataRoot() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "grok-state-test-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "bench-state-test-"));
 }
 
 test("resolveStateDir uses CLAUDE_PLUGIN_DATA when set", () => {
@@ -128,9 +128,9 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when set", () => {
   assert.match(path.basename(dir), /^some-ws-[0-9a-f]{16}$/);
 });
 
-test("resolveStateDir falls back to grok-companion-fallback", () => {
+test("resolveStateDir falls back to peerbench-fallback", () => {
   const dir = resolveStateDir("/tmp/some-ws", { env: {} });
-  assert.ok(dir.includes(path.join(".claude", "plugins", "data", "grok-companion-fallback", "state")));
+  assert.ok(dir.includes(path.join(".claude", "plugins", "data", "peerbench-fallback", "state")));
 });
 
 test("loadState returns default schema when missing", () => {
@@ -147,7 +147,7 @@ test("saveState then loadState round-trips and appendJob caps at 50", () => {
   saveState("/tmp/ws-b", st, opts);
   assert.equal(loadState("/tmp/ws-b", opts).config.panelStops, true);
   for (let i = 0; i < 60; i++) {
-    appendJob("/tmp/ws-b", { id: `task-${i}`, title: "Grok Task", status: "completed" }, opts);
+    appendJob("/tmp/ws-b", { id: `task-${i}`, title: "Bench Task", status: "completed" }, opts);
   }
   assert.equal(loadState("/tmp/ws-b", opts).jobs.length, 50);
 });
@@ -155,10 +155,10 @@ test("saveState then loadState round-trips and appendJob caps at 50", () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `node --test tests/grok-state.test.mjs`
-Expected: FAIL — `Cannot find module '.../scripts/lib/grok-state.mjs'`
+Run: `node --test tests/bench-state.test.mjs`
+Expected: FAIL — `Cannot find module '.../scripts/lib/bench-state.mjs'`
 
-- [ ] **Step 3: Implement `scripts/lib/grok-state.mjs`**
+- [ ] **Step 3: Implement `scripts/lib/bench-state.mjs`**
 
 ```js
 // State layout copies codex-companion's envelope shape so debug habits and
@@ -168,7 +168,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const FALLBACK_ROOT = path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-fallback");
+const FALLBACK_ROOT = path.join(os.homedir(), ".claude", "plugins", "data", "peerbench-fallback");
 
 function defaultState() {
   return { version: 1, config: { panelStops: false }, jobs: [] };
@@ -219,54 +219,54 @@ export function appendJob(workspaceRoot, job, opts = {}) {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `node --test tests/grok-state.test.mjs`
+Run: `node --test tests/bench-state.test.mjs`
 Expected: 4 passing
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/lib/grok-state.mjs tests/grok-state.test.mjs
+git add scripts/lib/bench-state.mjs tests/bench-state.test.mjs
 git commit -m "feat: codex-shaped state module with panelStops"
 ```
 
 ---
 
-### Task 3: Exec module + fake-grok test shim (content-level mutation check)
+### Task 3: Exec module + fake-bench test shim (content-level mutation check)
 
 **Files:**
-- Create: `scripts/lib/grok-exec.mjs`
-- Create: `tests/fixtures/fake-grok` (chmod +x)
-- Test: `tests/grok-exec.test.mjs`
+- Create: `scripts/lib/bench-exec.mjs`
+- Create: `tests/fixtures/fake-bench` (chmod +x)
+- Test: `tests/bench-exec.test.mjs`
 
-- [ ] **Step 1: Write the fake grok shim** (records argv, emits canned JSON, can simulate workspace mutation)
+- [ ] **Step 1: Write the fake bench shim** (records argv, emits canned JSON, can simulate workspace mutation)
 
 ```bash
 #!/bin/bash
-# tests/fixtures/fake-grok — records args, replies with canned grok JSON.
-# FAKE_GROK_LOG: file to append argv to.
-# FAKE_GROK_REPLY: JSON to emit (optional).
-# FAKE_GROK_EXIT: nonzero exit simulation (optional).
-# FAKE_GROK_TOUCH: file to (over)write before replying — simulates a review
+# tests/fixtures/fake-bench — records args, replies with canned bench JSON.
+# FAKE_BENCH_LOG: file to append argv to.
+# FAKE_BENCH_REPLY: JSON to emit (optional).
+# FAKE_BENCH_EXIT: nonzero exit simulation (optional).
+# FAKE_BENCH_TOUCH: file to (over)write before replying — simulates a review
 #                  run that mutates the workspace (must be caught as failure).
-printf '%s\n' "$*" >> "${FAKE_GROK_LOG:-/dev/null}"
-if [ -n "$FAKE_GROK_TOUCH" ]; then echo mutated > "$FAKE_GROK_TOUCH"; fi
-if [ -n "$FAKE_GROK_EXIT" ]; then exit "$FAKE_GROK_EXIT"; fi
-echo "${FAKE_GROK_REPLY:-{\"text\":\"ALLOW: looks fine\",\"stopReason\":\"EndTurn\",\"sessionId\":\"fake-session-1\"}}"
+printf '%s\n' "$*" >> "${FAKE_BENCH_LOG:-/dev/null}"
+if [ -n "$FAKE_BENCH_TOUCH" ]; then echo mutated > "$FAKE_BENCH_TOUCH"; fi
+if [ -n "$FAKE_BENCH_EXIT" ]; then exit "$FAKE_BENCH_EXIT"; fi
+echo "${FAKE_BENCH_REPLY:-{\"text\":\"ALLOW: looks fine\",\"stopReason\":\"EndTurn\",\"sessionId\":\"fake-session-1\"}}"
 ```
 
-Run: `chmod +x tests/fixtures/fake-grok`
+Run: `chmod +x tests/fixtures/fake-bench`
 
 - [ ] **Step 2: Write the failing tests**
 
 ```js
-// tests/grok-exec.test.mjs
+// tests/bench-exec.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildGrokArgs, runGrok, READONLY_DENY_TOOLS } from "../scripts/lib/grok-exec.mjs";
+import { buildBenchArgs, runBench, READONLY_DENY_TOOLS } from "../scripts/lib/bench-exec.mjs";
 
 const FIXTURES = path.join(import.meta.dirname, "fixtures");
 
@@ -284,14 +284,14 @@ function commitAll(dir, msg = "c") {
 function shimEnv(log, extra = {}) {
   return {
     ...process.env,
-    GROK_BIN: path.join(FIXTURES, "fake-grok"),
-    FAKE_GROK_LOG: log,
+    BENCH_BIN: path.join(FIXTURES, "fake-bench"),
+    FAKE_BENCH_LOG: log,
     ...extra
   };
 }
 
-test("buildGrokArgs review mode includes full read-only stack", () => {
-  const s = buildGrokArgs({ mode: "review", prompt: "P", cwd: "/ws" }, {}).join(" ");
+test("buildBenchArgs review mode includes full read-only stack", () => {
+  const s = buildBenchArgs({ mode: "review", prompt: "P", cwd: "/ws" }, {}).join(" ");
   assert.ok(s.includes("--permission-mode plan"));
   assert.ok(s.includes(`--disallowed-tools ${READONLY_DENY_TOOLS.join(",")}`));
   assert.ok(s.includes("--no-subagents"));
@@ -302,82 +302,82 @@ test("buildGrokArgs review mode includes full read-only stack", () => {
   assert.ok(!s.includes("--sandbox"));
 });
 
-test("buildGrokArgs adds --sandbox when GROK_SANDBOX_PROFILE set", () => {
-  const s = buildGrokArgs({ mode: "review", prompt: "P", cwd: "/ws" }, { GROK_SANDBOX_PROFILE: "readonly" }).join(" ");
+test("buildBenchArgs adds --sandbox when BENCH_SANDBOX_PROFILE set", () => {
+  const s = buildBenchArgs({ mode: "review", prompt: "P", cwd: "/ws" }, { BENCH_SANDBOX_PROFILE: "readonly" }).join(" ");
   assert.ok(s.includes("--sandbox readonly"));
 });
 
-test("buildGrokArgs write mode omits read-only stack, raises turns", () => {
-  const s = buildGrokArgs({ mode: "write", prompt: "P", cwd: "/ws" }, {}).join(" ");
+test("buildBenchArgs write mode omits read-only stack, raises turns", () => {
+  const s = buildBenchArgs({ mode: "write", prompt: "P", cwd: "/ws" }, {}).join(" ");
   assert.ok(!s.includes("--permission-mode plan"));
   assert.ok(!s.includes("--disallowed-tools"));
   assert.ok(s.includes("--max-turns 40"));
 });
 
-test("runGrok parses fake grok JSON", async () => {
+test("runBench parses fake bench JSON", async () => {
   const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ge-")), "argv.log");
   const ws = tmpGitRepo();
-  const res = await runGrok({ mode: "review", prompt: "review this", cwd: ws }, { env: shimEnv(log) });
+  const res = await runBench({ mode: "review", prompt: "review this", cwd: ws }, { env: shimEnv(log) });
   assert.equal(res.status, 0);
   assert.equal(res.rawOutput, "ALLOW: looks fine");
   assert.equal(res.sessionId, "fake-session-1");
   assert.match(fs.readFileSync(log, "utf8"), /--permission-mode plan/);
 });
 
-test("runGrok review mode detects NEW file creation -> failure", async () => {
+test("runBench review mode detects NEW file creation -> failure", async () => {
   const ws = tmpGitRepo();
-  const res = await runGrok(
+  const res = await runBench(
     { mode: "review", prompt: "x", cwd: ws },
-    { env: shimEnv("/dev/null", { FAKE_GROK_TOUCH: path.join(ws, "SHOULD_NOT_EXIST") }) }
+    { env: shimEnv("/dev/null", { FAKE_BENCH_TOUCH: path.join(ws, "SHOULD_NOT_EXIST") }) }
   );
   assert.notEqual(res.status, 0);
   assert.match(String(res.error), /mutated/i);
 });
 
-test("runGrok review mode detects content change to ALREADY-DIRTY file -> failure", async () => {
+test("runBench review mode detects content change to ALREADY-DIRTY file -> failure", async () => {
   // The git-status-only check would miss this: the file is dirty both before
   // and after, so porcelain output is identical. Content fingerprint catches it.
   const ws = tmpGitRepo();
   fs.writeFileSync(path.join(ws, "doc.md"), "v1\n");
   commitAll(ws);
   fs.writeFileSync(path.join(ws, "doc.md"), "v2 dirty before review\n"); // dirty pre-review
-  const res = await runGrok(
+  const res = await runBench(
     { mode: "review", prompt: "x", cwd: ws },
-    { env: shimEnv("/dev/null", { FAKE_GROK_TOUCH: path.join(ws, "doc.md") }) } // grok rewrites the dirty file
+    { env: shimEnv("/dev/null", { FAKE_BENCH_TOUCH: path.join(ws, "doc.md") }) } // bench rewrites the dirty file
   );
   assert.notEqual(res.status, 0);
   assert.match(String(res.error), /mutated/i);
 });
 
-test("runGrok review mode detects rewrite of a PRE-EXISTING untracked file -> failure", async () => {
+test("runBench review mode detects rewrite of a PRE-EXISTING untracked file -> failure", async () => {
   const ws = tmpGitRepo();
   fs.writeFileSync(path.join(ws, "notes.txt"), "original untracked\n"); // untracked, unchanged status both sides
-  const res = await runGrok(
+  const res = await runBench(
     { mode: "review", prompt: "x", cwd: ws },
-    { env: shimEnv("/dev/null", { FAKE_GROK_TOUCH: path.join(ws, "notes.txt") }) }
+    { env: shimEnv("/dev/null", { FAKE_BENCH_TOUCH: path.join(ws, "notes.txt") }) }
   );
   assert.notEqual(res.status, 0);
   assert.match(String(res.error), /mutated/i);
 });
 
-test("runGrok write mode does NOT run mutation check", async () => {
+test("runBench write mode does NOT run mutation check", async () => {
   const ws = tmpGitRepo();
-  const res = await runGrok(
+  const res = await runBench(
     { mode: "write", prompt: "x", cwd: ws },
-    { env: shimEnv("/dev/null", { FAKE_GROK_TOUCH: path.join(ws, "expected-edit.txt") }) }
+    { env: shimEnv("/dev/null", { FAKE_BENCH_TOUCH: path.join(ws, "expected-edit.txt") }) }
   );
   assert.equal(res.status, 0);
 });
 
-test("runGrok surfaces nonzero exit as error result", async () => {
+test("runBench surfaces nonzero exit as error result", async () => {
   const ws = tmpGitRepo();
-  const res = await runGrok({ mode: "review", prompt: "x", cwd: ws }, { env: shimEnv("/dev/null", { FAKE_GROK_EXIT: "3" }) });
+  const res = await runBench({ mode: "review", prompt: "x", cwd: ws }, { env: shimEnv("/dev/null", { FAKE_BENCH_EXIT: "3" }) });
   assert.equal(res.status, 3);
   assert.equal(res.rawOutput, "");
 });
 
-test("runGrok missing binary -> error result, no throw", async () => {
-  const res = await runGrok({ mode: "review", prompt: "x", cwd: "/tmp" }, { env: { ...process.env, GROK_BIN: "/nonexistent/grok" } });
+test("runBench missing binary -> error result, no throw", async () => {
+  const res = await runBench({ mode: "review", prompt: "x", cwd: "/tmp" }, { env: { ...process.env, BENCH_BIN: "/nonexistent/bench" } });
   assert.notEqual(res.status, 0);
   assert.ok(res.error);
 });
@@ -385,10 +385,10 @@ test("runGrok missing binary -> error result, no throw", async () => {
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `node --test tests/grok-exec.test.mjs`
+Run: `node --test tests/bench-exec.test.mjs`
 Expected: FAIL — module not found
 
-- [ ] **Step 4: Implement `scripts/lib/grok-exec.mjs`**
+- [ ] **Step 4: Implement `scripts/lib/bench-exec.mjs`**
 
 ```js
 import { createHash } from "node:crypto";
@@ -396,19 +396,19 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-// Grok mirrors Claude Code tool naming (its --help references Claude Code
-// flags). Verified against `grok inspect` during implementation — adjust this
+// Bench mirrors Claude Code tool naming (its --help references Claude Code
+// flags). Verified against `bench inspect` during implementation — adjust this
 // list there if names differ; --permission-mode plan is the primary guard
 // and carries enforcement even if a name here is wrong.
 export const READONLY_DENY_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"];
 
 const TIMEOUT_MS = 13 * 60 * 1000;
 
-// env.GROK_SANDBOX_PROFILE: optional sandbox profile name (spec: applied when
+// env.BENCH_SANDBOX_PROFILE: optional sandbox profile name (spec: applied when
 // discoverable). Set it in ~/.claude/settings.json env once a valid profile
-// name for the installed grok version is known; unset = flag omitted and the
+// name for the installed bench version is known; unset = flag omitted and the
 // permission-mode/deny-list/mutation-check layers carry enforcement.
-export function buildGrokArgs({ mode, prompt, cwd, effort = "medium", maxTurns }, env = process.env) {
+export function buildBenchArgs({ mode, prompt, cwd, effort = "medium", maxTurns }, env = process.env) {
   const args = ["-p", prompt, "--output-format", "json", "--cwd", cwd, "--effort", effort];
   if (mode === "review") {
     args.push(
@@ -418,8 +418,8 @@ export function buildGrokArgs({ mode, prompt, cwd, effort = "medium", maxTurns }
       "--disable-web-search",
       "--max-turns", String(maxTurns ?? 8)
     );
-    if (env.GROK_SANDBOX_PROFILE) {
-      args.push("--sandbox", env.GROK_SANDBOX_PROFILE);
+    if (env.BENCH_SANDBOX_PROFILE) {
+      args.push("--sandbox", env.BENCH_SANDBOX_PROFILE);
     }
   } else {
     args.push("--max-turns", String(maxTurns ?? 40));
@@ -470,9 +470,9 @@ export function workspaceFingerprint(cwd) {
   }
 }
 
-export function runGrok(request, { env = process.env, timeoutMs = TIMEOUT_MS } = {}) {
-  const bin = env.GROK_BIN || "grok";
-  const args = buildGrokArgs(request, env);
+export function runBench(request, { env = process.env, timeoutMs = TIMEOUT_MS } = {}) {
+  const bin = env.BENCH_BIN || "bench";
+  const args = buildBenchArgs(request, env);
   const preFingerprint = request.mode === "review" ? workspaceFingerprint(request.cwd) : null;
   return new Promise((resolve) => {
     let stdout = "";
@@ -493,7 +493,7 @@ export function runGrok(request, { env = process.env, timeoutMs = TIMEOUT_MS } =
     }
     const timer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch { /* already dead */ }
-      finish({ status: 124, rawOutput: "", sessionId: null, error: "grok timed out" });
+      finish({ status: 124, rawOutput: "", sessionId: null, error: "bench timed out" });
     }, timeoutMs);
     child.stdout.on("data", (d) => { stdout += d; });
     child.stderr.on("data", (d) => { stderr += d; });
@@ -506,19 +506,19 @@ export function runGrok(request, { env = process.env, timeoutMs = TIMEOUT_MS } =
       if (request.mode === "review" && preFingerprint !== null) {
         const post = workspaceFingerprint(request.cwd);
         if (post !== null && post !== preFingerprint) {
-          finish({ status: 1, rawOutput: "", sessionId: null, error: "grok mutated the workspace during a read-only review — result discarded" });
+          finish({ status: 1, rawOutput: "", sessionId: null, error: "bench mutated the workspace during a read-only review — result discarded" });
           return;
         }
       }
       if (code !== 0) {
-        finish({ status: code ?? 1, rawOutput: "", sessionId: null, error: stderr.trim().slice(0, 400) || `grok exited ${code}` });
+        finish({ status: code ?? 1, rawOutput: "", sessionId: null, error: stderr.trim().slice(0, 400) || `bench exited ${code}` });
         return;
       }
       try {
         const parsed = JSON.parse(stdout);
         finish({ status: 0, rawOutput: String(parsed.text ?? "").trim(), sessionId: parsed.sessionId ?? null });
       } catch {
-        finish({ status: 1, rawOutput: "", sessionId: null, error: "grok returned non-JSON output" });
+        finish({ status: 1, rawOutput: "", sessionId: null, error: "bench returned non-JSON output" });
       }
     });
   });
@@ -527,21 +527,21 @@ export function runGrok(request, { env = process.env, timeoutMs = TIMEOUT_MS } =
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `node --test tests/grok-exec.test.mjs`
+Run: `node --test tests/bench-exec.test.mjs`
 Expected: 10 passing
 
 - [ ] **Step 6: Verify deny-tool names and probe for sandbox profile names**
 
-Run: `grok inspect 2>/dev/null | grep -iE "tools?|sandbox" | head -20` and `grok --help | grep -B2 -A4 sandbox`
+Run: `bench inspect 2>/dev/null | grep -iE "tools?|sandbox" | head -20` and `bench --help | grep -B2 -A4 sandbox`
 Expected: tool naming + any documented sandbox profile values. Actions:
 - If write-capable tool names differ from `READONLY_DENY_TOOLS`, update the constant AND the test expectation, re-run tests.
-- If a valid read-only sandbox profile name is found, add to `~/.claude/settings.json` env: `"GROK_SANDBOX_PROFILE": "<name>"` and live-verify `grok -p "say ok" --sandbox <name> --output-format json` succeeds. If none found, leave unset (documented fallback per spec).
+- If a valid read-only sandbox profile name is found, add to `~/.claude/settings.json` env: `"BENCH_SANDBOX_PROFILE": "<name>"` and live-verify `bench -p "say ok" --sandbox <name> --output-format json` succeeds. If none found, leave unset (documented fallback per spec).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add scripts/lib/grok-exec.mjs tests/grok-exec.test.mjs tests/fixtures/fake-grok
-git commit -m "feat: grok exec module — read-only stack, sandbox opt-in, content-level mutation check"
+git add scripts/lib/bench-exec.mjs tests/bench-exec.test.mjs tests/fixtures/fake-bench
+git commit -m "feat: bench exec module — read-only stack, sandbox opt-in, content-level mutation check"
 ```
 
 ---
@@ -549,7 +549,7 @@ git commit -m "feat: grok exec module — read-only stack, sandbox opt-in, conte
 ### Task 4: Runner CLI (flag-lifting arg parser, untracked-aware review)
 
 **Files:**
-- Create: `scripts/grok-runner.mjs`
+- Create: `scripts/bench-runner.mjs`
 - Test: `tests/runner.integration.test.mjs`
 
 The command templates (Task 6) invoke the runner as `task --json "$ARGUMENTS"` — so the runner receives MIXED argv like `["--json", "--write fix bug"]` or `["--json", "--base main"]`: standalone flag elements first, then ONE quoted string that may itself START with flags and end with the verbatim prompt. `parseArgs()` handles exactly that: it consumes standalone flag elements, then lifts leading flag tokens off the front of the first non-flag element; the remainder of that element is the prompt, character-for-character (no shell re-splitting — injection-safe).
@@ -566,7 +566,7 @@ import os from "node:os";
 import path from "node:path";
 
 const ROOT = path.join(import.meta.dirname, "..");
-const RUNNER = path.join(ROOT, "scripts", "grok-runner.mjs");
+const RUNNER = path.join(ROOT, "scripts", "bench-runner.mjs");
 const FIXTURES = path.join(import.meta.dirname, "fixtures");
 
 function freshWs() {
@@ -583,9 +583,9 @@ function run(args, { ws = freshWs(), envExtra = {} } = {}) {
     cwd: ws,
     env: {
       ...process.env,
-      GROK_BIN: path.join(FIXTURES, "fake-grok"),
+      BENCH_BIN: path.join(FIXTURES, "fake-bench"),
       CLAUDE_PLUGIN_DATA: dataRoot,
-      FAKE_GROK_LOG: path.join(dataRoot, "argv.log"),
+      FAKE_BENCH_LOG: path.join(dataRoot, "argv.log"),
       ...envExtra
     }
   });
@@ -606,7 +606,7 @@ test("task --json returns runner JSON and records a job", () => {
 
 test("template shape: ['task','--json','--write fix …'] — embedded flag lifted, prompt verbatim", () => {
   // Exactly what `task --json "$ARGUMENTS"` produces when the user typed
-  // `/grok:task --write fix the "auth bug" in app.ts; don't touch tests`.
+  // `/bench:task --write fix the "auth bug" in app.ts; don't touch tests`.
   const { dataRoot } = run(["task", "--json", `--write fix the "auth bug" in app.ts; don't touch tests`]);
   const log = fs.readFileSync(path.join(dataRoot, "argv.log"), "utf8");
   assert.doesNotMatch(log, /--permission-mode plan/); // --write recognized -> write mode
@@ -648,19 +648,19 @@ test("status prints recorded jobs", () => {
   const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runner-"));
   const env = {
     ...process.env,
-    GROK_BIN: path.join(FIXTURES, "fake-grok"),
+    BENCH_BIN: path.join(FIXTURES, "fake-bench"),
     CLAUDE_PLUGIN_DATA: dataRoot,
-    FAKE_GROK_LOG: "/dev/null"
+    FAKE_BENCH_LOG: "/dev/null"
   };
   execFileSync(process.execPath, [RUNNER, "task", "--json", "first"], { encoding: "utf8", cwd: ws, env });
   const out = execFileSync(process.execPath, [RUNNER, "status"], { encoding: "utf8", cwd: ws, env });
-  assert.match(out, /Grok Task/);
+  assert.match(out, /Bench Task/);
   assert.match(out, /completed/);
 });
 
 test("setup reports version or missing binary without throwing", () => {
   const { out } = run(["setup"]);
-  assert.match(out, /grok|GROK/i);
+  assert.match(out, /bench|BENCH/i);
 });
 ```
 
@@ -669,16 +669,16 @@ test("setup reports version or missing binary without throwing", () => {
 Run: `node --test tests/runner.integration.test.mjs`
 Expected: FAIL — runner missing
 
-- [ ] **Step 3: Implement `scripts/grok-runner.mjs`**
+- [ ] **Step 3: Implement `scripts/bench-runner.mjs`**
 
 ```js
 #!/usr/bin/env node
-// grok-companion runtime CLI.
+// peerbench runtime CLI.
 // Usage:
-//   grok-runner.mjs task [--json] [--write] [--effort E] [--max-turns N] <prompt…>
-//   grok-runner.mjs review [--json] [--base <ref>]
-//   grok-runner.mjs status
-//   grok-runner.mjs setup
+//   bench-runner.mjs task [--json] [--write] [--effort E] [--max-turns N] <prompt…>
+//   bench-runner.mjs review [--json] [--base <ref>]
+//   bench-runner.mjs status
+//   bench-runner.mjs setup
 //
 // Slash-command templates call `task --json "$ARGUMENTS"`, producing mixed
 // argv: standalone flags first, then ONE quoted element that may START with
@@ -690,8 +690,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runGrok } from "./lib/grok-exec.mjs";
-import { appendJob, loadState, resolveStateDir } from "./lib/grok-state.mjs";
+import { runBench } from "./lib/bench-exec.mjs";
+import { appendJob, loadState, resolveStateDir } from "./lib/bench-state.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -798,7 +798,7 @@ async function recordedRun({ title, prompt, mode, flags, cwd }) {
   const ws = workspaceRoot(cwd);
   const job = { id: newJobId(), title, status: "running", workspaceRoot: ws, createdAt: new Date().toISOString() };
   appendJob(ws, job, {});
-  const res = await runGrok({ mode, prompt, cwd: ws, effort: flags.effort, maxTurns: flags.maxTurns ?? undefined }, {});
+  const res = await runBench({ mode, prompt, cwd: ws, effort: flags.effort, maxTurns: flags.maxTurns ?? undefined }, {});
   const done = {
     ...job,
     status: res.status === 0 ? "completed" : "failed",
@@ -816,7 +816,7 @@ async function main() {
 
   if (sub === "task") {
     if (!prompt) throw new Error("task requires a prompt");
-    const payload = await recordedRun({ title: "Grok Task", prompt, mode: flags.write ? "write" : "review", flags, cwd });
+    const payload = await recordedRun({ title: "Bench Task", prompt, mode: flags.write ? "write" : "review", flags, cwd });
     emit(payload, flags);
     process.exitCode = payload.status === 0 ? 0 : 1;
     return;
@@ -832,7 +832,7 @@ async function main() {
       GIT_DIFF: diff,
       UNTRACKED: flags.base ? "" : untrackedBlock(ws)
     });
-    const payload = await recordedRun({ title: "Grok Review", prompt: reviewPrompt, mode: "review", flags, cwd });
+    const payload = await recordedRun({ title: "Bench Review", prompt: reviewPrompt, mode: "review", flags, cwd });
     emit(payload, flags);
     process.exitCode = payload.status === 0 ? 0 : 1;
     return;
@@ -842,7 +842,7 @@ async function main() {
     const ws = workspaceRoot(cwd);
     const state = loadState(ws, {});
     if (!state.jobs.length) {
-      process.stdout.write("No grok-companion jobs recorded for this workspace.\n");
+      process.stdout.write("No peerbench jobs recorded for this workspace.\n");
       return;
     }
     for (const job of state.jobs.slice(-10).reverse()) {
@@ -853,15 +853,15 @@ async function main() {
   }
 
   if (sub === "setup") {
-    const bin = process.env.GROK_BIN || "grok";
+    const bin = process.env.BENCH_BIN || "bench";
     const version = spawnSync(bin, ["--version"], { encoding: "utf8" });
     if (version.status !== 0) {
-      process.stdout.write("GROK NOT AVAILABLE: `grok --version` failed. Install Grok Build CLI and ensure it is on PATH.\n");
+      process.stdout.write("BENCH NOT AVAILABLE: `bench --version` failed. Install Bench Build CLI and ensure it is on PATH.\n");
       process.exitCode = 1;
       return;
     }
     const ws = workspaceRoot(cwd);
-    process.stdout.write(`grok binary: OK (${version.stdout.trim()})\nstate dir: ${resolveStateDir(ws, {})}\nsandbox profile: ${process.env.GROK_SANDBOX_PROFILE || "(unset — permission-mode/deny-list/mutation-check enforce read-only)"}\npanel (stops): ${loadState(ws, {}).config.panelStops ? "ON" : "off (v2 feature)"}\n`);
+    process.stdout.write(`bench binary: OK (${version.stdout.trim()})\nstate dir: ${resolveStateDir(ws, {})}\nsandbox profile: ${process.env.BENCH_SANDBOX_PROFILE || "(unset — permission-mode/deny-list/mutation-check enforce read-only)"}\npanel (stops): ${loadState(ws, {}).config.panelStops ? "ON" : "off (v2 feature)"}\n`);
     return;
   }
 
@@ -897,8 +897,8 @@ Expected: 7 passing
 - [ ] **Step 6: Commit**
 
 ```bash
-git add scripts/grok-runner.mjs prompts/review.md tests/runner.integration.test.mjs
-git commit -m "feat: grok-runner CLI — flag-lifting parser, untracked-aware review"
+git add scripts/bench-runner.mjs prompts/review.md tests/runner.integration.test.mjs
+git commit -m "feat: bench-runner CLI — flag-lifting parser, untracked-aware review"
 ```
 
 ---
@@ -988,31 +988,31 @@ All command templates pass `"$ARGUMENTS"` as ONE quoted shell argument; the runn
 
 ```markdown
 ---
-description: Check Grok CLI availability, auth, and grok-companion state for this workspace
-allowed-tools: Bash(node:*), Bash(grok:*)
+description: Check Bench CLI availability, auth, and peerbench state for this workspace
+allowed-tools: Bash(node:*), Bash(bench:*)
 ---
 
 Run:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-runner.mjs" setup
+node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" setup
 ```
 
-Present the output to the user verbatim. If it reports GROK NOT AVAILABLE, tell the user to install Grok Build CLI and ensure `grok` is on PATH, then stop.
+Present the output to the user verbatim. If it reports BENCH NOT AVAILABLE, tell the user to install Bench Build CLI and ensure `bench` is on PATH, then stop.
 ```
 
 - [ ] **Step 2: Write `commands/status.md`**
 
 ```markdown
 ---
-description: Show recent grok-companion jobs for this workspace
+description: Show recent peerbench jobs for this workspace
 allowed-tools: Bash(node:*)
 ---
 
 Run:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-runner.mjs" status
+node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" status
 ```
 
 Present the output verbatim.
@@ -1022,7 +1022,7 @@ Present the output verbatim.
 
 ```markdown
 ---
-description: Delegate a task to Grok (read-only by default; --write to allow edits)
+description: Delegate a task to Bench (read-only by default; --write to allow edits)
 argument-hint: '[--write] <task description>'
 disable-model-invocation: false
 allowed-tools: Bash(node:*)
@@ -1035,20 +1035,20 @@ lifts leading flags like --write safely from inside the quoted string; never
 unquote):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-runner.mjs" task --json "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" task --json "$ARGUMENTS"
 ```
 
 Rules:
 - Default is read-only investigation. Only include --write when the user asked for actual edits.
 - Return the `rawOutput` from the JSON verbatim. Do not paraphrase.
-- If status is nonzero, show the error and suggest /grok:setup.
+- If status is nonzero, show the error and suggest /bench:setup.
 ```
 
 - [ ] **Step 4: Write `commands/review.md`**
 
 ```markdown
 ---
-description: Run a Grok code review against local git state
+description: Run a Bench code review against local git state
 argument-hint: '[--base <ref>]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Bash(git:*)
@@ -1062,7 +1062,7 @@ Run — pass the arguments as ONE quoted string exactly as shown (the runner
 lifts --base from inside the quoted string; never unquote):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-runner.mjs" review --json "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" review --json "$ARGUMENTS"
 ```
 
 Return the `rawOutput` verbatim, exactly as-is. Do not paraphrase, summarize, or fix anything it mentions.
@@ -1083,23 +1083,23 @@ git commit -m "feat: setup/status/task/review commands (quoted args)"
 
 - [ ] **Step 1: Register the local directory marketplace**
 
-Run: `claude marketplace add /Users/rai/Desktop/Personal/Tools/grok-companion`
+Run: `claude marketplace add /Users/rai/Desktop/Personal/Tools/peerbench`
 Expected: marketplace `rai-tools` registered. (If the CLI subcommand differs in this version, the fallback is `/plugin marketplace add …` inside a Claude Code session.)
 
 - [ ] **Step 2: Enable the plugin in `~/.claude/settings.json`** — merge into `enabledPlugins`:
 
 ```json
-"grok-companion@rai-tools": true
+"peerbench@rai-tools": true
 ```
 
-Run: `jq -e '.enabledPlugins["grok-companion@rai-tools"]' ~/.claude/settings.json`
+Run: `jq -e '.enabledPlugins["peerbench@rai-tools"]' ~/.claude/settings.json`
 Expected: `true`
 
-- [ ] **Step 3: Verify in a fresh session** — run `/grok:setup` in any project.
-Expected output contains `grok binary: OK (grok 0.2.20 …)` and a state dir path.
+- [ ] **Step 3: Verify in a fresh session** — run `/bench:setup` in any project.
+Expected output contains `bench binary: OK (bench 0.2.20 …)` and a state dir path.
 
-- [ ] **Step 4: Live smoke: `/grok:task "List the three largest files in this repo"`**
-Expected: Grok's actual answer; `/grok:status` then shows the completed job.
+- [ ] **Step 4: Live smoke: `/bench:task "List the three largest files in this repo"`**
+Expected: Bench's actual answer; `/bench:status` then shows the completed job.
 
 ---
 
@@ -1119,7 +1119,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parseVerdict, combinePanel, grokGateEnv, buildGrokGateArgs, runGrokReview } from "../global-hooks/panel-lib.mjs";
+import { parseVerdict, combinePanel, benchGateEnv, buildBenchGateArgs, runBenchReview } from "../global-hooks/panel-lib.mjs";
 
 const FIXTURES = path.join(import.meta.dirname, "fixtures");
 
@@ -1144,39 +1144,39 @@ test("parseVerdict extracts ALLOW/BLOCK/null", () => {
 test("combinePanel: both allow", () => {
   const r = combinePanel(
     { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: also ok", raw: "ALLOW: also ok" }
+    { name: "Bench", verdict: "ALLOW", firstLine: "ALLOW: also ok", raw: "ALLOW: also ok" }
   );
   assert.equal(r.decision, "allow");
   assert.match(r.summary, /Codex.*ok/);
-  assert.match(r.summary, /Grok.*also ok/);
+  assert.match(r.summary, /Bench.*also ok/);
 });
 
 test("combinePanel: either blocks -> block with labeled findings", () => {
   const r = combinePanel(
     { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "Grok", verdict: "BLOCK", firstLine: "BLOCK: bad", raw: "BLOCK: bad\n- finding" }
+    { name: "Bench", verdict: "BLOCK", firstLine: "BLOCK: bad", raw: "BLOCK: bad\n- finding" }
   );
   assert.equal(r.decision, "block");
-  assert.match(r.findings, /\[Grok\]/);
+  assert.match(r.findings, /\[Bench\]/);
   assert.doesNotMatch(r.findings, /\[Codex\]/);
 });
 
 test("combinePanel: one errored -> working reviewer decides, note attached", () => {
   const r = combinePanel(
     { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "Grok", error: "grok not on PATH" }
+    { name: "Bench", error: "bench not on PATH" }
   );
   assert.equal(r.decision, "allow");
-  assert.match(r.summary, /Grok review skipped/);
+  assert.match(r.summary, /Bench review skipped/);
 });
 
 test("combinePanel: both errored -> fail open", () => {
-  const r = combinePanel({ name: "Codex", error: "quota" }, { name: "Grok", error: "down" });
+  const r = combinePanel({ name: "Codex", error: "quota" }, { name: "Bench", error: "down" });
   assert.equal(r.decision, "fail-open");
 });
 
-test("grokGateEnv strips codex plugin vars", () => {
-  const env = grokGateEnv({
+test("benchGateEnv strips codex plugin vars", () => {
+  const env = benchGateEnv({
     PATH: "/bin",
     CLAUDE_PLUGIN_DATA: "/codex-data",
     CODEX_COMPANION_SESSION_ID: "x",
@@ -1188,67 +1188,67 @@ test("grokGateEnv strips codex plugin vars", () => {
   assert.equal(env.HOME, "/Users/rai");
 });
 
-test("buildGrokGateArgs adds --sandbox only when profile set", () => {
-  assert.ok(!buildGrokGateArgs({}).includes("--sandbox"));
-  const withProfile = buildGrokGateArgs({ GROK_SANDBOX_PROFILE: "readonly" });
+test("buildBenchGateArgs adds --sandbox only when profile set", () => {
+  assert.ok(!buildBenchGateArgs({}).includes("--sandbox"));
+  const withProfile = buildBenchGateArgs({ BENCH_SANDBOX_PROFILE: "readonly" });
   const idx = withProfile.indexOf("--sandbox");
   assert.notEqual(idx, -1);
   assert.equal(withProfile[idx + 1], "readonly");
 });
 
-test("runGrokReview detects NEW file creation -> error side", async () => {
+test("runBenchReview detects NEW file creation -> error side", async () => {
   const ws = tmpGitRepo();
-  const res = await runGrokReview({
+  const res = await runBenchReview({
     prompt: "review",
     cwd: ws,
     env: {
       ...process.env,
-      GROK_BIN: path.join(FIXTURES, "fake-grok"),
-      FAKE_GROK_LOG: "/dev/null",
-      FAKE_GROK_TOUCH: path.join(ws, "SHOULD_NOT_EXIST")
+      BENCH_BIN: path.join(FIXTURES, "fake-bench"),
+      FAKE_BENCH_LOG: "/dev/null",
+      FAKE_BENCH_TOUCH: path.join(ws, "SHOULD_NOT_EXIST")
     }
   });
-  assert.equal(res.name, "Grok");
+  assert.equal(res.name, "Bench");
   assert.match(String(res.error), /mutated/i);
 });
 
-test("runGrokReview detects content change to ALREADY-DIRTY file -> error side", async () => {
+test("runBenchReview detects content change to ALREADY-DIRTY file -> error side", async () => {
   // This is the plan-file gate's exact situation: the plan md was just
   // written, so it is already dirty when the review starts. A status-only
-  // check would miss Grok rewriting it; the content fingerprint must not.
+  // check would miss Bench rewriting it; the content fingerprint must not.
   const ws = tmpGitRepo();
   fs.writeFileSync(path.join(ws, "plan.md"), "v1\n");
   commitAll(ws);
   fs.writeFileSync(path.join(ws, "plan.md"), "v2 dirty before review\n");
-  const res = await runGrokReview({
+  const res = await runBenchReview({
     prompt: "review",
     cwd: ws,
     env: {
       ...process.env,
-      GROK_BIN: path.join(FIXTURES, "fake-grok"),
-      FAKE_GROK_LOG: "/dev/null",
-      FAKE_GROK_TOUCH: path.join(ws, "plan.md")
+      BENCH_BIN: path.join(FIXTURES, "fake-bench"),
+      FAKE_BENCH_LOG: "/dev/null",
+      FAKE_BENCH_TOUCH: path.join(ws, "plan.md")
     }
   });
   assert.match(String(res.error), /mutated/i);
 });
 
-test("runGrokReview detects rewrite of a PRE-EXISTING untracked file -> error side", async () => {
+test("runBenchReview detects rewrite of a PRE-EXISTING untracked file -> error side", async () => {
   const ws = tmpGitRepo();
   fs.writeFileSync(path.join(ws, "notes.txt"), "original untracked\n");
-  const res = await runGrokReview({
+  const res = await runBenchReview({
     prompt: "review", cwd: ws,
-    env: { ...process.env, GROK_BIN: path.join(FIXTURES, "fake-grok"), FAKE_GROK_LOG: "/dev/null", FAKE_GROK_TOUCH: path.join(ws, "notes.txt") }
+    env: { ...process.env, BENCH_BIN: path.join(FIXTURES, "fake-bench"), FAKE_BENCH_LOG: "/dev/null", FAKE_BENCH_TOUCH: path.join(ws, "notes.txt") }
   });
   assert.match(String(res.error), /mutated/i);
 });
 
-test("runGrokReview happy path via fake grok", async () => {
+test("runBenchReview happy path via fake bench", async () => {
   const ws = tmpGitRepo();
-  const res = await runGrokReview({
+  const res = await runBenchReview({
     prompt: "review",
     cwd: ws,
-    env: { ...process.env, GROK_BIN: path.join(FIXTURES, "fake-grok"), FAKE_GROK_LOG: "/dev/null" }
+    env: { ...process.env, BENCH_BIN: path.join(FIXTURES, "fake-bench"), FAKE_BENCH_LOG: "/dev/null" }
   });
   assert.equal(res.verdict, "ALLOW");
 });
@@ -1262,9 +1262,9 @@ Expected: FAIL — module not found
 - [ ] **Step 3: Implement `global-hooks/panel-lib.mjs`**
 
 ```js
-// Shared logic for the dual Codex+Grok plan gates. Deployed to
-// ~/.claude/hooks/panel-lib.mjs (canonical copy lives in the grok-companion
-// repo — self-contained on purpose: no repo imports). Gate-side Grok runs are
+// Shared logic for the dual Codex+Bench plan gates. Deployed to
+// ~/.claude/hooks/panel-lib.mjs (canonical copy lives in the peerbench
+// repo — self-contained on purpose: no repo imports). Gate-side Bench runs are
 // STATELESS: no job records, env stripped of codex plugin vars, full
 // read-only enforcement stack + content-level workspace mutation check.
 import { createHash } from "node:crypto";
@@ -1280,7 +1280,7 @@ export function parseVerdict(rawOutput) {
   return { verdict: null, firstLine, raw };
 }
 
-export function grokGateEnv(base) {
+export function benchGateEnv(base) {
   const env = { ...base };
   delete env.CLAUDE_PLUGIN_DATA;
   for (const key of Object.keys(env)) {
@@ -1291,7 +1291,7 @@ export function grokGateEnv(base) {
 
 // Read-only enforcement stack (spec contract): permission-mode plan +
 // deny-list + optional --sandbox when a profile name is configured.
-export function buildGrokGateArgs(env) {
+export function buildBenchGateArgs(env) {
   const args = [
     "--output-format", "json",
     "--permission-mode", "plan",
@@ -1301,8 +1301,8 @@ export function buildGrokGateArgs(env) {
     "--max-turns", "8",
     "--effort", "medium"
   ];
-  if (env.GROK_SANDBOX_PROFILE) {
-    args.push("--sandbox", env.GROK_SANDBOX_PROFILE);
+  if (env.BENCH_SANDBOX_PROFILE) {
+    args.push("--sandbox", env.BENCH_SANDBOX_PROFILE);
   }
   return args;
 }
@@ -1388,12 +1388,12 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
   }
 }
 
-// Grok side: stateless gate run, stripped env, read-only stack, mutation check.
-export async function runGrokReview({ prompt, cwd, env }) {
-  const gateEnv = grokGateEnv(env);
-  const bin = gateEnv.GROK_BIN || "grok";
+// Bench side: stateless gate run, stripped env, read-only stack, mutation check.
+export async function runBenchReview({ prompt, cwd, env }) {
+  const gateEnv = benchGateEnv(env);
+  const bin = gateEnv.BENCH_BIN || "bench";
   const pre = workspaceFingerprint(cwd);
-  const r = await spawnCollect(bin, ["-p", prompt, "--cwd", cwd, ...buildGrokGateArgs(gateEnv)], {
+  const r = await spawnCollect(bin, ["-p", prompt, "--cwd", cwd, ...buildBenchGateArgs(gateEnv)], {
     cwd,
     env: gateEnv,
     timeoutMs: TIMEOUT_MS
@@ -1401,23 +1401,23 @@ export async function runGrokReview({ prompt, cwd, env }) {
   if (pre !== null) {
     const post = workspaceFingerprint(cwd);
     if (post !== null && post !== pre) {
-      return { name: "Grok", error: "grok mutated the workspace during a read-only review — result discarded" };
+      return { name: "Bench", error: "bench mutated the workspace during a read-only review — result discarded" };
     }
   }
-  if (r.status === 127) return { name: "Grok", error: "grok not on PATH" };
-  if (r.status !== 0) return { name: "Grok", error: (r.stderr || "grok failed").trim().slice(0, 300) };
+  if (r.status === 127) return { name: "Bench", error: "bench not on PATH" };
+  if (r.status !== 0) return { name: "Bench", error: (r.stderr || "bench failed").trim().slice(0, 300) };
   try {
     const raw = String(JSON.parse(r.stdout)?.text ?? "").trim();
     const v = parseVerdict(raw);
-    if (!v.verdict) return { name: "Grok", error: "unexpected reviewer output" };
-    return { name: "Grok", ...v };
+    if (!v.verdict) return { name: "Bench", error: "unexpected reviewer output" };
+    return { name: "Bench", ...v };
   } catch {
-    return { name: "Grok", error: "grok returned non-JSON output" };
+    return { name: "Bench", error: "bench returned non-JSON output" };
   }
 }
 
-export function combinePanel(codex, grok) {
-  const sides = [codex, grok];
+export function combinePanel(codex, bench) {
+  const sides = [codex, bench];
   const errors = sides.filter((s) => s.error);
   const verdicts = sides.filter((s) => !s.error);
   const skipNotes = errors.map((s) => `${s.name} review skipped: ${s.error}`);
@@ -1470,7 +1470,7 @@ The ALLOW skip is keyed to a CONTEXT-COMPLETE approval key — `sha256(POLICY_VE
 
 ```js
 #!/usr/bin/env node
-// PostToolUse hook on Write|Edit: plan/spec markdown -> DUAL Codex+Grok panel
+// PostToolUse hook on Write|Edit: plan/spec markdown -> DUAL Codex+Bench panel
 // review (strict AND-pass). Preserves: path filter, revision dedupe lock,
 // single-Write revision instruction. ALLOW skip is CONTENT-keyed: only a save
 // whose content hash equals the last APPROVED hash skips review. Fails OPEN
@@ -1479,7 +1479,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { combinePanel, runCodexReview, runGrokReview } from "./panel-lib.mjs";
+import { combinePanel, runCodexReview, runBenchReview } from "./panel-lib.mjs";
 
 const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");
 const CODEX_DATA = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex");
@@ -1625,14 +1625,14 @@ async function main() {
     ...(input.session_id ? { CODEX_COMPANION_SESSION_ID: input.session_id } : {})
   };
 
-  const [codex, grok] = await Promise.all([
+  const [codex, bench] = await Promise.all([
     codexRoot
       ? runCodexReview({ companionPath: path.join(codexRoot, "scripts", "codex-companion.mjs"), prompt, cwd, env: codexEnv })
       : Promise.resolve({ name: "Codex", error: "codex plugin not found" }),
-    runGrokReview({ prompt, cwd, env: process.env })
+    runBenchReview({ prompt, cwd, env: process.env })
   ]);
 
-  const panel = combinePanel(codex, grok);
+  const panel = combinePanel(codex, bench);
 
   if (panel.decision === "fail-open") {
     failOpen(panel.summary);
@@ -1666,16 +1666,16 @@ main().catch((error) => {
 });
 ```
 
-- [ ] **Step 2: Pipe-test against fake grok + real codex; non-plan path stays instant**
+- [ ] **Step 2: Pipe-test against fake bench + real codex; non-plan path stays instant**
 
 ```bash
 mkdir -p /tmp/panel-test/docs/plans && cd /tmp/panel-test && git init -q
 printf '# Plan: touch README\n1. Create README.md with one line.\n' > docs/plans/p.md
 echo '{"cwd":"/tmp/panel-test","tool_input":{"file_path":"/tmp/panel-test/docs/plans/p.md"}}' \
-  | node /Users/rai/Desktop/Personal/Tools/grok-companion/global-hooks/codex-plan-file-review.mjs
+  | node /Users/rai/Desktop/Personal/Tools/peerbench/global-hooks/codex-plan-file-review.mjs
 ```
 
-Expected: one line — `⛩ plan panel: ALLOW — Codex: … · Grok: …` or a labeled block. Both reviewer names present proves the panel ran.
+Expected: one line — `⛩ plan panel: ALLOW — Codex: … · Bench: …` or a labeled block. Both reviewer names present proves the panel ran.
 
 Run: `time (echo '{"tool_input":{"file_path":"/tmp/x.ts"}}' | node global-hooks/codex-plan-file-review.mjs)`
 Expected: silent, <100ms.
@@ -1694,10 +1694,10 @@ echo '{"cwd":"/tmp/panel-test","tool_input":{"file_path":"/tmp/panel-test/docs/p
 
 Expected: first command prints `content identical to the last approved version`; second runs a full panel review (output is an ALLOW/BLOCK verdict, not a skip).
 
-- [ ] **Step 4: Degradation test — grok absent**
+- [ ] **Step 4: Degradation test — bench absent**
 
-Re-run the plan pipe-test with `PATH=/usr/bin:/bin:/Users/rai/n/bin` (node available, grok not).
-Expected: verdict still produced by Codex; output contains `Grok review skipped: grok not on PATH`.
+Re-run the plan pipe-test with `PATH=/usr/bin:/bin:/Users/rai/n/bin` (node available, bench not).
+Expected: verdict still produced by Codex; output contains `Bench review skipped: bench not on PATH`.
 
 - [ ] **Step 5: Commit**
 
@@ -1717,13 +1717,13 @@ git commit -m "feat: dual-panel plan-file gate — AND-pass, content-keyed ALLOW
 
 ```js
 #!/usr/bin/env node
-// PreToolUse hook on ExitPlanMode: DUAL Codex+Grok panel review of the plan
+// PreToolUse hook on ExitPlanMode: DUAL Codex+Bench panel review of the plan
 // (strict AND-pass). deny -> Claude revises and resubmits. Fails OPEN only
 // when BOTH reviewers error.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { combinePanel, runCodexReview, runGrokReview } from "./panel-lib.mjs";
+import { combinePanel, runCodexReview, runBenchReview } from "./panel-lib.mjs";
 
 const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");
 const CODEX_DATA = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex");
@@ -1805,14 +1805,14 @@ async function main() {
     ...(input.session_id ? { CODEX_COMPANION_SESSION_ID: input.session_id } : {})
   };
 
-  const [codex, grok] = await Promise.all([
+  const [codex, bench] = await Promise.all([
     codexRoot
       ? runCodexReview({ companionPath: path.join(codexRoot, "scripts", "codex-companion.mjs"), prompt, cwd, env: codexEnv })
       : Promise.resolve({ name: "Codex", error: "codex plugin not found" }),
-    runGrokReview({ prompt, cwd, env: process.env })
+    runBenchReview({ prompt, cwd, env: process.env })
   ]);
 
-  const panel = combinePanel(codex, grok);
+  const panel = combinePanel(codex, bench);
 
   if (panel.decision === "fail-open") {
     decision("allow", `Review panel unavailable (${panel.summary}); plan allowed without review.`, `⛩ plan panel skipped: ${panel.summary.slice(0, 200)}`);
@@ -1835,14 +1835,14 @@ main().catch((error) => {
 });
 ```
 
-- [ ] **Step 2: Pipe-test (real codex + real grok, tiny plan)**
+- [ ] **Step 2: Pipe-test (real codex + real bench, tiny plan)**
 
 ```bash
 jq -n '{cwd:"/tmp/panel-test",tool_input:{plan:"# Plan: Add README\n1. Create README.md with one line."}}' \
   | node global-hooks/codex-plan-review.mjs | jq -r '.hookSpecificOutput.permissionDecision'
 ```
 
-Expected: `allow` (and the reason mentions both Codex and Grok).
+Expected: `allow` (and the reason mentions both Codex and Bench).
 
 - [ ] **Step 3: Commit**
 
@@ -1889,7 +1889,7 @@ echo '{"cwd":"/tmp/panel-test","tool_input":{"file_path":"/tmp/panel-test/docs/p
   | node ~/.claude/hooks/codex-plan-file-review.mjs
 ```
 
-Expected: `⛩ plan panel: ALLOW — Codex: … · Grok: …` (both names present = panel live).
+Expected: `⛩ plan panel: ALLOW — Codex: … · Bench: …` (both names present = panel live).
 
 - [ ] **Step 4: Read-only probe through the deployed hook (spec test #6)**
 
@@ -1921,12 +1921,12 @@ git commit --allow-empty -m "chore: panel hooks deployed to ~/.claude/hooks (bac
 Run: `node --test tests/`
 Expected: all tests passing (state 4 + exec 10 + runner 7 + panel 11 = 32).
 
-- [ ] **Step 2: Write `README.md`** (private-repo level: what it is, install, commands, panel behavior, global-hooks deploy step, GROK_SANDBOX_PROFILE knob — 40–60 lines, content drawn from the spec's Purpose/Decisions/Distribution sections).
+- [ ] **Step 2: Write `README.md`** (private-repo level: what it is, install, commands, panel behavior, global-hooks deploy step, BENCH_SANDBOX_PROFILE knob — 40–60 lines, content drawn from the spec's Purpose/Decisions/Distribution sections).
 
 - [ ] **Step 3: Create private remote and push**
 
 ```bash
-gh repo create grok-companion --private --source . --push
+gh repo create peerbench --private --source . --push
 ```
 
 Expected: repo created under the authenticated GitHub account, `main` pushed. If `gh` is unauthenticated: `gh auth login` first (user action), then re-run.
@@ -1940,10 +1940,10 @@ Expected: clean tree.
 
 ## Self-review notes
 
-- **Spec coverage:** manifests (T1), state (T2), exec with full read-only contract — permission-mode plan + deny-list + optional `--sandbox` + content-level mutation-check-as-failure (T3), runner with injection-safe flag-lifting parser and untracked-aware review (T4), prompts (T5), quoted commands (T6), local marketplace install (T7), panel lib with strict AND-pass + env isolation + gate-side content-level mutation check (T8), both dual gates preserving dedupe lock/single-Write instruction with content-keyed ALLOW skip (T9–10), create-once-backup deploy + read-only probe + degradation test (T11), private remote (T12). v2 items (panel stop hook, `/grok:panel`, statusline `⚡`, grok-rescue agent) intentionally absent per spec rollout.
+- **Spec coverage:** manifests (T1), state (T2), exec with full read-only contract — permission-mode plan + deny-list + optional `--sandbox` + content-level mutation-check-as-failure (T3), runner with injection-safe flag-lifting parser and untracked-aware review (T4), prompts (T5), quoted commands (T6), local marketplace install (T7), panel lib with strict AND-pass + env isolation + gate-side content-level mutation check (T8), both dual gates preserving dedupe lock/single-Write instruction with content-keyed ALLOW skip (T9–10), create-once-backup deploy + read-only probe + degradation test (T11), private remote (T12). v2 items (panel stop hook, `/bench:panel`, statusline `⚡`, bench-rescue agent) intentionally absent per spec rollout.
 - **Codex round-1 findings:** quoted `$ARGUMENTS` templates (T6); `test -e || cp` backups (T11); `--sandbox` opt-in + mutation detection in BOTH spawn paths (T3/T8) + deployed probe (T11); untracked content in reviews (T4/T5).
 - **Codex round-2 finding:** `parseArgs()` consumes standalone flag elements AND lifts leading flag tokens from the first non-flag element (real `["--json", "--write fix bug"]` template shape), prompt remainder verbatim; tests for both exact template shapes (T4).
 - **Codex round-3 findings:** `workspaceFingerprint()` is now content-level — porcelain status + `git diff HEAD` + untracked file content hashes — with "already-dirty file modified during review" tests in BOTH spawn paths (T3 test 6, T8 test 9), exactly the plan-file gate's post-Write state; the ALLOW cooldown is replaced by a content-keyed skip — the marker stores the sha256 of approved content, identical re-saves skip, ANY change re-reviews, TTL removed (T9 Step 1 + Step 3 behavior test).
 - **Codex round-4 findings:** untracked enumeration via `git ls-files --others --exclude-standard -z` + content hashing, with pre-existing-untracked-rewrite tests in both spawn paths (T3/T8); context-complete ALLOW key `sha256(POLICY_VERSION \0 HOOK_KIND \0 filePath \0 content)` replacing the bare content hash, so identical text in a different context never auto-skips and a policy bump invalidates prior approvals (T9).
-- **Types/names consistent:** `runGrok` → `{status, rawOutput, sessionId, error?}` (T3/T4); panel side → `{name, verdict?, firstLine?, raw?, error?}` (T8–10); state envelope `{version, config:{panelStops}, jobs}` (T2/T4); `workspaceFingerprint` exported with identical signature in both copies (T3/T8).
+- **Types/names consistent:** `runBench` → `{status, rawOutput, sessionId, error?}` (T3/T4); panel side → `{name, verdict?, firstLine?, raw?, error?}` (T8–10); state envelope `{version, config:{panelStops}, jobs}` (T2/T4); `workspaceFingerprint` exported with identical signature in both copies (T3/T8).
 - **Placeholders:** none — every step has complete code or an exact command with expected output.

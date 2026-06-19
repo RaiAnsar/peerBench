@@ -13,7 +13,7 @@ Run — pass the arguments as ONE quoted string exactly as shown (the runner
 lifts --base from inside the quoted string; never unquote):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-runner.mjs" review --json "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" review --json "$ARGUMENTS"
 ```
 
 Present each reviewer's verdict and the combined result verbatim. Do not paraphrase.

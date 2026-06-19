@@ -5,11 +5,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parseArgs, huntCommand } from "../scripts/grok-runner.mjs";
-process.env.GROK_COMPANION_ROOT = process.env.GROK_COMPANION_ROOT || fs.mkdtempSync(path.join(os.tmpdir(), "gc-h-"));
+import { parseArgs, huntCommand } from "../scripts/bench-runner.mjs";
+process.env.BENCH_ROOT = process.env.BENCH_ROOT || fs.mkdtempSync(path.join(os.tmpdir(), "gc-h-"));
 
 const ROOT = path.join(import.meta.dirname, "..");
-const RUNNER = path.join(ROOT, "scripts", "grok-runner.mjs");
+const RUNNER = path.join(ROOT, "scripts", "bench-runner.mjs");
 
 function freshWs() {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ws-"));
@@ -25,7 +25,7 @@ function run(args, { ws = freshWs(), envExtra = {} } = {}) {
     cwd: ws,
     env: {
       ...process.env,
-      GROK_COMPANION_ROOT: dataRoot,
+      BENCH_ROOT: dataRoot,
       ...envExtra
     }
   });
@@ -42,10 +42,10 @@ test("parseArgs: --base embedded in quoted arg lifted correctly", () => {
   assert.equal(flags.base, "main");
 });
 
-test("setup reports gang health without throwing", () => {
+test("setup reports bench health without throwing", () => {
   const { out } = run(["setup"]);
   assert.match(out, /Active reviewers/);
-  assert.match(out, /Gang disabled/);
+  assert.match(out, /Bench disabled/);
   assert.match(out, /KIMI_API_KEY/);
   assert.match(out, /MIMO_API_KEY/);
   assert.match(out, /Codex plugin/);
@@ -60,7 +60,7 @@ test("review subcommand runs panel and prints combined result (no-key fail-open)
     cwd: ws,
     env: {
       ...process.env,
-      GROK_COMPANION_ROOT: dataRoot,
+      BENCH_ROOT: dataRoot,
       KIMI_API_KEY: "",
       MIMO_API_KEY: ""
     }
@@ -80,7 +80,7 @@ test("review with --base flag runs without error (fail-open when no keys)", () =
   const out = execFileSync(process.execPath, [RUNNER, "review", "--json", "--base main"], {
     encoding: "utf8",
     cwd: ws,
-    env: { ...process.env, GROK_COMPANION_ROOT: dataRoot, KIMI_API_KEY: "", MIMO_API_KEY: "" }
+    env: { ...process.env, BENCH_ROOT: dataRoot, KIMI_API_KEY: "", MIMO_API_KEY: "" }
   });
   const payload = JSON.parse(out);
   assert.ok(["allow", "block", "fail-open"].includes(payload.decision));
@@ -88,7 +88,7 @@ test("review with --base flag runs without error (fail-open when no keys)", () =
 
 test("status shows no traces message when workspace has no traces", () => {
   const { out } = run(["status"]);
-  assert.match(out, /No gang review traces/);
+  assert.match(out, /No bench review traces/);
 });
 
 test("huntCommand formats findings per reviewer and records a trace", async () => {
@@ -117,6 +117,21 @@ test("huntCommand deep=true uses 'investigate' header and records gate='investig
   assert.equal(latest.gate, "investigate");
   const t = readTrace(ws, latest.id);
   assert.equal(t.gate, "investigate");
+});
+test("huntCommand mode='debug' uses DEBUG_SYSTEM + debug user and records gate='debug'", async () => {
+  const { DEBUG_SYSTEM } = await import("../global-hooks/hunt.mjs");
+  const { listTraces } = await import("../global-hooks/trace-store.mjs");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hcdbg-"));
+  let captured;
+  const huntImpl = async (args) => { captured = args; return [{ name: "Kimi", findings: "ROOT CAUSE: x.js:1 — null deref\nFIX: guard cart", model: "kimi" }]; };
+  const out = await huntCommand(ws, "TypeError at checkout", { huntImpl, mode: "debug" });
+  assert.equal(captured.system, DEBUG_SYSTEM);
+  assert.match(captured.user, /Debug this specific failure/);
+  assert.equal(captured.deep, false);                       // debug is fast-tier like hunt
+  assert.match(out, /Debug — TypeError at checkout/);
+  assert.match(out, /ROOT CAUSE/);
+  const [latest] = listTraces(ws, 1);
+  assert.equal(latest.gate, "debug");
 });
 test("huntCommand persists per-reviewer diag to the trace (for future debugging)", async () => {
   const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");

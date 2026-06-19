@@ -35,7 +35,7 @@ test("tool call then verdict → ALLOW, records filesRead", async () => {
 
 test("readSSE captures a final event with NO trailing blank line (truncated stream)", async () => {
   // A stream whose last `data:` event isn't terminated by \n\n (and no [DONE]) — the old reader
-  // dropped it, losing the verdict → spurious no-verdict/timeout (found by the gang's own hunt).
+  // dropped it, losing the verdict → spurious no-verdict/timeout (found by the bench's own hunt).
   const enc = new TextEncoder();
   const raw = `data: ${JSON.stringify({ choices: [{ delta: { content: "ALLOW: fine" }, finish_reason: "stop" }] })}`;
   const resp = { ok: true, status: 200, text: async () => "",

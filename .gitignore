@@ -7,3 +7,4 @@ node_modules/
 *.keys
 .env
 .env.*
+resultsofHunt.txt

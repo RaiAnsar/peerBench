@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { combinePanel } from "./panel-lib.mjs";
-import { isGangDisabled } from "./config-store.mjs";
+import { isBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers } from "./reviewers.mjs";
 import { writeTrace } from "./trace-store.mjs";
 import { execFileSync } from "node:child_process";
@@ -66,8 +66,8 @@ async function main() {
   }
 
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const ws = workspaceRoot(cwd);              // git top-level — matches /gang:off marker + the other gates
-  if (isGangDisabled(ws)) process.exit(0);    // gang layer disabled — no-op before any lock/review
+  const ws = workspaceRoot(cwd);              // git top-level — matches /bench:off marker + the other gates
+  if (isBenchDisabled(ws)) process.exit(0);    // bench layer disabled — no-op before any lock/review
 
   const locksRoot = path.join(os.tmpdir(), "plan-gate-locks");
   // Context-complete approval key: identical plan text must NOT skip review

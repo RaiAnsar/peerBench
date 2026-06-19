@@ -1,13 +1,13 @@
-# Design: OpenAI-compatible review gate (Kimi + MiMo) — extend grok-companion
+# Design: OpenAI-compatible review gate (Kimi + MiMo) — extend peerbench
 
 - **Date:** 2026-06-19
 - **Status:** Draft for review (rev 8 — reliability lessons + observability; content-only prompts; reviewer rename)
 - **Author:** Rai (with Claude)
-- **Supersedes reviewer backends in:** `2026-06-05-grok-companion-design.md`
+- **Supersedes reviewer backends in:** `2026-06-05-peerbench-design.md`
 
 ## 1. Goal
 
-Replace the **Codex** and **Grok** reviewer backends with **Kimi K2.7 Code** and
+Replace the **Codex** and **Bench** reviewer backends with **Kimi K2.7 Code** and
 **Xiaomi MiMo**, over their **OpenAI-compatible APIs**, to: **(1)** cut AI cost;
 **(2)** keep a **blocking** gate at three lifecycle points — plan/spec approval,
 every code-editing turn, before `git push`; **(3)** add **plan→code continuity**
@@ -41,7 +41,7 @@ wanted, is the one gate that could optionally keep an agentic reviewer — §10.
 | MiMo | `https://token-plan-sgp.xiaomimimo.com/v1` | `mimo-v2.5-pro` | `MIMO_API_KEY` |
 
 - **Resolution order (both contexts — §4):** env vars first, then
-  `~/.claude/plugins/data/grok-companion-shared/companion.json` (keys, overrides,
+  `~/.claude/plugins/data/bench-shared/companion.json` (keys, overrides,
   **and the `reviewers` selection list**). Base URLs + default models are
   built-in constants. The repo `.keys` (env-var form, **git-ignored**) is a dev
   convenience.
@@ -83,7 +83,7 @@ provider config via `config-store.mjs` (missing/empty/invalid →default; unknow
 
 ### 5.3 `combinePanel` → N-ary (the change to `panel-lib.mjs`)
 
-`combinePanel(codex,grok)` → **`combinePanel(results[])`**; AND-pass unchanged for
+`combinePanel(codex,bench)` → **`combinePanel(results[])`**; AND-pass unchanged for
 1/2/N. Call sites (enumerated for the plan): `codex-plan-review.mjs`,
 `codex-plan-file-review.mjs`, plus the migrated stop hook — all become
 `combinePanel([...])`. `parseVerdict` reused (with the robust pre-normalize, §8).
@@ -96,7 +96,7 @@ Env-independent shared dir (§7), atomic temp+rename:
 - **Continuity block** appended when armed: `APPROVED PLAN (review the diff for
   conformance; BLOCK on deviations, scope creep, or unfinished items):\n<text>`.
 - Truncation announced. New ExitPlanMode approval overwrites; stale armed plan is
-  harmless (errs safe). `/grok:panel off` calls `clearPlan` (§5.6 edit site).
+  harmless (errs safe). `/bench:panel off` calls `clearPlan` (§5.6 edit site).
 
 ### 5.5 Stop hook migration (`scripts/panel-stop-hook.mjs`)
 
@@ -114,9 +114,9 @@ Env-independent shared dir (§7), atomic temp+rename:
 - **`codex-plan-file-review.mjs` (Write/Edit) ALLOW → no plan-store interaction**
   (spec-quality gate only; not a commitment to execute). Re-arm happens on the
   next ExitPlanMode.
-- **`/grok:panel off` → `clearPlan(ws)`** — concrete edit site is
-  `scripts/grok-runner.mjs` (the `panel` command currently only toggles
-  `state.config.panelStops` at `grok-runner.mjs:194`); add the `clearPlan` import
+- **`/bench:panel off` → `clearPlan(ws)`** — concrete edit site is
+  `scripts/bench-runner.mjs` (the `panel` command currently only toggles
+  `state.config.panelStops` at `bench-runner.mjs:194`); add the `clearPlan` import
   + call and update the panel integration test.
 
 ### 5.7 Pre-push gate — git hook (authoritative) + Claude hook (advisory) + safe disarm
@@ -201,21 +201,21 @@ originals to `*.pre-panel.bak`, ensures the §6.2 `settings.json` entries.
 
 ## 7. State / files — what changes and what does NOT
 
-- **`scripts/lib/grok-state.mjs` + `state.json` + their tests: UNCHANGED**
+- **`scripts/lib/bench-state.mjs` + `state.json` + their tests: UNCHANGED**
   (env-dependent, shared with codex). Holds `panelStops` (read only by the
   plugin-local stop hook) + `jobs`. `reviewers` selection is **not** stored here.
 - **Env-independent shared dir** (pure `os.homedir()` + workspace, no env):
-  `…/grok-companion-shared/companion.json` (reviewer selection + provider config,
-  `config-store.mjs`); `…/grok-companion-shared/state/<slug>-<sha256(canonWs)[:16]>/`
+  `…/bench-shared/companion.json` (reviewer selection + provider config,
+  `config-store.mjs`); `…/bench-shared/state/<slug>-<sha256(canonWs)[:16]>/`
   with `plan.json` (`plan-store.mjs`) and `traces/<id>.json` (`trace-store.mjs`).
 
 ## 8. Reliability — designed against the failures we actually hit
 
-Each row is a real failure observed with the Grok/Codex gate this session:
+Each row is a real failure observed with the Bench/Codex gate this session:
 
 | Observed failure | Mitigation in this design |
 |---|---|
-| Grok "mutated the workspace during read-only review — discarded" (silent flaky skips) | No-tools API reviewers have **no filesystem access** — structurally impossible; no fingerprint/discard dance. |
+| Bench "mutated the workspace during read-only review — discarded" (silent flaky skips) | No-tools API reviewers have **no filesystem access** — structurally impossible; no fingerprint/discard dance. |
 | "returned non-JSON / unexpected reviewer output" → silent skip | **Robust verdict extraction:** normalize (trim, strip ``` fences / leading filler) before `parseVerdict`; if first line still ≠ `ALLOW:`/`BLOCK:`, **one strict retry** ("respond with ONLY a first line `ALLOW: …`/`BLOCK: …`"); still bad → typed `parse` error with the **raw text preserved and surfaced** (never a silent disappearance). |
 | Codex broker/auth down → gate silently unavailable | Typed errors `{kind: auth\|network\|http\|timeout\|parse\|nokey, detail}`; missing key → explicit skip note; every outcome recorded + summarized inline. |
 | Non-determinism | `temperature:0`, no tools → stable, repeatable verdicts. |
@@ -230,23 +230,23 @@ is recorded (§9) and shown in the gate's summary line.
   `{ id, ts, gate, ws, reviewers:[{ name, model, latencyMs, verdict, firstLine,
   usage?, error? }], systemPrompt, userPrompt, rawResponses }` (prompt/response
   size-capped, e.g. 64 KiB each). Also mirrored as a one-line entry in the
-  existing jobs store so `/grok:status` sees it.
+  existing jobs store so `/bench:status` sees it.
 - **Inspect (the "expand" Rai asked for):**
-  - `/grok:status` — recent reviews: gate · per-reviewer verdict · latency · id.
-  - **`/grok:status <id>` — expands one review**: the exact system+user prompt
+  - `/bench:status` — recent reviews: gate · per-reviewer verdict · latency · id.
+  - **`/bench:status <id>` — expands one review**: the exact system+user prompt
     sent and each model's raw response, side by side.
-- **Live:** `GROK_COMPANION_DEBUG=1` streams the full prompt + responses to stderr
+- **Live:** `BENCH_COMPANION_DEBUG=1` streams the full prompt + responses to stderr
   during the hook; one human-readable line per review appended to
-  `…/grok-companion-shared/review.log` for `tail -f`.
+  `…/bench-shared/review.log` for `tail -f`.
 - **Inline:** each gate `systemMessage` shows a compact summary + the id, e.g.
-  `⚡ panel: Kimi ALLOW · MiMo BLOCK — expand: /grok:status 2f3a`.
+  `⚡ panel: Kimi ALLOW · MiMo BLOCK — expand: /bench:status 2f3a`.
 
 ## 10. Open questions
 
 1. **Repo-aware plan review** — keep one agentic reviewer for the plan gate, or
    content-only? Default: content-only.
 2. **Single Kimi vs Kimi+MiMo panel** — default dual AND-pass (both keys set).
-3. **Rename `grok-companion`** (the package) — out of scope; track separately.
+3. **Rename `peerbench`** (the package) — out of scope; track separately.
 
 ## 11. Probes (run once before Phase 1)
 
@@ -265,7 +265,7 @@ is recorded (§9) and shown in the gate's summary line.
   `codex-plan-*.mjs` → `plan-*.mjs`; content-only prompt rewrite; add
   `deploy-global-hooks.mjs`; deploy. Both reviewers live; traces flowing.
 - **Phase 2** — `plan-store` + plan-aware stop prompt + ExitPlanMode-only
-  auto-arm + `/grok:panel off` disarm; `/grok:status <id>` expand.
+  auto-arm + `/bench:panel off` disarm; `/bench:status <id>` expand.
 - **Phase 3** — `pre-push-lib` + git entrypoint (shim, install, first-push base
   order) + Claude entrypoints (advisory + disarm).
 
@@ -278,8 +278,8 @@ Each phase is independently shippable and leaves a working gate.
   `resolveReviewers` (missing/empty/invalid/unknown/no-key) via shared config;
   `config-store` identical with/without `CLAUDE_PLUGIN_DATA`; `combinePanel`
   1/2/N + all-error (open vs closed); `plan-store` round-trip (truncation+announce,
-  atomic, clear); **`trace-store` round-trip + `/grok:status <id>` renders prompt
-  + raw responses**; `grok-state` tests stay green (unchanged module).
+  atomic, clear); **`trace-store` round-trip + `/bench:status <id>` renders prompt
+  + raw responses**; `bench-state` tests stay green (unchanged module).
 - **Pre-push:** ref-line parsing — update / **new-ref base-resolution order
   (empty-tree only when no base)** / delete / multi / error→fail-closed — abort on
   BLOCK; advisory hook no-ops on non-`git push` and indeterminate; shim buffers

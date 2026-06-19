@@ -45,7 +45,7 @@ async function readSSE(resp) {
     }
     // Flush: a final SSE event not terminated by a blank line (truncated/abrupt stream) would
     // otherwise be silently dropped — losing the last content + finish_reason → spurious
-    // "no verdict"/timeout on a review that actually finished (found by the gang's own hunt).
+    // "no verdict"/timeout on a review that actually finished (found by the bench's own hunt).
     buf += decoder.decode();
     if (buf.trim()) handleEvt(buf);
   } finally { try { reader.releaseLock(); } catch { /* noop */ } }

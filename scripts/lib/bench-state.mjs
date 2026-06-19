@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const FALLBACK_ROOT = path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-fallback");
+const FALLBACK_ROOT = path.join(os.homedir(), ".claude", "plugins", "data", "peerbench-fallback");
 
 function defaultState() {
   return { version: 1, config: { panelStops: false }, jobs: [] };
@@ -30,8 +30,8 @@ export function loadState(workspaceRoot, opts = {}) {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     // Preserve every other config key (e.g. codex-companion's stopReviewGate) —
-    // grok and codex share one state.json, so reducing config to just panelStops
-    // here silently wiped codex's gate flag on every grok load→save cycle.
+    // the panel and codex share one state.json, so reducing config to just panelStops
+    // here silently wiped codex's gate flag on every panel load→save cycle.
     const parsedConfig = parsed?.config && typeof parsed.config === "object" ? parsed.config : {};
     return {
       version: 1,

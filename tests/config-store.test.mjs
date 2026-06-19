@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-process.env.GROK_COMPANION_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root-"));
+process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root-"));
 import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers } from "../global-hooks/config-store.mjs";
 
 test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => {

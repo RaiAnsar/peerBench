@@ -3,9 +3,9 @@
   "owner": { "name": "Rai Ansar" },
   "plugins": [
     {
-      "name": "gang",
+      "name": "bench",
       "source": "./",
-      "description": "The gang — Codex + Kimi + MiMo review panel, agentic code review, and bug hunts for Claude Code"
+      "description": "peerbench — Codex + Kimi + MiMo + GLM review panel, agentic read-only code review, and bug hunts for Claude Code. Commands: /bench:*"
     }
   ]
 }

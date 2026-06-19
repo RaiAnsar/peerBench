@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { combinePanel } from "./panel-lib.mjs";
-import { isGangDisabled as defaultIsGangDisabled } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 
@@ -16,7 +16,7 @@ const MAX_DIFF_BYTES = 200_000;
 
 // A regex can't reliably detect `git push` across compound commands: it missed trailing
 // operators (`git push;cmd`), git global options (`git -C . push`), and shell control flow
-// (`cd /x || git push`). We tokenize into shell segments instead. (Bugs found by the gang's own hunt.)
+// (`cd /x || git push`). We tokenize into shell segments instead. (Bugs found by the bench's own hunt.)
 
 // Git global options that take a SEPARATE value token (so we skip the value when scanning for `push`).
 const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"]);
@@ -178,7 +178,7 @@ export function buildPrompt(commits, diff) {
 export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
-  isGangDisabledImpl = defaultIsGangDisabled,
+  isBenchDisabledImpl = defaultIsBenchDisabled,
   env = process.env,
   input: inputOverride
 } = {}) {
@@ -195,8 +195,8 @@ export async function runMain({
   const baseCwd = cdTargetBeforePush(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd());
   const ws = workspaceRoot(baseCwd);
 
-  // 2. Gang disabled check.
-  if (isGangDisabledImpl(ws)) {
+  // 2. Bench disabled check.
+  if (isBenchDisabledImpl(ws)) {
     process.exit(0);
   }
 
@@ -247,7 +247,7 @@ export async function runMain({
     decision(
       "allow",
       `Pre-push panel unavailable (${panel.summary}); push allowed without review.`,
-      `⛩ gang pre-push: panel skipped — ${panel.summary.slice(0, 200)}`
+      `⛩ bench pre-push: panel skipped — ${panel.summary.slice(0, 200)}`
     );
     return;
   }
@@ -263,7 +263,7 @@ export async function runMain({
   }
 
   // allow
-  decision("allow", `⛩ gang pre-push: ALLOW — ${panel.summary}`, `⛩ gang pre-push: ALLOW — ${panel.summary.slice(0, 220)}`);
+  decision("allow", `⛩ bench pre-push: ALLOW — ${panel.summary}`, `⛩ bench pre-push: ALLOW — ${panel.summary.slice(0, 220)}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

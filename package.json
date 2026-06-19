@@ -1,9 +1,9 @@
 {
-  "name": "gang",
-  "version": "0.2.0",
+  "name": "peerbench",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "The gang: Codex + Kimi + MiMo review panel, agentic read-only code review, and bug hunts for Claude Code",
+  "description": "peerbench — a multi-model AI review panel (Codex + Kimi + MiMo + GLM) for coding agents: gating reviews, agentic read-only code review, and bug hunts. Plugin command prefix: bench (/bench:*).",
   "scripts": {
     "test": "node --test 'tests/*.test.mjs'"
   }
