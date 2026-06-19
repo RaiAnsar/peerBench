@@ -1,0 +1,451 @@
+// tests/pre-push-review.test.mjs
+// Tests for global-hooks/pre-push-review.mjs
+// All reviewer calls are injected — no real API or Codex calls happen.
+// Git range logic is exercised via real temp repos with local bare remotes.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// Set GROK_COMPANION_ROOT before importing any module that uses config-store.
+const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
+process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+
+import { runMain, buildPrompt } from "../global-hooks/pre-push-review.mjs";
+import { setGangDisabled } from "../global-hooks/config-store.mjs";
+
+const ROOT = path.join(import.meta.dirname, "..");
+const HOOK = path.join(ROOT, "global-hooks", "pre-push-review.mjs");
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Make a bare remote + a working clone with one commit ahead of origin/main. */
+function freshPushRepo() {
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-bare-"));
+  execFileSync("git", ["init", "--bare", "-q", "-b", "main"], { cwd: bare });
+
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-ws-"));
+  execFileSync("git", ["clone", "-q", bare, ws]);
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "--allow-empty", "-qm", "initial"], { cwd: ws });
+  execFileSync("git", ["push", "-q", "origin", "main"], { cwd: ws });
+
+  // Add one more commit so there's something to push next time
+  fs.writeFileSync(path.join(ws, "file.js"), "export const x = 1;\n");
+  execFileSync("git", ["add", "."], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "-qm", "add file"], { cwd: ws });
+
+  return { ws, bare };
+}
+
+/** A repo with a remote but nothing ahead (already pushed). */
+function freshPushedRepo() {
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-pushed-bare-"));
+  execFileSync("git", ["init", "--bare", "-q", "-b", "main"], { cwd: bare });
+
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-pushed-ws-"));
+  execFileSync("git", ["clone", "-q", bare, ws]);
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "--allow-empty", "-qm", "initial"], { cwd: ws });
+  execFileSync("git", ["push", "-q", "origin", "main"], { cwd: ws });
+  // No additional commits — nothing ahead.
+  return { ws, bare };
+}
+
+/** Fake reviewer that always returns the given verdict. */
+function fakeReviewer(name, verdict) {
+  return {
+    name,
+    async run() {
+      return { name, verdict, firstLine: `${verdict}: test`, raw: `${verdict}: test\n\nDetails for ${name}.` };
+    }
+  };
+}
+
+/** Fake reviewer that returns an error (simulates API failure). */
+function fakeErrorReviewer(name) {
+  return {
+    name,
+    async run() {
+      return { name, error: "injected test error" };
+    }
+  };
+}
+
+/** Stub resolveReviewers factory → returns the given list. */
+function stubResolveReviewers(list) {
+  return () => list;
+}
+
+/** Capture JSON lines emitted to stdout by emit(). */
+function captureEmit(fn) {
+  const lines = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string") lines.push(chunk.trim()).filter(Boolean);
+    return orig(chunk, ...rest);
+  };
+  const restore = () => { process.stdout.write = orig; };
+  return { lines, restore };
+}
+
+/** Parse only non-empty JSON lines from a lines array. */
+function parseLines(lines) {
+  return lines.filter(Boolean).map((l) => {
+    try { return JSON.parse(l); } catch { return null; }
+  }).filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
+// Test: non-git-push command → allow no-op (no trace, no emit)
+// ---------------------------------------------------------------------------
+
+test("non-git-push command → allow no-op (git status)", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-np-")));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  let reviewersCalled = false;
+  let traceWritten = false;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { reviewersCalled = true; return [fakeReviewer("Kimi", "ALLOW")]; },
+      writeTraceImpl: () => { traceWritten = true; },
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git status" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(reviewersCalled, false, "reviewers must NOT be called for non-push command");
+  assert.equal(traceWritten, false, "no trace should be written for non-push command");
+  assert.equal(emittedLines.length, 0, "no output for non-push command");
+});
+
+// ---------------------------------------------------------------------------
+// Test: git push --help → allow no-op
+// ---------------------------------------------------------------------------
+
+test("git push --help → allow no-op (ignored)", async () => {
+  const { ws } = freshPushRepo();
+  let reviewersCalled = false;
+
+  await runMain({
+    resolveReviewersImpl: () => { reviewersCalled = true; return []; },
+    writeTraceImpl: () => {},
+    isGangDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, tool_input: { command: "git push --help" } }
+  });
+
+  assert.equal(reviewersCalled, false, "reviewers must NOT be called for git push --help");
+});
+
+// ---------------------------------------------------------------------------
+// Test: git push, panel ALLOW → allow + trace with gate:"push"
+// ---------------------------------------------------------------------------
+
+test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=push", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-al-")));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  let traceRecord = null;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([
+        fakeReviewer("Kimi", "ALLOW"),
+        fakeReviewer("MiMo", "ALLOW")
+      ]),
+      writeTraceImpl: (_ws, trace) => { traceRecord = trace; },
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  assert.ok(emittedLines.length > 0, "should emit output for git push");
+  const parsed = parseLines(emittedLines);
+  assert.ok(parsed.length > 0, "emitted line(s) should be valid JSON");
+  const hookOut = parsed[0]?.hookSpecificOutput;
+  assert.ok(hookOut, "hookSpecificOutput must be present");
+  assert.equal(hookOut.hookEventName, "PreToolUse", "hookEventName must be PreToolUse");
+  assert.equal(hookOut.permissionDecision, "allow", "panel ALLOW → permissionDecision=allow");
+
+  assert.ok(traceRecord !== null, "trace should be written");
+  assert.equal(traceRecord.gate, "push", "trace gate must be 'push'");
+  assert.ok(traceRecord.ws, "trace.ws should be set");
+  assert.ok(Array.isArray(traceRecord.reviewers), "trace.reviewers should be an array");
+});
+
+// ---------------------------------------------------------------------------
+// Test: git push, a reviewer BLOCKs → deny with findings in reason
+// ---------------------------------------------------------------------------
+
+test("git push + panel BLOCK → deny with findings in permissionDecisionReason", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-blk-")));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([
+        fakeReviewer("Kimi", "ALLOW"),
+        fakeReviewer("MiMo", "BLOCK")
+      ]),
+      writeTraceImpl: () => {},
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  assert.ok(emittedLines.length > 0, "should emit output on BLOCK");
+  const parsed = parseLines(emittedLines);
+  assert.ok(parsed.length > 0, "emitted line should be valid JSON");
+  const hookOut = parsed[0]?.hookSpecificOutput;
+  assert.ok(hookOut, "hookSpecificOutput must be present");
+  assert.equal(hookOut.hookEventName, "PreToolUse", "hookEventName must be PreToolUse");
+  assert.equal(hookOut.permissionDecision, "deny", "panel BLOCK → permissionDecision=deny");
+  assert.ok(hookOut.permissionDecisionReason, "deny reason must be present");
+  assert.match(hookOut.permissionDecisionReason, /MiMo|BLOCK|Details for MiMo/i, "findings should include BLOCK details");
+});
+
+// ---------------------------------------------------------------------------
+// Test: disabled workspace → allow no-op (exit 0, no reviewers called)
+// ---------------------------------------------------------------------------
+
+test("disabled workspace → allow no-op on git push (gang disabled)", () => {
+  const { ws } = freshPushRepo();
+
+  setGangDisabled(ws, true, { scope: "workspace" });
+  try {
+    const result = spawnSync(process.execPath, [HOOK], {
+      input: JSON.stringify({ cwd: ws, tool_input: { command: "git push origin main" } }),
+      encoding: "utf8",
+      env: { ...process.env, GROK_COMPANION_ROOT: TEMP_GCR }
+    });
+
+    assert.equal(result.status, 0, `exit code should be 0 when gang is disabled; stderr: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "", "no output expected when gang disabled");
+  } finally {
+    setGangDisabled(ws, false, { scope: "workspace" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test: no upstream / nothing to push → fail-open allow no-op
+// ---------------------------------------------------------------------------
+
+test("no upstream → fail-open allow (no reviewers called)", async () => {
+  // Repo with no remote configured → resolvePushRange fails gracefully.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-noremote-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "--allow-empty", "-qm", "init"], { cwd: ws });
+
+  let reviewersCalled = false;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { reviewersCalled = true; return []; },
+      writeTraceImpl: () => {},
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+  }
+
+  assert.equal(reviewersCalled, false, "reviewers must NOT be called when no upstream");
+  // Should allow — either exits silently or emits an allow decision.
+  if (emittedLines.length > 0) {
+    const parsed = parseLines(emittedLines);
+    if (parsed.length > 0 && parsed[0]?.hookSpecificOutput) {
+      assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "allow",
+        "no upstream should result in allow decision");
+    }
+  }
+  // (If no lines emitted, that's also fine — silent allow via early return.)
+});
+
+// ---------------------------------------------------------------------------
+// Test: nothing to push (already up-to-date) → allow no-op
+// ---------------------------------------------------------------------------
+
+test("nothing to push (already up-to-date) → allow no-op", async () => {
+  const { ws } = freshPushedRepo();
+
+  let reviewersCalled = false;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { reviewersCalled = true; return []; },
+      writeTraceImpl: () => {},
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+  }
+
+  assert.equal(reviewersCalled, false, "reviewers must NOT be called when nothing to push");
+  if (emittedLines.length > 0) {
+    const parsed = parseLines(emittedLines);
+    if (parsed.length > 0 && parsed[0]?.hookSpecificOutput) {
+      assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "allow",
+        "nothing-to-push should produce allow decision");
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test: all reviewers errored → fail-open (allow, not deny)
+// ---------------------------------------------------------------------------
+
+test("all reviewers errored → fail-open allow", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-fo-")));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([
+        fakeErrorReviewer("Kimi"),
+        fakeErrorReviewer("MiMo")
+      ]),
+      writeTraceImpl: () => {},
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  assert.ok(emittedLines.length > 0, "should emit a fail-open allow decision");
+  const parsed = parseLines(emittedLines);
+  assert.ok(parsed.length > 0, "emitted line should be valid JSON");
+  const hookOut = parsed[0]?.hookSpecificOutput;
+  assert.ok(hookOut, "hookSpecificOutput must be present");
+  assert.equal(hookOut.permissionDecision, "allow",
+    "all-reviewers-errored should fail-open to allow (never deny)");
+});
+
+// ---------------------------------------------------------------------------
+// Test: buildPrompt — content-only, no tool/repo claim
+// ---------------------------------------------------------------------------
+
+test("buildPrompt: system is content-only with ALLOW:/BLOCK: instruction", () => {
+  const { system, user } = buildPrompt("abc1234 add feature", "diff --git a/x.js ...");
+  // Must NOT claim repo/filesystem access for the reviewer
+  assert.doesNotMatch(system, /read access|verify.*against.*code/i);
+  // Must instruct reviewer to stay content-only (no tools, no repo reads)
+  assert.match(system, /ALLOW:|BLOCK:/);
+  assert.match(system, /Do NOT use any tools/i);
+  assert.match(user, /add feature/);
+  assert.match(user, /diff --git/);
+});
+
+// ---------------------------------------------------------------------------
+// Test: git push embedded in compound command → detected
+// ---------------------------------------------------------------------------
+
+test("compound command with git push → detected as push", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-cpd-")));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  let reviewersCalled = false;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      resolveReviewersImpl: () => {
+        reviewersCalled = true;
+        return [fakeReviewer("Kimi", "ALLOW")];
+      },
+      writeTraceImpl: () => {},
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "cd /repo && git push origin main" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  // The compound command contains "git push", so reviewers should be called
+  // (or we hit a fail-open for range reasons, but NOT skipped entirely).
+  // Either way, we should NOT have silently skipped.
+  const parsed = parseLines(emittedLines);
+  // If reviewers were called, great. If the range failed and we allowed early,
+  // that's acceptable fail-open behavior.
+  if (!reviewersCalled) {
+    // Must have emitted an allow decision (fail-open, not a silent skip)
+    assert.ok(parsed.length > 0, "compound push command should produce some output if reviewers not called");
+  }
+});
