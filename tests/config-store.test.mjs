@@ -17,8 +17,15 @@ test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => 
   assert.match(a.providers.kimi.headers["User-Agent"], /claude-cli/);
   assert.equal(a.providers.mimo.apiKey, "xk");
   assert.equal(a.providers.mimo.temperature, 0);
+  // glm provider is defined (selectable) but NOT a default reviewer
+  assert.equal(a.providers.glm.baseURL, "https://api.z.ai/api/coding/paas/v4");
+  assert.equal(a.providers.glm.model, "glm-5.2");
   assert.deepEqual(a.reviewers, ["kimi", "mimo"]);
   assert.deepEqual(a, b);
+});
+test("glm is selectable (KNOWN) but not in the default reviewer set", () => {
+  assert.ok(KNOWN_REVIEWERS.includes("glm"), "glm must be KNOWN/selectable");
+  assert.ok(!resolveConfig({ env: {} }).reviewers.includes("glm"), "glm must not be active by default");
 });
 test("companion.json can override temperature/headers (via file param seam)", () => {
   // resolveConfig reads companion.json from sharedRoot; we can't write there in a unit test,

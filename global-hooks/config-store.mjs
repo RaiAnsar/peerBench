@@ -12,10 +12,14 @@ const DEFAULTS = {
           timeoutMs: 300_000 },  // 5 min
   mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
-          headers: {}, timeoutMs: 180_000 }  // 3 min
+          headers: {}, timeoutMs: 180_000 },  // 3 min
+  // GLM (z.ai coding plan) — OpenAI-compatible /chat/completions.
+  glm: { baseURL: "https://api.z.ai/api/coding/paas/v4", model: "glm-5.2", keyEnv: "GLM_API_KEY",
+         temperature: 0.6, thinking: "disabled", thinkingEnv: "GLM_THINKING",
+         headers: {}, timeoutMs: 300_000 }  // 5 min
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
-export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex"];
+export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "glm"];
 export function sharedRoot() {
   return process.env.GROK_COMPANION_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared");
