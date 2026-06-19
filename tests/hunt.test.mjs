@@ -13,8 +13,13 @@ test("huntPanel runs kimi+mimo agentically and returns findings", async () => {
   const root = process.env.GROK_COMPANION_ROOT;
   fs.writeFileSync(path.join(root, "companion.json"), JSON.stringify({ reviewers: ["kimi", "mimo"], providers: {
     kimi: { baseURL: "https://x/v1", model: "kimi-for-coding", apiKey: "k" }, mimo: { baseURL: "https://y/v1", model: "mimo", apiKey: "m" } } }));
-  // stub fetch: immediately return a findings message (no tool calls)
-  const reviewImpl = async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "1. bug at x.js:3" } }] }) });
+  // stub fetch: immediately return a findings message (no tool calls) — SSE format (stream:true)
+  const enc = new TextEncoder();
+  const reviewImpl = async () => {
+    const data = `data: ${JSON.stringify({ choices: [{ delta: { content: "1. bug at x.js:3" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`;
+    const body = new ReadableStream({ start(c) { c.enqueue(enc.encode(data)); c.close(); } });
+    return { ok: true, status: 200, body, text: async () => "" };
+  };
   const out = await huntPanel({ cwd: process.cwd(), seed: "test", reviewImpl });
   assert.deepEqual(out.map((o) => o.name).sort(), ["Kimi", "MiMo"]);
   for (const o of out) assert.match(o.findings, /x\.js:3/);

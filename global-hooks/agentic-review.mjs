@@ -1,5 +1,48 @@
 import { extractVerdict } from "./reviewers.mjs";
 
+// Parse an OpenAI-compatible SSE chat stream into one assembled message.
+// Returns { message: { content, tool_calls }, finish_reason, usage }.
+async function readSSE(resp) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", content = "", finish = null, usage = null;
+  const tc = [];  // tool_calls assembled by index
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n\n")) >= 0) {
+        const evt = buf.slice(0, nl); buf = buf.slice(nl + 2);
+        for (const line of evt.split("\n")) {
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const data = t.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          let j; try { j = JSON.parse(data); } catch { continue; }
+          if (j.usage) usage = j.usage;
+          const ch = j.choices?.[0];
+          if (!ch) continue;
+          if (ch.finish_reason) finish = ch.finish_reason;
+          const d = ch.delta || {};
+          if (typeof d.content === "string") content += d.content;
+          if (Array.isArray(d.tool_calls)) {
+            for (const td of d.tool_calls) {
+              const i = td.index ?? 0;
+              tc[i] = tc[i] || { id: "", type: "function", function: { name: "", arguments: "" } };
+              if (td.id) tc[i].id = td.id;
+              if (td.function?.name) tc[i].function.name = td.function.name;
+              if (td.function?.arguments) tc[i].function.arguments += td.function.arguments;
+            }
+          }
+        }
+      }
+    }
+  } finally { try { reader.releaseLock(); } catch { /* noop */ } }
+  return { message: { content, tool_calls: tc.filter(Boolean) }, finish_reason: finish, usage };
+}
+
 const DEFAULT_MAX_STEPS = 24;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_NUDGES = 2;
@@ -42,7 +85,7 @@ export async function agenticReview({
           ? "You have gathered enough context. Do NOT call any more tools — write your final findings now, each with file:line."
           : "You have gathered enough context. Do NOT call any more tools — give your verdict now: the first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`." });
       }
-      const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: force ? "none" : "auto", temperature, stream: false });
+      const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: force ? "none" : "auto", temperature, stream: true });
       lastReqBytes = body.length;
       dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);
       let resp;
@@ -78,15 +121,17 @@ export async function agenticReview({
         rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}` });
         return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${b.slice(0, 200)}` }, diag: diag() };
       }
-      let json;
-      try { json = await resp.json(); } catch { return { ok: false, error: { kind: "parse", detail: "non-JSON response" }, diag: diag() }; }
-      const msg = json?.choices?.[0]?.message;
-      if (!msg) return { ok: false, error: { kind: "parse", detail: "no message in response" }, diag: diag() };
+      let parsed;
+      try { parsed = await readSSE(resp); } catch (e) {
+        const msg = String(e?.message || e).slice(0, 200);
+        return { ok: false, error: { kind: "network", detail: `stream read error: ${msg}` }, diag: diag() };
+      }
+      const msg = parsed.message;
 
       const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       const toolNames = toolCalls.map((t) => t.function?.name).join(",") || "-";
-      dlog(`step ${step}: ${Date.now() - t0}ms finish=${json?.choices?.[0]?.finish_reason} tools=${toolNames} reqKB=${(lastReqBytes / 1024) | 0}`);
-      rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, finish: json?.choices?.[0]?.finish_reason, tools: toolNames });
+      dlog(`step ${step}: ${Date.now() - t0}ms finish=${parsed.finish_reason} tools=${toolNames} reqKB=${(lastReqBytes / 1024) | 0}`);
+      rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, finish: parsed.finish_reason, tools: toolNames });
 
       if (toolCalls.length > 0) {
         messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: toolCalls });
@@ -111,11 +156,11 @@ export async function agenticReview({
       // No tool calls → check mode before verdict logic.
       const content = msg.content ?? "";
       if (mode === "report") {
-        return { ok: true, report: content, steps: stepsRun, filesRead, usage: json.usage ?? null, diag: diag() };
+        return { ok: true, report: content, steps: stepsRun, filesRead, usage: parsed.usage ?? null, diag: diag() };
       }
       const v = extractVerdict(content);
       if (v) {
-        return { ok: true, verdict: v.verdict, firstLine: v.firstLine, raw: content, steps: stepsRun, filesRead, usage: json.usage ?? null, diag: diag() };
+        return { ok: true, verdict: v.verdict, firstLine: v.firstLine, raw: content, steps: stepsRun, filesRead, usage: parsed.usage ?? null, diag: diag() };
       }
       if (nudges < MAX_NUDGES) {
         nudges++;
