@@ -1,7 +1,7 @@
 import { resolveConfig } from "./config-store.mjs";
 import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
-import { runCodexReview } from "./panel-lib.mjs";
+import { runCodexTask } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA } from "./reviewers.mjs";
 import path from "node:path";
 
@@ -26,6 +26,7 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
   const cfg = resolveConfig({ env });
   const system = HUNT_SYSTEM;
   const user = buildHuntUser(seed);
+  const debug = !!(env.GANG_DEBUG || env.GROK_DEBUG);
 
   const runOne = async (name) => {
     try {
@@ -33,8 +34,9 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
         const root = latestCodexRoot();
         if (!root) return { name: "Codex", findings: "", error: "codex plugin not found" };
         const codexEnv = { ...env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA || CODEX_DATA };
-        const r = await (codexImpl || runCodexReview)({ companionPath: path.join(root, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${user}`, cwd, env: codexEnv });
-        // codex task output is in r.raw whether or not it parsed as a verdict
+        // runCodexTask keeps the raw findings (a hunt has no ALLOW/BLOCK verdict to parse)
+        const r = await (codexImpl || runCodexTask)({ companionPath: path.join(root, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${user}`, cwd, env: codexEnv });
+        if (debug) console.error(`[hunt codex] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
         return { name: "Codex", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
       }
       const p = cfg.providers[name];
@@ -42,12 +44,14 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
       const res = await agenticReview({
         baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, temperature: p.temperature, headers: p.headers,
         system, user, tools: createReviewTools(cwd), mode: "report",
-        maxSteps: HUNT_MAX_STEPS, timeoutMs: Math.max(p.timeoutMs || 0, HUNT_TIMEOUT_MS), fetchImpl: reviewImpl
+        maxSteps: HUNT_MAX_STEPS, timeoutMs: Math.max(p.timeoutMs || 0, HUNT_TIMEOUT_MS), fetchImpl: reviewImpl, debug
       });
       const display = name === "kimi" ? "Kimi" : name === "mimo" ? "MiMo" : name;
+      const d = res.diag || {};
+      if (debug) console.error(`[hunt ${display}] ok=${res.ok} steps=${d.steps} files=${(d.filesRead || []).length} toolKB=${((d.toolBytes || 0) / 1024) | 0} lastReqKB=${((d.lastReqBytes || 0) / 1024) | 0} err=${res.ok ? "-" : res.error.kind}`);
       return res.ok
-        ? { name: display, findings: res.report, steps: res.steps, filesRead: res.filesRead, error: null }
-        : { name: display, findings: "", error: `${res.error.kind}: ${res.error.detail}` };
+        ? { name: display, findings: res.report, steps: res.steps, filesRead: res.filesRead, diag: res.diag, error: null }
+        : { name: display, findings: "", diag: res.diag, error: `${res.error.kind}: ${res.error.detail}` };
     } catch (e) {
       return { name, findings: "", error: String(e?.message || e).slice(0, 300) };
     }

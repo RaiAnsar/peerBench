@@ -133,6 +133,18 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
   }
 }
 
+// Codex open-ended TASK → raw output (for hunt; no verdict parsing, so findings are kept).
+export async function runCodexTask({ companionPath, prompt, cwd, env }) {
+  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env, timeoutMs: TIMEOUT_MS });
+  if (r.status !== 0) return { name: "Codex", error: (r.stderr || r.stdout || "codex task failed").trim().slice(0, 300) };
+  try {
+    const raw = String(JSON.parse(r.stdout)?.rawOutput ?? "").trim();
+    return raw ? { name: "Codex", raw } : { name: "Codex", error: "codex returned empty output" };
+  } catch {
+    return { name: "Codex", error: "invalid JSON from codex companion" };
+  }
+}
+
 // Grok side: stateless gate run, stripped env, read-only stack, mutation check.
 export async function runGrokReview({ prompt, cwd, env }) {
   const gateEnv = grokGateEnv(env);
