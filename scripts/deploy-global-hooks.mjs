@@ -8,8 +8,21 @@ import { fileURLToPath } from "node:url";
 export function migrateDataDir({ base = path.join(os.homedir(), ".claude", "plugins", "data") } = {}) {
   const from = path.join(base, "grok-companion-shared");
   const to = path.join(base, "bench-shared");
+  // Identify the REAL data by companion.json, not by the dir existing — a prior broken deploy could
+  // have pre-created an EMPTY bench-shared (e.g. a snapshot backup dir) while the real config + traces
+  // still sit in grok-companion-shared. Keying on the dir alone would skip that and orphan the data.
+  const hasConfig = (d) => { try { return fs.existsSync(path.join(d, "companion.json")); } catch { return false; } };
   try {
-    if (fs.existsSync(from) && !fs.existsSync(to)) { fs.renameSync(from, to); return { migrated: true, from, to }; }
+    if (hasConfig(from) && !hasConfig(to)) {
+      if (fs.existsSync(to)) {
+        // bench-shared exists but is incomplete — merge the real data over it (legacy wins), then drop legacy.
+        fs.cpSync(from, to, { recursive: true, force: true });
+        fs.rmSync(from, { recursive: true, force: true });
+        return { migrated: true, merged: true, from, to };
+      }
+      fs.renameSync(from, to);
+      return { migrated: true, from, to };
+    }
   } catch (e) { return { migrated: false, error: String(e?.message || e) }; }
   return { migrated: false };
 }

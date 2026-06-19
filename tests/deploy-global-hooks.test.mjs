@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { deploy, snapshot, syncSettings, migrateDataDir } from "../scripts/deploy-global-hooks.mjs";
 
-test("migrateDataDir moves grok-companion-shared → bench-shared once, then no-ops", () => {
+test("migrateDataDir: clean legacy → rename", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-"));
   fs.mkdirSync(path.join(base, "grok-companion-shared"), { recursive: true });
   fs.writeFileSync(path.join(base, "grok-companion-shared", "companion.json"), '{"reviewers":["kimi"]}');
@@ -11,12 +11,30 @@ test("migrateDataDir moves grok-companion-shared → bench-shared once, then no-
   assert.equal(r.migrated, true);
   assert.ok(fs.existsSync(path.join(base, "bench-shared", "companion.json")), "data moved to bench-shared");
   assert.equal(fs.existsSync(path.join(base, "grok-companion-shared")), false, "old dir removed");
-  // no-op when bench-shared already exists (don't clobber migrated data)
+});
+test("migrateDataDir: BROKEN-DEPLOY state (empty bench-shared pre-created) → merges real data + recovers", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-broken-"));
+  // real data in legacy:
+  fs.mkdirSync(path.join(base, "grok-companion-shared", "state", "ws-x", "traces"), { recursive: true });
+  fs.writeFileSync(path.join(base, "grok-companion-shared", "companion.json"), '{"reviewers":["kimi","glm"]}');
+  fs.writeFileSync(path.join(base, "grok-companion-shared", "state", "ws-x", "traces", "t.json"), "{}");
+  // empty/incomplete bench-shared pre-created by a prior broken deploy (no companion.json):
+  fs.mkdirSync(path.join(base, "bench-shared", "backup-x"), { recursive: true });
+  const r = migrateDataDir({ base });
+  assert.equal(r.migrated, true); assert.equal(r.merged, true);
+  assert.ok(JSON.parse(fs.readFileSync(path.join(base, "bench-shared", "companion.json"), "utf8")).reviewers.includes("glm"), "real config recovered");
+  assert.ok(fs.existsSync(path.join(base, "bench-shared", "state", "ws-x", "traces", "t.json")), "traces recovered");
+  assert.equal(fs.existsSync(path.join(base, "grok-companion-shared")), false, "legacy removed after merge");
+});
+test("migrateDataDir: already-migrated bench-shared is NOT clobbered; fresh install no-ops", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-done-"));
+  fs.mkdirSync(path.join(base, "bench-shared"), { recursive: true });
+  fs.writeFileSync(path.join(base, "bench-shared", "companion.json"), '{"reviewers":["mimo"]}');
   fs.mkdirSync(path.join(base, "grok-companion-shared"), { recursive: true });
+  fs.writeFileSync(path.join(base, "grok-companion-shared", "companion.json"), '{"reviewers":["STALE"]}');
   assert.equal(migrateDataDir({ base }).migrated, false);
-  // no-op on a fresh install (no legacy dir)
-  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "fresh-"));
-  assert.equal(migrateDataDir({ base: fresh }).migrated, false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(base, "bench-shared", "companion.json"), "utf8")).reviewers[0], "mimo", "current config not clobbered");
+  assert.equal(migrateDataDir({ base: fs.mkdtempSync(path.join(os.tmpdir(), "fresh-")) }).migrated, false);
 });
 
 test("deploy copies modules flat and backs up a differing existing file", () => {
