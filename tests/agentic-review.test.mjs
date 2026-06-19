@@ -64,3 +64,24 @@ test("report mode returns final content as report (no verdict needed)", async ()
       { json: { choices: [{ message: { content: "Findings:\n1. bug at a.js:5" } }] } } ]; return { ok: true, status: 200, json: async () => seq[Math.min(i++, seq.length - 1)].json }; }; })() });
   assert.equal(res.ok, true); assert.match(res.report, /a\.js:5/);
 });
+test("retries a transient network error, then succeeds", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    if (calls === 1) { const e = new Error("fetch failed"); e.cause = { code: "ECONNRESET" }; throw e; }
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) };
+  };
+  const tools = { schemas: [{ type: "function", function: { name: "x", parameters: { type: "object", properties: {} } } }], execute: async () => "x" };
+  const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, tools, fetchImpl });
+  assert.equal(res.ok, true); assert.equal(res.verdict, "ALLOW"); assert.equal(calls, 2);
+});
+test("report mode forces conclusion near the step cap (no infinite tool loop)", async () => {
+  const fetchImpl = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    if (body.tool_choice === "none") return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "Findings: bug at z.js:1" } }] }) };
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { tool_calls: [{ id: "1", function: { name: "read_file", arguments: "{}" } }] } }] }) };
+  };
+  const tools = { schemas: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: {} } } }], execute: async () => "x" };
+  const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, mode: "report", maxSteps: 4, tools, fetchImpl });
+  assert.equal(res.ok, true); assert.match(res.report, /z\.js:1/);
+});

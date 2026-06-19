@@ -4,6 +4,9 @@ const DEFAULT_MAX_STEPS = 24;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_NUDGES = 2;
 const TOOL_RESULT_CAP = 50_000;
+const CONCLUDE_BUDGET = 150_000;   // tool-output bytes after which we force the model to stop reading and conclude (kimi over-explores)
+const MAX_NET_RETRIES = 2;         // retry transient "fetch failed" (connection drops) — NOT genuine timeouts
+const RETRY_BACKOFF_MS = 750;
 
 export async function agenticReview({
   baseURL, apiKey, model, system, user,
@@ -23,30 +26,51 @@ export async function agenticReview({
   const messages = [{ role: "system", content: system }, { role: "user", content: user }];
   const filesRead = [];
   const rounds = [];                              // per-round diagnostics
-  let nudges = 0, toolBytes = 0, lastReqBytes = 0, stepsRun = 0;
+  let nudges = 0, toolBytes = 0, lastReqBytes = 0, stepsRun = 0, concludeNudged = false;
   const dlog = (...a) => { if (debug) console.error(`[agentic ${model}]`, ...a); };
   const diag = () => ({ steps: stepsRun, filesRead: filesRead.slice(), toolBytes, lastReqBytes, rounds: rounds.slice() });
 
   try {
     for (let step = 0; step < maxSteps; step++) {
       stepsRun = step + 1;
-      const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: "auto", temperature, stream: false });
+      // Force conclusion once enough context is gathered or we're near the cap — otherwise some
+      // models (kimi) read files forever and hit maxSteps with no output. tool_choice:"none" makes it answer.
+      const force = toolBytes > CONCLUDE_BUDGET || step >= maxSteps - 2;
+      if (force && !concludeNudged) {
+        concludeNudged = true;
+        messages.push({ role: "user", content: mode === "report"
+          ? "You have gathered enough context. Do NOT call any more tools — write your final findings now, each with file:line."
+          : "You have gathered enough context. Do NOT call any more tools — give your verdict now: the first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`." });
+      }
+      const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: force ? "none" : "auto", temperature, stream: false });
       lastReqBytes = body.length;
-      dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}`);
+      dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);
       let resp;
       const t0 = Date.now();
-      try {
-        resp = await doFetch(`${baseURL}/chat/completions`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
-          body, signal: controller.signal
-        });
-      } catch (e) {
-        const kind = e?.name === "AbortError" ? "timeout" : "network";
-        const cause = e?.cause ? ` cause=${e.cause.code || e.cause.message || String(e.cause).slice(0, 80)}` : "";
-        dlog(`step ${step}: FETCH ${kind.toUpperCase()} after ${Date.now() - t0}ms reqKB=${(lastReqBytes / 1024) | 0}: ${e?.message}${cause}`);
-        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${e?.message}${cause}` });
-        return { ok: false, error: { kind, detail: `${String(e?.message || e).slice(0, 200)}${cause}` }, diag: diag() };
+      let netErr = null;
+      for (let attempt = 0; attempt <= MAX_NET_RETRIES; attempt++) {
+        try {
+          resp = await doFetch(`${baseURL}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+            body, signal: controller.signal
+          });
+          netErr = null; break;
+        } catch (e) {
+          netErr = e;
+          if (e?.name === "AbortError") break;                 // genuine wall-clock timeout — don't retry
+          if (attempt < MAX_NET_RETRIES) {
+            dlog(`step ${step}: net attempt ${attempt + 1} failed (${e?.cause?.code || e?.message}); retry in ${RETRY_BACKOFF_MS}ms`);
+            await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
+          }
+        }
+      }
+      if (netErr) {
+        const kind = netErr?.name === "AbortError" ? "timeout" : "network";
+        const cause = netErr?.cause ? ` cause=${netErr.cause.code || netErr.cause.message || String(netErr.cause).slice(0, 80)}` : "";
+        dlog(`step ${step}: FETCH ${kind.toUpperCase()} after ${Date.now() - t0}ms reqKB=${(lastReqBytes / 1024) | 0}: ${netErr?.message}${cause}`);
+        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${netErr?.message}${cause}` });
+        return { ok: false, error: { kind, detail: `${String(netErr?.message || netErr).slice(0, 200)}${cause}` }, diag: diag() };
       }
       if (!resp.ok) {
         const b = await resp.text().catch(() => "");
