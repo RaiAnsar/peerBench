@@ -1,7 +1,7 @@
 // global-hooks/review-client.mjs
 // OpenAI-compatible reviewer. READ-ONLY by omission: body never has tools/tool_choice.
 const DEFAULT_TIMEOUT_MS = 90_000;
-export async function review({ baseURL, apiKey, model, system, user, timeoutMs = DEFAULT_TIMEOUT_MS, temperature = 0, headers = {}, fetchImpl }) {
+export async function review({ baseURL, apiKey, model, system, user, timeoutMs = DEFAULT_TIMEOUT_MS, temperature = 0, headers = {}, thinking, fetchImpl }) {
   if (!apiKey) return { ok: false, error: { kind: "nokey", detail: "no api key" } };
   const doFetch = fetchImpl || globalThis.fetch;
   const controller = new AbortController();
@@ -12,7 +12,7 @@ export async function review({ baseURL, apiKey, model, system, user, timeoutMs =
     resp = await doFetch(`${baseURL}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
-      body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature, stream: false }),
+      body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature, stream: false, ...(thinking === "disabled" || thinking === "enabled" ? { thinking: { type: thinking } } : {}) }),
       signal: controller.signal
     });
   } catch (e) {

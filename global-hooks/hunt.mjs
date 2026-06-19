@@ -43,7 +43,7 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
       if (!p?.apiKey) return { name, findings: "", error: "no api key" };
       const res = await agenticReview({
         baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, temperature: p.temperature, headers: p.headers,
-        system, user, tools: createReviewTools(cwd), mode: "report",
+        system, user, tools: createReviewTools(cwd), mode: "report", thinking: p.thinking,
         maxSteps: HUNT_MAX_STEPS, timeoutMs: Math.max(p.timeoutMs || 0, HUNT_TIMEOUT_MS), fetchImpl: reviewImpl, debug
       });
       const display = name === "kimi" ? "Kimi" : name === "mimo" ? "MiMo" : name;

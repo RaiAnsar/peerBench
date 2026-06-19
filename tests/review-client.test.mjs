@@ -41,6 +41,24 @@ test("sends provided temperature and merges extra headers", async () => {
   assert.equal(cap.headers["User-Agent"], "claude-cli/1.0.83 (external, cli)");
   assert.equal(cap.headers.Authorization, "Bearer k");
 });
+test("thinking:disabled includes thinking:{type:disabled} in body", async () => {
+  const cap = {};
+  await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, thinking: "disabled",
+    fetchImpl: (url, opts) => { cap.body = JSON.parse(opts.body); return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
+  assert.deepEqual(cap.body.thinking, { type: "disabled" });
+});
+test("no thinking option → no thinking key in body (back-compat)", async () => {
+  const cap = {};
+  await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000,
+    fetchImpl: (url, opts) => { cap.body = JSON.parse(opts.body); return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
+  assert.equal("thinking" in cap.body, false);
+});
+test("thinking:null → no thinking key in body", async () => {
+  const cap = {};
+  await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, thinking: null,
+    fetchImpl: (url, opts) => { cap.body = JSON.parse(opts.body); return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
+  assert.equal("thinking" in cap.body, false);
+});
 test("reserved headers (Authorization, Content-Type) in provider headers are stripped; additive headers kept", async () => {
   const cap = {};
   await review({

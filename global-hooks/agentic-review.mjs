@@ -54,7 +54,7 @@ const DEFAULT_ROUND_MS = 90_000;   // per-EXPLORATION-round cap: one runaway thi
 
 export async function agenticReview({
   baseURL, apiKey, model, system, user,
-  temperature = 0, headers = {}, tools,
+  temperature = 0, headers = {}, tools, thinking,
   mode = "verdict",
   maxSteps = DEFAULT_MAX_STEPS, timeoutMs = DEFAULT_TIMEOUT_MS, maxRoundMs = DEFAULT_ROUND_MS, fetchImpl, debug = false
 }) {
@@ -86,7 +86,7 @@ export async function agenticReview({
           ? "You have gathered enough context. Do NOT call any more tools — write your final findings now, each with file:line."
           : "You have gathered enough context. Do NOT call any more tools — give your verdict now: the first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`." });
       }
-      const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: force ? "none" : "auto", temperature, stream: true });
+      const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: force ? "none" : "auto", temperature, stream: true, ...(thinking ? { thinking: { type: thinking } } : {}) });
       lastReqBytes = body.length;
       dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);
       const t0 = Date.now();

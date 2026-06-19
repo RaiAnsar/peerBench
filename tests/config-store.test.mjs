@@ -11,9 +11,9 @@ test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => 
   const a = resolveConfig({ env: { ...base } });
   const b = resolveConfig({ env: { ...base, CLAUDE_PLUGIN_DATA: "/tmp/whatever" } });
   assert.equal(a.providers.kimi.apiKey, "mk");
-  assert.equal(a.providers.kimi.model, "kimi-for-coding");
+  assert.equal(a.providers.kimi.model, "kimi-k2.6");
   assert.equal(a.providers.kimi.baseURL, "https://api.kimi.com/coding/v1");
-  assert.equal(a.providers.kimi.temperature, 1);
+  assert.equal(a.providers.kimi.temperature, 0.6);
   assert.match(a.providers.kimi.headers["User-Agent"], /claude-cli/);
   assert.equal(a.providers.mimo.apiKey, "xk");
   assert.equal(a.providers.mimo.temperature, 0);
@@ -55,4 +55,22 @@ test("resolveConfig includes per-provider timeoutMs defaults (kimi=300000, mimo=
   const cfg = resolveConfig({ env: { KIMI_API_KEY: "k" } });
   assert.equal(cfg.providers.kimi.timeoutMs, 300_000);
   assert.equal(cfg.providers.mimo.timeoutMs, 180_000);
+});
+test("resolveConfig kimi defaults: model kimi-k2.6, temperature 0.6, thinking disabled", () => {
+  const cfg = resolveConfig({ env: { KIMI_API_KEY: "k" } });
+  assert.equal(cfg.providers.kimi.model, "kimi-k2.6");
+  assert.equal(cfg.providers.kimi.temperature, 0.6);
+  assert.equal(cfg.providers.kimi.thinking, "disabled");
+});
+test("resolveConfig KIMI_THINKING env overrides kimi thinking", () => {
+  const cfg = resolveConfig({ env: { KIMI_API_KEY: "k", KIMI_THINKING: "enabled" } });
+  assert.equal(cfg.providers.kimi.thinking, "enabled");
+});
+test("resolveConfig normalizes empty string thinking to null", () => {
+  const cfg = resolveConfig({ env: { KIMI_API_KEY: "k", KIMI_THINKING: "" } });
+  assert.equal(cfg.providers.kimi.thinking, null);
+});
+test("resolveConfig mimo defaults: thinking null", () => {
+  const cfg = resolveConfig({ env: { MIMO_API_KEY: "m" } });
+  assert.equal(cfg.providers.mimo.thinking, null);
 });

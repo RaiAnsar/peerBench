@@ -6,11 +6,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 const DEFAULTS = {
-  kimi: { baseURL: "https://api.kimi.com/coding/v1", model: "kimi-for-coding", keyEnv: "KIMI_API_KEY",
-          temperature: 1, headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
-          timeoutMs: 300_000 },  // 5 min — kimi-for-coding thinking is slow on large inputs
+  kimi: { baseURL: "https://api.kimi.com/coding/v1", model: "kimi-k2.6", keyEnv: "KIMI_API_KEY",
+          temperature: 0.6, thinking: "disabled", thinkingEnv: "KIMI_THINKING",
+          headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
+          timeoutMs: 300_000 },  // 5 min
   mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
-          temperature: 0, headers: {}, timeoutMs: 180_000 }  // 3 min
+          temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
+          headers: {}, timeoutMs: 180_000 }  // 3 min
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
 export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "grok"];
@@ -43,13 +45,17 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
   const providers = {};
   for (const [name, d] of Object.entries(DEFAULTS)) {
     const f = file.providers?.[name] || {};
+    const envThinking = d.thinkingEnv && d.thinkingEnv in env ? env[d.thinkingEnv] : undefined;
+    const rawThinking = f.thinking !== undefined ? f.thinking : (envThinking !== undefined ? envThinking : (d.thinking || null));
+    const thinking = rawThinking === "" ? null : rawThinking;
     providers[name] = {
       baseURL: env[`${name.toUpperCase()}_BASE_URL`] || f.baseURL || d.baseURL,
       model: env[`${name.toUpperCase()}_MODEL`] || f.model || d.model,
       apiKey: env[d.keyEnv] || f.apiKey || "",
       temperature: typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0),
       headers: { ...(d.headers || {}), ...(f.headers || {}) },
-      timeoutMs: typeof f.timeoutMs === "number" ? f.timeoutMs : (d.timeoutMs ?? 90_000)
+      timeoutMs: typeof f.timeoutMs === "number" ? f.timeoutMs : (d.timeoutMs ?? 90_000),
+      thinking
     };
   }
   // If an explicit override is provided (non-empty array), use it; otherwise fall back to file/default.

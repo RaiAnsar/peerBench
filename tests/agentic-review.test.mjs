@@ -116,6 +116,22 @@ test("report mode forces conclusion near the step cap (no infinite tool loop)", 
   const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, mode: "report", maxSteps: 4, tools, fetchImpl });
   assert.equal(res.ok, true); assert.match(res.report, /z\.js:1/);
 });
+test("thinking:disabled includes thinking:{type:disabled} in first request body", async () => {
+  const bodies = [];
+  const tools = { schemas: SCHEMAS, execute: async (n, a) => `contents of ${a.path}` };
+  const fetchImpl = async (url, opts) => { bodies.push(JSON.parse(opts.body)); return sse([{ content: "ALLOW: ok" }]); };
+  const res = await agenticReview({ ...baseArgs, tools, thinking: "disabled", fetchImpl });
+  assert.equal(res.ok, true);
+  assert.deepEqual(bodies[0].thinking, { type: "disabled" });
+});
+test("no thinking option → no thinking key in body (back-compat)", async () => {
+  const bodies = [];
+  const tools = { schemas: SCHEMAS, execute: async (n, a) => `contents of ${a.path}` };
+  const fetchImpl = async (url, opts) => { bodies.push(JSON.parse(opts.body)); return sse([{ content: "ALLOW: ok" }]); };
+  const res = await agenticReview({ ...baseArgs, tools, fetchImpl });
+  assert.equal(res.ok, true);
+  assert.equal("thinking" in bodies[0], false);
+});
 test("per-round watchdog caps a slow exploration round, forcing conclusion", async () => {
   let call = 0;
   const fetchImpl = (url, opts) => new Promise((resolve, reject) => {
