@@ -1,7 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
-import { deploy, snapshot, syncSettings } from "../scripts/deploy-global-hooks.mjs";
+import { deploy, snapshot, syncSettings, migrateDataDir } from "../scripts/deploy-global-hooks.mjs";
+
+test("migrateDataDir moves grok-companion-shared → bench-shared once, then no-ops", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-"));
+  fs.mkdirSync(path.join(base, "grok-companion-shared"), { recursive: true });
+  fs.writeFileSync(path.join(base, "grok-companion-shared", "companion.json"), '{"reviewers":["kimi"]}');
+  const r = migrateDataDir({ base });
+  assert.equal(r.migrated, true);
+  assert.ok(fs.existsSync(path.join(base, "bench-shared", "companion.json")), "data moved to bench-shared");
+  assert.equal(fs.existsSync(path.join(base, "grok-companion-shared")), false, "old dir removed");
+  // no-op when bench-shared already exists (don't clobber migrated data)
+  fs.mkdirSync(path.join(base, "grok-companion-shared"), { recursive: true });
+  assert.equal(migrateDataDir({ base }).migrated, false);
+  // no-op on a fresh install (no legacy dir)
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "fresh-"));
+  assert.equal(migrateDataDir({ base: fresh }).migrated, false);
+});
 
 test("deploy copies modules flat and backs up a differing existing file", () => {
   const src = fs.mkdtempSync(path.join(os.tmpdir(), "src-")), dest = fs.mkdtempSync(path.join(os.tmpdir(), "dst-"));

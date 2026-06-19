@@ -1,6 +1,19 @@
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// ONE-TIME data-dir migration: pre-rename installs kept reviewer config + traces under
+// 'grok-companion-shared'; move it to 'bench-shared' once. No-op on fresh installs or after
+// migration. MUST run before anything that could create bench-shared (e.g. the snapshot backup
+// dir) — otherwise the dir already exists and the real data is orphaned.
+export function migrateDataDir({ base = path.join(os.homedir(), ".claude", "plugins", "data") } = {}) {
+  const from = path.join(base, "grok-companion-shared");
+  const to = path.join(base, "bench-shared");
+  try {
+    if (fs.existsSync(from) && !fs.existsSync(to)) { fs.renameSync(from, to); return { migrated: true, from, to }; }
+  } catch (e) { return { migrated: false, error: String(e?.message || e) }; }
+  return { migrated: false };
+}
+
 // Copy every global-hooks/*.mjs FLAT into dest; back up a differing pre-existing file once.
 export function deploy({ src, dest }) {
   fs.mkdirSync(dest, { recursive: true });
@@ -96,8 +109,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const hooksDir = path.join(os.homedir(), ".claude", "hooks");
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
   const backupDir = path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared", `backup-${Date.now()}`);
+  const migrate = migrateDataDir();   // FIRST — before snapshot's backupDir can create bench-shared
   const snap = snapshot({ hooksDir, settingsPath, backupDir });
   const dep = deploy({ src: path.join(here, "..", "global-hooks"), dest: hooksDir });
   const sync = syncSettings({ hooksDir, settingsPath });
-  console.log(JSON.stringify({ snapshot: snap, deploy: dep, sync }, null, 2));
+  console.log(JSON.stringify({ migrate, snapshot: snap, deploy: dep, sync }, null, 2));
 }
