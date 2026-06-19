@@ -8,12 +8,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-// Set GROK_COMPANION_ROOT before importing any module that uses config-store.
+// Set BENCH_ROOT before importing any module that uses config-store.
 const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
-process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt } from "../global-hooks/stop-review.mjs";
-import { setGangDisabled } from "../global-hooks/config-store.mjs";
+import { setBenchDisabled } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "stop-review.mjs");
@@ -78,7 +78,7 @@ function captureEmit(fn) {
 test("no diff → runMain returns early without trace or emit", async () => {
   const ws = freshRepo({ withChange: false });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-nd-"));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   let traceWritten = false;
   const writeTraceImpl = () => { traceWritten = true; };
@@ -93,13 +93,13 @@ test("no diff → runMain returns early without trace or emit", async () => {
     await runMain({
       resolveReviewersImpl,
       writeTraceImpl,
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws }
     });
   } finally {
     restore();
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   assert.equal(reviewersCalled, false, "reviewers should NOT be called on a no-diff turn");
@@ -120,7 +120,7 @@ test("stop_hook_active → runMain returns early (loop guard)", async () => {
   await runMain({
     resolveReviewersImpl,
     writeTraceImpl: () => {},
-    isGangDisabledImpl: () => false,
+    isBenchDisabledImpl: () => false,
     env: process.env,
     input: { cwd: ws, stop_hook_active: true }
   });
@@ -135,24 +135,24 @@ test("stop_hook_active → runMain returns early (loop guard)", async () => {
 test("disabled workspace → runMain exits 0 without calling reviewers", async () => {
   const ws = freshRepo({ withChange: true });
 
-  // setGangDisabled for workspace scope writes to workspaceStateDir(ws) which
-  // uses sharedRoot() → GROK_COMPANION_ROOT env. We write with TEMP_GCR active
+  // setBenchDisabled for workspace scope writes to workspaceStateDir(ws) which
+  // uses sharedRoot() → BENCH_ROOT env. We write with TEMP_GCR active
   // (it was set at module load time) so the subprocess must also see TEMP_GCR.
-  setGangDisabled(ws, true, { scope: "workspace" });
+  setBenchDisabled(ws, true, { scope: "workspace" });
 
   try {
     const result = spawnSync(process.execPath, [HOOK], {
       input: JSON.stringify({ cwd: ws }),
       encoding: "utf8",
-      env: { ...process.env, GROK_COMPANION_ROOT: TEMP_GCR }
+      env: { ...process.env, BENCH_ROOT: TEMP_GCR }
     });
 
-    assert.equal(result.status, 0, "exit code should be 0 when gang is disabled");
-    assert.equal(result.stdout.trim(), "", "no output expected when gang disabled");
-    assert.equal(result.stderr.trim(), "", "no stderr expected when gang disabled");
+    assert.equal(result.status, 0, "exit code should be 0 when bench is disabled");
+    assert.equal(result.stdout.trim(), "", "no output expected when bench disabled");
+    assert.equal(result.stderr.trim(), "", "no stderr expected when bench disabled");
   } finally {
     // Re-enable so this ws doesn't affect other tests sharing TEMP_GCR.
-    setGangDisabled(ws, false, { scope: "workspace" });
+    setBenchDisabled(ws, false, { scope: "workspace" });
   }
 });
 
@@ -163,7 +163,7 @@ test("disabled workspace → runMain exits 0 without calling reviewers", async (
 test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async () => {
   const ws = freshRepo({ withChange: true });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-al-"));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   let traceRecord = null;
   const writeTraceImpl = (_ws, trace) => { traceRecord = trace; };
@@ -176,19 +176,19 @@ test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async ()
         fakeReviewer("MiMo", "ALLOW", "ALLOW: no issues")
       ]),
       writeTraceImpl,
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, last_assistant_message: "wrote some code" }
     });
   } finally {
     restore();
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   assert.ok(lines.length > 0, "should emit at least one line");
   const parsed = JSON.parse(lines[0]);
   assert.ok(typeof parsed.systemMessage === "string", "systemMessage should be a string");
-  assert.match(parsed.systemMessage, /gang stop.*ALLOW/i, "systemMessage should mention gang stop and ALLOW");
+  assert.match(parsed.systemMessage, /bench stop.*ALLOW/i, "systemMessage should mention bench stop and ALLOW");
 
   assert.ok(traceRecord !== null, "trace should be written");
   assert.equal(traceRecord.gate, "stop", "trace gate should be 'stop'");
@@ -221,7 +221,7 @@ const fakeReviewer = {
 await runMain({
   resolveReviewersImpl: () => [fakeReviewer],
   writeTraceImpl: () => {},
-  isGangDisabledImpl: () => false,
+  isBenchDisabledImpl: () => false,
   env: process.env,
   input: { cwd: ${JSON.stringify(ws)}, last_assistant_message: "wrote some code" }
 });
@@ -229,7 +229,7 @@ await runMain({
 
   const result = spawnSync(process.execPath, [wrapperScript], {
     encoding: "utf8",
-    env: { ...process.env, GROK_COMPANION_ROOT: wrapperRoot }
+    env: { ...process.env, BENCH_ROOT: wrapperRoot }
   });
 
   assert.equal(result.status, 2, `expected exit code 2 on BLOCK, got ${result.status}; stderr: ${result.stderr}`);
@@ -244,7 +244,7 @@ await runMain({
 test("all reviewers error → fail-open systemMessage, no exit 2", async () => {
   const ws = freshRepo({ withChange: true });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fo-"));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   const { lines, restore } = captureEmit(() => {});
   try {
@@ -254,19 +254,19 @@ test("all reviewers error → fail-open systemMessage, no exit 2", async () => {
         fakeErrorReviewer("MiMo")
       ]),
       writeTraceImpl: () => {},
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws }
     });
   } finally {
     restore();
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   assert.ok(lines.length > 0, "should emit a fail-open message");
   const parsed = JSON.parse(lines[0]);
   assert.ok(typeof parsed.systemMessage === "string", "systemMessage should be a string");
-  assert.match(parsed.systemMessage, /gang stop.*review failed.*turn allowed/i, "should indicate fail-open");
+  assert.match(parsed.systemMessage, /bench stop.*review failed.*turn allowed/i, "should indicate fail-open");
 });
 
 // ---------------------------------------------------------------------------

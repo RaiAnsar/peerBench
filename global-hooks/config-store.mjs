@@ -21,8 +21,14 @@ const DEFAULTS = {
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
 export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "glm"];
 export function sharedRoot() {
-  return process.env.GROK_COMPANION_ROOT
-    || path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared");
+  if (process.env.BENCH_ROOT) return process.env.BENCH_ROOT;
+  const base = path.join(os.homedir(), ".claude", "plugins", "data");
+  const here = path.join(base, "bench-shared");
+  // Legacy installs kept state under the old name — fall back so keys/traces are never lost
+  // if the data dir hasn't been migrated yet (renamed from grok-companion → peerbench).
+  const legacy = path.join(base, "grok-companion-shared");
+  try { if (!fs.existsSync(here) && fs.existsSync(legacy)) return legacy; } catch { /* default below */ }
+  return here;
 }
 export function workspaceStateDir(ws) {
   let canonical = ws; try { canonical = fs.realpathSync.native(ws); } catch { canonical = ws; }
@@ -48,14 +54,14 @@ const GLOBAL_DISABLE = (root) => path.join(root || sharedRoot(), "disabled-globa
 const WS_DISABLE = (ws) => path.join(workspaceStateDir(ws), "disabled");
 
 // Disabled if the global marker exists OR this workspace's marker exists.
-export function isGangDisabled(ws, { root } = {}) {
+export function isBenchDisabled(ws, { root } = {}) {
   try { if (fs.existsSync(GLOBAL_DISABLE(root))) return true; } catch { /* noop */ }
   try { if (ws && fs.existsSync(WS_DISABLE(ws))) return true; } catch { /* noop */ }
   return false;
 }
 
 // scope: "global" writes/removes the global marker; otherwise the workspace marker.
-export function setGangDisabled(ws, disabled, { scope = "workspace", root } = {}) {
+export function setBenchDisabled(ws, disabled, { scope = "workspace", root } = {}) {
   const file = scope === "global" ? GLOBAL_DISABLE(root) : WS_DISABLE(ws);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   if (disabled) fs.writeFileSync(file, `disabled ${scope}\n`);

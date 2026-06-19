@@ -10,7 +10,7 @@ const LIST_MAX = 300;
 function realDir(p) { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } }
 
 // Read a [offset, offset+limit) line window WITHOUT loading the whole file (the 2MB guard only
-// covered full reads, so offset/limit on a multi-GB file could OOM — found by the gang's own hunt).
+// covered full reads, so offset/limit on a multi-GB file could OOM — found by the bench's own hunt).
 function readLineRange(abs, offset, limit) {
   const start = Math.max(0, (Number.isInteger(offset) ? offset : 1) - 1);
   const want = Number.isInteger(limit) ? Math.max(0, limit) : Infinity;

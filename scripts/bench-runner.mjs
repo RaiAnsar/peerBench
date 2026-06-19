@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// grok-companion runtime CLI.
+// peerbench runtime CLI.
 // Usage:
-//   grok-runner.mjs review [--json] [--base <ref>]
-//   grok-runner.mjs status
-//   grok-runner.mjs setup
+//   bench-runner.mjs review [--json] [--base <ref>]
+//   bench-runner.mjs status
+//   bench-runner.mjs setup
 //
 // Slash-command templates call `review --json "$ARGUMENTS"`, producing mixed
 // argv: standalone flags first, then ONE quoted element that may START with
@@ -13,10 +13,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveConfig, isGangDisabled, setGangDisabled, setReviewers } from "../global-hooks/config-store.mjs";
+import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers } from "../global-hooks/config-store.mjs";
 import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
-import { huntPanel, HUNT_SYSTEM, buildHuntUser } from "../global-hooks/hunt.mjs";
+import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -131,7 +131,7 @@ async function main() {
     const { listTraces } = await import("../global-hooks/trace-store.mjs");
     const traces = listTraces(ws, 10);
     if (!traces.length) {
-      process.stdout.write("No gang review traces for this workspace.\n");
+      process.stdout.write("No bench review traces for this workspace.\n");
       return;
     }
     for (const t of traces) {
@@ -146,14 +146,14 @@ async function main() {
     const codexFound = !!latestCodexRoot();
     const kimiKey = !!process.env.KIMI_API_KEY;
     const mimoKey = !!process.env.MIMO_API_KEY;
-    const disabled = isGangDisabled(ws);
+    const disabled = isBenchDisabled(ws);
     const lines = [
       `Active reviewers: ${cfg.reviewers.join(", ")}`,
       `KIMI_API_KEY: ${kimiKey ? "present" : "missing"}`,
       `MIMO_API_KEY: ${mimoKey ? "present" : "missing"}`,
       `Codex plugin: ${codexFound ? "found" : "not found"}`,
-      `Gang disabled: ${disabled ? "yes" : "no"}`,
-      `Hint: /gang:reviewers to change reviewers | /gang:off to disable | /gang:on to re-enable`
+      `Bench disabled: ${disabled ? "yes" : "no"}`,
+      `Hint: /bench:reviewers to change reviewers | /bench:off to disable | /bench:on to re-enable`
     ];
     process.stdout.write(lines.join("\n") + "\n");
     return;
@@ -186,29 +186,44 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|hunt|investigate|off|on`);
+  if (sub === "debug") {
+    const seed = rest.join(" ").trim();
+    if (!seed) {
+      process.stdout.write("Describe the failure to debug — e.g. `/bench:debug TypeError: cart is undefined at checkout when the cart is empty`\n");
+      return;
+    }
+    const ws = workspaceRoot(cwd);
+    const output = await huntCommand(ws, seed, { mode: "debug" });
+    process.stdout.write(`${output}\n`);
+    return;
+  }
+
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|hunt|investigate|debug|off|on`);
 }
 
-export async function huntCommand(cwd, seed, { huntImpl = huntPanel, deep = false } = {}) {
-  const results = await huntImpl({ cwd, seed, deep });
-  const gate = deep ? "investigate" : "hunt";
-  // record a trace so `/gang:status <id>` can show the full findings later
+const HUNT_MODES = {
+  hunt:        { deep: false, system: HUNT_SYSTEM,  buildUser: buildHuntUser,  header: (s) => s ? `Bug hunt — focus: ${s}` : "Bug hunt — broad sweep" },
+  investigate: { deep: true,  system: HUNT_SYSTEM,  buildUser: buildHuntUser,  header: (s) => s ? `Investigation — focus: ${s}` : "Investigation — broad sweep" },
+  debug:       { deep: false, system: DEBUG_SYSTEM, buildUser: buildDebugUser, header: (s) => `Debug — ${s || "(no failure described)"}` },
+};
+export async function huntCommand(cwd, seed, { huntImpl = huntPanel, deep = false, mode } = {}) {
+  const key = mode || (deep ? "investigate" : "hunt");           // back-compat: deep:true → investigate
+  const m = HUNT_MODES[key] || HUNT_MODES.hunt;
+  const results = await huntImpl({ cwd, seed, deep: m.deep, system: m.system, user: m.buildUser(seed) });
+  // record a trace so `/bench:status <id>` can show the full findings later
   let traceId = null;
   try {
     traceId = writeTrace(cwd, {
-      gate, ws: cwd,
+      gate: key, ws: cwd,
       reviewers: results.map((r) => ({ name: r.name, model: r.model, error: r.error || null, diag: r.diag || null })),
-      systemPrompt: HUNT_SYSTEM, userPrompt: buildHuntUser(seed),
+      systemPrompt: m.system, userPrompt: m.buildUser(seed),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
     });
   } catch { /* trace is best-effort */ }
   const blocks = results.map((r) =>
     `═══ ${r.name} ═══\n${r.findings?.trim() || `(no findings — ${r.error || "empty"})`}`);
-  const cmd = deep ? "investigate" : "hunt";
-  const header = deep
-    ? (seed?.trim() ? `Investigation — focus: ${seed.trim()}` : "Investigation — broad sweep")
-    : (seed?.trim() ? `Bug hunt — focus: ${seed.trim()}` : "Bug hunt — broad sweep");
-  return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /gang:${cmd} ${traceId})` : ""}`;
+  const header = m.header(seed?.trim() || "");
+  return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /bench:${key} ${traceId})` : ""}`;
 }
 
 export function gateToggleCommand(ws, args) {
@@ -216,10 +231,10 @@ export function gateToggleCommand(ws, args) {
   const hasGlobal = args.slice(1).includes("--global");
   const scope = hasGlobal ? "global" : "workspace";
   const disabled = sub === "off";
-  setGangDisabled(ws, disabled, { scope });
+  setBenchDisabled(ws, disabled, { scope });
   return disabled
-    ? `gang: disabled (${scope}). Gates will no-op until /gang:on.`
-    : `gang: enabled (${scope}).`;
+    ? `bench: disabled (${scope}). Gates will no-op until /bench:on.`
+    : `bench: enabled (${scope}).`;
 }
 
 export function reviewersCommand(args) {

@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveStateDir, loadState, saveState, appendJob } from "../scripts/lib/grok-state.mjs";
+import { resolveStateDir, loadState, saveState, appendJob } from "../scripts/lib/bench-state.mjs";
 
 function tmpDataRoot() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "grok-state-test-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "bench-state-test-"));
 }
 
 test("resolveStateDir uses CLAUDE_PLUGIN_DATA when set", () => {
@@ -16,9 +16,9 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when set", () => {
   assert.match(path.basename(dir), /^some-ws-[0-9a-f]{16}$/);
 });
 
-test("resolveStateDir falls back to grok-companion-fallback", () => {
+test("resolveStateDir falls back to peerbench-fallback", () => {
   const dir = resolveStateDir("/tmp/some-ws", { env: {} });
-  assert.ok(dir.includes(path.join(".claude", "plugins", "data", "grok-companion-fallback", "state")));
+  assert.ok(dir.includes(path.join(".claude", "plugins", "data", "peerbench-fallback", "state")));
 });
 
 test("loadState returns default schema when missing", () => {
@@ -35,7 +35,7 @@ test("saveState then loadState round-trips and appendJob caps at 50", () => {
   saveState("/tmp/ws-b", st, opts);
   assert.equal(loadState("/tmp/ws-b", opts).config.panelStops, true);
   for (let i = 0; i < 60; i++) {
-    appendJob("/tmp/ws-b", { id: `task-${i}`, title: "Grok Task", status: "completed" }, opts);
+    appendJob("/tmp/ws-b", { id: `task-${i}`, title: "Bench Task", status: "completed" }, opts);
   }
   assert.equal(loadState("/tmp/ws-b", opts).jobs.length, 50);
 });

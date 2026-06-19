@@ -1,14 +1,15 @@
-# gang
+# peerbench
 
 A Claude Code plugin that reviews your work with a **panel of AI reviewers** —
-**Codex** (OpenAI), **Kimi** (Moonshot `kimi-k2.6`), and **MiMo** (Xiaomi) — instead
-of a single reviewer. The panel runs automatically as **gates** (plans/specs, and
-optionally code turns) and on demand as a **bug hunt** that scours the repo
-read-only. Kimi and MiMo are cheap; the goal is Codex-grade review at a fraction of
-the cost, with Codex kept alongside as a benchmark you can drop with one command.
+**Codex** (OpenAI), **Kimi** (Moonshot `kimi-k2.6`), **MiMo** (Xiaomi), and **GLM**
+(z.ai `glm-5.2`) — instead of a single reviewer. The panel runs automatically as
+**gates** (plans/specs, code turns, pushes) and on demand as a **bug hunt** that
+scours the repo read-only. Kimi, MiMo, and GLM are cheap; the goal is Codex-grade
+review at a fraction of the cost, with Codex kept alongside as a benchmark you can
+drop with one command.
 
-> Formerly `grok-companion`. Grok has been removed; the reviewer panel is now
-> Codex + Kimi + MiMo, and the plugin is named **gang** (commands are `/gang:*`).
+> **Project:** `peerbench`. **Command prefix:** `bench` — e.g. `/bench:hunt`,
+> `/bench:investigate`, `/bench:review` (short to type; the project is peerbench).
 
 ## How it works
 
@@ -26,7 +27,7 @@ gets the findings and fixes them); **ALLOW** shows a brief status line.
 The panel is **AND-pass**: any reviewer's `BLOCK:` blocks; if a reviewer errors, the
 others decide; only if all error does the gate fail open (with a visible note).
 
-**2. Bug hunt (on demand).** `/gang:hunt [focus]` runs the panel **agentically** —
+**2. Bug hunt (on demand).** `/bench:hunt [focus]` runs the panel **agentically** —
 each reviewer explores the repository read-only via tools (read_file, grep, glob,
 list_dir), then reports concrete findings with `file:line`. Results are shown
 side-by-side so you can compare reviewers on the same code. This is the
@@ -41,7 +42,7 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
   `temperature:0.6`). Fast, non-thinking, tool-calling — no Open Platform key needed.
 - **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`).
 
-Switch the active panel any time with `/gang:reviewers` (e.g. `codex kimi mimo`,
+Switch the active panel any time with `/bench:reviewers` (e.g. `codex kimi mimo`,
 or run `kimi mimo` only). Selectable reviewers: `kimi`, `mimo`, `codex`.
 
 ### Read-only by construction
@@ -64,7 +65,7 @@ produce output:
 - **Conclude budget** — past ~150 KB of gathered context the model is told to stop
   reading and write its findings (prevents endless exploration).
 - **Network retry** + **wall-clock timeout** + per-tool try/catch.
-- **Diagnostics** — set `GANG_DEBUG=1` to stream per-round detail (request size,
+- **Diagnostics** — set `BENCH_DEBUG=1` to stream per-round detail (request size,
   tool calls, latency, the underlying error cause) to stderr; the same diagnostics
   are saved into each hunt's trace for later inspection.
 
@@ -72,39 +73,44 @@ produce output:
 
 `kimi-k2.6` supports thinking on **or** off via the `thinking` parameter:
 
-- **Default (gates, `/gang:hunt`)** — thinking **off**: fast (~3s rounds), reliable.
-- **`/gang:investigate` (planned)** — thinking **on**: deeper reasoning for hard
+- **Default (gates, `/bench:hunt`)** — thinking **off**: fast (~3s rounds), reliable.
+- **`/bench:investigate` (planned)** — thinking **on**: deeper reasoning for hard
   problems, with a generous budget. Same panel, opt-in depth.
 
 ## Commands
 
-- `/gang:hunt [focus]` — three-way agentic bug hunt (read-only). Optionally focus it:
-  `/gang:hunt a monitor never alerted me` or `/gang:hunt the auth/session code`.
-- `/gang:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo`
-  or `codex kimi mimo`). Selectable: `kimi`, `mimo`, `codex`.
-- `/gang:status [id]` — recent gate/hunt runs for this workspace; pass a trace id to
-  expand it.
-- `/gang:setup` — check reviewer availability and per-workspace state.
+- `/bench:hunt [focus]` — multi-model agentic bug hunt (read-only). Optionally focus it:
+  `/bench:hunt a monitor never alerted me` or `/bench:hunt the auth/session code`.
+- `/bench:debug <failure>` — root-cause a SPECIFIC error / failing test / wrong output
+  with the panel (read-only); each reviewer returns a root cause + minimal fix. Model-invokable.
+- `/bench:investigate <problem>` — deep tier: full panel, Kimi **thinking on**, generous
+  budget, for a hard specific problem. Slower than hunt.
+- `/bench:review [--base <ref>]` — on-demand panel review of your current changes.
+- `/bench:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo` or
+  `codex kimi mimo glm`). Selectable: `kimi`, `mimo`, `codex`, `glm`.
+- `/bench:status [id]` — recent gate/hunt runs for this workspace; pass a trace id to expand it.
+- `/bench:setup` — check reviewer availability and per-workspace state.
+- `/bench:off` / `/bench:on` — disable / re-enable the gates for this workspace (`--global` for everywhere).
 
-_Planned: `/gang:investigate` (thinking-on deep tier), `/gang:off|on` (disable the
-panel for a workspace)._
+`hunt`, `debug`, and `investigate` are **model-invokable** — Claude can reach for them on its own
+when a task calls for finding or root-causing a bug. The rest are user-invoked.
 
 ## Configuration
 
 - **`companion.json`** (shared, env-independent path under
-  `~/.claude/plugins/data/grok-companion-shared/`) — the active `reviewers` list and
+  `~/.claude/plugins/data/bench-shared/`) — the active `reviewers` list and
   each provider's `baseURL`, `model`, `apiKey`, `temperature`, `thinking`, headers.
 - **`.keys`** (repo, **gitignored** — never commit) — source secrets/config for the
   providers (`KIMI_*`, `MIMO_*`).
-- `GROK_COMPANION_ROOT` — override the shared dir (used for test isolation).
-- `GANG_DEBUG=1` — verbose agentic diagnostics.
+- `BENCH_ROOT` — override the shared dir (used for test isolation).
+- `BENCH_DEBUG=1` — verbose agentic diagnostics.
 
 State (panel on/off, gate history, traces) is **per-workspace**, keyed by git
 top-level. The provider config in `companion.json` is global/shared.
 
 ## Fallback (revert anytime)
 
-1. **Config toggle** — `/gang:reviewers kimi mimo` (or any subset of
+1. **Config toggle** — `/bench:reviewers kimi mimo` (or any subset of
    `kimi mimo codex`) re-selects the active panel without redeploying.
 2. **Rollback script** — `node scripts/rollback.mjs` restores the pre-deploy hook
    snapshot and settings.
@@ -131,13 +137,13 @@ This repo doubles as a local-directory marketplace (`rai-tools`). In
 ```json
 {
   "extraKnownMarketplaces": {
-    "rai-tools": { "source": { "source": "directory", "path": "/absolute/path/to/gang" } }
+    "rai-tools": { "source": { "source": "directory", "path": "/absolute/path/to/bench" } }
   },
-  "enabledPlugins": { "gang@rai-tools": true }
+  "enabledPlugins": { "bench@rai-tools": true }
 }
 ```
 
-Restart Claude Code; the `/gang:*` commands appear.
+Restart Claude Code; the `/bench:*` commands appear.
 
 ## Test
 

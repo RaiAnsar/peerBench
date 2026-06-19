@@ -1,5 +1,7 @@
 ---
-description: Show bench health — active reviewers, API key presence, workspace disable state
+name: setup
+description: Show bench health — active reviewers, API key presence, and workspace disable state. User-invoked.
+disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 

@@ -18,7 +18,7 @@ export function deploy({ src, dest }) {
 
 // LAYER-3 BACKUP: snapshot the current live hooks + settings BEFORE we mutate them, so rollback.mjs can
 // restore exactly. Snapshot EVERY live *.mjs in hooksDir (not a hardcoded list, which silently missed
-// newly-added hooks like stop-review/pre-push-review — found by the gang's own hunt).
+// newly-added hooks like stop-review/pre-push-review — found by the bench's own hunt).
 export function snapshot({ hooksDir, settingsPath, backupDir }) {
   fs.mkdirSync(backupDir, { recursive: true });
   const files = [];
@@ -80,8 +80,8 @@ export function syncSettings({ hooksDir, settingsPath }) {
   register(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"));
   register(s.hooks.Stop, undefined, path.join(hooksDir, "stop-review.mjs"), {
     timeout: 300, asyncRewake: true,
-    rewakeMessage: "⛩ gang stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
-    rewakeSummary: "⛩ gang stop"
+    rewakeMessage: "⛩ bench stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
+    rewakeSummary: "⛩ bench stop"
   });
   // Drop any blocks left empty by de-duping.
   for (const ev of ["PreToolUse", "PostToolUse", "Stop"]) {
@@ -95,7 +95,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const hooksDir = path.join(os.homedir(), ".claude", "hooks");
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
-  const backupDir = path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared", `backup-${Date.now()}`);
+  const backupDir = path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared", `backup-${Date.now()}`);
   const snap = snapshot({ hooksDir, settingsPath, backupDir });
   const dep = deploy({ src: path.join(here, "..", "global-hooks"), dest: hooksDir });
   const sync = syncSettings({ hooksDir, settingsPath });

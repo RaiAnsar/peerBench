@@ -1,0 +1,15 @@
+#!/bin/bash
+# tests/fixtures/fake-bench — records args, replies with canned reviewer JSON.
+# FAKE_reviewer_LOG: file to append argv to.
+# FAKE_reviewer_REPLY: JSON to emit (optional; default is a canned ALLOW).
+# FAKE_reviewer_EXIT: nonzero exit simulation (optional).
+# FAKE_reviewer_TOUCH: file to (over)write before replying — simulates a review
+#                  run that mutates the workspace (must be caught as failure).
+printf '%s\n' "$*" >> "${FAKE_reviewer_LOG:-/dev/null}"
+if [ -n "$FAKE_reviewer_TOUCH" ]; then echo mutated > "$FAKE_reviewer_TOUCH"; fi
+if [ -n "$FAKE_reviewer_EXIT" ]; then exit "$FAKE_reviewer_EXIT"; fi
+if [ -n "$FAKE_reviewer_REPLY" ]; then
+  printf '%s\n' "$FAKE_reviewer_REPLY"
+else
+  printf '%s\n' '{"text":"ALLOW: looks fine","stopReason":"EndTurn","sessionId":"fake-session-1"}'
+fi

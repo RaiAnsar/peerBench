@@ -1,5 +1,5 @@
 // Shared logic for the Codex+Kimi+MiMo panel gates. Deployed to
-// ~/.claude/hooks/panel-lib.mjs (canonical copy lives in the grok-companion
+// ~/.claude/hooks/panel-lib.mjs (canonical copy lives in the peerbench
 // repo — self-contained on purpose: no repo imports).
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
@@ -31,7 +31,7 @@ export function workspaceFingerprint(cwd) {
     }
     // Staged content: in a fresh repo (no HEAD) `git diff HEAD` is empty, so staged file CONTENT
     // would otherwise be invisible to the fingerprint (porcelain shows only "A name"). `git diff
-    // --cached` captures it (vs the empty tree in a fresh repo). Found by the gang's own hunt.
+    // --cached` captures it (vs the empty tree in a fresh repo). Found by the bench's own hunt.
     let staged = "";
     try {
       staged = execFileSync("git", ["diff", "--cached"], { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
@@ -66,8 +66,8 @@ export function workspaceFingerprint(cwd) {
 
 // List untracked files and embed their (text) contents for content-only review. NUL-delimited
 // (handles newlines in names) and NEVER follows a symlink out of the workspace — an untracked
-// symlink to e.g. ~/.ssh/config must not leak into a reviewer prompt (found by the gang's own hunt).
-// Shared by stop-review and grok-runner so both stay consistent.
+// symlink to e.g. ~/.ssh/config must not leak into a reviewer prompt (found by the bench's own hunt).
+// Shared by stop-review and bench-runner so both stay consistent.
 export function untrackedBlock(ws, { maxFiles = 20, maxBytesEach = 20_000 } = {}) {
   let names = [];
   try {

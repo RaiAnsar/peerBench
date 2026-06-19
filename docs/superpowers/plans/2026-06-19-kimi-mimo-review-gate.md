@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace grok-companion's Codex + Grok reviewer backends with Kimi K2.7 Code and Xiaomi MiMo, called over their OpenAI-compatible APIs (read-only by omitting `tools`), with reliable verdict handling and expandable per-review traces.
+**Goal:** Replace peerbench's Codex + Bench reviewer backends with Kimi K2.7 Code and Xiaomi MiMo, called over their OpenAI-compatible APIs (read-only by omitting `tools`), with reliable verdict handling and expandable per-review traces.
 
-**Architecture:** A small `review()` HTTP client (Node `fetch`, no `tools` field) drives both providers; a registry resolves which run; the existing AND-pass `combinePanel` aggregates an N-sized result array. Plan/stop/pre-push hooks call the registry. Approved plans (ExitPlanMode only) are persisted to an env-independent shared dir and injected into per-turn and pre-push reviews. Every review writes a trace inspectable via `/grok:status <id>`.
+**Architecture:** A small `review()` HTTP client (Node `fetch`, no `tools` field) drives both providers; a registry resolves which run; the existing AND-pass `combinePanel` aggregates an N-sized result array. Plan/stop/pre-push hooks call the registry. Approved plans (ExitPlanMode only) are persisted to an env-independent shared dir and injected into per-turn and pre-push reviews. Every review writes a trace inspectable via `/bench:status <id>`.
 
 **Tech Stack:** Node 20+ (ESM `.mjs`), `node:test`, `node:fetch`, git hooks (sh shim).
 
@@ -14,9 +14,9 @@
 - Reviewers are **read-only by omission**: the chat-completions body MUST NOT include `tools` or `tool_choice`.
 - Two execution contexts: `global-hooks/*` are self-contained (only `./`-relative imports; no `CLAUDE_PLUGIN_DATA`); `scripts/*` may import `../global-hooks/*` and have plugin env.
 - **Every entrypoint that also exports test helpers MUST guard its `main()`:** `if (import.meta.url === \`file://${process.argv[1]}\`) main();` — importing it for tests must NOT run `main()` or read stdin.
-- `scripts/lib/grok-state.mjs`, `state.json`, and `tests/grok-state.test.mjs` MUST remain unchanged.
+- `scripts/lib/bench-state.mjs`, `state.json`, and `tests/bench-state.test.mjs` MUST remain unchanged.
 - Provider defaults: Kimi `https://api.moonshot.ai/v1` / `kimi-k2.7-code` / `MOONSHOT_API_KEY`; MiMo `https://token-plan-sgp.xiaomimimo.com/v1` / `mimo-v2.5-pro` / `MIMO_API_KEY`.
-- Shared dir is env-independent: `~/.claude/plugins/data/grok-companion-shared/` (from `os.homedir()`, never `CLAUDE_PLUGIN_DATA`).
+- Shared dir is env-independent: `~/.claude/plugins/data/bench-shared/` (from `os.homedir()`, never `CLAUDE_PLUGIN_DATA`).
 - Verdict contract: success `{ name, verdict:"ALLOW"|"BLOCK", firstLine, raw }`; failure `{ name, error }`.
 - Run tests: `node --test 'tests/*.test.mjs'`.
 - Spec of record: `docs/superpowers/specs/2026-06-19-kimi-mimo-companion-design.md`.
@@ -27,7 +27,7 @@
 
 **Phase 0 — reviewer core (new code path, no behavior change):** `global-hooks/review-client.mjs`, `config-store.mjs`, `trace-store.mjs`, `reviewers.mjs`; modify `panel-lib.mjs` (`combinePanel` N-ary).
 **Phase 1 — switch plan hooks:** rename `codex-plan-*.mjs` → `plan-*.mjs` (content-only prompts, registry, trace); `scripts/deploy-global-hooks.mjs`.
-**Phase 2 — plan-store + stop migration + auto-arm + disarm + status:** `global-hooks/plan-store.mjs`; modify `scripts/panel-stop-hook.mjs`, `plan-review.mjs`, `scripts/grok-runner.mjs`.
+**Phase 2 — plan-store + stop migration + auto-arm + disarm + status:** `global-hooks/plan-store.mjs`; modify `scripts/panel-stop-hook.mjs`, `plan-review.mjs`, `scripts/bench-runner.mjs`.
 **Phase 3 — pre-push:** `global-hooks/pre-push-lib.mjs` (+ `isGitPush`), `scripts/pre-push-git.mjs`, `pre-push-review.mjs`, `pre-push-disarm.mjs`, `install-prepush.mjs`; modify `hooks/hooks.json`.
 
 ---
@@ -168,7 +168,7 @@ const DEFAULTS = {
   mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY" }
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
-export function sharedRoot() { return path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared"); }
+export function sharedRoot() { return path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared"); }
 export function workspaceStateDir(ws) {
   let canonical = ws; try { canonical = fs.realpathSync.native(ws); } catch { canonical = ws; }
   const slug = (path.basename(ws) || "workspace").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
@@ -452,7 +452,7 @@ export function buildPrompt(plan) {
       "behavior or significant rework if executed as written; otherwise ALLOW (minor notes may follow).",
     user: `<plan>\n${plan}\n</plan>` };
 }
-// inside main(): replace the old Promise.all([runCodexReview, runGrokReview]) with:
+// inside main(): replace the old Promise.all([runCodexReview, runBenchReview]) with:
 const { system, user } = buildPrompt(plan);
 const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user })));
 const panel = combinePanel(results);
@@ -460,7 +460,7 @@ try { writeTrace(cwd, { gate: "plan", ws: cwd, reviewers: results.map(({ raw, ..
   rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""])) }); } catch { /* best-effort */ }
 ```
 
-Remove `latestCodexRoot`, `runCodexReview`, `runGrokReview`, `CODEX_*` imports/env. Keep the existing `decision(...)` allow/deny emit. Ensure the bottom is `if (import.meta.url === \`file://${process.argv[1]}\`) main();` (so `buildPrompt` can be imported without running the hook).
+Remove `latestCodexRoot`, `runCodexReview`, `runBenchReview`, `CODEX_*` imports/env. Keep the existing `decision(...)` allow/deny emit. Ensure the bottom is `if (import.meta.url === \`file://${process.argv[1]}\`) main();` (so `buildPrompt` can be imported without running the hook).
 
 - [ ] **Step 5: Same content-only rewrite for `plan-file-review.mjs`**
 
@@ -672,7 +672,7 @@ export function buildStopUser({ status, diff, untracked, lastMsg, plan }) {
 const SYSTEM = "Review from ONLY the content provided. Do not assume filesystem access. Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`.";
 ```
 
-In `main()`: activate if `state.config.panelStops || loadPlan(ws)?.armed`; `const plan = loadPlan(ws)?.text ?? null;` `const user = buildStopUser({...});` `const results = await Promise.all(resolveReviewers().map((r)=>r.run({system:SYSTEM,user})));` `const panel = combinePanel(results);` write a `gate:"stop"` trace, capture its id; if `process.env.GROK_COMPANION_DEBUG` write the prompt+responses to stderr; on `block` emit `{decision:"block", reason: panel.findings}`; else emit `{ systemMessage: \`⚡ panel: ${panel.summary} — expand: /grok:status ${id}\` }`. Keep the `stop_hook_active` guard + no-change early return. End with `if (import.meta.url === \`file://${process.argv[1]}\`) main();` (guarded — remove the old unconditional `main().catch`).
+In `main()`: activate if `state.config.panelStops || loadPlan(ws)?.armed`; `const plan = loadPlan(ws)?.text ?? null;` `const user = buildStopUser({...});` `const results = await Promise.all(resolveReviewers().map((r)=>r.run({system:SYSTEM,user})));` `const panel = combinePanel(results);` write a `gate:"stop"` trace, capture its id; if `process.env.BENCH_COMPANION_DEBUG` write the prompt+responses to stderr; on `block` emit `{decision:"block", reason: panel.findings}`; else emit `{ systemMessage: \`⚡ panel: ${panel.summary} — expand: /bench:status ${id}\` }`. Keep the `stop_hook_active` guard + no-change early return. End with `if (import.meta.url === \`file://${process.argv[1]}\`) main();` (guarded — remove the old unconditional `main().catch`).
 
 - [ ] **Step 4: Run tests** — Expected: PASS.
 - [ ] **Step 5: Commit**
@@ -684,15 +684,15 @@ git commit -m "feat(stop): registry panel + plan continuity + trace + main guard
 
 ---
 
-### Task 11: `/grok:panel off` disarm + `/grok:status <id>` expand + main guard
+### Task 11: `/bench:panel off` disarm + `/bench:status <id>` expand + main guard
 
-**Files:** Modify `scripts/grok-runner.mjs`; Test `tests/runner.integration.test.mjs`
+**Files:** Modify `scripts/bench-runner.mjs`; Test `tests/runner.integration.test.mjs`
 
 - [ ] **Step 1: Write the failing test**
 
 ```javascript
 // add to tests/runner.integration.test.mjs
-import { panelCommand, statusExpand } from "../scripts/grok-runner.mjs";
+import { panelCommand, statusExpand } from "../scripts/bench-runner.mjs";
 import { savePlan, loadPlan } from "../global-hooks/plan-store.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
@@ -713,7 +713,7 @@ test("status expand renders prompt + raw responses", () => {
 - [ ] **Step 3: Implement + guard the CLI dispatch**
 
 ```javascript
-// in scripts/grok-runner.mjs
+// in scripts/bench-runner.mjs
 import { clearPlan } from "../global-hooks/plan-store.mjs";
 import { listTraces, readTrace } from "../global-hooks/trace-store.mjs";
 export function panelCommand(ws, arg) {
@@ -735,7 +735,7 @@ In the `status` command handler: with an id arg, print `statusExpand(ws, id)`; e
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/grok-runner.mjs tests/runner.integration.test.mjs
+git add scripts/bench-runner.mjs tests/runner.integration.test.mjs
 git commit -m "feat(cli): panel off disarms; status <id> expands a trace; guard CLI"
 ```
 
@@ -967,7 +967,7 @@ test("chains an existing hook and is idempotent", () => {
 ```javascript
 // scripts/install-prepush.mjs
 import fs from "node:fs"; import path from "node:path";
-const MARK = "# grok-companion pre-push shim";
+const MARK = "# peerbench pre-push shim";
 const shim = (pluginRoot) => `#!/usr/bin/env sh
 ${MARK}
 input=$(cat)
@@ -1006,11 +1006,11 @@ git commit -m "feat(pre-push): stdin-buffering chaining installer + Bash hook wi
 
 **Files:** Modify `commands/status.md`, `scripts/deploy-global-hooks.mjs`; Test `tests/deploy-global-hooks.test.mjs` (extend)
 
-**Interfaces:** `syncSettings({ hooksDir, settingsPath }) -> { removedFiles, removedEntries, addedEntries }` — deletes deployed `codex-plan-*.mjs`, removes `settings.json` hook entries referencing them, and **adds** entries for `plan-review.mjs` (PreToolUse ExitPlanMode) + `plan-file-review.mjs` (PostToolUse Write|Edit) if missing. (Trace visibility: `/grok:status` reads the env-independent `trace-store`, never the env-dependent jobs store.)
+**Interfaces:** `syncSettings({ hooksDir, settingsPath }) -> { removedFiles, removedEntries, addedEntries }` — deletes deployed `codex-plan-*.mjs`, removes `settings.json` hook entries referencing them, and **adds** entries for `plan-review.mjs` (PreToolUse ExitPlanMode) + `plan-file-review.mjs` (PostToolUse Write|Edit) if missing. (Trace visibility: `/bench:status` reads the env-independent `trace-store`, never the env-dependent jobs store.)
 
 - [ ] **Step 1: Update `commands/status.md` to forward `$ARGUMENTS`**
 
-Change the command invocation to `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-runner.mjs" status $ARGUMENTS` and add to its description: `Pass a trace id (/grok:status <id>) to expand that review's full prompt and each model's raw response.`
+Change the command invocation to `node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" status $ARGUMENTS` and add to its description: `Pass a trace id (/bench:status <id>) to expand that review's full prompt and each model's raw response.`
 
 - [ ] **Step 2: Write the failing test**
 
@@ -1079,7 +1079,7 @@ git commit -m "feat(deploy): activate plan-* hooks (prune codex-plan-*, register
 
 **Files:** Modify `scripts/install-prepush.mjs` (add CLI), `global-hooks/panel-lib.mjs` (remove dead exports), `tests/panel-lib.test.mjs`, `tests/panel-stop-hook.test.mjs`, `tests/runner.integration.test.mjs`
 
-This task makes `node --test 'tests/*.test.mjs'` pass after the migration and makes the installer actually install. `tests/grok-state.test.mjs` and `tests/grok-exec.test.mjs` stay UNCHANGED (the `/grok:task` delegation path via `grok-exec.mjs` is out of scope and keeps `runGrok`/its `workspaceFingerprint`).
+This task makes `node --test 'tests/*.test.mjs'` pass after the migration and makes the installer actually install. `tests/bench-state.test.mjs` and `tests/bench-exec.test.mjs` stay UNCHANGED (the `/bench:task` delegation path via `bench-exec.mjs` is out of scope and keeps `runBench`/its `workspaceFingerprint`).
 
 - [ ] **Step 1: Add a runnable CLI to `scripts/install-prepush.mjs`** (finding #1)
 
@@ -1114,10 +1114,10 @@ test("parseVerdict reads ALLOW/BLOCK first line", () => {
   assert.equal(parseVerdict("BLOCK: no\n- x").verdict, "BLOCK");
   assert.equal(parseVerdict("hmm").verdict, null);
 });
-test("legacy Grok/Codex helpers are gone", () => {
-  assert.equal(panel.runGrokReview, undefined);
+test("legacy Bench/Codex helpers are gone", () => {
+  assert.equal(panel.runBenchReview, undefined);
   assert.equal(panel.runCodexReview, undefined);
-  assert.equal(panel.buildGrokGateArgs, undefined);
+  assert.equal(panel.buildBenchGateArgs, undefined);
 });
 test("combinePanel array: allow / block / fail-open", () => {
   assert.equal(combinePanel([{ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: a", raw: "ALLOW: a" }]).decision, "allow");
@@ -1130,22 +1130,22 @@ test("combinePanel array: allow / block / fail-open", () => {
 
 - [ ] **Step 4: Remove the dead exports from `global-hooks/panel-lib.mjs`**
 
-Delete `runCodexReview`, `runGrokReview`, `grokGateEnv`, `buildGrokGateArgs`, the `GROK_REVIEW_PREAMBLE` const, `spawnCollect`, and panel-lib's own `workspaceFingerprint` (the review path no longer spawns CLIs or fingerprints — read-only is by API omission). Keep `parseVerdict` and `combinePanel`. Remove now-unused `node:child_process`/`node:crypto`/`fs`/`path` imports.
+Delete `runCodexReview`, `runBenchReview`, `benchGateEnv`, `buildBenchGateArgs`, the `BENCH_REVIEW_PREAMBLE` const, `spawnCollect`, and panel-lib's own `workspaceFingerprint` (the review path no longer spawns CLIs or fingerprints — read-only is by API omission). Keep `parseVerdict` and `combinePanel`. Remove now-unused `node:child_process`/`node:crypto`/`fs`/`path` imports.
 
 - [ ] **Step 5: Migrate the stop-hook / runner integration tests** (finding #4)
 
-The old `tests/panel-stop-hook.test.mjs` and the stop-hook part of `tests/runner.integration.test.mjs` spawn the hook with `GROK_BIN=tests/fixtures/fake-grok` and assert Grok-specific ALLOW/BLOCK. That path no longer exists. Replace that coverage:
+The old `tests/panel-stop-hook.test.mjs` and the stop-hook part of `tests/runner.integration.test.mjs` spawn the hook with `BENCH_BIN=tests/fixtures/fake-bench` and assert Bench-specific ALLOW/BLOCK. That path no longer exists. Replace that coverage:
 - Keep/confirm the **`buildStopUser`** unit tests (Task 10) and the **registry** tests with injected `reviewImpl` (Task 5) as the behavioral coverage for review verdicts.
-- In `tests/panel-stop-hook.test.mjs`, **remove the `fake-grok` spawn/ALLOW/BLOCK cases**; keep only the hook-logic tests that need no reviewer: `stop_hook_active` guard returns early, and the no-diff early return. For an end-to-end "reviewer errors → fail-open systemMessage (not block)" case, spawn the hook with **no API keys in env** so `resolveReviewers` returns no-key errors and the panel fails open — assert the output is a `systemMessage`, not a `decision:"block"`.
-- In `tests/runner.integration.test.mjs`, drop any assertion that depends on the removed Grok review path; keep `panelCommand`/`statusExpand` tests (Task 11). `tests/fixtures/fake-grok` may be deleted if no remaining test references it (grep first: `grep -rl fake-grok tests/`).
+- In `tests/panel-stop-hook.test.mjs`, **remove the `fake-bench` spawn/ALLOW/BLOCK cases**; keep only the hook-logic tests that need no reviewer: `stop_hook_active` guard returns early, and the no-diff early return. For an end-to-end "reviewer errors → fail-open systemMessage (not block)" case, spawn the hook with **no API keys in env** so `resolveReviewers` returns no-key errors and the panel fails open — assert the output is a `systemMessage`, not a `decision:"block"`.
+- In `tests/runner.integration.test.mjs`, drop any assertion that depends on the removed Bench review path; keep `panelCommand`/`statusExpand` tests (Task 11). `tests/fixtures/fake-bench` may be deleted if no remaining test references it (grep first: `grep -rl fake-bench tests/`).
 
-- [ ] **Step 6: Run the full suite** — Run: `node --test 'tests/*.test.mjs'` — Expected: PASS (no references to removed exports; no orphan fake-grok assertions).
+- [ ] **Step 6: Run the full suite** — Run: `node --test 'tests/*.test.mjs'` — Expected: PASS (no references to removed exports; no orphan fake-bench assertions).
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add scripts/install-prepush.mjs global-hooks/panel-lib.mjs tests/panel-lib.test.mjs tests/panel-stop-hook.test.mjs tests/runner.integration.test.mjs
-git commit -m "chore(migrate): installer CLI + drop dead Grok/Codex exports + migrate tests"
+git commit -m "chore(migrate): installer CLI + drop dead Bench/Codex exports + migrate tests"
 ```
 
 > **Sequencing:** run Task 16 Steps 4–5 (export/test removal) **together with Task 6** (which stops importing those helpers) so the suite is never left red between commits. Task 16 Step 1 (installer CLI) can land any time after Task 14.

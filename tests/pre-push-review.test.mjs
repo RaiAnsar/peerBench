@@ -10,12 +10,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-// Set GROK_COMPANION_ROOT before importing any module that uses config-store.
+// Set BENCH_ROOT before importing any module that uses config-store.
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
-process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment } from "../global-hooks/pre-push-review.mjs";
-import { setGangDisabled } from "../global-hooks/config-store.mjs";
+import { setBenchDisabled } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "pre-push-review.mjs");
@@ -109,7 +109,7 @@ function parseLines(lines) {
 test("non-git-push command → allow no-op (git status)", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-np-")));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   let reviewersCalled = false;
   let traceWritten = false;
@@ -124,13 +124,13 @@ test("non-git-push command → allow no-op (git status)", async () => {
     await runMain({
       resolveReviewersImpl: () => { reviewersCalled = true; return [fakeReviewer("Kimi", "ALLOW")]; },
       writeTraceImpl: () => { traceWritten = true; },
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git status" } }
     });
   } finally {
     process.stdout.write = origWrite;
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   assert.equal(reviewersCalled, false, "reviewers must NOT be called for non-push command");
@@ -149,7 +149,7 @@ test("git push --help → allow no-op (ignored)", async () => {
   await runMain({
     resolveReviewersImpl: () => { reviewersCalled = true; return []; },
     writeTraceImpl: () => {},
-    isGangDisabledImpl: () => false,
+    isBenchDisabledImpl: () => false,
     env: process.env,
     input: { cwd: ws, tool_input: { command: "git push --help" } }
   });
@@ -164,7 +164,7 @@ test("git push --help → allow no-op (ignored)", async () => {
 test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=push", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-al-")));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   let traceRecord = null;
   const emittedLines = [];
@@ -181,13 +181,13 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
         fakeReviewer("MiMo", "ALLOW")
       ]),
       writeTraceImpl: (_ws, trace) => { traceRecord = trace; },
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
   } finally {
     process.stdout.write = origWrite;
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   assert.ok(emittedLines.length > 0, "should emit output for git push");
@@ -211,7 +211,7 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
 test("git push + panel BLOCK → deny with findings in permissionDecisionReason", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-blk-")));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   const emittedLines = [];
   const origWrite = process.stdout.write.bind(process.stdout);
@@ -227,13 +227,13 @@ test("git push + panel BLOCK → deny with findings in permissionDecisionReason"
         fakeReviewer("MiMo", "BLOCK")
       ]),
       writeTraceImpl: () => {},
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push" } }
     });
   } finally {
     process.stdout.write = origWrite;
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   assert.ok(emittedLines.length > 0, "should emit output on BLOCK");
@@ -251,21 +251,21 @@ test("git push + panel BLOCK → deny with findings in permissionDecisionReason"
 // Test: disabled workspace → allow no-op (exit 0, no reviewers called)
 // ---------------------------------------------------------------------------
 
-test("disabled workspace → allow no-op on git push (gang disabled)", () => {
+test("disabled workspace → allow no-op on git push (bench disabled)", () => {
   const { ws } = freshPushRepo();
 
-  setGangDisabled(ws, true, { scope: "workspace" });
+  setBenchDisabled(ws, true, { scope: "workspace" });
   try {
     const result = spawnSync(process.execPath, [HOOK], {
       input: JSON.stringify({ cwd: ws, tool_input: { command: "git push origin main" } }),
       encoding: "utf8",
-      env: { ...process.env, GROK_COMPANION_ROOT: TEMP_GCR }
+      env: { ...process.env, BENCH_ROOT: TEMP_GCR }
     });
 
-    assert.equal(result.status, 0, `exit code should be 0 when gang is disabled; stderr: ${result.stderr}`);
-    assert.equal(result.stdout.trim(), "", "no output expected when gang disabled");
+    assert.equal(result.status, 0, `exit code should be 0 when bench is disabled; stderr: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "", "no output expected when bench disabled");
   } finally {
-    setGangDisabled(ws, false, { scope: "workspace" });
+    setBenchDisabled(ws, false, { scope: "workspace" });
   }
 });
 
@@ -292,7 +292,7 @@ test("no upstream → fail-open allow (no reviewers called)", async () => {
     await runMain({
       resolveReviewersImpl: () => { reviewersCalled = true; return []; },
       writeTraceImpl: () => {},
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push" } }
     });
@@ -331,7 +331,7 @@ test("nothing to push (already up-to-date) → allow no-op", async () => {
     await runMain({
       resolveReviewersImpl: () => { reviewersCalled = true; return []; },
       writeTraceImpl: () => {},
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push" } }
     });
@@ -356,7 +356,7 @@ test("nothing to push (already up-to-date) → allow no-op", async () => {
 test("all reviewers errored → fail-open allow", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-fo-")));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   const emittedLines = [];
   const origWrite = process.stdout.write.bind(process.stdout);
@@ -372,13 +372,13 @@ test("all reviewers errored → fail-open allow", async () => {
         fakeErrorReviewer("MiMo")
       ]),
       writeTraceImpl: () => {},
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
   } finally {
     process.stdout.write = origWrite;
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   assert.ok(emittedLines.length > 0, "should emit a fail-open allow decision");
@@ -463,7 +463,7 @@ test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
 test("compound command with git push → detected as push", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-cpd-")));
-  process.env.GROK_COMPANION_ROOT = root;
+  process.env.BENCH_ROOT = root;
 
   let reviewersCalled = false;
   const emittedLines = [];
@@ -480,13 +480,13 @@ test("compound command with git push → detected as push", async () => {
         return [fakeReviewer("Kimi", "ALLOW")];
       },
       writeTraceImpl: () => {},
-      isGangDisabledImpl: () => false,
+      isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "cd /repo && git push origin main" } }
     });
   } finally {
     process.stdout.write = origWrite;
-    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
 
   // The compound command contains "git push", so reviewers should be called
@@ -501,7 +501,7 @@ test("compound command with git push → detected as push", async () => {
   }
 });
 
-// --- push DETECTION: bypasses the old GIT_PUSH_RE missed (found by the gang's own hunt) ---
+// --- push DETECTION: bypasses the old GIT_PUSH_RE missed (found by the bench's own hunt) ---
 test("findPushSegment detects pushes the old regex bypassed (trailing operators, global options)", () => {
   for (const cmd of [
     "git push;echo done",        // ; immediately after push
