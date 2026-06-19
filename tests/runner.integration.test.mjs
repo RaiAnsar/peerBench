@@ -130,6 +130,21 @@ test("huntCommand formats findings per reviewer and records a trace", async () =
   assert.match(out, /═══ Codex ═══/); assert.match(out, /a\.ts:10/);
   assert.match(out, /═══ MiMo ═══/); assert.match(out, /no findings — timeout/);
 });
+test("huntCommand deep=true uses 'investigate' header and records gate='investigate' in trace", async () => {
+  const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hci-"));
+  const huntImpl = async () => ([
+    { name: "Codex", findings: "deep finding", model: "gpt" },
+    { name: "Kimi", findings: "deep kimi finding", model: "kimi-for-coding" },
+    { name: "MiMo", findings: "deep mimo finding", model: "mimo" }
+  ]);
+  const out = await huntCommand(ws, "why does uptime monitor never escalate", { huntImpl, deep: true });
+  assert.match(out, /Investigation — focus: why does uptime monitor never escalate/);
+  const [latest] = listTraces(ws, 1);
+  assert.equal(latest.gate, "investigate");
+  const t = readTrace(ws, latest.id);
+  assert.equal(t.gate, "investigate");
+});
 test("huntCommand persists per-reviewer diag to the trace (for future debugging)", async () => {
   const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hcd-"));

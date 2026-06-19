@@ -22,7 +22,12 @@ export function buildHuntUser(seed) {
 const HUNT_MAX_STEPS = 40;
 const HUNT_TIMEOUT_MS = 12 * 60 * 1000;
 
-export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, codexImpl }) {
+// deep (investigate) budget — thinking ON, more steps, longer timeouts, relaxed per-round watchdog
+const INVESTIGATE_MAX_STEPS = 60;
+const INVESTIGATE_TIMEOUT_MS = 20 * 60 * 1000;
+const INVESTIGATE_ROUND_MS = 240_000;     // thinking rounds are slow ON PURPOSE here; relax the 90s watchdog
+
+export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, codexImpl, deep = false }) {
   const cfg = resolveConfig({ env });
   const system = HUNT_SYSTEM;
   const user = buildHuntUser(seed);
@@ -43,8 +48,12 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
       if (!p?.apiKey) return { name, findings: "", error: "no api key" };
       const res = await agenticReview({
         baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, temperature: p.temperature, headers: p.headers,
-        system, user, tools: createReviewTools(cwd), mode: "report", thinking: p.thinking,
-        maxSteps: HUNT_MAX_STEPS, timeoutMs: Math.max(p.timeoutMs || 0, HUNT_TIMEOUT_MS), fetchImpl: reviewImpl, debug
+        system, user, tools: createReviewTools(cwd), mode: "report",
+        thinking: deep ? "enabled" : p.thinking,
+        maxSteps: deep ? INVESTIGATE_MAX_STEPS : HUNT_MAX_STEPS,
+        timeoutMs: Math.max(p.timeoutMs || 0, deep ? INVESTIGATE_TIMEOUT_MS : HUNT_TIMEOUT_MS),
+        maxRoundMs: deep ? INVESTIGATE_ROUND_MS : undefined,
+        fetchImpl: reviewImpl, debug
       });
       const display = name === "kimi" ? "Kimi" : name === "mimo" ? "MiMo" : name;
       const d = res.diag || {};

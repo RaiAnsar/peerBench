@@ -232,16 +232,25 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers|hunt|off|on`);
+  if (sub === "investigate") {
+    const seed = rest.join(" ").trim();
+    const ws = workspaceRoot(cwd);
+    const output = await huntCommand(ws, seed, { deep: true });
+    process.stdout.write(`${output}\n`);
+    return;
+  }
+
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers|hunt|investigate|off|on`);
 }
 
-export async function huntCommand(cwd, seed, { huntImpl = huntPanel } = {}) {
-  const results = await huntImpl({ cwd, seed });
+export async function huntCommand(cwd, seed, { huntImpl = huntPanel, deep = false } = {}) {
+  const results = await huntImpl({ cwd, seed, deep });
+  const gate = deep ? "investigate" : "hunt";
   // record a trace so `/gang:status <id>` can show the full findings later
   let traceId = null;
   try {
     traceId = writeTrace(cwd, {
-      gate: "hunt", ws: cwd,
+      gate, ws: cwd,
       reviewers: results.map((r) => ({ name: r.name, model: r.model, error: r.error || null, diag: r.diag || null })),
       systemPrompt: HUNT_SYSTEM, userPrompt: buildHuntUser(seed),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
@@ -249,8 +258,11 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel } = {}) {
   } catch { /* trace is best-effort */ }
   const blocks = results.map((r) =>
     `═══ ${r.name} ═══\n${r.findings?.trim() || `(no findings — ${r.error || "empty"})`}`);
-  const header = seed?.trim() ? `Bug hunt — focus: ${seed.trim()}` : "Bug hunt — broad sweep";
-  return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /gang:status ${traceId})` : ""}`;
+  const cmd = deep ? "investigate" : "hunt";
+  const header = deep
+    ? (seed?.trim() ? `Investigation — focus: ${seed.trim()}` : "Investigation — broad sweep")
+    : (seed?.trim() ? `Bug hunt — focus: ${seed.trim()}` : "Bug hunt — broad sweep");
+  return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /gang:${cmd} ${traceId})` : ""}`;
 }
 
 export function gateToggleCommand(ws, args) {
