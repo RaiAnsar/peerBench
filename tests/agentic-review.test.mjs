@@ -106,11 +106,13 @@ test("retries a transient network error, then succeeds", async () => {
   assert.equal(res.ok, true); assert.equal(res.verdict, "ALLOW"); assert.equal(calls, 2);
 });
 
-test("report mode forces conclusion near the step cap (no infinite tool loop)", async () => {
+test("conclude round OMITS tools so a tool_choice-ignoring model still converges (kimi-k2.6 fix)", async () => {
+  // Simulate a model that IGNORES tool_choice and keeps calling tools whenever tools are offered.
+  // The fix: on the conclude round the tools array is omitted entirely → it cannot call tools → must answer.
   const fetchImpl = async (url, opts) => {
     const body = JSON.parse(opts.body);
-    if (body.tool_choice === "none") return sse([{ content: "Findings: bug at z.js:1" }]);
-    return sse([{ tool_calls: [{ id: "1", index: 0, function: { name: "read_file", arguments: "{}" } }] }]);
+    if (body.tools === undefined) return sse([{ content: "Findings: bug at z.js:1" }]);   // conclude round: no tools offered
+    return sse([{ tool_calls: [{ id: "1", index: 0, function: { name: "read_file", arguments: "{}" } }] }]); // keeps reading regardless of tool_choice
   };
   const tools = { schemas: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: {} } } }], execute: async () => "x" };
   const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, mode: "report", maxSteps: 4, tools, fetchImpl });
