@@ -1,24 +1,21 @@
 #!/usr/bin/env node
 // grok-companion runtime CLI.
 // Usage:
-//   grok-runner.mjs task [--json] [--write] [--effort E] [--max-turns N] <prompt…>
 //   grok-runner.mjs review [--json] [--base <ref>]
 //   grok-runner.mjs status
 //   grok-runner.mjs setup
 //
-// Slash-command templates call `task --json "$ARGUMENTS"`, producing mixed
+// Slash-command templates call `review --json "$ARGUMENTS"`, producing mixed
 // argv: standalone flags first, then ONE quoted element that may START with
-// flags and end with the verbatim prompt. parseArgs() consumes standalone
-// flag elements, lifts leading flag tokens off the front of the first
-// non-flag element, and keeps that element's remainder character-for-character
-// as the prompt (no shell re-splitting — injection-safe).
+// flags. parseArgs() consumes standalone flag elements, lifts leading flag
+// tokens off the front of the first non-flag element.
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runGrok } from "./lib/grok-exec.mjs";
-import { appendJob, loadState, resolveStateDir, saveState } from "./lib/grok-state.mjs";
-import { resolveConfig, setReviewers, isGangDisabled, setGangDisabled } from "../global-hooks/config-store.mjs";
+import { resolveConfig, isGangDisabled, setGangDisabled, setReviewers } from "../global-hooks/config-store.mjs";
+import { combinePanel } from "../global-hooks/panel-lib.mjs";
+import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser } from "../global-hooks/hunt.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 
@@ -84,14 +81,6 @@ export function parseArgs(argv) {
   return { flags, prompt };
 }
 
-function loadPrompt(name, vars = {}) {
-  let text = fs.readFileSync(path.join(ROOT, "prompts", `${name}.md`), "utf8");
-  for (const [k, v] of Object.entries(vars)) {
-    text = text.replaceAll(`{{${k}}}`, v);
-  }
-  return text;
-}
-
 function untrackedBlock(ws) {
   let names = [];
   try {
@@ -115,101 +104,83 @@ function untrackedBlock(ws) {
   return parts.join("\n\n");
 }
 
-function newJobId() {
-  return `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function emit(payload, flags) {
-  process.stdout.write(flags.json ? `${JSON.stringify(payload)}\n` : `${payload.rawOutput || payload.error || ""}\n`);
-}
-
-async function recordedRun({ title, prompt, mode, flags, cwd }) {
-  const ws = workspaceRoot(cwd);
-  const job = { id: newJobId(), title, status: "running", workspaceRoot: ws, createdAt: new Date().toISOString() };
-  appendJob(ws, job, {});
-  const res = await runGrok({ mode, prompt, cwd: ws, effort: flags.effort, maxTurns: flags.maxTurns ?? undefined }, {});
-  const done = {
-    ...job,
-    status: res.status === 0 ? "completed" : "failed",
-    completedAt: new Date().toISOString(),
-    result: { rawOutput: res.rawOutput, sessionId: res.sessionId, error: res.error ?? null }
-  };
-  appendJob(ws, done, {});
-  return { status: res.status, rawOutput: res.rawOutput, sessionId: res.sessionId, error: res.error ?? null };
-}
-
 async function main() {
   const [sub, ...rest] = process.argv.slice(2);
   const { flags, prompt } = parseArgs(rest);
   const cwd = process.cwd();
-
-  if (sub === "task") {
-    if (!prompt) throw new Error("task requires a prompt");
-    const payload = await recordedRun({ title: "Grok Task", prompt, mode: flags.write ? "write" : "review", flags, cwd });
-    emit(payload, flags);
-    process.exitCode = payload.status === 0 ? 0 : 1;
-    return;
-  }
 
   if (sub === "review") {
     const ws = workspaceRoot(cwd);
     const status = spawnSync("git", ["status", "--short", "--untracked-files=all"], { cwd: ws, encoding: "utf8" }).stdout || "";
     const diffArgs = flags.base ? ["diff", `${flags.base}...HEAD`] : ["diff", "HEAD"];
     const diff = (spawnSync("git", diffArgs, { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES);
-    const reviewPrompt = loadPrompt("review", {
-      GIT_STATUS: status,
-      GIT_DIFF: diff,
-      UNTRACKED: flags.base ? "" : untrackedBlock(ws)
-    });
-    const payload = await recordedRun({ title: "Grok Review", prompt: reviewPrompt, mode: "review", flags, cwd });
-    emit(payload, flags);
-    process.exitCode = payload.status === 0 ? 0 : 1;
+    const untracked = flags.base ? "" : untrackedBlock(ws);
+
+    const system = "You are a code reviewer. Review the diff below and respond with ALLOW: <reason> or BLOCK: <reason> on the first line. BLOCK only for concrete bugs, regressions, or unsafe changes. Content-only review — no tools needed.";
+    const userParts = ["GIT STATUS:\n" + status];
+    if (diff) userParts.push("GIT DIFF:\n" + diff);
+    if (untracked) userParts.push("UNTRACKED FILES:\n" + untracked);
+    const user = userParts.join("\n\n");
+
+    const reviewers = resolveReviewers({ env: process.env });
+    const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env: process.env })));
+    const panel = combinePanel(results);
+
+    try {
+      writeTrace(ws, {
+        gate: "review",
+        ws,
+        reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null })),
+        systemPrompt: system,
+        userPrompt: user.slice(0, 2000),
+        rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || r.error || ""]))
+      });
+    } catch { /* trace is best-effort */ }
+
+    if (flags.json) {
+      process.stdout.write(JSON.stringify({ decision: panel.decision, summary: panel.summary, findings: panel.findings, results }) + "\n");
+    } else {
+      for (const r of results) {
+        const line = r.error ? `${r.name}: skipped (${r.error})` : `${r.name}: ${r.firstLine || r.verdict}`;
+        process.stdout.write(line + "\n");
+      }
+      process.stdout.write(`\nResult: ${panel.decision.toUpperCase()} — ${panel.summary}\n`);
+      if (panel.findings) process.stdout.write("\n" + panel.findings + "\n");
+    }
+    process.exitCode = panel.decision === "block" ? 1 : 0;
     return;
   }
 
   if (sub === "status") {
     const ws = workspaceRoot(cwd);
-    const state = loadState(ws, {});
-    if (!state.jobs.length) {
-      process.stdout.write("No grok-companion jobs recorded for this workspace.\n");
+    const { listTraces } = await import("../global-hooks/trace-store.mjs");
+    const traces = listTraces(ws, 10);
+    if (!traces.length) {
+      process.stdout.write("No gang review traces for this workspace.\n");
       return;
     }
-    for (const job of state.jobs.slice(-10).reverse()) {
-      const first = String(job.result?.rawOutput ?? "").split("\n")[0].slice(0, 80);
-      process.stdout.write(`${job.createdAt}  ${job.title}  ${job.status}  ${first}\n`);
+    for (const t of traces) {
+      process.stdout.write(`${t.ts || ""}  gate:${t.gate}  ${t.id}\n`);
     }
     return;
   }
 
   if (sub === "setup") {
-    const bin = process.env.GROK_BIN || "grok";
-    const version = spawnSync(bin, ["--version"], { encoding: "utf8" });
-    if (version.status !== 0) {
-      process.stdout.write("GROK NOT AVAILABLE: `grok --version` failed. Install Grok Build CLI and ensure it is on PATH.\n");
-      process.exitCode = 1;
-      return;
-    }
     const ws = workspaceRoot(cwd);
-    process.stdout.write(`grok binary: OK (${version.stdout.trim()})\nstate dir: ${resolveStateDir(ws, {})}\nsandbox profile: ${process.env.GROK_SANDBOX_PROFILE || "(unset — permission-mode/deny-list/mutation-check enforce read-only)"}\npanel (stops): ${loadState(ws, {}).config.panelStops ? "ON" : "off (v2 feature)"}\n`);
-    return;
-  }
-
-  if (sub === "panel") {
-    const ws = workspaceRoot(cwd);
-    const mode = prompt.trim().toLowerCase();
-    if (mode === "on" || mode === "off") {
-      const state = loadState(ws, {});
-      state.config.panelStops = mode === "on";
-      saveState(ws, state, {});
-      process.stdout.write(
-        mode === "on"
-          ? `Grok stop-gate panel: ON for this workspace.\nGrok now reviews every code-editing turn alongside Codex (takes effect next turn end).\n`
-          : `Grok stop-gate panel: off for this workspace.\nThe Codex stop gate (if enabled) is unaffected.\n`
-      );
-      return;
-    }
-    const on = loadState(ws, {}).config.panelStops;
-    process.stdout.write(`Grok stop-gate panel is ${on ? "ON" : "off"} for this workspace.\nToggle with \`/grok:panel on\` or \`/grok:panel off\`.\n`);
+    const cfg = resolveConfig({ env: process.env });
+    const codexFound = !!latestCodexRoot();
+    const kimiKey = !!process.env.KIMI_API_KEY;
+    const mimoKey = !!process.env.MIMO_API_KEY;
+    const disabled = isGangDisabled(ws);
+    const lines = [
+      `Active reviewers: ${cfg.reviewers.join(", ")}`,
+      `KIMI_API_KEY: ${kimiKey ? "present" : "missing"}`,
+      `MIMO_API_KEY: ${mimoKey ? "present" : "missing"}`,
+      `Codex plugin: ${codexFound ? "found" : "not found"}`,
+      `Gang disabled: ${disabled ? "yes" : "no"}`,
+      `Hint: /gang:reviewers to change reviewers | /gang:off to disable | /gang:on to re-enable`
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
     return;
   }
 
@@ -240,7 +211,7 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers|hunt|investigate|off|on`);
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|hunt|investigate|off|on`);
 }
 
 export async function huntCommand(cwd, seed, { huntImpl = huntPanel, deep = false } = {}) {

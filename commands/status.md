@@ -1,5 +1,5 @@
 ---
-description: Show recent grok-companion jobs for this workspace
+description: Show recent gang review traces for this workspace
 allowed-tools: Bash(node:*)
 ---
 

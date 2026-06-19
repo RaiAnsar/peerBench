@@ -32,9 +32,9 @@ test("workspaceStateDir lands under the env-independent shared root", () => {
   assert.ok(dir.startsWith(sharedRoot()));
   assert.ok(/\/state\/workspace-[0-9a-f]{16}$/.test(dir));
 });
-test("reviewers override allows codex/grok selection", () => {
-  const cfg = resolveConfig({ env: {}, reviewers: ["codex", "grok"] });
-  assert.deepEqual(cfg.reviewers, ["codex", "grok"]);
+test("reviewers override allows codex-only selection", () => {
+  const cfg = resolveConfig({ env: {}, reviewers: ["codex"] });
+  assert.deepEqual(cfg.reviewers, ["codex"]);
 });
 test("unknown reviewer names are filtered out", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["kimi", "bogus"] });
@@ -42,10 +42,10 @@ test("unknown reviewer names are filtered out", () => {
 });
 test("setReviewers writes companion.json and filters unknowns", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj-"));
-  const out = setReviewers(["codex", "grok", "bogus"], { root });
-  assert.deepEqual(out, ["codex", "grok"]);
+  const out = setReviewers(["codex", "kimi", "bogus"], { root });
+  assert.deepEqual(out, ["codex", "kimi"]);
   const saved = JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8"));
-  assert.deepEqual(saved.reviewers, ["codex", "grok"]);
+  assert.deepEqual(saved.reviewers, ["codex", "kimi"]);
 });
 test("setReviewers throws on all-invalid", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj2-"));

@@ -32,10 +32,9 @@ test("hard error from client → error side", async () => {
   const res = await r.find((x) => x.name === "kimi").run({ system: "s", user: "u" });
   assert.match(res.error, /timeout/);
 });
-test("codex/grok resolve to named CLI adapters", () => {
-  const r = resolveReviewers({ env: {}, reviewers: ["codex", "grok"] });
-  assert.deepEqual(r.map((x) => x.name), ["codex", "grok"]);
-  // both expose a run() function (CLI-backed; not exercised here)
+test("codex resolves to named CLI adapter", () => {
+  const r = resolveReviewers({ env: {}, reviewers: ["codex"] });
+  assert.deepEqual(r.map((x) => x.name), ["codex"]);
   assert.equal(typeof r[0].run, "function");
 });
 test("kimi adapter run still accepts the extended params and ignores cwd/env", async () => {

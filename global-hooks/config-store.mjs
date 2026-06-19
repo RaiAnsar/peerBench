@@ -15,7 +15,7 @@ const DEFAULTS = {
           headers: {}, timeoutMs: 180_000 }  // 3 min
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
-export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "grok"];
+export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex"];
 export function sharedRoot() {
   return process.env.GROK_COMPANION_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "grok-companion-shared");

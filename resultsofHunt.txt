@@ -1,0 +1,162 @@
+❯ /gang:hunt look for bugs in this system which is in production with around 40-50 users.
+
+  Ran 1 shell command
+
+Bug hunt — focus: look for bugs in this system which is in production with around 40-50 users.
+
+═══ Codex ═══
+(no findings — unexpected reviewer output)
+
+═══ Kimi ═══
+(no findings — network: fetch failed)
+
+═══ MiMo ═══
+
+Bug Findings — Prioritized
+
+1. CRITICAL: Suspended/Locked Users Can Log In Via 2FA Bypass
+
+Files:
+- app/api/auth/login/route.ts:76-97
+- app/api/auth/2fa/verify/route.ts:90-135
+
+Mechanism: The login route has a special code path for ompletely bypasses AuthService.login(). The normal(non-2FA) login flow goes through AuthService.login() which checks suspendedAt and lockedUntil before issuing a session. But the 2FA path:
+
+1. Fetches the user directly from the DB (login/route.ts:76)
+2. Verifies the password manually via AuthCrypto.verify)
+3. If valid, immediately issues an MFA challenge token (login/route.ts:93-100) — no suspension or lock check
+4. The /api/auth/2fa/verify endpoint then creates a full session (verify/route.ts:115-135) — also no suspension or lock check, and it actively clears failedLoginCount and lockedUntil (verif
+
+Impact: A user account that has been suspended by an admin or locked due to brute-force protection can still log in if they have 2FA enabled and know their password + TOTP code. The admin's suspension action is completely bypassed.
+
+Minimal repro:
+1. Admin suspends a user who has 2FA enabled
+2. Suspended user goes to login page, enters correct password
+3. Gets MFA challenge token (should be rejected here)
+4. Enters valid TOTP code
+5. Full session is issued — user is logged in despite s
+
+---
+2. HIGH: SSRF via Notification Channel Webhook URLs (No
+
+File: app/api/notification-channels/route.ts:136-182
+
+Mechanism: The webhook URL validation in the notification channel creation flow uses validateWebhookUrl() which calls isPrivateOrLocalhost() to check the hostname string against a blocklist and regex patterns. It does NOT resolve DNS and check the resolved IPs. Compare this with
+the monitor creation flow which uses assertSafeUrl() frh resolves DNS via dns.lookup() and checks all resolvedIPs against private ranges.
+
+The notification channel SSRF check (isPrivateOrLocalhost) only blocks literal hostnames like localhost, 127.0.0.1, 169.254.169.254, and private IP regex patterns. An attacker who controls a DNS A record can point any domain to an internal IP.
+
+Impact: An authenticated user (with DEVELOPER+ role) can create a webhook notification channel with a URL like
+https://attacker-controlled.com/webhook where that doma2.30.0.1 (the Docker bridge). When a notification fires, the server will make an HTTP request to the internal network.
+
+Minimal repro:
+1. Register a domain and set its A record to 172.30.0.1
+2. Create a WEBHOOK notification channel with URL https://yourdomain.com:5432/
+3. Trigger a downtime alert
+4. The notification service sends an HTTP request to ther bridge
+
+Note: This same pattern is also in app/api/monitors/test/route.ts:52-139 (monitor test route) — though that one does resolve DNS for the
+check, the isPrivateOrLocalhost function at line 52 alsy checks resolved IPs when they're passed in, while theinitial check at line 113 only checks the hostname.
+
+---
+3. MEDIUM: Login User Enumeration via Different Error Messages (2FA vs Non-2FA)
+
+File: app/api/auth/login/route.ts:86-96 vs app/api/auth/login/route.ts:117 (AuthService)
+
+Mechanism: The login route returns different error messages depending on whether the user has 2FA enabled:
+- User with 2FA + wrong password → "Invalid credentials
+- User without 2FA + wrong password → "Invalid email or password" (AuthService, thrown as authError.message)
+- Non-existent user → "Invalid email or password" (Auth
+
+Impact: An attacker can enumerate which email addresses have accounts AND have 2FA enabled by observing the error message. This is a
+low-severity information disclosure, but in a system wiattacker which accounts are hardened and which aren't.
+
+Minimal repro:
+1. Send login request with email=victim@example.com&password=wrong
+2. Response "Invalid credentials" → user exists AND has 2FA
+3. Response "Invalid email or password" → user either d2FA
+
+---
+4. MEDIUM: Organization Settings PATCH Missing CSRF Protection
+
+File: app/api/organization/settings/route.ts:115-175
+
+Mechanism: The PATCH /api/organization/settings endpoinrations (modifying alert defaults, monitoringthresholds, notification channel IDs) but does not call requireCSRF(). While SameSite=Lax on the session cookie provides baseline CSRF protection for modern browsers, the project consistently applies CSRF checks on other state-changing routes as defense-in-depth (monitors, API keys, invitations, 2FA, sessions, etc.).
+
+Impact: If a browser bug or proxy misconfiguration strips SameSite attributes, a cross-site request could modify organization alert
+thresholds (e.g., setting CPU/memory thresholds to 1%) irect default notifications to attacker-controlledchannel IDs.
+
+---
+5. MEDIUM: Notification Channel Update/Delete and Sever CSRF
+
+Files:
+- app/api/notification-channels/[id]/route.ts:167 (PUT)
+- app/api/alert-rules/[id]/route.ts:119 (PUT)
+- app/api/incidents/[id]/route.ts:268 (PUT)
+- app/api/status-pages/[id]/route.ts:234 (PATCH)
+- app/api/organization/branding/route.ts:92 (PUT)
+- app/api/organization/smtp/route.ts:181 (PUT)
+- app/api/organization/route.ts:158 (PUT)
+
+Mechanism: None of these routes import or call requireCSRF(). They all rely solely on SameSite=Lax. The project's own security model (visible in monitors, API keys, invitations, etc.) treats CSRF tokens as mandatory for state-changing operations.
+
+Impact: Same as #4 but broader scope — notification chaPI keys), alert rules, status pages, and SMTP settingscould all be modified by a cross-site request if SameSite is ever stripped.
+
+---
+6. LOW: validateCSRFToken() Defined But Never Called
+
+File: lib/auth/crypto.ts:203-209
+
+Mechanism: The AuthCrypto.validateCSRFToken() method exists and performs a proper timing-safe HMAC comparison against the session token. However, the actual CSRF validation in lib/api/middleware.ts:252-276 uses a simple string comparison (csrfToken !== session.csrfToken). The
+HMAC-based method is never invoked anywhere in the code
+
+Impact: The current CSRF validation uses exact string comparison, which is functionally correct but doesn't use the timing-safe comparison
+that was clearly intended. While the timing attack surfens are random, not user-controlled secrets), itrepresents dead security code and a potential confusion point.
+
+---
+7. LOW: Email Verification Tokens Stored in Session Table (Design Debt)
+
+File: lib/auth/email-verification.ts:29-38
+
+Mechanism: Email verification tokens are stored by creating rows in the Session table with ipAddress: 'email-verification' and userAgent:
+'email-verification' as sentinel values. This means:
+1. Verification tokens share the same table as real sessions
+2. The deleteMany on login (auth-service.ts:157-161) deletes ALL sessions for the user — including pending email verification tokens
+3. A user who registers, receives a verification email,on link or OAuth before clicking the verification linkwill have their verification token silently invalidated
+
+Impact: Low — the user can always request a new verificn smell that could cause confusing edge cases.
+
+---
+8. LOW: Password Reset cleanupExpiredTokens() Is a No-o
+
+File: lib/auth/password-reset.ts:123-133
+
+Mechanism: The cleanupExpiredTokens() method iterates the in-memory store and cleans it up, but the database cleanup comment // In
+production, you'd also clean up database entries is jusE FROM PasswordResetToken WHERE expiresAt < NOW() isever executed. Expired tokens accumulate in the database indefinitely.
+
+Impact: Minor data accumulation. With 40-50 users, the volume is negligible, but it's a latent issue that will grow over time and represents an incomplete implementation.
+
+---
+Summary (Most Severe First)                                                                                                            
+┌─────┬──────────┬─────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────┐
+│  #  │ Severity │                         Bug                         │                              File                              │
+├─────┼──────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ 1   │ CRITICAL │ Suspended/locked users bypass via 2FA login path    │ app/api/auth/login/route.ts:76-97 +                           │     │          │                                     h/2fa/verify/route.ts                               │
+├─────┼──────────┼─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────│ 2   │ HIGH     │ SSRF via webhook URLs (no DNS resoluification-channels/route.ts:136-182                 │
+├─────┼──────────┼─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────│ 3   │ MEDIUM   │ User enumeration via different 2FA vh/login/route.ts:86-96                              │
+│     │          │  messages                                           │                                                                │
+├─────┼──────────┼─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────│ 4   │ MEDIUM   │ Org settings PATCH missing CSRF     anization/settings/route.ts:115                     │
+├─────┼──────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ 5   │ MEDIUM   │ Multiple state-changing routes missing CSRF (7+     │ Various (see list)                                            │     │          │ routes)                                                                                 │
+├─────┼──────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┤
+│ 6   │ LOW      │ Dead validateCSRFToken() method; CSRF uses simple   │ lib/auth/crypto.ts:203                                         │
+│     │          │ string compare                                      │                                                                │
+├─────┼──────────┼─────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────│ 7   │ LOW      │ Verification tokens in Session tableail-verification.ts:29                              │
+│     │          │ login)                                              │                                                               ├─────┼──────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
+│ 8   │ LOW      │ Password reset token DB cleanup never runs          │ lib/auth/password-reset.ts:123                                └─────┴──────────┴─────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                                       (trace 1781832903643-9049d5 — expand later with /gang:s
+
+---                                                                                                                                    That's the runner output verbatim. Two caveats before y
+
+- This was effectively a single-reviewer run. Codex returned unexpected output and Kimi failed on a network error — so you only have MiMo's pass, not the three-way cross-check. No corroboration, so false-positive risk is higher than usual.                                    - These are unverified AI claims. They cite specific fit regularly overstates severity (e.g., "CRITICAL" authbypasses that turn out to be guarded one frame up the stack). I'd want to read the actual code paths before treating #1 as real.       
+If you want, I'll verify the top two against the real code right now — #1 (does the 2FA path actually skip the suspendedAt/lockedUntil checks?) and #2 (does notification-channel webhook valition SSRF protection that monitors have?). Those are the only two worth dropping everything for; #3–#8 are hardening/debt. Want me to verify #1 and #2, or re-run the hunt to get Codex + Kimi back for corroboration first?
