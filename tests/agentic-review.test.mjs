@@ -33,6 +33,17 @@ test("tool call then verdict → ALLOW, records filesRead", async () => {
   assert.deepEqual(res.filesRead, ["a.js"]); assert.equal(res.steps, 2);
 });
 
+test("readSSE captures a final event with NO trailing blank line (truncated stream)", async () => {
+  // A stream whose last `data:` event isn't terminated by \n\n (and no [DONE]) — the old reader
+  // dropped it, losing the verdict → spurious no-verdict/timeout (found by the gang's own hunt).
+  const enc = new TextEncoder();
+  const raw = `data: ${JSON.stringify({ choices: [{ delta: { content: "ALLOW: fine" }, finish_reason: "stop" }] })}`;
+  const resp = { ok: true, status: 200, text: async () => "",
+    body: new ReadableStream({ start(c) { c.enqueue(enc.encode(raw)); c.close(); } }) };
+  const res = await agenticReview({ ...baseArgs, tools: { schemas: SCHEMAS, execute: async () => "" }, fetchImpl: async () => resp });
+  assert.equal(res.ok, true); assert.equal(res.verdict, "ALLOW");
+});
+
 test("tool error is fed back, not thrown → loop still reaches a verdict", async () => {
   const tools = { schemas: SCHEMAS, execute: async () => { throw new Error("path escapes workspace"); } };
   const res = await agenticReview({ ...baseArgs, tools,

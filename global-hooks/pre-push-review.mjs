@@ -14,23 +14,67 @@ import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
 
-// Matches `git push` as a command token (with optional leading env/chain glue),
-// but not as a substring of another word.
-const GIT_PUSH_RE = /(^|[\s;&|(])git\s+push(\s|$)/;
-// git push --help / -h → ignore (user is just reading the manual)
-const HELP_FLAG_RE = /git\s+push\b.*\s(--help|-h)(\s|$)/;
+// A regex can't reliably detect `git push` across compound commands: it missed trailing
+// operators (`git push;cmd`), git global options (`git -C . push`), and shell control flow
+// (`cd /x || git push`). We tokenize into shell segments instead. (Bugs found by the gang's own hunt.)
 
-// Derive the effective working directory from a `cd <path>` that appears BEFORE
-// the `git push` token in a compound command (handles umbrella/multi-repo setups
-// where Claude does `cd subrepo && git push`). Uses the LAST cd before git push.
+// Git global options that take a SEPARATE value token (so we skip the value when scanning for `push`).
+const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"]);
+
+// Split a compound command into segments on top-level shell operators (; && || | &),
+// honoring single/double quotes so operators inside strings don't split. Each segment carries
+// the `joiner` operator that PRECEDED it ("" for the first) — needed to reason about control flow.
+export function shellSegments(command) {
+  const segs = []; let cur = "", quote = null, joiner = "";
+  const cmd = String(command ?? "");
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i], next = cmd[i + 1];
+    if (quote) { cur += c; if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
+    if ((c === "&" && next === "&") || (c === "|" && next === "|")) { segs.push({ text: cur, joiner }); joiner = c + next; cur = ""; i++; continue; }
+    if (c === ";" || c === "|" || c === "&" || c === "\n") { segs.push({ text: cur, joiner }); joiner = c; cur = ""; continue; }
+    cur += c;
+  }
+  segs.push({ text: cur, joiner });
+  return segs.map((s) => ({ text: s.text.trim(), joiner: s.joiner })).filter((s) => s.text);
+}
+
+// True if a single segment is a real `git push` (allowing leading env assignments and git
+// global options before the `push` subcommand). Excludes `--help`/`-h` and `--dry-run`/`-n`.
+export function isGitPushSegment(text) {
+  const toks = String(text ?? "").split(/\s+/).filter(Boolean);
+  let i = toks.indexOf("git");
+  if (i < 0) return false;
+  i++;
+  while (i < toks.length && toks[i].startsWith("-")) { const t = toks[i]; i++; if (GIT_VALUE_OPTS.has(t)) i++; }
+  if (toks[i] !== "push") return false;
+  const rest = toks.slice(i + 1);
+  if (rest.some((t) => t === "--help" || t === "-h" || t === "--dry-run" || t === "-n")) return false;
+  return true;
+}
+
+// The first segment that is a real git push, or null.
+export function findPushSegment(command) {
+  for (const s of shellSegments(command)) if (isGitPushSegment(s.text)) return s;
+  return null;
+}
+
+// Derive the effective working directory of the push from `cd` segments before it (umbrella/multi-repo
+// `cd subrepo && git push`). A `cd` is only honored if the NEXT segment isn't joined by `||` — i.e. the
+// `cd` succeeded; `cd /missing || git push` runs the push in the ORIGINAL dir, so we must NOT use /missing.
 export function cdTargetBeforePush(command, fallbackCwd) {
-  const pushIdx = command.search(/(^|[\s;&|(])git\s+push(\s|$)/);
-  const head = pushIdx >= 0 ? command.slice(0, pushIdx) : command;
-  const re = /(?:^|&&|;|\|)\s*cd\s+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
-  let m, last = null;
-  while ((m = re.exec(head)) !== null) last = m[1] || m[2] || m[3];
-  if (!last) return fallbackCwd;
-  return path.isAbsolute(last) ? last : path.resolve(fallbackCwd, last);
+  const segs = shellSegments(command);
+  let cwd = fallbackCwd;
+  for (let k = 0; k < segs.length; k++) {
+    if (isGitPushSegment(segs[k].text)) return cwd;
+    const m = segs[k].text.match(/^cd\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*$/);
+    if (m) {
+      const target = m[1] || m[2] || m[3];
+      const next = segs[k + 1];
+      if (!(next && next.joiner === "||")) cwd = path.isAbsolute(target) ? target : path.resolve(cwd, target);
+    }
+  }
+  return cwd;
 }
 
 function readInput() {
@@ -142,8 +186,8 @@ export async function runMain({
 
   const command = String(input.tool_input?.command ?? "");
 
-  // 1. Only act on a real `git push` (not help, not another git command).
-  if (!GIT_PUSH_RE.test(command) || HELP_FLAG_RE.test(command)) {
+  // 1. Only act on a real `git push` (not help/dry-run, not another git command, not a quoted mention).
+  if (!findPushSegment(command)) {
     // Not a git push — silent allow.
     return;
   }

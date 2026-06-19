@@ -41,8 +41,8 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
   `temperature:0.6`). Fast, non-thinking, tool-calling — no Open Platform key needed.
 - **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`).
 
-Switch the active panel any time with `/gang:reviewers` (e.g. revert to the old
-`codex grok` combination, or run `kimi mimo` only).
+Switch the active panel any time with `/gang:reviewers` (e.g. `codex kimi mimo`,
+or run `kimi mimo` only). Selectable reviewers: `kimi`, `mimo`, `codex`.
 
 ### Read-only by construction
 
@@ -80,8 +80,8 @@ produce output:
 
 - `/gang:hunt [focus]` — three-way agentic bug hunt (read-only). Optionally focus it:
   `/gang:hunt a monitor never alerted me` or `/gang:hunt the auth/session code`.
-- `/gang:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo`,
-  `codex kimi mimo`, or `codex grok` to revert).
+- `/gang:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo`
+  or `codex kimi mimo`). Selectable: `kimi`, `mimo`, `codex`.
 - `/gang:status [id]` — recent gate/hunt runs for this workspace; pass a trace id to
   expand it.
 - `/gang:setup` — check reviewer availability and per-workspace state.
@@ -104,8 +104,8 @@ top-level. The provider config in `companion.json` is global/shared.
 
 ## Fallback (revert anytime)
 
-1. **Config toggle** — `/gang:reviewers codex grok` restores the old combination
-   (the Codex/Grok CLI adapters are kept in the registry).
+1. **Config toggle** — `/gang:reviewers kimi mimo` (or any subset of
+   `kimi mimo codex`) re-selects the active panel without redeploying.
 2. **Rollback script** — `node scripts/rollback.mjs` restores the pre-deploy hook
    snapshot and settings.
 3. **Branch** — the work lives on a feature branch; `main` is untouched.

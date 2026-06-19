@@ -40,8 +40,9 @@ async function main() {
   try {
     const raw = fs.readFileSync(0, "utf8").trim();
     if (raw) input = JSON.parse(raw);
-  } catch {
-    // fall through
+  } catch (e) {
+    // Malformed stdin → treat as empty, but say so on stderr instead of failing silently (found by the hunt).
+    process.stderr.write(`⛩ plan-review: could not parse hook input (${e instanceof Error ? e.message : String(e)}); treating as empty.\n`);
   }
 
   const plan = String(input.tool_input?.plan ?? "").trim();

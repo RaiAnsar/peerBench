@@ -5,6 +5,8 @@ import { runCodexTask } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA } from "./reviewers.mjs";
 import path from "node:path";
 
+const displayName = (name) => ({ kimi: "Kimi", mimo: "MiMo", glm: "GLM", codex: "Codex" }[name] || name);
+
 export const HUNT_SYSTEM =
   "You are an expert bug hunter exploring a repository READ-ONLY via the provided tools. " +
   "Find CONCRETE bugs: for each, give the file:line, the precise mechanism, and a minimal repro or trigger condition. " +
@@ -34,6 +36,7 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
   const debug = !!(env.GANG_DEBUG || env.GROK_DEBUG);
 
   const runOne = async (name) => {
+    const display = displayName(name);
     try {
       if (name === "codex") {
         const root = latestCodexRoot();
@@ -45,7 +48,7 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
         return { name: "Codex", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
       }
       const p = cfg.providers[name];
-      if (!p?.apiKey) return { name, findings: "", error: "no api key" };
+      if (!p?.apiKey) return { name: display, findings: "", error: "no api key" };
       const res = await agenticReview({
         baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, temperature: p.temperature, headers: p.headers,
         system, user, tools: createReviewTools(cwd), mode: "report",
@@ -55,14 +58,13 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
         maxRoundMs: deep ? INVESTIGATE_ROUND_MS : undefined,
         fetchImpl: reviewImpl, debug
       });
-      const display = name === "kimi" ? "Kimi" : name === "mimo" ? "MiMo" : name;
       const d = res.diag || {};
       if (debug) console.error(`[hunt ${display}] ok=${res.ok} steps=${d.steps} files=${(d.filesRead || []).length} toolKB=${((d.toolBytes || 0) / 1024) | 0} lastReqKB=${((d.lastReqBytes || 0) / 1024) | 0} err=${res.ok ? "-" : res.error.kind}`);
       return res.ok
         ? { name: display, findings: res.report, steps: res.steps, filesRead: res.filesRead, diag: res.diag, error: null }
         : { name: display, findings: "", diag: res.diag, error: `${res.error.kind}: ${res.error.detail}` };
     } catch (e) {
-      return { name, findings: "", error: String(e?.message || e).slice(0, 300) };
+      return { name: display, findings: "", error: String(e?.message || e).slice(0, 300) };
     }
   };
 

@@ -14,7 +14,7 @@ import path from "node:path";
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
 process.env.GROK_COMPANION_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, cdTargetBeforePush } from "../global-hooks/pre-push-review.mjs";
+import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment } from "../global-hooks/pre-push-review.mjs";
 import { setGangDisabled } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
@@ -428,9 +428,9 @@ test("cdTargetBeforePush: no cd → returns fallback", () => {
   assert.equal(result, "/fallback");
 });
 
-test("cdTargetBeforePush: multiple cds before git push → last one wins", () => {
+test("cdTargetBeforePush: relative cds chain like a real shell (cd a && cd b → a/b)", () => {
   const result = cdTargetBeforePush("cd a && cd b && git push", "/parent");
-  assert.equal(result, path.resolve("/parent", "b"));
+  assert.equal(result, path.resolve("/parent", "a", "b"));
 });
 
 test("cdTargetBeforePush: cd after git push is ignored", () => {
@@ -499,4 +499,40 @@ test("compound command with git push → detected as push", async () => {
     // Must have emitted an allow decision (fail-open, not a silent skip)
     assert.ok(parsed.length > 0, "compound push command should produce some output if reviewers not called");
   }
+});
+
+// --- push DETECTION: bypasses the old GIT_PUSH_RE missed (found by the gang's own hunt) ---
+test("findPushSegment detects pushes the old regex bypassed (trailing operators, global options)", () => {
+  for (const cmd of [
+    "git push;echo done",        // ; immediately after push
+    "git push|tee log.txt",      // | immediately after push
+    "git push&",                 // backgrounded
+    "git -C . push origin main", // global option before subcommand
+    "cd repo && git push",       // compound
+    "FOO=bar git push"           // leading env assignment
+  ]) {
+    assert.ok(findPushSegment(cmd), `should detect a push in: ${cmd}`);
+  }
+});
+test("findPushSegment ignores non-pushes (quoted mention, help, dry-run, other subcommands)", () => {
+  for (const cmd of [
+    'echo "remember to git push" && git status',  // push only inside a quoted string
+    "git push --help",
+    "git push --dry-run",
+    "git pushx",                                   // not the push subcommand
+    "git status"
+  ]) {
+    assert.equal(findPushSegment(cmd), null, `should NOT detect a push in: ${cmd}`);
+  }
+});
+test("isGitPushSegment: skips git global value-options before push", () => {
+  assert.ok(isGitPushSegment("git -c user.name=x push"));
+  assert.ok(isGitPushSegment("git --git-dir /tmp/x push"));
+  assert.ok(!isGitPushSegment("git -c user.name=x status"));
+});
+test("cdTargetBeforePush: a cd joined to the push by || did NOT run → push uses the original cwd", () => {
+  // `cd /missing || git push` runs the push in the ORIGINAL dir (cd failed); must NOT review /missing.
+  assert.equal(cdTargetBeforePush("cd /missing || git push origin main", "/orig"), "/orig");
+  // but `cd sub && git push` DID cd → review sub
+  assert.equal(cdTargetBeforePush("cd sub && git push", "/orig"), path.resolve("/orig", "sub"));
 });

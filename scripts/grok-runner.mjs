@@ -14,7 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig, isGangDisabled, setGangDisabled, setReviewers } from "../global-hooks/config-store.mjs";
-import { combinePanel } from "../global-hooks/panel-lib.mjs";
+import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser } from "../global-hooks/hunt.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
@@ -22,8 +22,6 @@ import { writeTrace } from "../global-hooks/trace-store.mjs";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
 const MAX_DIFF_BYTES = 200_000;
-const MAX_UNTRACKED_FILES = 20;
-const MAX_UNTRACKED_BYTES_EACH = 20_000;
 
 function workspaceRoot(cwd) {
   try {
@@ -79,29 +77,6 @@ export function parseArgs(argv) {
     break;
   }
   return { flags, prompt };
-}
-
-function untrackedBlock(ws) {
-  let names = [];
-  try {
-    names = execFileSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: ws, encoding: "utf8" })
-      .split("\n").filter(Boolean);
-  } catch {
-    return "";
-  }
-  const parts = [];
-  for (const name of names.slice(0, MAX_UNTRACKED_FILES)) {
-    try {
-      const body = fs.readFileSync(path.join(ws, name), "utf8").slice(0, MAX_UNTRACKED_BYTES_EACH);
-      parts.push(`--- NEW UNTRACKED FILE: ${name} ---\n${body}`);
-    } catch {
-      parts.push(`--- NEW UNTRACKED FILE (unreadable/binary): ${name} ---`);
-    }
-  }
-  if (names.length > MAX_UNTRACKED_FILES) {
-    parts.push(`(… ${names.length - MAX_UNTRACKED_FILES} more untracked files omitted)`);
-  }
-  return parts.join("\n\n");
 }
 
 async function main() {

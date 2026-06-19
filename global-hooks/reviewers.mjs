@@ -32,6 +32,10 @@ function codexAdapter() {
 // Lines inside a ``` fence are ignored so model examples can't trigger a false verdict.
 export function extractVerdict(text) {
   const s = String(text ?? "").trim();
+  // Fast path: the INSTRUCTED format is the verdict on the first line — accept it directly so no
+  // code-fence tracking (which can mis-toggle on nested/unbalanced fences) can hide it. Found by the hunt.
+  const first = s.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  if (first.startsWith("ALLOW:") || first.startsWith("BLOCK:")) return parseVerdict(s);
   let inFence = false;
   for (const line of s.split(/\r?\n/)) {
     const t = line.trim();
@@ -56,14 +60,14 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
         const call = (u) => reviewImpl({ baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, system, user: u, temperature: p.temperature, headers: p.headers, timeoutMs: p.timeoutMs, thinking: p.thinking });
         let r = await call(user);
         if (!r.ok) return { name: display, error: `${r.error.kind}: ${r.error.detail}` };
-        let v = extractVerdict(r.text), raw = r.text;
+        let v = extractVerdict(r.text), raw = r.text, usage = r.usage;
         if (!v) {
           const r2 = await call(user + STRICT);
           if (!r2.ok) return { name: display, error: `${r2.error.kind}: ${r2.error.detail}` };
-          v = extractVerdict(r2.text); raw = r2.text;
+          v = extractVerdict(r2.text); raw = r2.text; usage = r2.usage;   // bill the retry, not the first call
         }
         if (!v) return { name: display, error: "unparseable verdict", raw };
-        return { name: display, verdict: v.verdict, firstLine: v.firstLine, raw, model: p.model, usage: r.usage ?? null };
+        return { name: display, verdict: v.verdict, firstLine: v.firstLine, raw, model: p.model, usage: usage ?? null };
       }
     };
   });

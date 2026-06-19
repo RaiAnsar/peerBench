@@ -24,6 +24,22 @@ test("read_file rejects path traversal", async () => {
   const { execute } = createReviewTools(tmpRepo());
   await assert.rejects(() => execute("read_file", { path: "../../etc/passwd" }), /escapes workspace/);
 });
+test("read_file offset/limit returns the right window", async () => {
+  const d = tmpRepo();
+  fs.writeFileSync(path.join(d, "lines.txt"), Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n"));
+  const { execute } = createReviewTools(d);
+  assert.equal(await execute("read_file", { path: "lines.txt", offset: 3, limit: 2 }), "line3\nline4");
+});
+test("read_file with offset/limit reads a >2MB file as a bounded window (no whole-file load, no 'too large')", async () => {
+  const d = tmpRepo();
+  const big = path.join(d, "big.log");
+  // ~3MB: first line is short, then a lot of filler — offset/limit must NOT trip the 2MB full-read guard.
+  fs.writeFileSync(big, "FIRST_LINE\n" + "x".repeat(3_000_000) + "\n");
+  const { execute } = createReviewTools(d);
+  const out = await execute("read_file", { path: "big.log", offset: 1, limit: 1 });
+  assert.equal(out, "FIRST_LINE");
+  assert.doesNotMatch(out, /too large/);
+});
 test("grep finds matches via git grep", async () => {
   const { execute } = createReviewTools(tmpRepo());
   const out = await execute("grep", { pattern: "find me" });

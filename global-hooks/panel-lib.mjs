@@ -27,9 +27,18 @@ export function workspaceFingerprint(cwd) {
     try {
       diff = execFileSync("git", ["diff", "HEAD"], { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     } catch {
-      diff = ""; // repo with no commits: untracked hashing below covers content
+      diff = ""; // repo with no commits: diff HEAD fails — staged diff + untracked hashing below cover content
     }
-    const h = createHash("sha256").update(status).update(" ").update(diff);
+    // Staged content: in a fresh repo (no HEAD) `git diff HEAD` is empty, so staged file CONTENT
+    // would otherwise be invisible to the fingerprint (porcelain shows only "A name"). `git diff
+    // --cached` captures it (vs the empty tree in a fresh repo). Found by the gang's own hunt.
+    let staged = "";
+    try {
+      staged = execFileSync("git", ["diff", "--cached"], { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    } catch {
+      staged = "";
+    }
+    const h = createHash("sha256").update(status).update(" ").update(diff).update(" ").update(staged);
     // NUL-separated enum handles spaces/newlines in names; hashing CONTENT is
     // what catches a PRE-EXISTING untracked file rewritten during review (its
     // porcelain "?? name" line is unchanged in that case).
@@ -53,6 +62,41 @@ export function workspaceFingerprint(cwd) {
   } catch {
     return null;
   }
+}
+
+// List untracked files and embed their (text) contents for content-only review. NUL-delimited
+// (handles newlines in names) and NEVER follows a symlink out of the workspace — an untracked
+// symlink to e.g. ~/.ssh/config must not leak into a reviewer prompt (found by the gang's own hunt).
+// Shared by stop-review and grok-runner so both stay consistent.
+export function untrackedBlock(ws, { maxFiles = 20, maxBytesEach = 20_000 } = {}) {
+  let names = [];
+  try {
+    names = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: ws, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 })
+      .split("\0").filter(Boolean);
+  } catch {
+    return "";
+  }
+  let root; try { root = fs.realpathSync.native(ws); } catch { root = ws; }
+  const parts = [];
+  for (const name of names.slice(0, maxFiles)) {
+    const abs = path.join(ws, name);
+    let real;
+    try {
+      if (fs.lstatSync(abs).isSymbolicLink()) { parts.push(`--- NEW UNTRACKED FILE (symlink skipped): ${name} ---`); continue; }
+      real = fs.realpathSync.native(abs);
+      if (real !== root && !real.startsWith(root + path.sep)) { parts.push(`--- NEW UNTRACKED FILE (outside workspace, skipped): ${name} ---`); continue; }
+    } catch {
+      parts.push(`--- NEW UNTRACKED FILE (unreadable): ${name} ---`); continue;
+    }
+    try {
+      const body = fs.readFileSync(real, "utf8").slice(0, maxBytesEach);
+      parts.push(`--- NEW UNTRACKED FILE: ${name} ---\n${body}`);
+    } catch {
+      parts.push(`--- NEW UNTRACKED FILE (unreadable/binary): ${name} ---`);
+    }
+  }
+  if (names.length > maxFiles) parts.push(`(… ${names.length - maxFiles} more untracked files omitted)`);
+  return parts.join("\n\n");
 }
 
 export function spawnCollect(cmd, args, { cwd, env, timeoutMs }) {

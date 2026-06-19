@@ -7,7 +7,7 @@ const cap = (s) => (typeof s === "string" ? s.slice(0, CAP) : s);
 export function writeTrace(ws, trace, { now = Date.now() } = {}) {
   const dir = path.join(workspaceStateDir(ws), "traces");
   fs.mkdirSync(dir, { recursive: true });
-  const id = `${now}-${randomBytes(3).toString("hex")}`; // random suffix: no same-ms collision (BLOCK 1)
+  const id = `${now}-${randomBytes(6).toString("hex")}`; // 48-bit random suffix: same-ms collision is negligible
   const record = { id, ts: new Date(now).toISOString(), gate: trace.gate, ws: trace.ws, reviewers: trace.reviewers || [],
     systemPrompt: cap(trace.systemPrompt), userPrompt: cap(trace.userPrompt),
     rawResponses: Object.fromEntries(Object.entries(trace.rawResponses || {}).map(([k, v]) => [k, cap(v)])) };
@@ -21,7 +21,7 @@ export function listTraces(ws, limit = 20) {
   files.sort().reverse();
   return files.slice(0, limit).map((f) => {
     const t = readTrace(ws, f.replace(/\.json$/, "")) || {};
-    const summary = (t.reviewers || []).map((r) => `${r.name} ${r.verdict || `err(${r.error?.kind || r.error || "?"})`}`).join(" · ");
+    const summary = (t.reviewers || []).map((r) => `${r.name} ${r.verdict || `err(${r.error || "?"})`}`).join(" · ");
     return { id: t.id, ts: t.ts, gate: t.gate, summary };
   });
 }

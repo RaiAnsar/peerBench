@@ -8,7 +8,7 @@ test("write/read/list round-trip and prompt cap", () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "tw-"));
   const id = writeTrace(ws, { gate: "stop", ws, reviewers: [{ name: "kimi", model: "kimi-k2.7-code", latencyMs: 12, verdict: "ALLOW", firstLine: "ALLOW: ok" }],
     systemPrompt: "s", userPrompt: "u", rawResponses: { kimi: "x".repeat(100_000) } }, { now: 1750000000000 });
-  assert.match(id, /^\d+-[0-9a-f]{6}$/);
+  assert.match(id, /^\d+-[0-9a-f]{12}$/);
   const t = readTrace(ws, id);
   assert.equal(t.gate, "stop");
   assert.ok(t.rawResponses.kimi.length <= 64 * 1024);

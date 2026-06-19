@@ -29,7 +29,7 @@ export function workspaceStateDir(ws) {
 function readFileConfig() { try { return JSON.parse(fs.readFileSync(path.join(sharedRoot(), "companion.json"), "utf8")); } catch { return {}; } }
 // Persist the active reviewer selection to the env-independent companion.json (atomic).
 export function setReviewers(list, { root = sharedRoot() } = {}) {
-  const reviewers = (Array.isArray(list) ? list : []).filter((n) => KNOWN_REVIEWERS.includes(n));
+  const reviewers = [...new Set((Array.isArray(list) ? list : []).filter((n) => KNOWN_REVIEWERS.includes(n)))];
   if (!reviewers.length) throw new Error(`no valid reviewers in [${list}]; known: ${KNOWN_REVIEWERS.join(", ")}`);
   fs.mkdirSync(root, { recursive: true });
   const file = path.join(root, "companion.json");
@@ -81,6 +81,6 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
   const sel = Array.isArray(reviewersOverride) && reviewersOverride.length
     ? reviewersOverride
     : (Array.isArray(file.reviewers) && file.reviewers.length ? file.reviewers : DEFAULT_REVIEWERS);
-  const reviewers = sel.filter((n) => KNOWN_REVIEWERS.includes(n));
+  const reviewers = [...new Set(sel.filter((n) => KNOWN_REVIEWERS.includes(n)))];
   return { reviewers: reviewers.length ? reviewers : DEFAULT_REVIEWERS, providers };
 }
