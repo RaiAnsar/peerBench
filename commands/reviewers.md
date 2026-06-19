@@ -1,5 +1,4 @@
 ---
-name: reviewers
 description: Show or set the active review backends for the panel (kimi, mimo, codex, glm). No argument shows the current selection; names set it (e.g. "kimi mimo" or "codex kimi mimo glm"). Takes effect on the next gate run. User-invoked.
 argument-hint: '[kimi|mimo|codex|glm ...]'
 disable-model-invocation: true

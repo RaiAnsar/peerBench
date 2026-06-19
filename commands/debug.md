@@ -1,5 +1,4 @@
 ---
-name: debug
 description: Get a multi-model panel (Codex + Kimi + MiMo + GLM) to root-cause a SPECIFIC failure read-only. Use when you are stuck debugging — an error, exception, stack trace, failing test, crash, or wrong/unexpected output — and want independent reviewers to find the root cause (file:line + mechanism) and the minimal fix. Pass the error text, what you expected vs. got, and where it happens. Faster and more targeted than a broad hunt; never edits files.
 argument-hint: '[error / failing behavior / what you expected vs got]'
 allowed-tools: Bash(node:*)

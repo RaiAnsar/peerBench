@@ -1,5 +1,4 @@
 ---
-name: status
 description: Show recent bench review traces for this workspace (gate and hunt history). Pass a trace id to expand a single run. User-invoked.
 argument-hint: '[trace-id]'
 disable-model-invocation: true

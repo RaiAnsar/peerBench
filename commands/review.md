@@ -1,5 +1,4 @@
 ---
-name: review
 description: On-demand panel review (Codex + Kimi + MiMo + GLM) of the current working changes; pass --base REF to review a commit range instead. Content-only and fast. User-invoked.
 argument-hint: '[--base <ref>]'
 disable-model-invocation: true

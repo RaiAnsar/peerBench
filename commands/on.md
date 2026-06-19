@@ -1,5 +1,4 @@
 ---
-name: on
 description: Re-enable the bench review gates (use --global to clear a global disable). User-invoked.
 argument-hint: '[--global]'
 disable-model-invocation: true
