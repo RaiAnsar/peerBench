@@ -6,6 +6,7 @@
 // only a real panel BLOCK prevents the push.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { combinePanel } from "./panel-lib.mjs";
 import { isGangDisabled as defaultIsGangDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
@@ -18,6 +19,19 @@ const MAX_DIFF_BYTES = 200_000;
 const GIT_PUSH_RE = /(^|[\s;&|(])git\s+push(\s|$)/;
 // git push --help / -h → ignore (user is just reading the manual)
 const HELP_FLAG_RE = /git\s+push\b.*\s(--help|-h)(\s|$)/;
+
+// Derive the effective working directory from a `cd <path>` that appears BEFORE
+// the `git push` token in a compound command (handles umbrella/multi-repo setups
+// where Claude does `cd subrepo && git push`). Uses the LAST cd before git push.
+export function cdTargetBeforePush(command, fallbackCwd) {
+  const pushIdx = command.search(/(^|[\s;&|(])git\s+push(\s|$)/);
+  const head = pushIdx >= 0 ? command.slice(0, pushIdx) : command;
+  const re = /(?:^|&&|;|\|)\s*cd\s+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
+  let m, last = null;
+  while ((m = re.exec(head)) !== null) last = m[1] || m[2] || m[3];
+  if (!last) return fallbackCwd;
+  return path.isAbsolute(last) ? last : path.resolve(fallbackCwd, last);
+}
 
 function readInput() {
   try {
@@ -101,18 +115,18 @@ export function buildPrompt(commits, diff) {
   const system =
     "You are reviewing a set of commits about to be pushed. Review based ONLY on the content " +
     "provided in this message. Do NOT use any tools or explore the filesystem. " +
-    "Your reply must begin with ALLOW: or BLOCK: on the first line. " +
+    "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`. " +
     "BLOCK only if there is a concrete bug, regression, security issue, or unsafe change " +
-    "that must be fixed before these commits are pushed. Otherwise ALLOW.";
+    "that must be fixed before these commits are pushed; otherwise ALLOW " +
+    "(minor notes may follow the first line).";
   const user = [
-    "Review the following commits that are about to be pushed to the remote.",
-    "BLOCK only for concrete problems that should be fixed before push. Otherwise ALLOW.",
-    "",
-    "COMMITS BEING PUSHED:",
+    "<commits>",
     commits || "(no commit list available)",
+    "</commits>",
     "",
-    "DIFF OF CHANGES:",
-    diff || "(no diff available)"
+    "<diff>",
+    diff || "(no diff available)",
+    "</diff>"
   ].join("\n");
   return { system, user };
 }
@@ -134,8 +148,8 @@ export async function runMain({
     return;
   }
 
-  const cwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
-  const ws = workspaceRoot(cwd);
+  const baseCwd = cdTargetBeforePush(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd());
+  const ws = workspaceRoot(baseCwd);
 
   // 2. Gang disabled check.
   if (isGangDisabledImpl(ws)) {

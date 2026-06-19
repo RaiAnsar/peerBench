@@ -68,22 +68,27 @@ function emit(obj) {
 
 export function buildPrompt(status, diff, untracked, lastMsg) {
   const system =
-    "You are reviewing based ONLY on the content provided in this message. Do NOT use any tools or explore the filesystem. Your reply must begin with ALLOW: or BLOCK: on the first line.";
+    "You are reviewing the code changes from a Claude turn. Review based ONLY on the content " +
+    "provided in this message. Do NOT use any tools or explore the filesystem. " +
+    "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`. " +
+    "BLOCK only if there is a concrete bug, regression, or unsafe change that should be fixed " +
+    "before the session ends; otherwise ALLOW (minor notes may follow the first line).";
   const user = [
-    "Review the code changes from the previous Claude turn (git diff + untracked files below).",
-    "BLOCK only if there is a concrete bug, regression, or unsafe change that should be fixed before the session ends. Otherwise ALLOW.",
-    "",
-    "PREVIOUS ASSISTANT MESSAGE (context):",
+    "<previous_assistant_message>",
     lastMsg,
+    "</previous_assistant_message>",
     "",
-    "GIT STATUS:",
+    "<git_status>",
     status,
+    "</git_status>",
     "",
-    "GIT DIFF:",
+    "<git_diff>",
     diff,
+    "</git_diff>",
     "",
-    "UNTRACKED FILES:",
-    untracked
+    "<untracked_files>",
+    untracked,
+    "</untracked_files>"
   ].join("\n");
   return { system, user };
 }

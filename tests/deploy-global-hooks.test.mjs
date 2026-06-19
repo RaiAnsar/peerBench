@@ -44,3 +44,77 @@ test("syncSettings removes only matching legacy commands, drops empty entries, r
   assert.ok(!pre.some((e) => e.hooks.some((h) => h.command.includes("codex-plan-review.mjs"))));
   assert.ok(s.hooks.PostToolUse.some((e) => e.matcher === "Write|Edit" && e.hooks.some((h) => h.command.includes("plan-file-review.mjs"))));
 });
+
+test("syncSettings registers all four gates: plan-review(ExitPlanMode), pre-push-review(Bash), plan-file-review(Write|Edit), stop-review(Stop) with asyncRewake", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss4-"));
+  const settingsPath = path.join(hooks, "settings.json");
+  fs.writeFileSync(settingsPath, "{}");
+  syncSettings({ hooksDir: hooks, settingsPath });
+  const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+
+  // PreToolUse: ExitPlanMode → plan-review.mjs
+  assert.ok(
+    s.hooks.PreToolUse.some((e) => e.matcher === "ExitPlanMode" && e.hooks.some((h) => h.command.includes("plan-review.mjs"))),
+    "plan-review must be registered under ExitPlanMode"
+  );
+  // PreToolUse: Bash → pre-push-review.mjs
+  assert.ok(
+    s.hooks.PreToolUse.some((e) => e.matcher === "Bash" && e.hooks.some((h) => h.command.includes("pre-push-review.mjs"))),
+    "pre-push-review must be registered under Bash"
+  );
+  // PostToolUse: Write|Edit → plan-file-review.mjs
+  assert.ok(
+    s.hooks.PostToolUse.some((e) => e.matcher === "Write|Edit" && e.hooks.some((h) => h.command.includes("plan-file-review.mjs"))),
+    "plan-file-review must be registered under Write|Edit"
+  );
+  // Stop: stop-review.mjs with asyncRewake:true
+  assert.ok(Array.isArray(s.hooks.Stop), "Stop hooks array must exist");
+  const stopHook = s.hooks.Stop.flatMap((b) => b.hooks || []).find((h) => h.command.includes("stop-review.mjs"));
+  assert.ok(stopHook, "stop-review must be registered in Stop hooks");
+  assert.equal(stopHook.asyncRewake, true, "stop-review must have asyncRewake:true");
+  assert.ok(stopHook.rewakeMessage, "stop-review must have rewakeMessage");
+  assert.ok(stopHook.rewakeSummary, "stop-review must have rewakeSummary");
+  assert.ok(typeof stopHook.timeout === "number", "stop-review must have numeric timeout");
+});
+
+test("syncSettings is idempotent: running twice does not duplicate any gate", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-idem-"));
+  const settingsPath = path.join(hooks, "settings.json");
+  fs.writeFileSync(settingsPath, "{}");
+  syncSettings({ hooksDir: hooks, settingsPath });
+  syncSettings({ hooksDir: hooks, settingsPath });
+  const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+
+  const countPlanReview = s.hooks.PreToolUse.filter(
+    (e) => e.matcher === "ExitPlanMode" && e.hooks.some((h) => h.command.includes("plan-review.mjs"))
+  ).length;
+  const countPrePush = s.hooks.PreToolUse.filter(
+    (e) => e.matcher === "Bash" && e.hooks.some((h) => h.command.includes("pre-push-review.mjs"))
+  ).length;
+  const countPlanFile = s.hooks.PostToolUse.filter(
+    (e) => e.matcher === "Write|Edit" && e.hooks.some((h) => h.command.includes("plan-file-review.mjs"))
+  ).length;
+  const countStop = s.hooks.Stop.flatMap((b) => b.hooks || []).filter((h) => h.command.includes("stop-review.mjs")).length;
+
+  assert.equal(countPlanReview, 1, "plan-review must appear exactly once after two syncSettings calls");
+  assert.equal(countPrePush, 1, "pre-push-review must appear exactly once after two syncSettings calls");
+  assert.equal(countPlanFile, 1, "plan-file-review must appear exactly once after two syncSettings calls");
+  assert.equal(countStop, 1, "stop-review must appear exactly once after two syncSettings calls");
+});
+
+test("syncSettings does not remove a pre-existing unrelated Stop hook", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-stoppreserve-"));
+  const settingsPath = path.join(hooks, "settings.json");
+  // Seed with an existing Stop hook (e.g. a codex multi-repo gate)
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: 'node "/home/user/.claude/hooks/codex-multirepo-gate.mjs"' }] }]
+    }
+  }, null, 2));
+  syncSettings({ hooksDir: hooks, settingsPath });
+  const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  // Unrelated stop hook must still be present
+  const allStopCmds = s.hooks.Stop.flatMap((b) => b.hooks || []).map((h) => h.command);
+  assert.ok(allStopCmds.some((c) => c.includes("codex-multirepo-gate.mjs")), "unrelated Stop hook must be preserved");
+  assert.ok(allStopCmds.some((c) => c.includes("stop-review.mjs")), "stop-review must also be registered");
+});
