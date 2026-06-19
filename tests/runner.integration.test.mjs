@@ -5,10 +5,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { parseArgs, huntCommand } from "../scripts/grok-runner.mjs";
+process.env.GROK_COMPANION_ROOT = process.env.GROK_COMPANION_ROOT || fs.mkdtempSync(path.join(os.tmpdir(), "gc-h-"));
 
 const ROOT = path.join(import.meta.dirname, "..");
 const RUNNER = path.join(ROOT, "scripts", "grok-runner.mjs");
-const FIXTURES = path.join(import.meta.dirname, "fixtures");
 
 function freshWs() {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ws-"));
@@ -24,94 +25,110 @@ function run(args, { ws = freshWs(), envExtra = {} } = {}) {
     cwd: ws,
     env: {
       ...process.env,
-      GROK_BIN: path.join(FIXTURES, "fake-grok"),
-      CLAUDE_PLUGIN_DATA: dataRoot,
-      FAKE_GROK_LOG: path.join(dataRoot, "argv.log"),
+      GROK_COMPANION_ROOT: dataRoot,
       ...envExtra
     }
   });
   return { out, dataRoot, ws };
 }
 
-test("task --json returns runner JSON and records a job", () => {
-  const { out, dataRoot } = run(["task", "--json", "do the thing"]);
-  const payload = JSON.parse(out);
-  assert.equal(payload.status, 0);
-  assert.equal(payload.rawOutput, "ALLOW: looks fine");
-  assert.equal(payload.sessionId, "fake-session-1");
-  const stateDirs = fs.readdirSync(path.join(dataRoot, "state"));
-  assert.equal(stateDirs.length, 1);
-  const jobs = fs.readdirSync(path.join(dataRoot, "state", stateDirs[0], "jobs"));
-  assert.equal(jobs.length, 1);
+test("parseArgs: --base flag consumed correctly", () => {
+  const { flags } = parseArgs(["--base", "main"]);
+  assert.equal(flags.base, "main");
 });
 
-test("template shape: ['task','--json','--write fix …'] — embedded flag lifted, prompt verbatim", () => {
-  // Exactly what `task --json "$ARGUMENTS"` produces when the user typed
-  // `/grok:task --write fix the "auth bug" in app.ts; don't touch tests`.
-  const { dataRoot } = run(["task", "--json", `--write fix the "auth bug" in app.ts; don't touch tests`]);
-  const log = fs.readFileSync(path.join(dataRoot, "argv.log"), "utf8");
-  assert.doesNotMatch(log, /--permission-mode plan/); // --write recognized -> write mode
-  assert.match(log, /fix the "auth bug" in app\.ts; don't touch tests/); // prompt intact incl. quotes/semicolon
-  assert.doesNotMatch(log, /-p --write/); // the flag was lifted, not left in the prompt
+test("parseArgs: --base embedded in quoted arg lifted correctly", () => {
+  const { flags } = parseArgs(["--base main"]);
+  assert.equal(flags.base, "main");
 });
 
-test("template shape: ['review','--json','--base main'] — embedded --base recognized", () => {
+test("setup reports gang health without throwing", () => {
+  const { out } = run(["setup"]);
+  assert.match(out, /Active reviewers/);
+  assert.match(out, /Gang disabled/);
+  assert.match(out, /KIMI_API_KEY/);
+  assert.match(out, /MIMO_API_KEY/);
+  assert.match(out, /Codex plugin/);
+});
+
+test("review subcommand runs panel and prints combined result (no-key fail-open)", () => {
+  const ws = freshWs();
+  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runner-"));
+  fs.writeFileSync(path.join(ws, "change.ts"), "export const x = 1;\n");
+  const out = execFileSync(process.execPath, [RUNNER, "review"], {
+    encoding: "utf8",
+    cwd: ws,
+    env: {
+      ...process.env,
+      GROK_COMPANION_ROOT: dataRoot,
+      KIMI_API_KEY: "",
+      MIMO_API_KEY: ""
+    }
+  });
+  assert.ok(out.length > 0);
+  // No keys → reviewers fail-open; result line present
+  assert.match(out, /Result:/i);
+});
+
+test("review with --base flag runs without error (fail-open when no keys)", () => {
   const ws = freshWs();
   fs.writeFileSync(path.join(ws, "feature.txt"), "NEEDLE_BRANCH_DIFF\n");
   execFileSync("git", ["checkout", "-qb", "feat"], { cwd: ws });
   execFileSync("git", ["add", "feature.txt"], { cwd: ws });
   execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "feat"], { cwd: ws });
-  const { dataRoot } = run(["review", "--json", "--base main"], { ws });
-  const log = fs.readFileSync(path.join(dataRoot, "argv.log"), "utf8");
-  assert.match(log, /NEEDLE_BRANCH_DIFF/);   // base diff content reached the prompt
-  assert.doesNotMatch(log, /--base main/);   // flag consumed, not leaked into prompt
-});
-
-test("task without --write runs read-only; with --write relaxes", () => {
-  const a = run(["task", "--json", "investigate"]);
-  assert.match(fs.readFileSync(path.join(a.dataRoot, "argv.log"), "utf8"), /--permission-mode plan/);
-  const b = run(["task", "--json", "--write", "fix it"]);
-  assert.doesNotMatch(fs.readFileSync(path.join(b.dataRoot, "argv.log"), "utf8"), /--permission-mode plan/);
-});
-
-test("review includes untracked file contents", () => {
-  const ws = freshWs();
-  fs.mkdirSync(path.join(ws, "src"), { recursive: true });
-  fs.writeFileSync(path.join(ws, "src", "brand-new.ts"), "export const NEEDLE_UNTRACKED = 42;\n");
-  const { dataRoot } = run(["review", "--json"], { ws });
-  const log = fs.readFileSync(path.join(dataRoot, "argv.log"), "utf8");
-  assert.match(log, /NEEDLE_UNTRACKED/);          // content present in prompt
-  assert.match(log, /src\/brand-new\.ts/);         // labeled with its path
-});
-
-test("status prints recorded jobs", () => {
-  const ws = freshWs();
   const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runner-"));
-  const env = {
-    ...process.env,
-    GROK_BIN: path.join(FIXTURES, "fake-grok"),
-    CLAUDE_PLUGIN_DATA: dataRoot,
-    FAKE_GROK_LOG: "/dev/null"
-  };
-  execFileSync(process.execPath, [RUNNER, "task", "--json", "first"], { encoding: "utf8", cwd: ws, env });
-  const out = execFileSync(process.execPath, [RUNNER, "status"], { encoding: "utf8", cwd: ws, env });
-  assert.match(out, /Grok Task/);
-  assert.match(out, /completed/);
+  const out = execFileSync(process.execPath, [RUNNER, "review", "--json", "--base main"], {
+    encoding: "utf8",
+    cwd: ws,
+    env: { ...process.env, GROK_COMPANION_ROOT: dataRoot, KIMI_API_KEY: "", MIMO_API_KEY: "" }
+  });
+  const payload = JSON.parse(out);
+  assert.ok(["allow", "block", "fail-open"].includes(payload.decision));
 });
 
-test("panel on/off/status toggles config.panelStops", () => {
-  const ws = freshWs();
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runner-"));
-  const env = { ...process.env, GROK_BIN: path.join(FIXTURES, "fake-grok"), CLAUDE_PLUGIN_DATA: dataRoot, FAKE_GROK_LOG: "/dev/null" };
-  const r = (a) => execFileSync(process.execPath, [RUNNER, ...a], { encoding: "utf8", cwd: ws, env });
-  assert.match(r(["panel"]), /off/i);
-  assert.match(r(["panel", "on"]), /ON/);
-  assert.match(r(["panel"]), /ON/);
-  assert.match(r(["panel", "off"]), /off/i);
-  assert.match(r(["panel"]), /off/i);
+test("status shows no traces message when workspace has no traces", () => {
+  const { out } = run(["status"]);
+  assert.match(out, /No gang review traces/);
 });
 
-test("setup reports version or missing binary without throwing", () => {
-  const { out } = run(["setup"]);
-  assert.match(out, /grok|GROK/i);
+test("huntCommand formats findings per reviewer and records a trace", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hc-"));
+  const huntImpl = async () => ([
+    { name: "Codex", findings: "1. bug at a.ts:10", model: "gpt" },
+    { name: "Kimi", findings: "1. bug at a.ts:10\n2. risk at b.ts:4", model: "kimi-for-coding" },
+    { name: "MiMo", findings: "", error: "timeout" }
+  ]);
+  const out = await huntCommand(ws, "a monitor never alerted", { huntImpl });
+  assert.match(out, /focus: a monitor never alerted/);
+  assert.match(out, /═══ Codex ═══/); assert.match(out, /a\.ts:10/);
+  assert.match(out, /═══ MiMo ═══/); assert.match(out, /no findings — timeout/);
+});
+test("huntCommand deep=true uses 'investigate' header and records gate='investigate' in trace", async () => {
+  const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hci-"));
+  const huntImpl = async () => ([
+    { name: "Codex", findings: "deep finding", model: "gpt" },
+    { name: "Kimi", findings: "deep kimi finding", model: "kimi-for-coding" },
+    { name: "MiMo", findings: "deep mimo finding", model: "mimo" }
+  ]);
+  const out = await huntCommand(ws, "why does uptime monitor never escalate", { huntImpl, deep: true });
+  assert.match(out, /Investigation — focus: why does uptime monitor never escalate/);
+  const [latest] = listTraces(ws, 1);
+  assert.equal(latest.gate, "investigate");
+  const t = readTrace(ws, latest.id);
+  assert.equal(t.gate, "investigate");
+});
+test("huntCommand persists per-reviewer diag to the trace (for future debugging)", async () => {
+  const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hcd-"));
+  const huntImpl = async () => ([
+    { name: "Kimi", findings: "x", model: "kimi-for-coding", diag: { steps: 3, filesRead: ["a.ts"], toolBytes: 1234, lastReqBytes: 9000 } },
+    { name: "MiMo", findings: "", error: "network: fetch failed", diag: { steps: 5, filesRead: [], toolBytes: 250000, lastReqBytes: 300000 } }
+  ]);
+  await huntCommand(ws, "x", { huntImpl });
+  const [latest] = listTraces(ws, 1);
+  const t = readTrace(ws, latest.id);
+  const kimi = t.reviewers.find((r) => r.name === "Kimi");
+  assert.equal(kimi.diag.steps, 3); assert.equal(kimi.diag.toolBytes, 1234);
+  assert.equal(t.reviewers.find((r) => r.name === "MiMo").diag.lastReqBytes, 300000);
 });

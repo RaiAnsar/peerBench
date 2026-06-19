@@ -3,9 +3,9 @@
   "owner": { "name": "Rai Ansar" },
   "plugins": [
     {
-      "name": "grok-companion",
+      "name": "gang",
       "source": "./",
-      "description": "Grok second-reviewer panel + delegation for Claude Code"
+      "description": "The gang — Codex + Kimi + MiMo review panel, agentic code review, and bug hunts for Claude Code"
     }
   ]
 }

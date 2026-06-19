@@ -1,0 +1,284 @@
+// tests/stop-review.test.mjs
+// Tests for global-hooks/stop-review.mjs.
+// All reviewer calls are injected so NO real API or Codex call happens.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// Set GROK_COMPANION_ROOT before importing any module that uses config-store.
+const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
+process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+
+import { runMain, buildPrompt } from "../global-hooks/stop-review.mjs";
+import { setGangDisabled } from "../global-hooks/config-store.mjs";
+
+const ROOT = path.join(import.meta.dirname, "..");
+const HOOK = path.join(ROOT, "global-hooks", "stop-review.mjs");
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Create a temp git repo. withChange=true writes an untracked file so the
+ *  diff/untracked check sees a change and does not early-return. */
+function freshRepo({ withChange = true } = {}) {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "sr-ws-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "init"], { cwd: ws });
+  if (withChange) {
+    fs.writeFileSync(path.join(ws, "changed.js"), "export const x = 1;\n");
+  }
+  return ws;
+}
+
+/** Build a fake reviewer that always returns the given verdict. */
+function fakeReviewer(name, verdict, firstLine) {
+  return {
+    name,
+    async run() {
+      return { name, verdict, firstLine: firstLine ?? `${verdict}: test`, raw: `${verdict}: test` };
+    }
+  };
+}
+
+/** Build a fake reviewer that always returns an error (simulates API failure). */
+function fakeErrorReviewer(name) {
+  return {
+    name,
+    async run() {
+      return { name, error: "injected test error" };
+    }
+  };
+}
+
+/** Fake resolveReviewers factory that returns the given list of reviewer stubs. */
+function stubResolveReviewers(reviewerList) {
+  return () => reviewerList;
+}
+
+/** Capture stdout lines written by emit() in runMain. */
+function captureEmit(fn) {
+  const lines = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string") lines.push(chunk);
+    return orig(chunk, ...rest);
+  };
+  const restore = () => { process.stdout.write = orig; };
+  return { lines, restore };
+}
+
+// ---------------------------------------------------------------------------
+// Test: no diff → no-op (exit 0, no trace written)
+// ---------------------------------------------------------------------------
+
+test("no diff → runMain returns early without trace or emit", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-nd-"));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  let traceWritten = false;
+  const writeTraceImpl = () => { traceWritten = true; };
+  let reviewersCalled = false;
+  const resolveReviewersImpl = () => {
+    reviewersCalled = true;
+    return [fakeReviewer("Kimi", "ALLOW")];
+  };
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl,
+      writeTraceImpl,
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally {
+    restore();
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(reviewersCalled, false, "reviewers should NOT be called on a no-diff turn");
+  assert.equal(traceWritten, false, "no trace should be written on a no-diff turn");
+  assert.equal(lines.length, 0, "no output should be emitted on a no-diff turn");
+});
+
+// ---------------------------------------------------------------------------
+// Test: stop_hook_active loop guard → no-op
+// ---------------------------------------------------------------------------
+
+test("stop_hook_active → runMain returns early (loop guard)", async () => {
+  const ws = freshRepo({ withChange: true });
+
+  let reviewersCalled = false;
+  const resolveReviewersImpl = () => { reviewersCalled = true; return []; };
+
+  await runMain({
+    resolveReviewersImpl,
+    writeTraceImpl: () => {},
+    isGangDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, stop_hook_active: true }
+  });
+
+  assert.equal(reviewersCalled, false, "reviewers must NOT be called when stop_hook_active is set");
+});
+
+// ---------------------------------------------------------------------------
+// Test: disabled workspace → no-op (exit 0)
+// ---------------------------------------------------------------------------
+
+test("disabled workspace → runMain exits 0 without calling reviewers", async () => {
+  const ws = freshRepo({ withChange: true });
+
+  // setGangDisabled for workspace scope writes to workspaceStateDir(ws) which
+  // uses sharedRoot() → GROK_COMPANION_ROOT env. We write with TEMP_GCR active
+  // (it was set at module load time) so the subprocess must also see TEMP_GCR.
+  setGangDisabled(ws, true, { scope: "workspace" });
+
+  try {
+    const result = spawnSync(process.execPath, [HOOK], {
+      input: JSON.stringify({ cwd: ws }),
+      encoding: "utf8",
+      env: { ...process.env, GROK_COMPANION_ROOT: TEMP_GCR }
+    });
+
+    assert.equal(result.status, 0, "exit code should be 0 when gang is disabled");
+    assert.equal(result.stdout.trim(), "", "no output expected when gang disabled");
+    assert.equal(result.stderr.trim(), "", "no stderr expected when gang disabled");
+  } finally {
+    // Re-enable so this ws doesn't affect other tests sharing TEMP_GCR.
+    setGangDisabled(ws, false, { scope: "workspace" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test: all ALLOW → systemMessage emitted, exit 0, trace with gate:"stop"
+// ---------------------------------------------------------------------------
+
+test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-al-"));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  let traceRecord = null;
+  const writeTraceImpl = (_ws, trace) => { traceRecord = trace; };
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([
+        fakeReviewer("Kimi", "ALLOW", "ALLOW: looks fine"),
+        fakeReviewer("MiMo", "ALLOW", "ALLOW: no issues")
+      ]),
+      writeTraceImpl,
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, last_assistant_message: "wrote some code" }
+    });
+  } finally {
+    restore();
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  assert.ok(lines.length > 0, "should emit at least one line");
+  const parsed = JSON.parse(lines[0]);
+  assert.ok(typeof parsed.systemMessage === "string", "systemMessage should be a string");
+  assert.match(parsed.systemMessage, /gang stop.*ALLOW/i, "systemMessage should mention gang stop and ALLOW");
+
+  assert.ok(traceRecord !== null, "trace should be written");
+  assert.equal(traceRecord.gate, "stop", "trace gate should be 'stop'");
+  assert.ok(traceRecord.ws, "trace should include ws");
+  assert.ok(Array.isArray(traceRecord.reviewers), "trace.reviewers should be an array");
+});
+
+// ---------------------------------------------------------------------------
+// Test: BLOCK → exit code 2, findings on stderr
+// ---------------------------------------------------------------------------
+
+test("BLOCK → subprocess exits with code 2 and findings on stderr", () => {
+  const ws = freshRepo({ withChange: true });
+
+  // We need a subprocess that imports stop-review.mjs and calls runMain with
+  // a fake reviewer returning BLOCK. Write a small wrapper script.
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "sr-blk-"));
+  const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sr-blk-root-"));
+  const wrapperScript = path.join(wrapperDir, "block-wrapper.mjs");
+  const hookPath = path.join(ROOT, "global-hooks", "stop-review.mjs");
+
+  fs.writeFileSync(wrapperScript, `
+import { runMain } from ${JSON.stringify(hookPath)};
+const fakeReviewer = {
+  name: "Kimi",
+  async run() {
+    return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: introduced a bug", raw: "BLOCK: introduced a bug\\n\\nThe function at line 5 has an off-by-one error." };
+  }
+};
+await runMain({
+  resolveReviewersImpl: () => [fakeReviewer],
+  writeTraceImpl: () => {},
+  isGangDisabledImpl: () => false,
+  env: process.env,
+  input: { cwd: ${JSON.stringify(ws)}, last_assistant_message: "wrote some code" }
+});
+`);
+
+  const result = spawnSync(process.execPath, [wrapperScript], {
+    encoding: "utf8",
+    env: { ...process.env, GROK_COMPANION_ROOT: wrapperRoot }
+  });
+
+  assert.equal(result.status, 2, `expected exit code 2 on BLOCK, got ${result.status}; stderr: ${result.stderr}`);
+  assert.match(result.stderr, /BLOCK|block|introduced a bug/i, "findings should appear on stderr");
+  assert.equal(result.stdout.trim(), "", "no stdout on BLOCK (asyncRewake uses stderr)");
+});
+
+// ---------------------------------------------------------------------------
+// Test: all reviewers errored → fail-open, systemMessage, exit 0
+// ---------------------------------------------------------------------------
+
+test("all reviewers error → fail-open systemMessage, no exit 2", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fo-"));
+  process.env.GROK_COMPANION_ROOT = root;
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([
+        fakeErrorReviewer("Kimi"),
+        fakeErrorReviewer("MiMo")
+      ]),
+      writeTraceImpl: () => {},
+      isGangDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally {
+    restore();
+    process.env.GROK_COMPANION_ROOT = TEMP_GCR;
+  }
+
+  assert.ok(lines.length > 0, "should emit a fail-open message");
+  const parsed = JSON.parse(lines[0]);
+  assert.ok(typeof parsed.systemMessage === "string", "systemMessage should be a string");
+  assert.match(parsed.systemMessage, /gang stop.*review failed.*turn allowed/i, "should indicate fail-open");
+});
+
+// ---------------------------------------------------------------------------
+// Test: buildPrompt — content-only, no tool or repo claim
+// ---------------------------------------------------------------------------
+
+test("buildPrompt: system is content-only with ALLOW:/BLOCK: instruction", () => {
+  const { system, user } = buildPrompt("M changed.js", "diff --git ...", "", "did some work");
+  // Must instruct reviewer to stay content-only (no repo reads, no tools).
+  assert.doesNotMatch(system, /read access|verify.*against.*code/i);
+  assert.match(system, /ALLOW:|BLOCK:/);
+  assert.match(system, /Do NOT use any tools/i);
+  assert.match(user, /changed\.js|GIT STATUS/);
+  assert.match(user, /did some work/);
+});

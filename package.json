@@ -1,9 +1,9 @@
 {
-  "name": "grok-companion",
-  "version": "0.1.0",
+  "name": "gang",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Grok Build CLI companion for Claude Code: dual-reviewer panel + delegation",
+  "description": "The gang: Codex + Kimi + MiMo review panel, agentic read-only code review, and bug hunts for Claude Code",
   "scripts": {
     "test": "node --test 'tests/*.test.mjs'"
   }

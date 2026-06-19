@@ -29,9 +29,13 @@ export function loadState(workspaceRoot, opts = {}) {
   const file = path.join(resolveStateDir(workspaceRoot, opts), "state.json");
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    // Preserve every other config key (e.g. codex-companion's stopReviewGate) —
+    // grok and codex share one state.json, so reducing config to just panelStops
+    // here silently wiped codex's gate flag on every grok load→save cycle.
+    const parsedConfig = parsed?.config && typeof parsed.config === "object" ? parsed.config : {};
     return {
       version: 1,
-      config: { panelStops: Boolean(parsed?.config?.panelStops) },
+      config: { ...parsedConfig, panelStops: Boolean(parsed?.config?.panelStops) },
       jobs: Array.isArray(parsed?.jobs) ? parsed.jobs : []
     };
   } catch {
