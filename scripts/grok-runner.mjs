@@ -19,6 +19,8 @@ import { fileURLToPath } from "node:url";
 import { runGrok } from "./lib/grok-exec.mjs";
 import { appendJob, loadState, resolveStateDir, saveState } from "./lib/grok-state.mjs";
 import { resolveConfig, setReviewers } from "../global-hooks/config-store.mjs";
+import { huntPanel, HUNT_SYSTEM, buildHuntUser } from "../global-hooks/hunt.mjs";
+import { writeTrace } from "../global-hooks/trace-store.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -215,7 +217,33 @@ async function main() {
     return reviewersCommand(rest);
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers`);
+  if (sub === "hunt") {
+    const seed = rest.join(" ").trim();
+    const ws = workspaceRoot(cwd);
+    const output = await huntCommand(ws, seed);
+    process.stdout.write(`${output}\n`);
+    return;
+  }
+
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers|hunt`);
+}
+
+export async function huntCommand(cwd, seed, { huntImpl = huntPanel } = {}) {
+  const results = await huntImpl({ cwd, seed });
+  // record a trace so `/gang:status <id>` can show the full findings later
+  let traceId = null;
+  try {
+    traceId = writeTrace(cwd, {
+      gate: "hunt", ws: cwd,
+      reviewers: results.map((r) => ({ name: r.name, model: r.model, error: r.error || null })),
+      systemPrompt: HUNT_SYSTEM, userPrompt: buildHuntUser(seed),
+      rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
+    });
+  } catch { /* trace is best-effort */ }
+  const blocks = results.map((r) =>
+    `═══ ${r.name} ═══\n${r.findings?.trim() || `(no findings — ${r.error || "empty"})`}`);
+  const header = seed?.trim() ? `Bug hunt — focus: ${seed.trim()}` : "Bug hunt — broad sweep";
+  return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /gang:status ${traceId})` : ""}`;
 }
 
 export function reviewersCommand(args) {

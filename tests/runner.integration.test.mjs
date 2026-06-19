@@ -5,6 +5,8 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { huntCommand } from "../scripts/grok-runner.mjs";
+process.env.GROK_COMPANION_ROOT = process.env.GROK_COMPANION_ROOT || fs.mkdtempSync(path.join(os.tmpdir(), "gc-h-"));
 
 const ROOT = path.join(import.meta.dirname, "..");
 const RUNNER = path.join(ROOT, "scripts", "grok-runner.mjs");
@@ -114,4 +116,17 @@ test("panel on/off/status toggles config.panelStops", () => {
 test("setup reports version or missing binary without throwing", () => {
   const { out } = run(["setup"]);
   assert.match(out, /grok|GROK/i);
+});
+
+test("huntCommand formats findings per reviewer and records a trace", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hc-"));
+  const huntImpl = async () => ([
+    { name: "Codex", findings: "1. bug at a.ts:10", model: "gpt" },
+    { name: "Kimi", findings: "1. bug at a.ts:10\n2. risk at b.ts:4", model: "kimi-for-coding" },
+    { name: "MiMo", findings: "", error: "timeout" }
+  ]);
+  const out = await huntCommand(ws, "a monitor never alerted", { huntImpl });
+  assert.match(out, /focus: a monitor never alerted/);
+  assert.match(out, /═══ Codex ═══/); assert.match(out, /a\.ts:10/);
+  assert.match(out, /═══ MiMo ═══/); assert.match(out, /no findings — timeout/);
 });
