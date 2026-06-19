@@ -5,20 +5,25 @@ import { workspaceStateDir } from "./config-store.mjs";
 
 const C = { ALLOW: 48, BLOCK: 196, error: 208 };           // 256-color codes (match gate-status.py palette)
 const col = (code, s) => `\x1b[38;5;${code}m${s}\x1b[0m`;
+const dim = (s) => `\x1b[2m${s}\x1b[0m`;
 const GATE_LABEL = { "plan-file": "plan", "pre-push": "push" };  // shorten; others pass through
+const glyph = (r) => (r.verdict === "ALLOW" ? "✓" : r.verdict === "BLOCK" ? "✗" : "!");
+const STALE_MS = 45 * 60 * 1000;  // a verdict older than this is past, not current → dim it
 
 // Pure: render one trace as the format-C segment. Returns "" if nothing to show.
-export function renderSegment(trace) {
+export function renderSegment(trace, { now = Date.now() } = {}) {
   if (!trace || !Array.isArray(trace.reviewers) || trace.reviewers.length === 0) return "";
   const gate = GATE_LABEL[trace.gate] || trace.gate || "review";
+  const ts = trace.ts ? Date.parse(trace.ts) : NaN;
+  if (Number.isFinite(ts) && now - ts > STALE_MS) {
+    // stale: dim it with (idle) so an old verdict doesn't masquerade as an active block
+    return dim(`⛩ ${gate}: ${trace.reviewers.map((r) => `${r.name}${glyph(r)}`).join(" ")} (idle)`);
+  }
   const anyBlock = trace.reviewers.some((r) => r.verdict === "BLOCK");
   const allAllow = trace.reviewers.every((r) => r.verdict === "ALLOW");
   const labelColor = anyBlock ? C.BLOCK : (allAllow ? C.ALLOW : C.error);
-  const parts = trace.reviewers.map((r) => {
-    if (r.verdict === "ALLOW") return col(C.ALLOW, `${r.name}✓`);
-    if (r.verdict === "BLOCK") return col(C.BLOCK, `${r.name}✗`);
-    return col(C.error, `${r.name}!`);                      // error / skipped reviewer
-  });
+  const parts = trace.reviewers.map((r) =>
+    col(r.verdict === "ALLOW" ? C.ALLOW : r.verdict === "BLOCK" ? C.BLOCK : C.error, `${r.name}${glyph(r)}`));
   return `${col(labelColor, `⛩ ${gate}:`)} ${parts.join(" ")}`;
 }
 
