@@ -9,6 +9,35 @@ const LIST_MAX = 300;
 
 function realDir(p) { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } }
 
+// Read a [offset, offset+limit) line window WITHOUT loading the whole file (the 2MB guard only
+// covered full reads, so offset/limit on a multi-GB file could OOM — found by the gang's own hunt).
+function readLineRange(abs, offset, limit) {
+  const start = Math.max(0, (Number.isInteger(offset) ? offset : 1) - 1);
+  const want = Number.isInteger(limit) ? Math.max(0, limit) : Infinity;
+  const fd = fs.openSync(abs, "r");
+  try {
+    const buf = Buffer.alloc(64 * 1024);
+    let leftover = "", lineNo = 0, scanned = 0; const out = [];
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      scanned += n;
+      const lines = (leftover + buf.toString("utf8", 0, n)).split("\n");
+      leftover = lines.pop();
+      for (const ln of lines) {
+        if (lineNo >= start && out.length < want) out.push(ln);
+        lineNo++;
+      }
+      if (out.length >= want) return out.join("\n");
+      if (scanned > 64 * 1024 * 1024) break;   // hard safety cap for limit-less ranges
+    }
+    if (leftover && lineNo >= start && out.length < want) out.push(leftover);
+    return out.join("\n");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function safePath(cwd, p) {
   const root = realDir(cwd);
   const abs = path.resolve(root, p ?? ".");
@@ -27,15 +56,14 @@ export function createReviewTools(cwd, { execImpl = spawnSync } = {}) {
   const tools = {
     read_file({ path: p, offset, limit }) {
       const abs = safePath(cwd, p);
-      if (!Number.isInteger(offset) && !Number.isInteger(limit)) {
+      const hasRange = Number.isInteger(offset) || Number.isInteger(limit);
+      let text;
+      if (hasRange) {
+        text = readLineRange(abs, offset, limit);   // streamed window — never loads the whole file
+      } else {
         const size = fs.statSync(abs).size;
         if (size > 2_000_000) return `[file too large to read: ${size} bytes; use grep or read with offset/limit]`;
-      }
-      let text = fs.readFileSync(abs, "utf8");
-      if (Number.isInteger(offset) || Number.isInteger(limit)) {
-        const lines = text.split(/\r?\n/);
-        const start = Math.max(0, (offset ?? 1) - 1);
-        text = lines.slice(start, limit ? start + limit : undefined).join("\n");
+        text = fs.readFileSync(abs, "utf8");
       }
       let truncated = "";
       if (text.length > READ_FILE_MAX) { text = text.slice(0, READ_FILE_MAX); truncated = "\n…[truncated]"; }

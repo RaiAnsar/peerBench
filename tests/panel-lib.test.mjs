@@ -1,7 +1,22 @@
 // tests/panel-lib.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseVerdict, combinePanel } from "../global-hooks/panel-lib.mjs";
+import fs from "node:fs"; import os from "node:os"; import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { parseVerdict, combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
+
+test("untrackedBlock embeds a real untracked file but NEVER follows a symlink out of the workspace", () => {
+  const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-")));
+  execFileSync("git", ["init", "-q"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "real.txt"), "REAL_UNTRACKED_CONTENT");
+  const secret = path.join(os.tmpdir(), `ub-secret-${process.pid}.txt`);
+  fs.writeFileSync(secret, "TOP_SECRET_SHOULD_NOT_LEAK");
+  fs.symlinkSync(secret, path.join(ws, "leak.txt"));   // untracked symlink pointing OUTSIDE the workspace
+  const out = untrackedBlock(ws);
+  assert.match(out, /REAL_UNTRACKED_CONTENT/, "the real untracked file content is included");
+  assert.doesNotMatch(out, /TOP_SECRET_SHOULD_NOT_LEAK/, "symlink target content must NOT leak");
+  assert.match(out, /symlink skipped/, "the symlink is reported as skipped");
+});
 
 test("parseVerdict extracts ALLOW/BLOCK/null", () => {
   assert.equal(parseVerdict("ALLOW: fine\nmore").verdict, "ALLOW");

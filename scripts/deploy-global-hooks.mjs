@@ -16,14 +16,17 @@ export function deploy({ src, dest }) {
   return { copied, backedUp };
 }
 
-// LAYER-3 BACKUP: snapshot the current live hooks + settings BEFORE we mutate them, so rollback.mjs can restore exactly.
-const SNAPSHOT_FILES = ["codex-plan-review.mjs", "codex-plan-file-review.mjs", "plan-review.mjs", "plan-file-review.mjs", "panel-lib.mjs", "stop-review.mjs", "pre-push-review.mjs"];
+// LAYER-3 BACKUP: snapshot the current live hooks + settings BEFORE we mutate them, so rollback.mjs can
+// restore exactly. Snapshot EVERY live *.mjs in hooksDir (not a hardcoded list, which silently missed
+// newly-added hooks like stop-review/pre-push-review — found by the gang's own hunt).
 export function snapshot({ hooksDir, settingsPath, backupDir }) {
   fs.mkdirSync(backupDir, { recursive: true });
   const files = [];
-  for (const f of SNAPSHOT_FILES) {
+  let live = [];
+  try { live = fs.readdirSync(hooksDir).filter((f) => f.endsWith(".mjs")); } catch { live = []; }
+  for (const f of live) {
     const p = path.join(hooksDir, f);
-    if (fs.existsSync(p)) { fs.copyFileSync(p, path.join(backupDir, f)); files.push(f); }
+    try { fs.copyFileSync(p, path.join(backupDir, f)); files.push(f); } catch { /* skip unreadable */ }
   }
   let settingsBackedUp = false;
   if (fs.existsSync(settingsPath)) { fs.copyFileSync(settingsPath, path.join(backupDir, "settings.json")); settingsBackedUp = true; }

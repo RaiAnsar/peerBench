@@ -8,6 +8,30 @@ async function readSSE(resp) {
   const decoder = new TextDecoder();
   let buf = "", content = "", finish = null, usage = null;
   const tc = [];  // tool_calls assembled by index
+  const handleEvt = (evt) => {
+    for (const line of evt.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const data = t.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      let j; try { j = JSON.parse(data); } catch { continue; }
+      if (j.usage) usage = j.usage;
+      const ch = j.choices?.[0];
+      if (!ch) continue;
+      if (ch.finish_reason) finish = ch.finish_reason;
+      const d = ch.delta || {};
+      if (typeof d.content === "string") content += d.content;
+      if (Array.isArray(d.tool_calls)) {
+        for (const td of d.tool_calls) {
+          const i = td.index ?? 0;
+          tc[i] = tc[i] || { id: "", type: "function", function: { name: "", arguments: "" } };
+          if (td.id) tc[i].id = td.id;
+          if (td.function?.name) tc[i].function.name = td.function.name;
+          if (td.function?.arguments) tc[i].function.arguments += td.function.arguments;
+        }
+      }
+    }
+  };
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -16,30 +40,14 @@ async function readSSE(resp) {
       let nl;
       while ((nl = buf.indexOf("\n\n")) >= 0) {
         const evt = buf.slice(0, nl); buf = buf.slice(nl + 2);
-        for (const line of evt.split("\n")) {
-          const t = line.trim();
-          if (!t.startsWith("data:")) continue;
-          const data = t.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          let j; try { j = JSON.parse(data); } catch { continue; }
-          if (j.usage) usage = j.usage;
-          const ch = j.choices?.[0];
-          if (!ch) continue;
-          if (ch.finish_reason) finish = ch.finish_reason;
-          const d = ch.delta || {};
-          if (typeof d.content === "string") content += d.content;
-          if (Array.isArray(d.tool_calls)) {
-            for (const td of d.tool_calls) {
-              const i = td.index ?? 0;
-              tc[i] = tc[i] || { id: "", type: "function", function: { name: "", arguments: "" } };
-              if (td.id) tc[i].id = td.id;
-              if (td.function?.name) tc[i].function.name = td.function.name;
-              if (td.function?.arguments) tc[i].function.arguments += td.function.arguments;
-            }
-          }
-        }
+        handleEvt(evt);
       }
     }
+    // Flush: a final SSE event not terminated by a blank line (truncated/abrupt stream) would
+    // otherwise be silently dropped — losing the last content + finish_reason → spurious
+    // "no verdict"/timeout on a review that actually finished (found by the gang's own hunt).
+    buf += decoder.decode();
+    if (buf.trim()) handleEvt(buf);
   } finally { try { reader.releaseLock(); } catch { /* noop */ } }
   return { message: { content, tool_calls: tc.filter(Boolean) }, finish_reason: finish, usage };
 }
@@ -92,7 +100,7 @@ export async function agenticReview({
       // e.g. kimi-k2.6, which then reads until maxSteps and drops out with "no verdict".)
       const body = JSON.stringify({ model, messages, temperature, stream: true,
         ...(force ? {} : { tools: tools.schemas, tool_choice: "auto" }),
-        ...(thinking ? { thinking: { type: thinking } } : {}) });
+        ...(thinking === "enabled" || thinking === "disabled" ? { thinking: { type: thinking } } : {}) });
       lastReqBytes = body.length;
       dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);
       const t0 = Date.now();

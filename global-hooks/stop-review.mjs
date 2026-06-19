@@ -5,14 +5,12 @@
 // On ALLOW: emit systemMessage + exit 0. Fails OPEN on any error.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { combinePanel } from "./panel-lib.mjs";
+import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
 import { isGangDisabled as defaultIsGangDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
-const MAX_UNTRACKED_FILES = 20;
-const MAX_UNTRACKED_BYTES_EACH = 20_000;
 
 function readInput() {
   try {
@@ -37,29 +35,6 @@ function git(args, cwd) {
   } catch {
     return "";
   }
-}
-
-function untrackedBlock(ws) {
-  let names = [];
-  try {
-    names = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: ws, encoding: "utf8" })
-      .split("\0").filter(Boolean);
-  } catch {
-    return "";
-  }
-  const parts = [];
-  for (const name of names.slice(0, MAX_UNTRACKED_FILES)) {
-    try {
-      const body = fs.readFileSync(`${ws}/${name}`, "utf8").slice(0, MAX_UNTRACKED_BYTES_EACH);
-      parts.push(`--- NEW UNTRACKED FILE: ${name} ---\n${body}`);
-    } catch {
-      parts.push(`--- NEW UNTRACKED FILE (unreadable/binary): ${name} ---`);
-    }
-  }
-  if (names.length > MAX_UNTRACKED_FILES) {
-    parts.push(`(… ${names.length - MAX_UNTRACKED_FILES} more untracked files omitted)`);
-  }
-  return parts.join("\n\n");
 }
 
 function emit(obj) {
@@ -130,6 +105,11 @@ export async function runMain({
   // this content-only gate adds just the cheap reviewers. To make this the sole per-turn gate
   // (incl. Codex) later, drop this filter and disable Codex's own gate.
   const reviewers = resolveReviewersImpl({ env }).filter((r) => String(r.name).toLowerCase() !== "codex");
+  if (!reviewers.length) {
+    // e.g. reviewers configured as codex-only — nothing left for this content-only gate to run.
+    emit({ systemMessage: "⛩ gang stop: no non-Codex reviewers configured — turn allowed (Codex runs its own gate)." });
+    return;
+  }
   const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
   const panel = combinePanel(results);
 

@@ -51,6 +51,13 @@ test("setReviewers throws on all-invalid", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj2-"));
   assert.throws(() => setReviewers(["bogus"], { root }));
 });
+test("setReviewers de-dupes (kimi kimi mimo → kimi mimo) — no double API calls", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj3-"));
+  assert.deepEqual(setReviewers(["kimi", "kimi", "mimo"], { root }), ["kimi", "mimo"]);
+});
+test("resolveConfig de-dupes a duplicated reviewer override", () => {
+  assert.deepEqual(resolveConfig({ env: {}, reviewers: ["kimi", "kimi"] }).reviewers, ["kimi"]);
+});
 test("resolveConfig includes per-provider timeoutMs defaults (kimi=300000, mimo=180000)", () => {
   const cfg = resolveConfig({ env: { KIMI_API_KEY: "k" } });
   assert.equal(cfg.providers.kimi.timeoutMs, 300_000);
