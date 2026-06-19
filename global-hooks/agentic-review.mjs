@@ -3,6 +3,7 @@ import { extractVerdict } from "./reviewers.mjs";
 // Parse an OpenAI-compatible SSE chat stream into one assembled message.
 // Returns { message: { content, tool_calls }, finish_reason, usage }.
 async function readSSE(resp) {
+  if (!resp.body) throw new Error("response has no body");   // clear error instead of a cryptic null TypeError (found by Kimi's own hunt)
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buf = "", content = "", finish = null, usage = null;
