@@ -17,7 +17,7 @@ export function deploy({ src, dest }) {
 }
 
 // LAYER-3 BACKUP: snapshot the current live hooks + settings BEFORE we mutate them, so rollback.mjs can restore exactly.
-const SNAPSHOT_FILES = ["codex-plan-review.mjs", "codex-plan-file-review.mjs", "plan-review.mjs", "plan-file-review.mjs", "panel-lib.mjs"];
+const SNAPSHOT_FILES = ["codex-plan-review.mjs", "codex-plan-file-review.mjs", "plan-review.mjs", "plan-file-review.mjs", "panel-lib.mjs", "stop-review.mjs", "pre-push-review.mjs"];
 export function snapshot({ hooksDir, settingsPath, backupDir }) {
   fs.mkdirSync(backupDir, { recursive: true });
   const files = [];
@@ -34,6 +34,15 @@ const LEGACY = ["codex-plan-review.mjs", "codex-plan-file-review.mjs"];
 function ensure(list, matcher, absCmd) {
   const has = list.some((e) => e.matcher === matcher && (e.hooks || []).some((h) => String(h.command).includes(absCmd)));
   if (!has) list.push({ matcher, hooks: [{ type: "command", command: `node "${absCmd}"` }] });
+}
+// Idempotent Stop hook registration — adds our hook to the first block (or a new block)
+// without disturbing any other existing Stop hooks (e.g. a codex multi-repo gate).
+function ensureStop(list, absCmd, extra) {
+  const has = list.some((b) => (b.hooks || []).some((h) => String(h.command).includes(absCmd)));
+  if (has) return;
+  // Add to the first block's hooks if present (alongside e.g. codex-multirepo-gate), else a new block
+  const block = list[0] && Array.isArray(list[0].hooks) ? list[0] : (list.push({ hooks: [] }), list[list.length - 1]);
+  block.hooks.push({ type: "command", command: `node "${absCmd}"`, ...extra });
 }
 // Remove ONLY the matching legacy hook COMMANDS (not whole entries unless they become empty); register the new plan-*.mjs with ABSOLUTE paths.
 export function syncSettings({ hooksDir, settingsPath }) {
@@ -54,8 +63,15 @@ export function syncSettings({ hooksDir, settingsPath }) {
   }
   s.hooks.PreToolUse = s.hooks.PreToolUse || [];
   s.hooks.PostToolUse = s.hooks.PostToolUse || [];
+  s.hooks.Stop = s.hooks.Stop || [];
   ensure(s.hooks.PreToolUse, "ExitPlanMode", path.join(hooksDir, "plan-review.mjs"));   // ABSOLUTE homedir path (no ~)
   ensure(s.hooks.PostToolUse, "Write|Edit", path.join(hooksDir, "plan-file-review.mjs"));
+  ensure(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"));
+  ensureStop(s.hooks.Stop, path.join(hooksDir, "stop-review.mjs"), {
+    timeout: 300, asyncRewake: true,
+    rewakeMessage: "⛩ gang stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
+    rewakeSummary: "⛩ gang stop"
+  });
   fs.writeFileSync(settingsPath, `${JSON.stringify(s, null, 2)}\n`);
   return { removedFiles, removedEntries };
 }

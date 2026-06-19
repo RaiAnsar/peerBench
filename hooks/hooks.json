@@ -1,4 +1,4 @@
 {
-  "description": "Gang plugin hooks (currently empty — Stop review gate is in global-hooks/stop-review.mjs).",
+  "description": "Gang plugin hooks (currently empty — all review gates live in global-hooks/ and are registered into ~/.claude/settings.json by scripts/deploy-global-hooks.mjs: plan-review.mjs, plan-file-review.mjs, pre-push-review.mjs, stop-review.mjs).",
   "hooks": {}
 }

@@ -279,6 +279,21 @@ test("buildPrompt: system is content-only with ALLOW:/BLOCK: instruction", () =>
   assert.doesNotMatch(system, /read access|verify.*against.*code/i);
   assert.match(system, /ALLOW:|BLOCK:/);
   assert.match(system, /Do NOT use any tools/i);
-  assert.match(user, /changed\.js|GIT STATUS/);
+  assert.match(user, /changed\.js|git_status/i);
   assert.match(user, /did some work/);
+});
+
+test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
+  const { system, user } = buildPrompt("M changed.js", "diff --git ...", "new-file.js contents", "did some work");
+  // "BLOCK only" instruction must be in system, NOT in user
+  assert.match(system, /BLOCK only/i, "system must contain BLOCK guidance");
+  assert.doesNotMatch(user, /BLOCK only/i, "user must NOT contain BLOCK-only guidance");
+  // user must contain ONLY the content to review
+  assert.match(user, /did some work/, "user must contain last_assistant_message");
+  assert.match(user, /changed\.js/, "user must contain git status");
+  assert.match(user, /diff --git/, "user must contain diff");
+  assert.match(user, /new-file\.js/, "user must contain untracked file content");
+  // user must not contain format instructions
+  assert.doesNotMatch(user, /first line must be/i, "user must not have format instructions");
+  assert.doesNotMatch(user, /Review the code changes/i, "user must not have review instructions");
 });

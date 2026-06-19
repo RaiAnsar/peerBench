@@ -14,7 +14,7 @@ import path from "node:path";
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
 process.env.GROK_COMPANION_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt } from "../global-hooks/pre-push-review.mjs";
+import { runMain, buildPrompt, cdTargetBeforePush } from "../global-hooks/pre-push-review.mjs";
 import { setGangDisabled } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
@@ -403,6 +403,57 @@ test("buildPrompt: system is content-only with ALLOW:/BLOCK: instruction", () =>
   assert.match(system, /Do NOT use any tools/i);
   assert.match(user, /add feature/);
   assert.match(user, /diff --git/);
+});
+
+// ---------------------------------------------------------------------------
+// Test: git push embedded in compound command → detected
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Tests: cdTargetBeforePush
+// ---------------------------------------------------------------------------
+
+test("cdTargetBeforePush: absolute quoted path before git push", () => {
+  const result = cdTargetBeforePush('cd "/abs/sub repo" && git push origin staging', "/fallback");
+  assert.equal(result, "/abs/sub repo");
+});
+
+test("cdTargetBeforePush: relative cd resolves against fallback", () => {
+  const result = cdTargetBeforePush("cd sub && git push", "/parent");
+  assert.equal(result, path.resolve("/parent", "sub"));
+});
+
+test("cdTargetBeforePush: no cd → returns fallback", () => {
+  const result = cdTargetBeforePush("git push origin main", "/fallback");
+  assert.equal(result, "/fallback");
+});
+
+test("cdTargetBeforePush: multiple cds before git push → last one wins", () => {
+  const result = cdTargetBeforePush("cd a && cd b && git push", "/parent");
+  assert.equal(result, path.resolve("/parent", "b"));
+});
+
+test("cdTargetBeforePush: cd after git push is ignored", () => {
+  // The cd appears AFTER the git push token — should not be picked up
+  const result = cdTargetBeforePush("git push && cd /somewhere", "/fallback");
+  assert.equal(result, "/fallback");
+});
+
+// ---------------------------------------------------------------------------
+// Test: buildPrompt prompt system/user split
+// ---------------------------------------------------------------------------
+
+test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
+  const { system, user } = buildPrompt("abc1234 add feature", "diff --git a/x.js ...");
+  // "BLOCK only" instruction must be in system, NOT in user
+  assert.match(system, /BLOCK only/i, "system must contain BLOCK guidance");
+  assert.doesNotMatch(user, /BLOCK only/i, "user must NOT contain BLOCK-only guidance");
+  // user must contain ONLY the content to review
+  assert.match(user, /add feature/, "user must contain the commits content");
+  assert.match(user, /diff --git/, "user must contain the diff content");
+  // user must not contain format instructions
+  assert.doesNotMatch(user, /first line must be/i, "user must not have format instructions");
+  assert.doesNotMatch(user, /Review the following commits/i, "user must not have review instructions");
 });
 
 // ---------------------------------------------------------------------------
