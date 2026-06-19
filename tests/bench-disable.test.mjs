@@ -6,6 +6,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// CRITICAL: set BENCH_ROOT before importing config-store so sharedRoot() (used by the
+// WORKSPACE disable marker via workspaceStateDir) points at a temp dir — otherwise
+// workspace-scoped setBenchDisabled writes into the user's REAL data dir. ({root} only
+// isolates the GLOBAL marker, not the per-workspace one.)
+process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-disable-root-"));
+
 // Use a fresh isolated root for every test so nothing bleeds across.
 function freshRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "gc-disable-"));

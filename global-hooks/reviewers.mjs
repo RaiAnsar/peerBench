@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const NAMES = { kimi: "Kimi", mimo: "MiMo" };
+const NAMES = { kimi: "Kimi", mimo: "MiMo", glm: "GLM", codex: "Codex" };
 const STRICT = "\n\nIMPORTANT: respond with ONLY a first line of `ALLOW: <reason>` or `BLOCK: <reason>`. No preamble, no code fences.";
 
 const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");

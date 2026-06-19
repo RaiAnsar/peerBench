@@ -21,14 +21,8 @@ const DEFAULTS = {
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
 export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "glm"];
 export function sharedRoot() {
-  if (process.env.BENCH_ROOT) return process.env.BENCH_ROOT;
-  const base = path.join(os.homedir(), ".claude", "plugins", "data");
-  const here = path.join(base, "bench-shared");
-  // Legacy installs kept state under the old name — fall back so keys/traces are never lost
-  // if the data dir hasn't been migrated yet (renamed from grok-companion → peerbench).
-  const legacy = path.join(base, "grok-companion-shared");
-  try { if (!fs.existsSync(here) && fs.existsSync(legacy)) return legacy; } catch { /* default below */ }
-  return here;
+  return process.env.BENCH_ROOT
+    || path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
 }
 export function workspaceStateDir(ws) {
   let canonical = ws; try { canonical = fs.realpathSync.native(ws); } catch { canonical = ws; }
