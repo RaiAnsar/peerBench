@@ -40,6 +40,25 @@ export function setReviewers(list, { root = sharedRoot() } = {}) {
   fs.renameSync(tmp, file);
   return reviewers;
 }
+const GLOBAL_DISABLE = (root) => path.join(root || sharedRoot(), "disabled-global");
+const WS_DISABLE = (ws) => path.join(workspaceStateDir(ws), "disabled");
+
+// Disabled if the global marker exists OR this workspace's marker exists.
+export function isGangDisabled(ws, { root } = {}) {
+  try { if (fs.existsSync(GLOBAL_DISABLE(root))) return true; } catch { /* noop */ }
+  try { if (ws && fs.existsSync(WS_DISABLE(ws))) return true; } catch { /* noop */ }
+  return false;
+}
+
+// scope: "global" writes/removes the global marker; otherwise the workspace marker.
+export function setGangDisabled(ws, disabled, { scope = "workspace", root } = {}) {
+  const file = scope === "global" ? GLOBAL_DISABLE(root) : WS_DISABLE(ws);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (disabled) fs.writeFileSync(file, `disabled ${scope}\n`);
+  else { try { fs.rmSync(file); } catch { /* already gone */ } }
+  return { scope, disabled, file };
+}
+
 export function resolveConfig({ env = process.env, reviewers: reviewersOverride } = {}) {
   const file = readFileConfig();
   const providers = {};

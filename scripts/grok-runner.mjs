@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runGrok } from "./lib/grok-exec.mjs";
 import { appendJob, loadState, resolveStateDir, saveState } from "./lib/grok-state.mjs";
-import { resolveConfig, setReviewers } from "../global-hooks/config-store.mjs";
+import { resolveConfig, setReviewers, isGangDisabled, setGangDisabled } from "../global-hooks/config-store.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser } from "../global-hooks/hunt.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 
@@ -213,6 +213,13 @@ async function main() {
     return;
   }
 
+  if (sub === "off" || sub === "on") {
+    const ws = workspaceRoot(cwd);
+    const output = gateToggleCommand(ws, [sub, ...rest]);
+    process.stdout.write(`${output}\n`);
+    return;
+  }
+
   if (sub === "reviewers") {
     return reviewersCommand(rest);
   }
@@ -225,7 +232,7 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers|hunt`);
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected task|review|status|setup|panel|reviewers|hunt|off|on`);
 }
 
 export async function huntCommand(cwd, seed, { huntImpl = huntPanel } = {}) {
@@ -244,6 +251,17 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel } = {}) {
     `═══ ${r.name} ═══\n${r.findings?.trim() || `(no findings — ${r.error || "empty"})`}`);
   const header = seed?.trim() ? `Bug hunt — focus: ${seed.trim()}` : "Bug hunt — broad sweep";
   return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /gang:status ${traceId})` : ""}`;
+}
+
+export function gateToggleCommand(ws, args) {
+  const sub = args[0]; // "off" or "on"
+  const hasGlobal = args.slice(1).includes("--global");
+  const scope = hasGlobal ? "global" : "workspace";
+  const disabled = sub === "off";
+  setGangDisabled(ws, disabled, { scope });
+  return disabled
+    ? `gang: disabled (${scope}). Gates will no-op until /gang:on.`
+    : `gang: enabled (${scope}).`;
 }
 
 export function reviewersCommand(args) {

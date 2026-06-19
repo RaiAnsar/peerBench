@@ -4,6 +4,7 @@
 // when ALL reviewers error.
 import fs from "node:fs";
 import { combinePanel } from "./panel-lib.mjs";
+import { isGangDisabled } from "./config-store.mjs";
 import { resolveReviewers } from "./reviewers.mjs";
 import { writeTrace } from "./trace-store.mjs";
 
@@ -44,6 +45,7 @@ async function main() {
   }
 
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  if (isGangDisabled(cwd)) process.exit(0);   // gang layer disabled for this workspace
   const { system, user } = buildPrompt(plan);
 
   const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user, cwd })));
