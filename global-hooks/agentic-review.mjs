@@ -8,6 +8,7 @@ const TOOL_RESULT_CAP = 50_000;
 export async function agenticReview({
   baseURL, apiKey, model, system, user,
   temperature = 0, headers = {}, tools,
+  mode = "verdict",
   maxSteps = DEFAULT_MAX_STEPS, timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl
 }) {
   if (!apiKey) return { ok: false, error: { kind: "nokey", detail: "no api key" } };
@@ -63,8 +64,11 @@ export async function agenticReview({
         continue;
       }
 
-      // No tool calls → the model should have given a verdict.
+      // No tool calls → check mode before verdict logic.
       const content = msg.content ?? "";
+      if (mode === "report") {
+        return { ok: true, report: content, steps: step + 1, filesRead, usage: json.usage ?? null };
+      }
       const v = extractVerdict(content);
       if (v) {
         return { ok: true, verdict: v.verdict, firstLine: v.firstLine, raw: content, steps: step + 1, filesRead, usage: json.usage ?? null };

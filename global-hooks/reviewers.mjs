@@ -10,9 +10,9 @@ const NAMES = { kimi: "Kimi", mimo: "MiMo" };
 const STRICT = "\n\nIMPORTANT: respond with ONLY a first line of `ALLOW: <reason>` or `BLOCK: <reason>`. No preamble, no code fences.";
 
 const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");
-const CODEX_DATA = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex");
+export const CODEX_DATA = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex");
 
-function latestCodexRoot() {
+export function latestCodexRoot() {
   let entries; try { entries = fs.readdirSync(PLUGIN_CACHE).filter((d) => /^\d+\.\d+\.\d+/.test(d)); } catch { return null; }
   entries.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const latest = entries.at(-1);

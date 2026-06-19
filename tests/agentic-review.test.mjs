@@ -56,3 +56,11 @@ test("no api key → nokey", async () => {
   const res = await agenticReview({ ...baseArgs, apiKey: "", tools: { schemas: SCHEMAS, execute: async () => "x" } });
   assert.equal(res.ok, false); assert.equal(res.error.kind, "nokey");
 });
+test("report mode returns final content as report (no verdict needed)", async () => {
+  const tools = { schemas: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: {}, } } }], execute: async () => "x" };
+  const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, mode: "report", tools,
+    fetchImpl: (() => { let i = 0; return async () => { const seq = [
+      { json: { choices: [{ message: { tool_calls: [{ id: "1", function: { name: "read_file", arguments: "{}" } }] } }] } },
+      { json: { choices: [{ message: { content: "Findings:\n1. bug at a.js:5" } }] } } ]; return { ok: true, status: 200, json: async () => seq[Math.min(i++, seq.length - 1)].json }; }; })() });
+  assert.equal(res.ok, true); assert.match(res.report, /a\.js:5/);
+});
