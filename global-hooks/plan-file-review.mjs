@@ -12,6 +12,12 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isGangDisabled } from "./config-store.mjs";
 import { resolveReviewers } from "./reviewers.mjs";
 import { writeTrace } from "./trace-store.mjs";
+import { execFileSync } from "node:child_process";
+
+function workspaceRoot(cwd) {
+  try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
+  catch { return cwd; }
+}
 
 const MAX_PLAN_BYTES = 64 * 1024;
 const PLAN_PATH_RE = /\/(plans|specs)\/[^/]*\.md$/i;
@@ -58,6 +64,10 @@ async function main() {
   if (!content.trim()) {
     return;
   }
+
+  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const ws = workspaceRoot(cwd);              // git top-level — matches /gang:off marker + the other gates
+  if (isGangDisabled(ws)) process.exit(0);    // gang layer disabled — no-op before any lock/review
 
   const locksRoot = path.join(os.tmpdir(), "plan-gate-locks");
   // Context-complete approval key: identical plan text must NOT skip review
@@ -113,17 +123,15 @@ async function main() {
     }
   }
 
-  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  if (isGangDisabled(cwd)) process.exit(0);   // gang layer disabled for this workspace
   const { system, user } = buildPrompt(filePath, content);
 
-  const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user, cwd })));
+  const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user, cwd: ws })));
   const panel = combinePanel(results);
 
   try {
-    writeTrace(cwd, {
+    writeTrace(ws, {
       gate: "plan-file",
-      ws: cwd,
+      ws,
       reviewers: results.map(({ raw, ...m }) => m),
       systemPrompt: system,
       userPrompt: user,

@@ -7,6 +7,12 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isGangDisabled } from "./config-store.mjs";
 import { resolveReviewers } from "./reviewers.mjs";
 import { writeTrace } from "./trace-store.mjs";
+import { execFileSync } from "node:child_process";
+
+function workspaceRoot(cwd) {
+  try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
+  catch { return cwd; }
+}
 
 function emit(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -45,16 +51,17 @@ async function main() {
   }
 
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  if (isGangDisabled(cwd)) process.exit(0);   // gang layer disabled for this workspace
+  const ws = workspaceRoot(cwd);              // git top-level — matches where /gang:off writes the marker + the stop/push gates
+  if (isGangDisabled(ws)) process.exit(0);    // gang layer disabled for this workspace
   const { system, user } = buildPrompt(plan);
 
-  const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user, cwd })));
+  const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user, cwd: ws })));
   const panel = combinePanel(results);
 
   try {
-    writeTrace(cwd, {
+    writeTrace(ws, {
       gate: "plan",
-      ws: cwd,
+      ws,
       reviewers: results.map(({ raw, ...m }) => m),
       systemPrompt: system,
       userPrompt: user,
