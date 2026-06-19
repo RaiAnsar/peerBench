@@ -118,3 +118,31 @@ test("syncSettings does not remove a pre-existing unrelated Stop hook", () => {
   assert.ok(allStopCmds.some((c) => c.includes("codex-multirepo-gate.mjs")), "unrelated Stop hook must be preserved");
   assert.ok(allStopCmds.some((c) => c.includes("stop-review.mjs")), "stop-review must also be registered");
 });
+
+test("syncSettings DE-DUPES pre-existing stop/pre-push entries across path forms ($HOME vs absolute)", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-dedup-"));
+  const settingsPath = path.join(hooks, "settings.json");
+  // Real-world bug: an existing $HOME-form entry + a duplicate absolute-form entry for the same hook.
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: {
+    Stop: [
+      { hooks: [
+        { type: "command", command: 'node "/x/.claude/hooks/codex-multirepo-gate.mjs"' },
+        { type: "command", command: 'node "$HOME/.claude/hooks/stop-review.mjs"' }
+      ] },
+      { hooks: [{ type: "command", command: 'node "/abs/.claude/hooks/stop-review.mjs"' }] }
+    ],
+    PreToolUse: [
+      { matcher: "Bash", hooks: [{ type: "command", command: 'node "$HOME/.claude/hooks/pre-push-review.mjs"' }] },
+      { matcher: "Bash", hooks: [{ type: "command", command: 'node "/abs/.claude/hooks/pre-push-review.mjs"' }] }
+    ]
+  } }, null, 2));
+  syncSettings({ hooksDir: hooks, settingsPath });
+  const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  const stop = s.hooks.Stop.flatMap((b) => b.hooks || []);
+  const push = s.hooks.PreToolUse.flatMap((b) => b.hooks || []);
+  assert.equal(stop.filter((h) => h.command.includes("stop-review.mjs")).length, 1, "stop-review collapses to exactly one");
+  assert.equal(push.filter((h) => h.command.includes("pre-push-review.mjs")).length, 1, "pre-push-review collapses to exactly one");
+  assert.ok(stop.some((h) => h.command.includes("codex-multirepo-gate.mjs")), "unrelated Stop hook preserved");
+  const stopCmd = stop.find((h) => h.command.includes("stop-review.mjs")).command;
+  assert.ok(stopCmd.includes(path.join(hooks, "stop-review.mjs")) && !stopCmd.includes("$HOME"), "canonical entry uses the absolute deploy path");
+});
