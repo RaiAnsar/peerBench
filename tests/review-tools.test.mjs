@@ -54,3 +54,26 @@ test("schemas are well-formed OpenAI tool defs", () => {
   assert.equal(schemas.length, 4);
   for (const s of schemas) { assert.equal(s.type, "function"); assert.ok(s.function.name); assert.equal(s.function.parameters.type, "object"); }
 });
+test("read_file: >2MB file without offset/limit returns 'too large' message", async () => {
+  const d = tmpRepo();
+  // Write a file just over 2MB
+  const bigPath = path.join(d, "big.bin");
+  fs.writeFileSync(bigPath, Buffer.alloc(2_000_001, 0x61)); // 2MB+1 bytes of 'a'
+  execFileSync("git", ["add", "big.bin"], { cwd: d });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "big"], { cwd: d });
+  const { execute } = createReviewTools(d);
+  const out = await execute("read_file", { path: "big.bin" });
+  assert.match(out, /too large/);
+  assert.match(out, /2000001 bytes/);
+});
+test("read_file: >2MB file with limit still reads", async () => {
+  const d = tmpRepo();
+  const bigPath = path.join(d, "big2.bin");
+  fs.writeFileSync(bigPath, "line1\n".repeat(500_000)); // ~3MB of text
+  execFileSync("git", ["add", "big2.bin"], { cwd: d });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "big2"], { cwd: d });
+  const { execute } = createReviewTools(d);
+  const out = await execute("read_file", { path: "big2.bin", limit: 5 });
+  assert.match(out, /line1/);
+  assert.doesNotMatch(out, /too large/);
+});

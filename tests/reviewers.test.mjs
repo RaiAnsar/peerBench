@@ -5,9 +5,14 @@ process.env.GROK_COMPANION_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root
 import { extractVerdict, resolveReviewers } from "../global-hooks/reviewers.mjs";
 
 test("extractVerdict skips filler + code fences to find the verdict line", () => {
-  assert.equal(extractVerdict("Sure!\n```\nALLOW: looks fine\n```").verdict, "ALLOW");
+  // ALLOW inside a fence is ignored (Fix 2); must find verdict outside
+  assert.equal(extractVerdict("Sure!\n```\nALLOW: looks fine\n```"), null);
   assert.equal(extractVerdict("BLOCK: bad\n- reason").verdict, "BLOCK");
   assert.equal(extractVerdict("no verdict here"), null);
+});
+test("extractVerdict ignores ALLOW:/BLOCK: inside fenced code blocks", () => {
+  const result = extractVerdict("```\nALLOW: not real\n```\nBLOCK: the real one");
+  assert.equal(result?.verdict, "BLOCK");
 });
 test("run retries once on non-conforming output then succeeds", async () => {
   const calls = [];
@@ -37,4 +42,15 @@ test("kimi adapter run still accepts the extended params and ignores cwd/env", a
   const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: true, text: "ALLOW: ok" }) });
   const res = await kimi.run({ system: "s", user: "u", cwd: "/tmp", env: {} });
   assert.equal(res.verdict, "ALLOW");
+});
+test("retry call failure surfaces the retry error, not 'unparseable verdict'", async () => {
+  let calls = 0;
+  const reviewImpl = async () => {
+    calls++;
+    if (calls === 1) return { ok: true, text: "I think it is fine", usage: null };
+    return { ok: false, error: { kind: "timeout", detail: "slow" } };
+  };
+  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl });
+  const res = await kimi.run({ system: "s", user: "u" });
+  assert.match(res.error, /timeout/);
 });

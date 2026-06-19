@@ -7,9 +7,10 @@ import os from "node:os";
 import path from "node:path";
 const DEFAULTS = {
   kimi: { baseURL: "https://api.kimi.com/coding/v1", model: "kimi-for-coding", keyEnv: "KIMI_API_KEY",
-          temperature: 1, headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" } },
+          temperature: 1, headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
+          timeoutMs: 300_000 },  // 5 min — kimi-for-coding thinking is slow on large inputs
   mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
-          temperature: 0, headers: {} }
+          temperature: 0, headers: {}, timeoutMs: 180_000 }  // 3 min
 };
 const DEFAULT_REVIEWERS = ["kimi", "mimo"];
 export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "grok"];
@@ -47,7 +48,8 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
       model: env[`${name.toUpperCase()}_MODEL`] || f.model || d.model,
       apiKey: env[d.keyEnv] || f.apiKey || "",
       temperature: typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0),
-      headers: { ...(d.headers || {}), ...(f.headers || {}) }
+      headers: { ...(d.headers || {}), ...(f.headers || {}) },
+      timeoutMs: typeof f.timeoutMs === "number" ? f.timeoutMs : (d.timeoutMs ?? 90_000)
     };
   }
   // If an explicit override is provided (non-empty array), use it; otherwise fall back to file/default.

@@ -41,3 +41,14 @@ test("sends provided temperature and merges extra headers", async () => {
   assert.equal(cap.headers["User-Agent"], "claude-cli/1.0.83 (external, cli)");
   assert.equal(cap.headers.Authorization, "Bearer k");
 });
+test("reserved headers (Authorization, Content-Type) in provider headers are stripped; additive headers kept", async () => {
+  const cap = {};
+  await review({
+    baseURL: "https://x/v1", apiKey: "real-key", model: "m", system: "s", user: "u", timeoutMs: 5000,
+    headers: { Authorization: "Bearer EVIL", "Content-Type": "text/plain", "User-Agent": "x" },
+    fetchImpl: (url, opts) => { cap.headers = opts.headers; return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); }
+  });
+  assert.equal(cap.headers.Authorization, "Bearer real-key");
+  assert.equal(cap.headers["Content-Type"], "application/json");
+  assert.equal(cap.headers["User-Agent"], "x");
+});

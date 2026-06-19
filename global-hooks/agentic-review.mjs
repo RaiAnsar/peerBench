@@ -15,6 +15,7 @@ export async function agenticReview({
     return { ok: false, error: { kind: "config", detail: "tools {schemas, execute} required" } };
   }
   const doFetch = fetchImpl || globalThis.fetch;
+  const safeHeaders = Object.fromEntries(Object.entries(headers || {}).filter(([k]) => !["authorization", "content-type"].includes(k.toLowerCase())));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const messages = [{ role: "system", content: system }, { role: "user", content: user }];
@@ -27,7 +28,7 @@ export async function agenticReview({
       try {
         resp = await doFetch(`${baseURL}/chat/completions`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...headers },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
           body: JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: "auto", temperature, stream: false }),
           signal: controller.signal
         });
@@ -45,7 +46,7 @@ export async function agenticReview({
 
       const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       if (toolCalls.length > 0) {
-        messages.push({ role: "assistant", content: msg.content ?? "", tool_calls: toolCalls });
+        messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: toolCalls });
         for (const tc of toolCalls) {
           const name = tc.function?.name;
           let args = {};

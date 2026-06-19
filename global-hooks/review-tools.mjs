@@ -27,6 +27,10 @@ export function createReviewTools(cwd, { execImpl = spawnSync } = {}) {
   const tools = {
     read_file({ path: p, offset, limit }) {
       const abs = safePath(cwd, p);
+      if (!Number.isInteger(offset) && !Number.isInteger(limit)) {
+        const size = fs.statSync(abs).size;
+        if (size > 2_000_000) return `[file too large to read: ${size} bytes; use grep or read with offset/limit]`;
+      }
       let text = fs.readFileSync(abs, "utf8");
       if (Number.isInteger(offset) || Number.isInteger(limit)) {
         const lines = text.split(/\r?\n/);

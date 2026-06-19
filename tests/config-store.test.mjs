@@ -51,3 +51,8 @@ test("setReviewers throws on all-invalid", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj2-"));
   assert.throws(() => setReviewers(["bogus"], { root }));
 });
+test("resolveConfig includes per-provider timeoutMs defaults (kimi=300000, mimo=180000)", () => {
+  const cfg = resolveConfig({ env: { KIMI_API_KEY: "k" } });
+  assert.equal(cfg.providers.kimi.timeoutMs, 300_000);
+  assert.equal(cfg.providers.mimo.timeoutMs, 180_000);
+});

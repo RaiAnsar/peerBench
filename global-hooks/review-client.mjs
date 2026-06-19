@@ -7,12 +7,11 @@ export async function review({ baseURL, apiKey, model, system, user, timeoutMs =
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let resp;
+  const safeHeaders = Object.fromEntries(Object.entries(headers || {}).filter(([k]) => !["authorization", "content-type"].includes(k.toLowerCase())));
   try {
     resp = await doFetch(`${baseURL}/chat/completions`, {
       method: "POST",
-      // NOTE: provider `headers` spread last and so could override Content-Type/Authorization —
-      // callers must only use it for additive headers (e.g. User-Agent), never auth.
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...headers },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
       body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature, stream: false }),
       signal: controller.signal
     });
