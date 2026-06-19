@@ -235,7 +235,7 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel } = {}) {
   try {
     traceId = writeTrace(cwd, {
       gate: "hunt", ws: cwd,
-      reviewers: results.map((r) => ({ name: r.name, model: r.model, error: r.error || null })),
+      reviewers: results.map((r) => ({ name: r.name, model: r.model, error: r.error || null, diag: r.diag || null })),
       systemPrompt: HUNT_SYSTEM, userPrompt: buildHuntUser(seed),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
     });

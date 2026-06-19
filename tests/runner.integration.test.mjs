@@ -130,3 +130,17 @@ test("huntCommand formats findings per reviewer and records a trace", async () =
   assert.match(out, /═══ Codex ═══/); assert.match(out, /a\.ts:10/);
   assert.match(out, /═══ MiMo ═══/); assert.match(out, /no findings — timeout/);
 });
+test("huntCommand persists per-reviewer diag to the trace (for future debugging)", async () => {
+  const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hcd-"));
+  const huntImpl = async () => ([
+    { name: "Kimi", findings: "x", model: "kimi-for-coding", diag: { steps: 3, filesRead: ["a.ts"], toolBytes: 1234, lastReqBytes: 9000 } },
+    { name: "MiMo", findings: "", error: "network: fetch failed", diag: { steps: 5, filesRead: [], toolBytes: 250000, lastReqBytes: 300000 } }
+  ]);
+  await huntCommand(ws, "x", { huntImpl });
+  const [latest] = listTraces(ws, 1);
+  const t = readTrace(ws, latest.id);
+  const kimi = t.reviewers.find((r) => r.name === "Kimi");
+  assert.equal(kimi.diag.steps, 3); assert.equal(kimi.diag.toolBytes, 1234);
+  assert.equal(t.reviewers.find((r) => r.name === "MiMo").diag.lastReqBytes, 300000);
+});
