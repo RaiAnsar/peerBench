@@ -31,18 +31,26 @@ export function snapshot({ hooksDir, settingsPath, backupDir }) {
 }
 
 const LEGACY = ["codex-plan-review.mjs", "codex-plan-file-review.mjs"];
-function ensure(list, matcher, absCmd) {
-  const has = list.some((e) => e.matcher === matcher && (e.hooks || []).some((h) => String(h.command).includes(absCmd)));
-  if (!has) list.push({ matcher, hooks: [{ type: "command", command: `node "${absCmd}"` }] });
-}
-// Idempotent Stop hook registration — adds our hook to the first block (or a new block)
-// without disturbing any other existing Stop hooks (e.g. a codex multi-repo gate).
-function ensureStop(list, absCmd, extra) {
-  const has = list.some((b) => (b.hooks || []).some((h) => String(h.command).includes(absCmd)));
-  if (has) return;
-  // Add to the first block's hooks if present (alongside e.g. codex-multirepo-gate), else a new block
-  const block = list[0] && Array.isArray(list[0].hooks) ? list[0] : (list.push({ hooks: [] }), list[list.length - 1]);
-  block.hooks.push({ type: "command", command: `node "${absCmd}"`, ...extra });
+// Register our hook canonically AND de-dupe: remove any existing entries referencing this hook
+// FILE (matched by basename, so it catches ANY path form — $HOME, absolute, different quoting),
+// then add exactly one absolute-path entry. Idempotent + self-healing against duplicates.
+// matcher === undefined → Stop-style (no matcher): scan all blocks, add to the first (keeping
+// other Stop hooks like a codex multi-repo gate intact).
+function register(list, matcher, absCmd, extra = {}) {
+  const base = path.basename(absCmd);
+  for (const b of list) {
+    if (!Array.isArray(b.hooks)) continue;
+    if (matcher !== undefined && b.matcher !== matcher) continue;   // matcher-scoped: only same-matcher blocks
+    b.hooks = b.hooks.filter((h) => !String(h.command || "").includes(base));
+  }
+  const cmd = { type: "command", command: `node "${absCmd}"`, ...extra };
+  if (matcher !== undefined) {
+    const block = list.find((b) => b.matcher === matcher);
+    if (block) { block.hooks = block.hooks || []; block.hooks.push(cmd); } else list.push({ matcher, hooks: [cmd] });
+  } else {
+    const block = list.find((b) => Array.isArray(b.hooks));
+    if (block) { block.hooks = block.hooks || []; block.hooks.push(cmd); } else list.push({ hooks: [cmd] });
+  }
 }
 // Remove ONLY the matching legacy hook COMMANDS (not whole entries unless they become empty); register the new plan-*.mjs with ABSOLUTE paths.
 export function syncSettings({ hooksDir, settingsPath }) {
@@ -64,14 +72,18 @@ export function syncSettings({ hooksDir, settingsPath }) {
   s.hooks.PreToolUse = s.hooks.PreToolUse || [];
   s.hooks.PostToolUse = s.hooks.PostToolUse || [];
   s.hooks.Stop = s.hooks.Stop || [];
-  ensure(s.hooks.PreToolUse, "ExitPlanMode", path.join(hooksDir, "plan-review.mjs"));   // ABSOLUTE homedir path (no ~)
-  ensure(s.hooks.PostToolUse, "Write|Edit", path.join(hooksDir, "plan-file-review.mjs"));
-  ensure(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"));
-  ensureStop(s.hooks.Stop, path.join(hooksDir, "stop-review.mjs"), {
+  register(s.hooks.PreToolUse, "ExitPlanMode", path.join(hooksDir, "plan-review.mjs"));   // ABSOLUTE homedir path (no ~)
+  register(s.hooks.PostToolUse, "Write|Edit", path.join(hooksDir, "plan-file-review.mjs"));
+  register(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"));
+  register(s.hooks.Stop, undefined, path.join(hooksDir, "stop-review.mjs"), {
     timeout: 300, asyncRewake: true,
     rewakeMessage: "⛩ gang stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
     rewakeSummary: "⛩ gang stop"
   });
+  // Drop any blocks left empty by de-duping.
+  for (const ev of ["PreToolUse", "PostToolUse", "Stop"]) {
+    s.hooks[ev] = (s.hooks[ev] || []).filter((b) => !Array.isArray(b.hooks) || b.hooks.length > 0);
+  }
   fs.writeFileSync(settingsPath, `${JSON.stringify(s, null, 2)}\n`);
   return { removedFiles, removedEntries };
 }
