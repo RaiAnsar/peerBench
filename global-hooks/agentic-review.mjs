@@ -43,9 +43,10 @@ export async function agenticReview({
         });
       } catch (e) {
         const kind = e?.name === "AbortError" ? "timeout" : "network";
-        dlog(`step ${step}: FETCH ${kind.toUpperCase()} after ${Date.now() - t0}ms reqKB=${(lastReqBytes / 1024) | 0}: ${e?.message}`);
-        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${e?.message}` });
-        return { ok: false, error: { kind, detail: String(e?.message || e).slice(0, 300) }, diag: diag() };
+        const cause = e?.cause ? ` cause=${e.cause.code || e.cause.message || String(e.cause).slice(0, 80)}` : "";
+        dlog(`step ${step}: FETCH ${kind.toUpperCase()} after ${Date.now() - t0}ms reqKB=${(lastReqBytes / 1024) | 0}: ${e?.message}${cause}`);
+        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${e?.message}${cause}` });
+        return { ok: false, error: { kind, detail: `${String(e?.message || e).slice(0, 200)}${cause}` }, diag: diag() };
       }
       if (!resp.ok) {
         const b = await resp.text().catch(() => "");
