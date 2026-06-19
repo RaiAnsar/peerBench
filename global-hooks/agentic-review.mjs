@@ -48,7 +48,7 @@ const DEFAULT_MAX_STEPS = 24;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_NUDGES = 2;
 const TOOL_RESULT_CAP = 50_000;
-const CONCLUDE_BUDGET = 150_000;   // tool-output bytes after which we force the model to stop reading and conclude (kimi over-explores)
+const CONCLUDE_BUDGET = 120_000;   // tool-output bytes after which we force conclusion (kimi over-explores big repos) — conclude round drops the tools array entirely
 const MAX_NET_RETRIES = 2;         // retry transient "fetch failed" (connection drops) — NOT genuine timeouts
 const RETRY_BACKOFF_MS = 750;
 const DEFAULT_ROUND_MS = 90_000;   // per-EXPLORATION-round cap: one runaway thinking round can't eat the whole budget
@@ -87,7 +87,12 @@ export async function agenticReview({
           ? "You have gathered enough context. Do NOT call any more tools — write your final findings now, each with file:line."
           : "You have gathered enough context. Do NOT call any more tools — give your verdict now: the first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`." });
       }
-      const body = JSON.stringify({ model, messages, tools: tools.schemas, tool_choice: force ? "none" : "auto", temperature, stream: true, ...(thinking ? { thinking: { type: thinking } } : {}) });
+      // On conclude (force): OMIT the tools array entirely — a model can't call tools that aren't
+      // offered, so it MUST produce content. (tool_choice:"none" alone is ignored by some models,
+      // e.g. kimi-k2.6, which then reads until maxSteps and drops out with "no verdict".)
+      const body = JSON.stringify({ model, messages, temperature, stream: true,
+        ...(force ? {} : { tools: tools.schemas, tool_choice: "auto" }),
+        ...(thinking ? { thinking: { type: thinking } } : {}) });
       lastReqBytes = body.length;
       dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);
       const t0 = Date.now();
