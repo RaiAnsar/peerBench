@@ -15,6 +15,10 @@ test("errored reviewer → !", () => {
   const s = renderSegment({ gate: "plan", reviewers: [{ name: "Kimi", error: "timeout" }, { name: "MiMo", verdict: "ALLOW" }] });
   assert.match(s, /Kimi!/);
 });
+test("hunt trace: findings (no verdict, no error) → ✓; errored → !", () => {
+  const s = renderSegment({ gate: "hunt", reviewers: [{ name: "Codex" }, { name: "Kimi" }, { name: "MiMo", error: "timeout" }] });
+  assert.match(s, /⛩ hunt:/); assert.match(s, /Codex✓/); assert.match(s, /Kimi✓/); assert.match(s, /MiMo!/);
+});
 test("plan-file shortens to plan; pre-push to push", () => {
   assert.match(renderSegment({ gate: "plan-file", reviewers: [{ name: "Kimi", verdict: "ALLOW" }] }), /⛩ plan:/);
   assert.match(renderSegment({ gate: "pre-push", reviewers: [{ name: "Kimi", verdict: "ALLOW" }] }), /⛩ push:/);

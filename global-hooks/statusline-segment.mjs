@@ -7,7 +7,9 @@ const C = { ALLOW: 48, BLOCK: 196, error: 208 };           // 256-color codes (m
 const col = (code, s) => `\x1b[38;5;${code}m${s}\x1b[0m`;
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
 const GATE_LABEL = { "plan-file": "plan", "pre-push": "push" };  // shorten; others pass through
-const glyph = (r) => (r.verdict === "ALLOW" ? "✓" : r.verdict === "BLOCK" ? "✗" : "!");
+// ✗ block; ! errored/skipped; ✓ allow OR hunt-success (findings: no verdict, no error)
+const glyph = (r) => (r.verdict === "BLOCK" ? "✗" : (r.error && r.verdict !== "ALLOW") ? "!" : "✓");
+const rColor = (r) => (r.verdict === "BLOCK" ? C.BLOCK : (r.error && r.verdict !== "ALLOW") ? C.error : C.ALLOW);
 const STALE_MS = 45 * 60 * 1000;  // a verdict older than this is past, not current → dim it
 
 // Pure: render one trace as the format-C segment. Returns "" if nothing to show.
@@ -20,10 +22,9 @@ export function renderSegment(trace, { now = Date.now() } = {}) {
     return dim(`⛩ ${gate}: ${trace.reviewers.map((r) => `${r.name}${glyph(r)}`).join(" ")} (idle)`);
   }
   const anyBlock = trace.reviewers.some((r) => r.verdict === "BLOCK");
-  const allAllow = trace.reviewers.every((r) => r.verdict === "ALLOW");
-  const labelColor = anyBlock ? C.BLOCK : (allAllow ? C.ALLOW : C.error);
-  const parts = trace.reviewers.map((r) =>
-    col(r.verdict === "ALLOW" ? C.ALLOW : r.verdict === "BLOCK" ? C.BLOCK : C.error, `${r.name}${glyph(r)}`));
+  const anyErr = trace.reviewers.some((r) => r.error && r.verdict !== "ALLOW" && r.verdict !== "BLOCK");
+  const labelColor = anyBlock ? C.BLOCK : anyErr ? C.error : C.ALLOW;
+  const parts = trace.reviewers.map((r) => col(rColor(r), `${r.name}${glyph(r)}`));
   return `${col(labelColor, `⛩ ${gate}:`)} ${parts.join(" ")}`;
 }
 
