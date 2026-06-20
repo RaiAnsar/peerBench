@@ -19,7 +19,8 @@ function readInput() {
   try {
     const raw = fs.readFileSync(0, "utf8").trim();
     return raw ? JSON.parse(raw) : {};
-  } catch {
+  } catch (e) {
+    process.stderr.write(`⛩ bench stop: could not parse hook input (${e instanceof Error ? e.message : String(e)}); treating as empty.\n`);
     return {};
   }
 }
@@ -44,7 +45,7 @@ function emit(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
 }
 
-export function buildPrompt(status, diff, untracked, lastMsg) {
+export function buildPrompt(status, diff, untracked, lastMsg, staged = "") {
   const system =
     "You are reviewing the code changes from a Claude turn. Review based ONLY on the content " +
     "provided in this message. Do NOT use any tools or explore the filesystem. " +
@@ -63,6 +64,10 @@ export function buildPrompt(status, diff, untracked, lastMsg) {
     "<git_diff>",
     diff,
     "</git_diff>",
+    "",
+    "<staged_diff>",
+    staged,
+    "</staged_diff>",
     "",
     "<untracked_files>",
     untracked,
@@ -103,15 +108,20 @@ export async function runMain({
 
   const status = git(["status", "--short", "--untracked-files=all"], ws);
   const diff = git(["diff", "HEAD"], ws).slice(0, MAX_DIFF_BYTES);
+  // Staged-diff FALLBACK only: on an unborn HEAD (fresh repo, no commits) `git diff HEAD`
+  // is empty, so a staged-only change would be missed. Use `git diff --cached` only when
+  // `diff` is empty — appending it unconditionally would duplicate the staged hunk that
+  // `git diff HEAD` already shows in a normal repo.
+  const staged = diff.trim() ? "" : git(["diff", "--cached"], ws).slice(0, MAX_DIFF_BYTES);
   const untracked = untrackedBlock(ws);
 
-  if (!diff.trim() && !untracked.trim()) {
+  if (!diff.trim() && !staged.trim() && !untracked.trim()) {
     // No code changes this turn (status/report-only) — nothing to review.
     return;
   }
 
   const lastMsg = String(input.last_assistant_message ?? "").slice(0, 4000);
-  const { system, user } = buildPrompt(status, diff, untracked, lastMsg);
+  const { system, user } = buildPrompt(status, diff, untracked, lastMsg, staged);
 
   // (c) Codex reviews each turn via its OWN agentic gate (codex-plugin), where it scours files;
   // this content-only gate adds just the cheap reviewers. To make this the sole per-turn gate

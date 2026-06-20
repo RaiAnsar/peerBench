@@ -306,6 +306,117 @@ test("buildPrompt: system is content-only with ALLOW:/BLOCK: instruction", () =>
   assert.match(user, /did some work/);
 });
 
+// ---------------------------------------------------------------------------
+// Task 7 — E1: staged-only change in a fresh repo (no commits) is reviewed,
+// and a normal repo's staged hunk is NOT duplicated in the diff block.
+// ---------------------------------------------------------------------------
+
+/** Fresh repo with NO commits (unborn HEAD). Stage `staged.js`, no untracked. */
+function freshRepoNoCommits() {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "sr-unborn-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "staged.js"), "export const fresh = 1;\n");
+  execFileSync("git", ["add", "staged.js"], { cwd: ws });
+  return ws;
+}
+
+test("E1: fresh repo (no commits), staged-only change → reviewed with staged content", async () => {
+  const ws = freshRepoNoCommits();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-e1-"));
+  process.env.BENCH_ROOT = root;
+
+  let called = false;
+  let seenUser = "";
+  const resolveReviewersImpl = () => [{
+    name: "Kimi",
+    async run({ user }) {
+      called = true;
+      seenUser = user;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  }];
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, last_assistant_message: "staged a new file" }
+    });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(called, true, "reviewer must be called for a staged-only fresh-repo change");
+  assert.match(seenUser, /staged\.js|fresh = 1/, "reviewed content must include the staged change");
+});
+
+test("E1: normal repo with a staged modification → diff block does NOT duplicate the staged hunk", () => {
+  // Build a repo with a commit, then stage a modification. `git diff HEAD` already
+  // shows the staged change; we must NOT also append `git diff --cached` (would dup it).
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "sr-dup-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "f.js"), "export const a = 1;\n");
+  execFileSync("git", ["add", "f.js"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: ws });
+  // Stage a modification with a unique marker line.
+  fs.writeFileSync(path.join(ws, "f.js"), "export const a = 1;\nexport const UNIQUE_STAGED_MARKER = 2;\n");
+  execFileSync("git", ["add", "f.js"], { cwd: ws });
+
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "sr-dup-wrap-"));
+  const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sr-dup-root-"));
+  const wrapperScript = path.join(wrapperDir, "dup-wrapper.mjs");
+  fs.writeFileSync(wrapperScript, `
+import { runMain } from ${JSON.stringify(HOOK)};
+const fakeReviewer = {
+  name: "Kimi",
+  async run({ user }) {
+    process.stdout.write(JSON.stringify({ user }) + "\\n");
+    return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+  }
+};
+await runMain({
+  resolveReviewersImpl: () => [fakeReviewer],
+  writeTraceImpl: () => {},
+  isBenchDisabledImpl: () => false,
+  env: process.env,
+  input: { cwd: ${JSON.stringify(ws)}, last_assistant_message: "staged a mod" }
+});
+`);
+
+  const result = spawnSync(process.execPath, [wrapperScript], {
+    encoding: "utf8",
+    env: { ...process.env, BENCH_ROOT: wrapperRoot }
+  });
+
+  assert.equal(result.status, 0, `wrapper should exit 0; stderr: ${result.stderr}`);
+  const line = result.stdout.trim().split("\n").find((l) => l.includes("UNIQUE_STAGED_MARKER"));
+  assert.ok(line, `reviewed content should include the staged marker; got: ${result.stdout}`);
+  const { user } = JSON.parse(line);
+  const occurrences = user.split("UNIQUE_STAGED_MARKER").length - 1;
+  assert.equal(occurrences, 1, `staged hunk must appear exactly once (no duplication), saw ${occurrences}`);
+});
+
+// ---------------------------------------------------------------------------
+// Task 7 — E2: visible stderr note on malformed stdin (mirrors pre-push E2)
+// ---------------------------------------------------------------------------
+
+test("E2: malformed stdin → ⛩ stderr note (treated as empty)", () => {
+  // Run in a clean temp dir as cwd so the fallback (process.cwd()) has no diff.
+  const cleanWs = fs.mkdtempSync(path.join(os.tmpdir(), "sr-e2-cwd-"));
+  const result = spawnSync(process.execPath, [HOOK], {
+    input: "{not json",
+    encoding: "utf8",
+    cwd: cleanWs,
+    env: { ...process.env, BENCH_ROOT: TEMP_GCR }
+  });
+  assert.equal(result.status, 0, "malformed stdin must not crash (fail-open)");
+  assert.match(result.stderr, /⛩ bench stop: could not parse hook input/, "should emit a visible ⛩ note");
+});
+
 test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
   const { system, user } = buildPrompt("M changed.js", "diff --git ...", "new-file.js contents", "did some work");
   // "BLOCK only" instruction must be in system, NOT in user
