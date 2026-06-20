@@ -11,13 +11,14 @@
 // tokens off the front of the first non-flag element.
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers } from "../global-hooks/config-store.mjs";
 import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
-import { writeTrace } from "../global-hooks/trace-store.mjs";
+import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -128,15 +129,7 @@ async function main() {
 
   if (sub === "status") {
     const ws = workspaceRoot(cwd);
-    const { listTraces } = await import("../global-hooks/trace-store.mjs");
-    const traces = listTraces(ws, 10);
-    if (!traces.length) {
-      process.stdout.write("No bench review traces for this workspace.\n");
-      return;
-    }
-    for (const t of traces) {
-      process.stdout.write(`${t.ts || ""}  gate:${t.gate}  ${t.id}\n`);
-    }
+    statusCommand(ws, rest);
     return;
   }
 
@@ -147,12 +140,14 @@ async function main() {
     const kimiKey = !!process.env.KIMI_API_KEY;
     const mimoKey = !!process.env.MIMO_API_KEY;
     const disabled = isBenchDisabled(ws);
+    const settingsPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "settings.json");
     const lines = [
       `Active reviewers: ${cfg.reviewers.join(", ")}`,
       `KIMI_API_KEY: ${kimiKey ? "present" : "missing"}`,
       `MIMO_API_KEY: ${mimoKey ? "present" : "missing"}`,
       `Codex plugin: ${codexFound ? "found" : "not found"}`,
       `Bench disabled: ${disabled ? "yes" : "no"}`,
+      setupStatus(settingsPath),
       `Hint: /bench:reviewers to change reviewers | /bench:off to disable | /bench:on to re-enable`
     ];
     process.stdout.write(lines.join("\n") + "\n");
@@ -226,15 +221,25 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel, deep = fals
   return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /bench:${key} ${traceId})` : ""}`;
 }
 
-export function gateToggleCommand(ws, args) {
+export function gateToggleCommand(ws, args, { root } = {}) {
   const sub = args[0]; // "off" or "on"
   const hasGlobal = args.slice(1).includes("--global");
   const scope = hasGlobal ? "global" : "workspace";
   const disabled = sub === "off";
-  setBenchDisabled(ws, disabled, { scope });
-  return disabled
-    ? `bench: disabled (${scope}). Gates will no-op until /bench:on.`
-    : `bench: enabled (${scope}).`;
+  // ALWAYS act on the selected scope's marker first (never early-return before this).
+  setBenchDisabled(ws, disabled, { scope, root });
+  if (disabled) {
+    return `bench: disabled (${scope}). Gates will no-op until /bench:on.`;
+  }
+  // Re-enable: derive the message from a fresh read so we never claim "enabled"
+  // while the OTHER scope's marker is still disabling the gates.
+  const stillDisabled = isBenchDisabled(ws, { root });
+  if (!stillDisabled) return `bench: enabled (${scope}).`;
+  // The cleared scope didn't fully re-enable — name the remaining source honestly.
+  if (scope === "workspace") {
+    return `bench: workspace re-enabled, but STILL DISABLED GLOBALLY — run /bench:on --global to fully re-enable.`;
+  }
+  return `bench: global re-enabled, but STILL DISABLED in this WORKSPACE — run /bench:on to fully re-enable.`;
 }
 
 export function reviewersCommand(args) {
@@ -244,8 +249,89 @@ export function reviewersCommand(args) {
     process.stdout.write(`Current reviewers: ${current.join(", ")}\n`);
     return;
   }
-  const saved = setReviewers(names);
+  let saved;
+  try {
+    saved = setReviewers(names);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stdout.write(`Error: ${msg}\n`);
+    process.exitCode = 1;
+    return;
+  }
   process.stdout.write(`Reviewers set to: ${saved.join(", ")}\nTakes effect on the next gate run.\n`);
+}
+
+// The four gates, keyed by event + matcher + hook file (mirror deploy-global-hooks.mjs).
+// matcher === undefined means the Stop hook MUST live in a matcher-less block.
+const SETUP_GATES = [
+  { event: "PreToolUse", matcher: "ExitPlanMode", file: "plan-review.mjs" },
+  { event: "PostToolUse", matcher: "Write|Edit", file: "plan-file-review.mjs" },
+  { event: "PreToolUse", matcher: "Bash", file: "pre-push-review.mjs" },
+  { event: "Stop", matcher: undefined, file: "stop-review.mjs" }
+];
+
+// Inspect a settings.json and report each gate's registration honestly.
+// Unreadable/malformed/missing → "unable to check" + fail-open (no crash).
+export function setupStatus(settingsPath) {
+  let settings;
+  try {
+    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  } catch {
+    return `Gate registration: unable to check (${settingsPath} unreadable or malformed).`;
+  }
+  const hooks = (settings && settings.hooks) || {};
+  const lines = ["Gate registration (~/.claude/settings.json):"];
+  for (const g of SETUP_GATES) {
+    const blocks = Array.isArray(hooks[g.event]) ? hooks[g.event] : [];
+    const has = (block) =>
+      Array.isArray(block.hooks) &&
+      block.hooks.some((h) => String((h && h.command) || "").includes(g.file));
+    const correct = blocks.some((b) =>
+      has(b) && (g.matcher === undefined ? !b.matcher : b.matcher === g.matcher));
+    const elsewhere = blocks.some((b) => has(b));
+    const label = g.matcher === undefined ? `${g.event}(matcher-less)` : `${g.event}/${g.matcher}`;
+    let state;
+    if (correct) state = "registered";
+    else if (elsewhere) state = "MISREGISTERED (wrong matcher block)";
+    else state = "MISSING (not registered)";
+    lines.push(`  ${label} → ${g.file}: ${state}`);
+  }
+  return lines.join("\n");
+}
+
+// `/bench:status` — no id lists recent traces; `/bench:status <id>` expands one.
+export function statusCommand(ws, rest = []) {
+  const id = (rest || []).find((a) => a && !a.startsWith("-"));
+  if (id) {
+    const t = readTrace(ws, id);
+    if (!t) {
+      process.stdout.write(`Trace ${id} not found for this workspace.\n`);
+      return;
+    }
+    const lines = [`Trace ${t.id}  gate:${t.gate}  ${t.ts || ""}`, ""];
+    lines.push("Reviewers:");
+    for (const r of t.reviewers || []) {
+      const verdict = r.verdict || (r.error ? `err(${r.error})` : "?");
+      lines.push(`  ${r.name}${r.model ? ` (${r.model})` : ""}: ${verdict}`);
+    }
+    if (t.systemPrompt) lines.push("", "System prompt:", t.systemPrompt);
+    if (t.userPrompt) lines.push("", "User prompt:", t.userPrompt);
+    const responses = Object.entries(t.rawResponses || {});
+    if (responses.length) {
+      lines.push("", "Responses:");
+      for (const [name, body] of responses) lines.push(`═══ ${name} ═══`, body);
+    }
+    process.stdout.write(lines.join("\n") + "\n");
+    return;
+  }
+  const traces = listTraces(ws, 10);
+  if (!traces.length) {
+    process.stdout.write("No bench review traces for this workspace.\n");
+    return;
+  }
+  for (const t of traces) {
+    process.stdout.write(`${t.ts || ""}  gate:${t.gate}  ${t.id}\n`);
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

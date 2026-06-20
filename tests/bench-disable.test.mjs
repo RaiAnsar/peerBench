@@ -141,3 +141,46 @@ test("gateToggleCommand on --global: clears global disable", () => {
     else process.env.BENCH_ROOT = prev;
   }
 });
+
+// ── C1: /bench:on must not lie in either direction ───────────────────────────
+test("C1: off --global then plain on → still disabled globally (honest message)", () => {
+  const root = freshRoot();
+  const ws = freshWs();
+  setBenchDisabled(ws, true, { scope: "global", root });
+  assert.equal(isBenchDisabled(ws, { root }), true);
+  // A plain (workspace) `on` must NOT claim it's enabled while global still disables.
+  const out = gateToggleCommand(ws, ["on"], { root });
+  assert.equal(isBenchDisabled(ws, { root }), true, "global marker must remain");
+  assert.match(out, /still disabled globally/i);
+});
+
+test("C1: off then plain on → isBenchDisabled false (workspace re-enable unchanged)", () => {
+  const root = freshRoot();
+  const ws = freshWs();
+  setBenchDisabled(ws, true, { scope: "workspace", root });
+  assert.equal(isBenchDisabled(ws, { root }), true);
+  const out = gateToggleCommand(ws, ["on"], { root });
+  assert.equal(isBenchDisabled(ws, { root }), false);
+  assert.match(out, /enabled/i);
+});
+
+test("C1: off then off --global then on --global → message names remaining workspace disable", () => {
+  const root = freshRoot();
+  const ws = freshWs();
+  setBenchDisabled(ws, true, { scope: "workspace", root });
+  setBenchDisabled(ws, true, { scope: "global", root });
+  assert.equal(isBenchDisabled(ws, { root }), true);
+  // Clearing only the global marker leaves the workspace marker → still disabled.
+  const out = gateToggleCommand(ws, ["on", "--global"], { root });
+  assert.equal(isBenchDisabled(ws, { root }), true, "workspace marker must remain");
+  assert.match(out, /workspace/i);
+  assert.match(out, /still disabled|disabled/i);
+});
+
+test("C1: a workspace on never clears the global marker", () => {
+  const root = freshRoot();
+  const ws = freshWs();
+  setBenchDisabled(ws, true, { scope: "global", root });
+  gateToggleCommand(ws, ["on"], { root }); // workspace scope
+  assert.equal(isBenchDisabled(ws, { root }), true, "global marker untouched by workspace on");
+});
