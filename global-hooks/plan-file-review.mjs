@@ -20,7 +20,7 @@ function workspaceRoot(cwd) {
 }
 
 const MAX_PLAN_BYTES = 64 * 1024;
-const PLAN_PATH_RE = /\/(plans|specs)\/[^/]*\.md$/i;
+export const PLAN_PATH_RE = /(^|\/)(plans|specs)\/[^/]*\.md$/i;
 
 function emit(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -44,7 +44,8 @@ function readInput() {
   try {
     const raw = fs.readFileSync(0, "utf8").trim();
     if (raw) input = JSON.parse(raw);
-  } catch {
+  } catch (e) {
+    process.stderr.write(`⛩ plan-file-review: could not parse hook input (${e instanceof Error ? e.message : String(e)}); treating as empty.\n`);
     return {};
   }
   return input;
@@ -58,10 +59,16 @@ export async function runMain({
 } = {}) {
   const input = inputOverride ?? readInput();
 
-  const filePath = String(input.tool_input?.file_path ?? "");
-  if (!PLAN_PATH_RE.test(filePath)) {
+  const rawFilePath = String(input.tool_input?.file_path ?? "");
+  if (!PLAN_PATH_RE.test(rawFilePath)) {
     return;
   }
+
+  // Resolve a non-absolute file_path against the hook's workspace BEFORE
+  // stat/read and before computing the approval-key path context — a relative
+  // path is otherwise read against the hook process cwd and silently fails.
+  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const filePath = path.isAbsolute(rawFilePath) ? rawFilePath : path.resolve(cwd, rawFilePath);
 
   let content = "";
   let mtimeMs = 0;
@@ -75,7 +82,6 @@ export async function runMain({
     return;
   }
 
-  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);              // git top-level — matches /bench:off marker + the other gates
   if (isBenchDisabledImpl(ws)) return;         // bench layer disabled — no-op before any lock/review
 
