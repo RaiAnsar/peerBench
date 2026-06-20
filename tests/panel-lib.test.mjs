@@ -116,3 +116,75 @@ test("F: combinePanel badge — stop-gate (no Codex) omits the Codex glyph", () 
   assert.equal(r.badge, "Kimi✓ MiMo✓ GLM✓");
   assert.doesNotMatch(r.badge, /Codex/);
 });
+
+// --- Severity-gating: combinePanel({ blockMinSeverity }) ---
+// The fast plan/spec gates pass blockMinSeverity:"high" so a BLOCK below high becomes
+// an ADVISORY (allow + note + `~` badge), not a hard block. Stop/pre-push pass nothing
+// (UNCHANGED — any BLOCK blocks).
+
+test("severity-gate: a medium-severity BLOCK → decision allow + advisory + badge ~", () => {
+  const r = combinePanel([
+    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: nit", raw: "BLOCK: nit\nSEVERITY: medium\n- a minor nit" }
+  ], { blockMinSeverity: "high" });
+  assert.equal(r.decision, "allow", "a sub-threshold BLOCK must NOT block");
+  assert.ok(Array.isArray(r.advisories) && r.advisories.length === 1, "the medium BLOCK is carried as an advisory");
+  assert.match(r.advisories[0], /MiMo/);
+  assert.match(r.advisories[0], /medium/);
+  assert.match(r.summary, /MiMo/, "advisory surfaces in the summary");
+  assert.equal(r.badge, "Kimi✓ MiMo~", "sub-threshold BLOCK renders as ~");
+});
+
+test("severity-gate: a high-severity BLOCK → decision block + badge ✗", () => {
+  const r = combinePanel([
+    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: real bug", raw: "BLOCK: real bug\nSEVERITY: high\n- broken build" }
+  ], { blockMinSeverity: "high" });
+  assert.equal(r.decision, "block", "a high BLOCK still blocks");
+  assert.match(r.findings, /\[MiMo\]/);
+  assert.equal(r.badge, "Kimi✓ MiMo✗", "high BLOCK renders as ✗");
+});
+
+test("severity-gate: a critical BLOCK → block (above the high threshold)", () => {
+  const r = combinePanel([
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: data loss", raw: "BLOCK: data loss\nSEVERITY: critical\n- drops rows" }
+  ], { blockMinSeverity: "high" });
+  assert.equal(r.decision, "block");
+  assert.equal(r.badge, "MiMo✗");
+});
+
+test("severity-gate: a BLOCK with NO SEVERITY line defaults to high → blocks", () => {
+  const r = combinePanel([
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bad", raw: "BLOCK: bad\n- some finding" }
+  ], { blockMinSeverity: "high" });
+  assert.equal(r.decision, "block", "no SEVERITY line on a BLOCK defaults to high (safe)");
+  assert.equal(r.badge, "MiMo✗");
+});
+
+test("severity-gate: mixed — one medium (advisory) + one high (blocks) → block", () => {
+  const r = combinePanel([
+    { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: nit", raw: "BLOCK: nit\nSEVERITY: low\n- tiny" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\nSEVERITY: high\n- real" }
+  ], { blockMinSeverity: "high" });
+  assert.equal(r.decision, "block", "any real (>= high) blocker blocks even with advisories present");
+  assert.equal(r.badge, "Kimi~ MiMo✗", "low BLOCK is ~, high BLOCK is ✗");
+});
+
+test("severity-gate: all advisory (only sub-threshold BLOCKs) → allow with advisories", () => {
+  const r = combinePanel([
+    { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: a", raw: "BLOCK: a\nSEVERITY: low\n- a" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: b", raw: "BLOCK: b\nSEVERITY: medium\n- b" }
+  ], { blockMinSeverity: "high" });
+  assert.equal(r.decision, "allow");
+  assert.equal(r.advisories.length, 2);
+  assert.equal(r.badge, "Kimi~ MiMo~");
+});
+
+test("severity-gate UNCHANGED default: a medium BLOCK with NO blockMinSeverity still blocks (stop/pre-push)", () => {
+  const r = combinePanel([
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: nit", raw: "BLOCK: nit\nSEVERITY: medium\n- a minor nit" }
+  ]);
+  assert.equal(r.decision, "block", "without blockMinSeverity, ANY BLOCK blocks (stop/pre-push strict)");
+  assert.equal(r.badge, "MiMo✗", "no severity-gating → ✗ for a BLOCK");
+  assert.equal(r.advisories === undefined || r.advisories.length === 0, true, "no advisories without severity-gating");
+});

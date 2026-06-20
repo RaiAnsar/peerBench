@@ -33,11 +33,25 @@ export function severityRank(sev) {
   return SEVERITY_RANK[String(sev ?? "none").toLowerCase()] ?? 0;
 }
 
+// Extract the worst severity a reviewer declared from its raw text. Mirrors the
+// severity logic in hunt.parseSpecFindings so the fast plan/spec gates and the deep
+// pass read severity identically. A `SEVERITY: <x>` line wins; otherwise a BLOCK with
+// no SEVERITY line defaults to "high" (safe — a BLOCK is treated as a real blocker),
+// and a non-BLOCK with no line is "none". `verdict` is the already-parsed ALLOW/BLOCK.
+export function parseSeverity(raw, verdict) {
+  const s = String(raw ?? "");
+  const m = s.match(/^\s*SEVERITY:\s*(none|low|medium|high|critical)\b/im);
+  if (m) return m[1].toLowerCase();
+  return verdict === "BLOCK" ? "high" : "none";
+}
+
 // Aggregate per-reviewer spec-review results into the machine-readable contract
 // used by the surfacing gate. results: [{ name, verdict, findingCount, severity }]
 export function summarizeSpecReview(results) {
   const list = Array.isArray(results) ? results : [];
-  const reviewers = list.map((r) => ({ name: r.name, verdict: r.verdict ?? null }));
+  // Carry per-reviewer severity so the surfaced badge + statusline can render a
+  // sub-threshold BLOCK as `~` (advisory) rather than the alarming `✗`.
+  const reviewers = list.map((r) => ({ name: r.name, verdict: r.verdict ?? null, severity: r.severity ?? null }));
   const findingCount = list.reduce((n, r) => n + (Number(r.findingCount) || 0), 0);
   let maxSeverity = "none";
   for (const r of list) {

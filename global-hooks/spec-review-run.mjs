@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { specReviewPanel, SPEC_REVIEW_SYSTEM, buildSpecReviewUser, pushReviewPanel, PUSH_REVIEW_SYSTEM, buildPushReviewUser } from "./hunt.mjs";
 import { panelBadge } from "./panel-lib.mjs";
 import { writeTrace } from "./trace-store.mjs";
-import { summarizeSpecReview, writeDeepResult, deepKey } from "./deep-review.mjs";
+import { summarizeSpecReview, writeDeepResult, deepKey, DEEP_REWAKE_SEVERITY } from "./deep-review.mjs";
 
 // Cap the reviewed push diff so a huge changeset doesn't blow up the prompt. Mirrors the
 // pre-push gate's MAX_DIFF_BYTES.
@@ -49,7 +49,9 @@ export async function runSpecReview(filePath, ws, {
   const results = await panelImpl({ cwd: ws, filePath, content, env: process.env });
 
   const structured = summarizeSpecReview(results);   // { reviewers, findingCount, maxSeverity }
-  const badge = panelBadge(results.map((r) => ({ name: r.name, error: r.error, verdict: r.verdict })));
+  // Severity-aware badge: a sub-threshold BLOCK renders `~` (advisory), matching the HIGH-only
+  // rewake. Carry each reviewer's parsed severity + the DEEP_REWAKE_SEVERITY threshold.
+  const badge = panelBadge(results.map((r) => ({ name: r.name, error: r.error, verdict: r.verdict, severity: r.severity })), { blockMinSeverity: DEEP_REWAKE_SEVERITY });
   const summary = structured.findingCount > 0
     ? `${structured.findingCount} finding(s), max severity ${structured.maxSeverity}`
     : "no blocking findings";
@@ -115,7 +117,9 @@ export async function runPushReview(range, ws, {
   const results = await panelImpl({ cwd: ws, range, content, env: process.env });
 
   const structured = summarizeSpecReview(results);   // { reviewers, findingCount, maxSeverity }
-  const badge = panelBadge(results.map((r) => ({ name: r.name, error: r.error, verdict: r.verdict })));
+  // Severity-aware badge: a sub-threshold BLOCK renders `~` (advisory), matching the HIGH-only
+  // rewake. Carry each reviewer's parsed severity + the DEEP_REWAKE_SEVERITY threshold.
+  const badge = panelBadge(results.map((r) => ({ name: r.name, error: r.error, verdict: r.verdict, severity: r.severity })), { blockMinSeverity: DEEP_REWAKE_SEVERITY });
   const summary = structured.findingCount > 0
     ? `${structured.findingCount} finding(s), max severity ${structured.maxSeverity}`
     : "no blocking findings";

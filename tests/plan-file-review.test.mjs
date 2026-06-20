@@ -252,6 +252,81 @@ test("D3: plan-file trace write failure emits a ⛩ note and still allows", asyn
 });
 
 // ===========================================================================
+// Severity-gating — block (rewake) only on HIGH+; medium/low → advisory (allow).
+// ===========================================================================
+
+test("severity-gate: a MEDIUM-severity BLOCK does NOT block the save (allows with advisory note)", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-sev-med-"));
+  const planDir = path.join(ws, "specs");
+  fs.mkdirSync(planDir, { recursive: true });
+  fs.writeFileSync(path.join(planDir, "s.md"), "# Spec\n\nmedium severity body.\n");
+
+  const resolveReviewersImpl = () => [
+    { name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) },
+    { name: "MiMo", run: async () => ({ name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: nit", raw: "BLOCK: nit\nSEVERITY: medium\n- a prose nit" }) }
+  ];
+
+  const lines = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return orig(chunk, ...rest); };
+  let exited = false;
+  const origExit = process.exit;
+  process.exit = () => { exited = true; throw new Error("__exit__"); };
+  try {
+    await runMain({
+      resolveReviewersImpl,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      spawnImpl: () => ({ unref() {} }),
+      input: { cwd: ws, tool_input: { file_path: path.join(planDir, "s.md") } }
+    });
+  } finally {
+    process.stdout.write = orig;
+    process.exit = origExit;
+  }
+  assert.equal(exited, false, "a medium BLOCK must NOT exit 2 (no rewake)");
+  const parsed = JSON.parse(lines.find((l) => l.trim()));
+  assert.match(parsed.systemMessage || "", /ALLOW/, "the save is allowed");
+  assert.match(parsed.systemMessage || "", /MiMo~/, "badge shows MiMo~ (advisory)");
+  assert.match(parsed.systemMessage || "", /advisor/i, "an advisory note is surfaced");
+});
+
+test("severity-gate: a HIGH-severity BLOCK still blocks (rewake, exit 2)", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-sev-high-"));
+  const planDir = path.join(ws, "specs");
+  fs.mkdirSync(planDir, { recursive: true });
+  fs.writeFileSync(path.join(planDir, "s.md"), "# Spec\n\nhigh severity body.\n");
+
+  const resolveReviewersImpl = () => [
+    { name: "MiMo", run: async () => ({ name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: broken build", raw: "BLOCK: broken build\nSEVERITY: high\n- references a missing function" }) }
+  ];
+
+  const stderrChunks = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
+  let exitCode = null;
+  const origExit = process.exit;
+  process.exit = (c) => { exitCode = c; throw new Error("__exit__"); };
+  try {
+    await runMain({
+      resolveReviewersImpl,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      spawnImpl: () => ({ unref() {} }),
+      input: { cwd: ws, tool_input: { file_path: path.join(planDir, "s.md") } }
+    });
+  } catch (e) {
+    if (e.message !== "__exit__") throw e;   // expected sentinel from the stubbed exit
+  } finally {
+    process.stderr.write = origErr;
+    process.exit = origExit;
+  }
+  assert.equal(exitCode, 2, "a high BLOCK must rewake (exit 2)");
+  assert.match(stderrChunks.join(""), /MiMo✗/, "badge shows MiMo✗ (real block)");
+  assert.match(stderrChunks.join(""), /blocked the plan file/i, "block feedback written to stderr");
+});
+
+// ===========================================================================
 // Task 10 — G2/G3: fast ALLOW → debounced detached spec-review spawn
 // ===========================================================================
 

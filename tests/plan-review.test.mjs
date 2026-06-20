@@ -59,6 +59,54 @@ test("F: plan-review fail-open reason leads with the badge", () => {
 });
 
 // ===========================================================================
+// Severity-gating — deny only on HIGH+; medium/low → advisory (allow + note).
+// ===========================================================================
+
+/** A reviewer that emits a given verdict + SEVERITY line in its raw. */
+function prSevReviewer(name, verdict, severity) {
+  return {
+    name,
+    async run() {
+      return { name, verdict, firstLine: `${verdict}: ${name} reason`, raw: `${verdict}: ${name} reason\nSEVERITY: ${severity}\n- a finding from ${name}` };
+    }
+  };
+}
+
+async function runPlanCapture(reviewers) {
+  const ws = prRepo();
+  const lines = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return orig(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl: () => reviewers,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { plan: "do a thing" } }
+    });
+  } finally {
+    process.stdout.write = orig;
+  }
+  return JSON.parse(lines.find((l) => l.trim()));
+}
+
+test("severity-gate: a MEDIUM-severity BLOCK does NOT deny the plan (allows with advisory)", async () => {
+  const parsed = await runPlanCapture([prReviewer("Kimi", "ALLOW"), prSevReviewer("MiMo", "BLOCK", "medium")]);
+  const out = parsed.hookSpecificOutput;
+  assert.equal(out.permissionDecision, "allow", "a medium BLOCK must NOT deny");
+  assert.match(out.permissionDecisionReason, /MiMo~/, "badge shows MiMo~ (advisory)");
+  assert.match(parsed.systemMessage || "", /advisor/i, "an advisory note is surfaced");
+});
+
+test("severity-gate: a HIGH-severity BLOCK still denies the plan", async () => {
+  const parsed = await runPlanCapture([prReviewer("Kimi", "ALLOW"), prSevReviewer("MiMo", "BLOCK", "high")]);
+  const out = parsed.hookSpecificOutput;
+  assert.equal(out.permissionDecision, "deny", "a high BLOCK must deny");
+  assert.match(out.permissionDecisionReason, /MiMo✗/, "badge shows MiMo✗ (real block)");
+  assert.match(out.permissionDecisionReason, /must be fixed/i, "block findings surfaced");
+});
+
+// ===========================================================================
 // Task 9 — H1: invocation-scoped emit-once guard for plan-review
 // ===========================================================================
 

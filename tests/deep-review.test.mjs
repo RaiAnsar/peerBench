@@ -44,7 +44,8 @@ test("summarizeSpecReview produces the structured contract", () => {
     { name: "Kimi", verdict: "ALLOW", findingCount: 1, severity: "low" },
     { name: "MiMo", verdict: "BLOCK", findingCount: 2, severity: "high" }
   ]);
-  assert.deepEqual(s.reviewers, [{ name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }]);
+  // reviewers[] now carries per-reviewer severity (for the severity-aware badge/statusline).
+  assert.deepEqual(s.reviewers, [{ name: "Kimi", verdict: "ALLOW", severity: "low" }, { name: "MiMo", verdict: "BLOCK", severity: "high" }]);
   assert.equal(s.findingCount, 3);
   assert.equal(s.maxSeverity, "high");
 });
@@ -169,7 +170,7 @@ test("G1: specReviewCommand writes a gate:'spec-review' trace and returns the st
 
   const result = await specReviewCommand(file, ws, { panelImpl });
 
-  assert.deepEqual(result.reviewers, [{ name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }]);
+  assert.deepEqual(result.reviewers, [{ name: "Kimi", verdict: "ALLOW", severity: "none" }, { name: "MiMo", verdict: "BLOCK", severity: "high" }]);
   assert.equal(result.findingCount, 1);
   assert.equal(result.maxSeverity, "high");
 
@@ -243,10 +244,10 @@ test("H: runPushReview writes a gate:'push-review' trace and returns the structu
   assert.match(seeded.content, /c1 first/, "content must include the commit list");
   assert.match(seeded.content, /\+broken\(\)/, "content must include the diff");
 
-  assert.deepEqual(result.reviewers, [{ name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }]);
+  assert.deepEqual(result.reviewers, [{ name: "Kimi", verdict: "ALLOW", severity: "none" }, { name: "MiMo", verdict: "BLOCK", severity: "high" }]);
   assert.equal(result.findingCount, 1);
   assert.equal(result.maxSeverity, "high");
-  assert.match(result.badge, /Kimi✓ MiMo✗/, "badge reflects per-reviewer verdicts");
+  assert.match(result.badge, /Kimi✓ MiMo✗/, "badge reflects per-reviewer verdicts (high BLOCK stays ✗)");
 
   // Trace written with gate:"push-review".
   const [latest] = listTraces(ws, 1);

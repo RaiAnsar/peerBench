@@ -4,6 +4,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { parseSeverity, severityRank } from "./deep-review.mjs";
 
 export function parseVerdict(rawOutput) {
   const raw = String(rawOutput ?? "").trim();
@@ -100,26 +101,56 @@ export async function runCodexTask({ companionPath, prompt, cwd, env }) {
   }
 }
 
+// Resolve a reviewer's effective severity: an already-parsed `severity` field (deep-result
+// reviewers carry one) wins; otherwise parse it from the raw text (fast-gate reviewers carry
+// `raw`). A BLOCK with neither parses to "high" via parseSeverity — safe.
+function sideSeverity(s) {
+  return s.severity != null ? String(s.severity).toLowerCase() : parseSeverity(s.raw, s.verdict);
+}
+
+// True when a reviewer's BLOCK is SUB-THRESHOLD under severity-gating: its severity is below
+// blockMinSeverity, so it's an advisory (render `~`), not a hard block (`✗`). Only meaningful
+// with a blockMinSeverity; a BLOCK with no severity at all resolves to "high" — NOT
+// sub-threshold against "high" — safe.
+function isAdvisoryBlock(s, blockMinSeverity) {
+  if (!blockMinSeverity || !s || s.error || s.verdict !== "BLOCK") return false;
+  return severityRank(sideSeverity(s)) < severityRank(blockMinSeverity);
+}
+
 // Per-reviewer verdict badge, in the order they appear (only reviewers that were
 // meant to run for the gate — the caller decides the set, e.g. stop excludes Codex).
-// ✓ = ALLOW, ✗ = BLOCK, ! = errored/skipped (matches the statusline's error glyph).
-export function panelBadge(sides) {
+// ✓ = ALLOW (or hunt-success); ✗ = a real BLOCK; ! = errored/skipped (matches the
+// statusline's error glyph); ~ = a sub-threshold BLOCK under severity-gating (advisory,
+// not blocking — only emitted when a blockMinSeverity is supplied).
+export function panelBadge(sides, { blockMinSeverity } = {}) {
   return sides
     .filter(Boolean)
-    .map((s) => `${s.name}${s.error ? "!" : s.verdict === "BLOCK" ? "✗" : "✓"}`)
+    .map((s) => `${s.name}${s.error ? "!" : s.verdict === "BLOCK" ? (isAdvisoryBlock(s, blockMinSeverity) ? "~" : "✗") : "✓"}`)
     .join(" ");
 }
 
-export function combinePanel(results) {
+// combinePanel(results, { blockMinSeverity })
+// Default (no blockMinSeverity — stop/pre-push): UNCHANGED — any BLOCK → decision:"block".
+// With blockMinSeverity (e.g. "high" — the plan/spec gates): a BLOCK is a REAL blocker only
+// when its severity >= blockMinSeverity. Sub-threshold BLOCKs do NOT block; they are carried
+// as `advisories` and folded into `summary` so the gate can surface them while allowing.
+export function combinePanel(results, { blockMinSeverity } = {}) {
   const sides = Array.isArray(results) ? results : [results];
-  const badge = panelBadge(sides);
+  const badge = panelBadge(sides, { blockMinSeverity });
   const errors = sides.filter((s) => s && s.error);
   const verdicts = sides.filter((s) => s && !s.error);
   const skipNotes = errors.map((s) => `${s.name} review skipped: ${s.error}`);
   if (verdicts.length === 0) return { decision: "fail-open", summary: skipNotes.join(" | "), findings: "", skipNotes, badge };
-  const blockers = verdicts.filter((s) => s.verdict === "BLOCK");
+  const allBlocks = verdicts.filter((s) => s.verdict === "BLOCK");
+  // Split BLOCKs into real (>= threshold, or no threshold at all) vs sub-threshold advisories.
+  const blockers = allBlocks.filter((s) => !isAdvisoryBlock(s, blockMinSeverity));
+  const advisorySides = allBlocks.filter((s) => isAdvisoryBlock(s, blockMinSeverity));
+  const advisories = advisorySides.map((s) => `⚠ ${s.name}: ${s.firstLine} (${sideSeverity(s)})`);
   if (blockers.length > 0) return { decision: "block", summary: blockers.map((s) => `${s.name}: ${s.firstLine}`).join(" | "),
-    findings: blockers.map((s) => `[${s.name}]\n${s.raw}`).join("\n\n"), skipNotes, badge };
-  const summary = verdicts.map((s) => `${s.name}: ${s.firstLine.slice("ALLOW:".length).trim().slice(0, 100)}`).concat(skipNotes).join(" · ");
-  return { decision: "allow", summary, findings: "", skipNotes, badge };
+    findings: blockers.map((s) => `[${s.name}]\n${s.raw}`).join("\n\n"), skipNotes, advisories, badge };
+  const allowParts = verdicts
+    .filter((s) => s.verdict !== "BLOCK")
+    .map((s) => `${s.name}: ${s.firstLine.slice("ALLOW:".length).trim().slice(0, 100)}`);
+  const summary = allowParts.concat(advisories).concat(skipNotes).join(" · ");
+  return { decision: "allow", summary, findings: "", skipNotes, advisories, badge };
 }

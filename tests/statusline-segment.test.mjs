@@ -11,6 +11,29 @@ test("a block → ✗ on the blocker", () => {
   const s = renderSegment({ gate: "stop", reviewers: [{ name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }] });
   assert.match(s, /MiMo✗/); assert.match(s, /Kimi✓/);
 });
+
+// Severity-aware glyph: a BLOCK with a present sub-high severity is advisory (~), not ✗.
+test("BLOCK with medium severity → ~ (advisory, not alarming ✗)", () => {
+  const s = renderSegment({ gate: "spec-review", reviewers: [{ name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK", severity: "medium" }] });
+  assert.match(s, /MiMo~/, "medium-severity BLOCK should render ~");
+  assert.doesNotMatch(s, /MiMo✗/);
+});
+test("BLOCK with low severity → ~", () => {
+  const s = renderSegment({ gate: "spec-review", reviewers: [{ name: "MiMo", verdict: "BLOCK", severity: "low" }] });
+  assert.match(s, /MiMo~/);
+});
+test("BLOCK with high severity → ✗ (real blocker)", () => {
+  const s = renderSegment({ gate: "spec-review", reviewers: [{ name: "MiMo", verdict: "BLOCK", severity: "high" }] });
+  assert.match(s, /MiMo✗/);
+});
+test("BLOCK with critical severity → ✗", () => {
+  const s = renderSegment({ gate: "spec-review", reviewers: [{ name: "MiMo", verdict: "BLOCK", severity: "critical" }] });
+  assert.match(s, /MiMo✗/);
+});
+test("BLOCK with NO severity (stop/pre-push trace) → ✗ (strict, unchanged)", () => {
+  const s = renderSegment({ gate: "stop", reviewers: [{ name: "MiMo", verdict: "BLOCK" }] });
+  assert.match(s, /MiMo✗/);
+});
 test("errored reviewer → !", () => {
   const s = renderSegment({ gate: "plan", reviewers: [{ name: "Kimi", error: "timeout" }, { name: "MiMo", verdict: "ALLOW" }] });
   assert.match(s, /Kimi!/);

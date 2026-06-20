@@ -3,6 +3,7 @@ import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { runCodexTask } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
+import { parseSeverity } from "./deep-review.mjs";
 import path from "node:path";
 
 const displayName = (name) => ({ kimi: "Kimi", mimo: "MiMo", glm: "GLM", codex: "Codex" }[name] || name);
@@ -57,8 +58,7 @@ export function parseSpecFindings(text) {
   const s = String(text ?? "");
   const v = extractVerdict(s);
   const verdict = v?.verdict ?? null;
-  const sevMatch = s.match(/^\s*SEVERITY:\s*(none|low|medium|high|critical)\b/im);
-  let severity = sevMatch ? sevMatch[1].toLowerCase() : (verdict === "BLOCK" ? "high" : "none");
+  let severity = parseSeverity(s, verdict);   // shared severity extractor (deep-review.mjs)
   const findingCount = (s.match(/^\s*-\s+\S/gm) || []).length;
   if (severity === "none" && findingCount > 0 && verdict !== "BLOCK") severity = "low";
   return { verdict, severity, findingCount };

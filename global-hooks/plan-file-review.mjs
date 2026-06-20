@@ -76,7 +76,9 @@ export function buildPrompt(filePath, content) {
   return {
     system: "You are reviewing an implementation plan/spec document from ONLY the text provided. Do not assume filesystem access. " +
       "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`. BLOCK only for issues that would cause wrong " +
-      "behavior or significant rework if executed as written; otherwise ALLOW.",
+      "behavior or significant rework if executed as written; otherwise ALLOW. " +
+      "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
+      "Only high/critical issues block the save — medium/low are advisory.",
     user: `<plan_document file="${filePath}">\n${content}\n</plan_document>`
   };
 }
@@ -190,7 +192,10 @@ export async function runMain({
   const { system, user } = buildPrompt(filePath, content);
 
   const results = await Promise.all(resolveReviewersImpl().map((r) => r.run({ system, user, cwd: ws })));
-  const panel = combinePanel(results);
+  // Severity-gate the plan/spec save: block (rewake) only on HIGH+ findings; medium/low/none
+  // are advisory — they allow the save and surface as a note (a design doc never converges to
+  // zero, so blocking on every medium nit causes endless churn).
+  const panel = combinePanel(results, { blockMinSeverity: "high" });
 
   try {
     writeTraceImpl(ws, {
@@ -233,7 +238,11 @@ export async function runMain({
   // G2/G3 — fast ALLOW (and NOT a dedup-hit: that path returned above): launch the
   // detached, debounced deep spec-review against the real repo. Never blocks the save.
   launchDeepReview(ws, filePath, content, { spawnImpl });
-  emit({ systemMessage: `⛩ plan panel: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
+  // Sub-threshold BLOCKs (medium/low) allow the save but surface as advisories, not a block.
+  const advisoryNote = panel.advisories && panel.advisories.length
+    ? ` — advisories (not blocking): ${panel.advisories.join(" · ").slice(0, 220)}`
+    : ` — ${panel.summary.slice(0, 220)}`;
+  emit({ systemMessage: `⛩ plan panel: ALLOW [${panel.badge}]${advisoryNote}` });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -2,14 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { workspaceStateDir } from "./config-store.mjs";
+import { severityRank } from "./deep-review.mjs";
 
-const C = { ALLOW: 48, BLOCK: 196, error: 208 };           // 256-color codes (match gate-status.py palette)
+const C = { ALLOW: 48, BLOCK: 196, error: 208, advisory: 245 };   // 256-color codes (match gate-status.py palette); advisory = dim grey
 const col = (code, s) => `\x1b[38;5;${code}m${s}\x1b[0m`;
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
 const GATE_LABEL = { "plan-file": "plan", "pre-push": "push" };  // shorten; others pass through
-// ✗ block; ! errored/skipped; ✓ allow OR hunt-success (findings: no verdict, no error)
-const glyph = (r) => (r.verdict === "BLOCK" ? "✗" : (r.error && r.verdict !== "ALLOW") ? "!" : "✓");
-const rColor = (r) => (r.verdict === "BLOCK" ? C.BLOCK : (r.error && r.verdict !== "ALLOW") ? C.error : C.ALLOW);
+// A BLOCK is ADVISORY (sub-threshold) when it carries an explicit severity BELOW high — the
+// plan/spec gates surface those without blocking. A BLOCK with NO severity (stop/pre-push
+// traces) is strict → ✗.
+const isAdvisoryBlock = (r) => r.verdict === "BLOCK" && r.severity != null && severityRank(r.severity) < severityRank("high");
+// ✗ real block; ~ sub-threshold/advisory block; ! errored/skipped; ✓ allow OR hunt-success
+const glyph = (r) => (r.verdict === "BLOCK" ? (isAdvisoryBlock(r) ? "~" : "✗") : (r.error && r.verdict !== "ALLOW") ? "!" : "✓");
+const rColor = (r) => (r.verdict === "BLOCK" ? (isAdvisoryBlock(r) ? C.advisory : C.BLOCK) : (r.error && r.verdict !== "ALLOW") ? C.error : C.ALLOW);
 const STALE_MS = 45 * 60 * 1000;  // a verdict older than this is past, not current → dim it
 
 // Pure: render one trace as the format-C segment. Returns "" if nothing to show.
@@ -21,7 +26,8 @@ export function renderSegment(trace, { now = Date.now() } = {}) {
     // stale: dim it with (idle) so an old verdict doesn't masquerade as an active block
     return dim(`⛩ ${gate}: ${trace.reviewers.map((r) => `${r.name}${glyph(r)}`).join(" ")} (idle)`);
   }
-  const anyBlock = trace.reviewers.some((r) => r.verdict === "BLOCK");
+  // Only a REAL (non-advisory) block reddens the label; an advisory-only trace stays calm.
+  const anyBlock = trace.reviewers.some((r) => r.verdict === "BLOCK" && !isAdvisoryBlock(r));
   const anyErr = trace.reviewers.some((r) => r.error && r.verdict !== "ALLOW" && r.verdict !== "BLOCK");
   const labelColor = anyBlock ? C.BLOCK : anyErr ? C.error : C.ALLOW;
   const parts = trace.reviewers.map((r) => col(rColor(r), `${r.name}${glyph(r)}`));

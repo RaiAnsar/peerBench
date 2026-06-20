@@ -43,7 +43,9 @@ export function buildPrompt(plan) {
   return {
     system: "You are reviewing an implementation plan from ONLY the text provided. Do not assume filesystem access. " +
       "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`. BLOCK only for issues that would cause wrong " +
-      "behavior or significant rework if executed as written; otherwise ALLOW (minor notes may follow the first line).",
+      "behavior or significant rework if executed as written; otherwise ALLOW (minor notes may follow the first line). " +
+      "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
+      "Only high/critical issues block the plan — medium/low are advisory.",
     user: `<plan>\n${plan}\n</plan>`
   };
 }
@@ -85,7 +87,8 @@ export async function runMain({
   const { system, user } = buildPrompt(plan);
 
   const results = await Promise.all(resolveReviewersImpl().map((r) => r.run({ system, user, cwd: ws })));
-  const panel = combinePanel(results);
+  // Severity-gate the plan gate: block only on HIGH+ findings; medium/low/none are advisory.
+  const panel = combinePanel(results, { blockMinSeverity: "high" });
 
   try {
     writeTraceImpl(ws, {
@@ -114,6 +117,16 @@ export async function runMain({
     return;
   }
 
+  // ALLOW — but if any sub-threshold BLOCKs were carried as advisories, surface them as a
+  // note (they did NOT block: medium/low findings are advisory under severity-gating).
+  if (panel.advisories && panel.advisories.length) {
+    decision(
+      "allow",
+      `[${panel.badge}] Review panel approved the plan (advisories below are NOT blocking). ${panel.summary}`,
+      `⛩ plan panel: ALLOW [${panel.badge}] — advisories (not blocking): ${panel.advisories.join(" · ").slice(0, 220)}`
+    );
+    return;
+  }
   decision("allow", `[${panel.badge}] Review panel approved the plan. ${panel.summary}`);
 }
 
