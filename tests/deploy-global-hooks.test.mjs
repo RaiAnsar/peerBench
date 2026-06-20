@@ -109,6 +109,15 @@ test("syncSettings registers all four gates: plan-review(ExitPlanMode), pre-push
   assert.ok(stopHook.rewakeMessage, "stop-review must have rewakeMessage");
   assert.ok(stopHook.rewakeSummary, "stop-review must have rewakeSummary");
   assert.ok(typeof stopHook.timeout === "number", "stop-review must have numeric timeout");
+
+  // Quick wins (hooks-doc optimizations): statusMessage on every gate (visible spinner) + an
+  // `if` narrowing pre-push to git commands (fails open, so compound pushes stay covered).
+  const allEntries = [...s.hooks.PreToolUse, ...s.hooks.PostToolUse, ...s.hooks.Stop];
+  const byFile = (name) => allEntries.flatMap((b) => b.hooks || []).find((h) => h.command.includes(name));
+  for (const f of ["plan-review.mjs", "plan-file-review.mjs", "pre-push-review.mjs", "stop-review.mjs"]) {
+    assert.ok(byFile(f)?.statusMessage, `${f} must carry a statusMessage (visible spinner)`);
+  }
+  assert.equal(byFile("pre-push-review.mjs").if, "Bash(git *)", "pre-push must narrow to git commands via `if`");
 });
 
 test("syncSettings is idempotent: running twice does not duplicate any gate", () => {

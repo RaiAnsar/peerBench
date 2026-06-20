@@ -103,11 +103,24 @@ export function syncSettings({ hooksDir, settingsPath }) {
   s.hooks.PreToolUse = s.hooks.PreToolUse || [];
   s.hooks.PostToolUse = s.hooks.PostToolUse || [];
   s.hooks.Stop = s.hooks.Stop || [];
-  register(s.hooks.PreToolUse, "ExitPlanMode", path.join(hooksDir, "plan-review.mjs"));   // ABSOLUTE homedir path (no ~)
-  register(s.hooks.PostToolUse, "Write|Edit", path.join(hooksDir, "plan-file-review.mjs"));
-  register(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"));
+  // statusMessage → the gate is VISIBLE in the spinner while it runs (~30–60s panel), so it never
+  // looks like "nothing happened". ABSOLUTE homedir paths (no ~).
+  register(s.hooks.PreToolUse, "ExitPlanMode", path.join(hooksDir, "plan-review.mjs"), {
+    statusMessage: "⛩ bench: reviewing plan…"
+  });
+  register(s.hooks.PostToolUse, "Write|Edit", path.join(hooksDir, "plan-file-review.mjs"), {
+    statusMessage: "⛩ bench: reviewing plan/spec…"
+  });
+  register(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"), {
+    statusMessage: "⛩ bench: reviewing push…",
+    // Perf: only spawn on git commands instead of EVERY Bash. The `if` permission rule checks
+    // subcommands and FAILS OPEN (runs the hook anyway) if it can't parse — so compound pushes
+    // like `cd x && git push` are still covered; we just stop spawning Node for `ls`/`npm`/etc.
+    if: "Bash(git *)"
+  });
   register(s.hooks.Stop, undefined, path.join(hooksDir, "stop-review.mjs"), {
     timeout: 300, asyncRewake: true,
+    statusMessage: "⛩ bench: reviewing turn…",
     rewakeMessage: "⛩ bench stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
     rewakeSummary: "⛩ bench stop"
   });
