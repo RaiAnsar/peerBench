@@ -39,10 +39,32 @@ export function shellSegments(command) {
   return segs.map((s) => ({ text: s.text.trim(), joiner: s.joiner })).filter((s) => s.text);
 }
 
+// Tokenize a single shell segment honoring single/double quotes and STRIPPING the quote chars,
+// splitting on unquoted whitespace. `git -C "/a b/r" push` → ["git","-C","/a b/r","push"]. A
+// split(/\s+/) would break a quoted path with spaces in two, derailing the `-C` value-skip so it
+// never sees `push` (A1 — found by the bench's own hunt). Strips quotes so values are clean.
+export function shellTokenize(text) {
+  const s = String(text ?? "");
+  const toks = [];
+  let cur = "", quote = null, started = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) { if (c === quote) quote = null; else cur += c; started = true; continue; }
+    if (c === '"' || c === "'") { quote = c; started = true; continue; }
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+      if (started) { toks.push(cur); cur = ""; started = false; }
+      continue;
+    }
+    cur += c; started = true;
+  }
+  if (started) toks.push(cur);
+  return toks;
+}
+
 // True if a single segment is a real `git push` (allowing leading env assignments and git
 // global options before the `push` subcommand). Excludes `--help`/`-h` and `--dry-run`/`-n`.
 export function isGitPushSegment(text) {
-  const toks = String(text ?? "").split(/\s+/).filter(Boolean);
+  const toks = shellTokenize(text).filter(Boolean);
   let i = toks.indexOf("git");
   if (i < 0) return false;
   i++;
@@ -53,9 +75,56 @@ export function isGitPushSegment(text) {
   return true;
 }
 
-// The first segment that is a real git push, or null.
+// Parse a git push segment into { remote, refspecs[], flags[] }. Remote defaults to "origin".
+// Positional non-flag tokens after `push`: the first is the remote, the rest are refspecs.
+// Used by resolvePushRange (A2) to compute the correct <base>..<source> range.
+export function parsePushCommand(text) {
+  const toks = shellTokenize(text).filter(Boolean);
+  let i = toks.indexOf("git");
+  const flags = [];
+  const positionals = [];
+  if (i >= 0) {
+    i++;
+    // skip git global options (and their value tokens) up to `push`
+    while (i < toks.length && toks[i].startsWith("-")) { const t = toks[i]; i++; if (GIT_VALUE_OPTS.has(t)) i++; }
+    if (toks[i] === "push") {
+      i++;
+      for (; i < toks.length; i++) {
+        const t = toks[i];
+        if (t.startsWith("-")) flags.push(t);
+        else positionals.push(t);
+      }
+    }
+  }
+  const remote = positionals.length > 0 ? positionals[0] : "origin";
+  const refspecs = positionals.slice(1);
+  return { remote, refspecs, flags };
+}
+
+// Extract -C target directories (in order) from a push segment, for review-cwd resolution (A1).
+function dashCTargets(text) {
+  const toks = shellTokenize(text).filter(Boolean);
+  let i = toks.indexOf("git");
+  const targets = [];
+  if (i < 0) return targets;
+  i++;
+  while (i < toks.length && toks[i].startsWith("-")) {
+    const t = toks[i];
+    if (t === "-C" && i + 1 < toks.length) { targets.push(toks[i + 1]); i += 2; continue; }
+    i++;
+    if (GIT_VALUE_OPTS.has(t)) i++;
+  }
+  return targets;
+}
+
+// The first segment that is a real git push, or null. Also detects a subshell-wrapped push
+// (`(git push)`) by stripping a balanced leading `(` / trailing `)` and re-checking (A3).
 export function findPushSegment(command) {
-  for (const s of shellSegments(command)) if (isGitPushSegment(s.text)) return s;
+  for (const s of shellSegments(command)) {
+    if (isGitPushSegment(s.text)) return s;
+    const stripped = s.text.replace(/^\(\s*/, "").replace(/\s*\)$/, "");
+    if (stripped !== s.text && isGitPushSegment(stripped)) return { text: stripped, joiner: s.joiner };
+  }
   return null;
 }
 
@@ -81,7 +150,8 @@ function readInput() {
   try {
     const raw = fs.readFileSync(0, "utf8").trim();
     return raw ? JSON.parse(raw) : {};
-  } catch {
+  } catch (e) {
+    process.stderr.write(`⛩ pre-push: could not parse hook input (${e instanceof Error ? e.message : String(e)}); treating as empty.\n`);
     return {};
   }
 }
@@ -91,14 +161,6 @@ function workspaceRoot(cwd) {
     return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
   } catch {
     return cwd;
-  }
-}
-
-function git(args, cwd) {
-  try {
-    return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  } catch {
-    return "";
   }
 }
 
@@ -112,11 +174,24 @@ function gitTry(args, cwd) {
   }
 }
 
-function emit(obj) {
-  process.stdout.write(`${JSON.stringify(obj)}\n`);
+// Invocation-scoped emit-once guard. Claude Code reads only the FIRST JSON line on stdout, so a
+// second emit (e.g. the top-level .catch firing after runMain already decided) is silently dropped.
+// MUST be created per runMain invocation — a module-level flag would suppress emits on later
+// invocations in the same process and break the suite (A4 — found by the bench's own hunt).
+export function createEmitter() {
+  let emitted = false;
+  return {
+    hasEmitted: () => emitted,
+    emit(payload) {
+      if (emitted) return false;
+      emitted = true;
+      process.stdout.write(`${JSON.stringify(payload)}\n`);
+      return true;
+    }
+  };
 }
 
-function decision(permissionDecision, reason, systemMessage) {
+function decisionPayload(permissionDecision, reason, systemMessage) {
   const out = {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -125,34 +200,91 @@ function decision(permissionDecision, reason, systemMessage) {
     }
   };
   if (systemMessage) out.systemMessage = systemMessage;
-  emit(out);
+  return out;
 }
 
-// Resolve push range (commits ahead of remote). Returns { range, ok, note }.
-// ok=false with a note means fail-open (can't determine range).
-function resolvePushRange(cwd) {
-  // 1. Try @{u} (configured upstream for current branch).
-  const [upstreamFull, upOk] = gitTry(
-    ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    cwd
-  );
-  if (upOk && upstreamFull) {
-    return { range: "@{u}..HEAD", ok: true };
+function refExists(ref, cwd) {
+  const [, ok] = gitTry(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
+  return ok;
+}
+
+// Resolve push range (commits ahead of remote) from the PARSED push command. Returns
+// { range, ok, note, deleteOnly }. ok=false means no review (clean allow when deleteOnly/empty,
+// or fail-open with a visible ⛩ note when undeterminable / out of clean scope) (A2).
+//
+//  - <src>:<dst>  → source = local <src> (HEAD if <src>=="HEAD"); base = <remote>/<dst> if it exists
+//                   (else the base-chain below). Explicit refspecs take precedence over @{u}.
+//  - bare <ref>   → src = dst = <ref> → <remote>/<ref>..<ref>
+//  - :<dst>       → delete → no commits → clean allow (deleteOnly).
+//  - no refspec   → source = HEAD; base chain: @{u} → <remote>/<branch> → <remote>/HEAD →
+//                   <remote>/main → <remote>/master → <remote>/master..HEAD as last resort.
+//  - --all/--tags/--mirror, or >1 refspec we can't union cleanly → fail-open ⛩ note.
+export function resolvePushRange(cwd, parsed) {
+  const { remote = "origin", refspecs = [], flags = [] } = parsed || {};
+
+  // Out-of-clean-scope flags push many refs at once → fail-open with a visible note.
+  for (const f of ["--all", "--tags", "--mirror"]) {
+    if (flags.includes(f)) {
+      return { range: "", ok: false, note: `⛩ pre-push: ${f} pushes multiple refs — out of review scope; push allowed without review.` };
+    }
   }
 
-  // 2. Try origin/HEAD as a fallback remote default.
-  const [, headOk] = gitTry(["rev-parse", "--verify", "origin/HEAD"], cwd);
-  if (headOk) {
-    return { range: "origin/HEAD..HEAD", ok: true };
+  if (refspecs.length > 1) {
+    return { range: "", ok: false, note: "⛩ pre-push: multiple refspecs — could not resolve a single review range; push allowed without review." };
   }
 
-  // 3. Try origin/main.
-  const [, mainOk] = gitTry(["rev-parse", "--verify", "origin/main"], cwd);
-  if (mainOk) {
-    return { range: "origin/main..HEAD", ok: true };
+  // Explicit refspec.
+  if (refspecs.length === 1) {
+    const spec = refspecs[0];
+    const colon = spec.indexOf(":");
+    if (colon >= 0) {
+      const src = spec.slice(0, colon);
+      const dst = spec.slice(colon + 1);
+      if (src === "") {
+        // delete refspec :<dst> — pushes no commits.
+        return { range: "", ok: false, deleteOnly: true };
+      }
+      const source = src === "HEAD" ? "HEAD" : src;
+      const baseRef = `${remote}/${dst}`;
+      const base = refExists(baseRef, cwd) ? baseRef : null;
+      if (!base) {
+        // No remote-tracking ref for the dst — fall back to base chain, but keep the explicit source.
+        const chain = baseChain(cwd, remote);
+        if (!chain) return { range: "", ok: false, note: `⛩ pre-push: could not resolve a base for ${spec}; push allowed without review.` };
+        return { range: `${chain}..${source}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
+      }
+      return { range: `${base}..${source}`, ok: true };
+    }
+    // bare <ref> → src = dst = <ref>
+    const baseRef = `${remote}/${spec}`;
+    if (refExists(baseRef, cwd)) return { range: `${baseRef}..${spec}`, ok: true };
+    const chain = baseChain(cwd, remote);
+    if (!chain) return { range: "", ok: false, note: `⛩ pre-push: no remote-tracking ref for ${spec}; push allowed without review.` };
+    return { range: `${chain}..${spec}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
   }
 
-  return { range: "", ok: false, note: "pre-push: no upstream to diff against; allowed" };
+  // No explicit refspec → source = HEAD; resolve base by precedence.
+  // 1. @{u} (configured upstream for current branch).
+  const [upstreamFull, upOk] = gitTry(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
+  if (upOk && upstreamFull) return { range: "@{u}..HEAD", ok: true };
+
+  const chain = baseChain(cwd, remote);
+  if (chain) {
+    const note = `pre-push: guessed base ${chain} (no @{u})`;
+    return { range: `${chain}..HEAD`, ok: true, note };
+  }
+  return { range: "", ok: false, note: "⛩ pre-push: no upstream to diff against; push allowed without review." };
+}
+
+// Base-ref precedence for a named remote with no explicit refspec / no @{u}:
+// <remote>/<current-branch> → <remote>/HEAD → <remote>/main → <remote>/master. null if none.
+function baseChain(cwd, remote) {
+  const [branch, brOk] = gitTry(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  const candidates = [];
+  if (brOk && branch && branch !== "HEAD") candidates.push(`${remote}/${branch}`);
+  candidates.push(`${remote}/HEAD`, `${remote}/main`, `${remote}/master`);
+  for (const c of candidates) if (refExists(c, cwd)) return c;
+  return null;
 }
 
 export function buildPrompt(commits, diff) {
@@ -180,19 +312,30 @@ export async function runMain({
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
   env = process.env,
-  input: inputOverride
+  input: inputOverride,
+  emitter = createEmitter()
 } = {}) {
+  // All decisions route through this invocation's emit-once guard (A4).
+  const decision = (permissionDecision, reason, systemMessage) =>
+    emitter.emit(decisionPayload(permissionDecision, reason, systemMessage));
+
   const input = inputOverride ?? readInput();
 
   const command = String(input.tool_input?.command ?? "");
 
   // 1. Only act on a real `git push` (not help/dry-run, not another git command, not a quoted mention).
-  if (!findPushSegment(command)) {
+  const pushSeg = findPushSegment(command);
+  if (!pushSeg) {
     // Not a git push — silent allow.
     return;
   }
 
-  const baseCwd = cdTargetBeforePush(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd());
+  // Resolve the review cwd: shell `cd` segments first, then `git -C <dir>` targets applied in order
+  // like git itself (A1) — so `git -C "/path with space/repo" push` reviews THAT repo.
+  let baseCwd = cdTargetBeforePush(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd());
+  for (const target of dashCTargets(pushSeg.text)) {
+    baseCwd = path.isAbsolute(target) ? target : path.resolve(baseCwd, target);
+  }
   const ws = workspaceRoot(baseCwd);
 
   // 2. Bench disabled check.
@@ -200,22 +343,45 @@ export async function runMain({
     process.exit(0);
   }
 
-  // 3. Compute push range — fail OPEN if undeterminable.
-  const { range, ok: rangeOk, note: rangeNote } = resolvePushRange(ws);
+  // 3. Compute push range from the PARSED command — fail OPEN if undeterminable.
+  const parsed = parsePushCommand(pushSeg.text);
+  const { range, ok: rangeOk, note: rangeNote, deleteOnly } = resolvePushRange(ws, parsed);
   if (!rangeOk) {
+    if (deleteOnly) {
+      // delete refspec → pushes no commits → clean allow, no review, no noisy note.
+      return;
+    }
     decision("allow", rangeNote || "pre-push: no upstream; allowed", rangeNote);
     return;
   }
 
-  // 4. Get commits in range; if nothing to push, allow quietly.
-  const commits = git(["log", "--oneline", range], ws).trim();
-  if (!commits) {
+  // 4. Get commits in range; if nothing to push, allow quietly. Use gitTry so a git ERROR
+  //    (not "no commits") is distinguishable and surfaced as a ⛩ note (A2).
+  const [commits, commitsOk] = gitTry(["log", "--oneline", range], ws);
+  if (!commitsOk) {
+    decision(
+      "allow",
+      `pre-push: could not list commits for ${range}; push allowed without review.`,
+      `⛩ pre-push: git log ${range} failed; push allowed without review.`
+    );
+    return;
+  }
+  if (!commits.trim()) {
     decision("allow", "pre-push: nothing to push (no commits ahead of remote); allowed");
     return;
   }
 
-  // 5. Get diff, capped.
-  let diff = git(["diff", range], ws);
+  // 5. Get diff, capped. gitTry → a git error is surfaced, not silently empty (A2).
+  const [diffRaw, diffOk] = gitTry(["diff", range], ws);
+  if (!diffOk) {
+    decision(
+      "allow",
+      `pre-push: could not compute diff for ${range}; push allowed without review.`,
+      `⛩ pre-push: git diff ${range} failed; push allowed without review.`
+    );
+    return;
+  }
+  let diff = diffRaw;
   if (diff.length > MAX_DIFF_BYTES) {
     diff = diff.slice(0, MAX_DIFF_BYTES) + "\n\n[... diff truncated at 200 000 bytes ...]";
   }
@@ -241,6 +407,8 @@ export async function runMain({
     // trace is best-effort — never block a push over it
   }
 
+  const rangeNoteSuffix = rangeNote ? ` (${rangeNote})` : "";
+
   // 8. Decision.
   if (panel.decision === "fail-open") {
     // All reviewers errored — fail OPEN with a visible note.
@@ -263,15 +431,19 @@ export async function runMain({
   }
 
   // allow
-  decision("allow", `⛩ bench pre-push: ALLOW — ${panel.summary}`, `⛩ bench pre-push: ALLOW — ${panel.summary.slice(0, 220)}`);
+  decision("allow", `⛩ bench pre-push: ALLOW — ${panel.summary}${rangeNoteSuffix}`, `⛩ bench pre-push: ALLOW — ${panel.summary.slice(0, 220)}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  runMain().catch((error) => {
-    // Top-level catch → fail OPEN, never wedge a push.
-    decision(
-      "allow",
-      `Pre-push hook errored (${error instanceof Error ? error.message : String(error)}); push allowed.`
-    );
+  const emitter = createEmitter();
+  runMain({ emitter }).catch((error) => {
+    // Top-level catch → fail OPEN, never wedge a push. Only emit if runMain hasn't already
+    // decided — a 2nd stdout line would be dropped by the harness (A4). Else log to stderr.
+    const msg = error instanceof Error ? error.message : String(error);
+    if (!emitter.hasEmitted()) {
+      emitter.emit(decisionPayload("allow", `Pre-push hook errored (${msg}); push allowed.`));
+    } else {
+      process.stderr.write(`⛩ pre-push: error after decision already emitted — ${msg}\n`);
+    }
   });
 }

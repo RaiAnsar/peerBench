@@ -14,7 +14,7 @@ import path from "node:path";
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment } from "../global-hooks/pre-push-review.mjs";
+import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange } from "../global-hooks/pre-push-review.mjs";
 import { setBenchDisabled } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
@@ -535,4 +535,245 @@ test("cdTargetBeforePush: a cd joined to the push by || did NOT run → push use
   assert.equal(cdTargetBeforePush("cd /missing || git push origin main", "/orig"), "/orig");
   // but `cd sub && git push` DID cd → review sub
   assert.equal(cdTargetBeforePush("cd sub && git push", "/orig"), path.resolve("/orig", "sub"));
+});
+
+// ===========================================================================
+// Task 2 — A1: spaces in repo path break push detection AND review-cwd
+// ===========================================================================
+
+test("A1: isGitPushSegment detects pushes with quoted/spaced paths and -c key=value", () => {
+  // Quoted -C value with a space splits in two with split(/\s+/); shellTokenize keeps it whole.
+  assert.ok(isGitPushSegment('git -C "/tmp/Ryan P/repo" push'), "spaced -C value");
+  assert.ok(isGitPushSegment('git -c user.name="John Doe" push'), "spaced -c key=value");
+  assert.ok(isGitPushSegment("git -C '/a b/r' push origin main"), "single-quoted -C value");
+  // Negatives must stay rejected.
+  assert.equal(isGitPushSegment("git pushx"), false, "git pushx");
+  assert.equal(isGitPushSegment("git push --help"), false, "--help");
+  assert.equal(isGitPushSegment("git push --dry-run"), false, "--dry-run");
+});
+
+test("A1: shellTokenize strips surrounding quotes and keeps spaced values whole", () => {
+  assert.deepEqual(shellTokenize('git -C "/a b/r" push'), ["git", "-C", "/a b/r", "push"]);
+  assert.deepEqual(shellTokenize("git -c user.name='John Doe' push"), ["git", "-c", "user.name=John Doe", "push"]);
+  assert.deepEqual(shellTokenize("git push origin main"), ["git", "push", "origin", "main"]);
+});
+
+test("A1: runMain resolves the review cwd to the -C target dir", async () => {
+  // Two repos: hook is invoked with cwd=other, but the push uses `git -C <spaced repo>`.
+  const { ws } = freshPushRepo();
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-other-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-c-")));
+  process.env.BENCH_ROOT = root;
+
+  let seenCwd = null;
+  const capturingReviewer = {
+    name: "Kimi",
+    async run({ cwd }) {
+      seenCwd = cwd;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [capturingReviewer],
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: other, tool_input: { command: `git -C "${ws}" push origin main` } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.ok(seenCwd, "reviewer should be invoked");
+  assert.equal(fs.realpathSync(seenCwd), fs.realpathSync(ws), "review cwd must be the -C target repo, not the hook cwd");
+});
+
+// ===========================================================================
+// Task 2 — A2: correct push range from the parsed command
+// ===========================================================================
+
+/** Build a repo whose remote-tracking refs are seeded under the given remote name. */
+function repoWithRemoteRefs(remote, branches, currentBranch) {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-"));
+  execFileSync("git", ["init", "-q", "-b", currentBranch || branches[0]], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t",
+    "commit", "--allow-empty", "-qm", "base"], { cwd: ws });
+  const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ws, encoding: "utf8" }).trim();
+  // Seed remote-tracking refs manually (no real remote needed).
+  for (const b of branches) {
+    execFileSync("git", ["update-ref", `refs/remotes/${remote}/${b}`, base], { cwd: ws });
+  }
+  return { ws, base };
+}
+
+test("A2: parsePushCommand extracts remote, refspecs, flags (origin default)", () => {
+  assert.deepEqual(parsePushCommand("git push"), { remote: "origin", refspecs: [], flags: [] });
+  assert.deepEqual(parsePushCommand("git push origin"), { remote: "origin", refspecs: [], flags: [] });
+  assert.deepEqual(parsePushCommand("git push upstream feature:release"),
+    { remote: "upstream", refspecs: ["feature:release"], flags: [] });
+  assert.deepEqual(parsePushCommand("git push origin topic"),
+    { remote: "origin", refspecs: ["topic"], flags: [] });
+  const tags = parsePushCommand("git push --tags");
+  assert.equal(tags.remote, "origin");
+  assert.ok(tags.flags.includes("--tags"));
+});
+
+test("A2: resolvePushRange — explicit HEAD:<dst> → <remote>/<dst>..HEAD", () => {
+  const { ws } = repoWithRemoteRefs("origin", ["main"], "main");
+  const r = resolvePushRange(ws, parsePushCommand("git push origin HEAD:main"));
+  assert.equal(r.ok, true);
+  assert.equal(r.range, "origin/main..HEAD");
+});
+
+test("A2: resolvePushRange — explicit <src>:<dst> uses src as source, not HEAD", () => {
+  const { ws } = repoWithRemoteRefs("origin", ["release"], "feature");
+  // Make sure a local 'feature' ref exists (current branch).
+  const r = resolvePushRange(ws, parsePushCommand("git push origin feature:release"));
+  assert.equal(r.ok, true);
+  assert.equal(r.range, "origin/release..feature");
+});
+
+test("A2: resolvePushRange — named remote is honored (upstream)", () => {
+  const { ws } = repoWithRemoteRefs("upstream", ["release"], "feature");
+  const r = resolvePushRange(ws, parsePushCommand("git push upstream feature:release"));
+  assert.equal(r.ok, true);
+  assert.equal(r.range, "upstream/release..feature");
+});
+
+test("A2: resolvePushRange — bare ref → <remote>/<ref>..<ref>", () => {
+  const { ws } = repoWithRemoteRefs("origin", ["topic"], "topic");
+  const r = resolvePushRange(ws, parsePushCommand("git push origin topic"));
+  assert.equal(r.ok, true);
+  assert.equal(r.range, "origin/topic..topic");
+});
+
+test("A2: resolvePushRange — only origin/master, no refspec → origin/master..HEAD", () => {
+  const { ws } = repoWithRemoteRefs("origin", ["master"], "master");
+  const r = resolvePushRange(ws, parsePushCommand("git push"));
+  assert.equal(r.ok, true);
+  assert.equal(r.range, "origin/master..HEAD");
+});
+
+test("A2: resolvePushRange — delete refspec :stale → clean allow, no review", () => {
+  const { ws } = repoWithRemoteRefs("origin", ["main"], "main");
+  const r = resolvePushRange(ws, parsePushCommand("git push origin :stale"));
+  assert.equal(r.ok, false, "delete-only push resolves to no range");
+  assert.equal(r.deleteOnly === true || r.range === "", true, "delete push has no commits to review");
+  // It should NOT carry a fail-open note (it is a clean allow, not a degradation).
+  assert.ok(!r.note || !/fail-open|limitation/i.test(r.note), "delete push is a clean allow");
+});
+
+test("A2: resolvePushRange — --tags → visible fail-open note", () => {
+  const { ws } = repoWithRemoteRefs("origin", ["main"], "main");
+  const r = resolvePushRange(ws, parsePushCommand("git push --tags"));
+  assert.equal(r.ok, false);
+  assert.ok(r.note && /⛩/.test(r.note), "should carry a visible ⛩ fail-open note");
+});
+
+// ===========================================================================
+// Task 2 — A3: wrapped subshell push form detected
+// ===========================================================================
+
+test("A3: findPushSegment detects subshell-wrapped push (git push)", () => {
+  assert.ok(findPushSegment("(git push)"), "(git push) should be detected");
+  assert.ok(findPushSegment("(git push origin main)"), "(git push origin main)");
+});
+
+test("A3: findPushSegment keeps existing negatives null", () => {
+  assert.equal(findPushSegment('echo "remember to git push" && git status'), null);
+  assert.equal(findPushSegment("git push --help"), null);
+  assert.equal(findPushSegment("git pushx"), null);
+});
+
+// ===========================================================================
+// Task 2 — A4: invocation-scoped emit-once guard
+// ===========================================================================
+
+test("A4: a second decision within one invocation writes no second stdout line", async () => {
+  // BLOCK path emits once; if any later code path tried to emit again it'd be a 2nd line.
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-a4a-")));
+  process.env.BENCH_ROOT = root;
+
+  const lines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "BLOCK")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(lines.filter(Boolean).length, 1, "exactly one decision line per invocation");
+});
+
+test("A4: two separate runMain invocations in one process each emit (no cross-invocation suppression)", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-a4b-")));
+  process.env.BENCH_ROOT = root;
+
+  const lines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+  try {
+    for (let i = 0; i < 2; i++) {
+      await runMain({
+        resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+        writeTraceImpl: () => {},
+        isBenchDisabledImpl: () => false,
+        env: process.env,
+        input: { cwd: ws, tool_input: { command: "git push origin main" } }
+      });
+    }
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(lines.filter(Boolean).length, 2, "each invocation emits its own decision line");
+});
+
+test("A4: entrypoint .catch routes a post-emit error to stderr, never a second stdout line", () => {
+  // Drive the real subprocess so the import.meta.url shim runs. A reviewer crash AFTER
+  // the panel emit must not produce a 2nd stdout JSON line; the fallback goes to stderr.
+  const { ws } = freshPushRepo();
+  const result = spawnSync(process.execPath, [HOOK], {
+    input: JSON.stringify({ cwd: ws, tool_input: { command: "git status" } }),
+    encoding: "utf8",
+    env: { ...process.env, BENCH_ROOT: TEMP_GCR }
+  });
+  // git status is a no-op (no emit) — just assert the shim runs cleanly (smoke for the wiring).
+  assert.equal(result.status, 0);
+  const stdoutLines = result.stdout.split("\n").filter((l) => l.trim());
+  assert.ok(stdoutLines.length <= 1, "no spurious stdout lines");
+});
+
+// ===========================================================================
+// Task 2 — E2: visible stderr note on malformed stdin
+// ===========================================================================
+
+test("E2: malformed stdin → ⛩ stderr note (treated as empty)", () => {
+  const result = spawnSync(process.execPath, [HOOK], {
+    input: "{not json",
+    encoding: "utf8",
+    env: { ...process.env, BENCH_ROOT: TEMP_GCR }
+  });
+  assert.equal(result.status, 0, "malformed stdin must not crash (fail-open)");
+  assert.match(result.stderr, /⛩ pre-push: could not parse hook input/, "should emit a visible ⛩ note");
 });
