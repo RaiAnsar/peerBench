@@ -256,7 +256,7 @@ test("D3: plan-file trace write failure emits a ⛩ note and still allows", asyn
 // ===========================================================================
 
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
-import { isDeepDebounced, contentHash } from "../global-hooks/deep-review.mjs";
+import { isDeepDebounced, deepKey } from "../global-hooks/deep-review.mjs";
 
 function allowReviewers() {
   return () => [{ name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) }];
@@ -293,8 +293,11 @@ test("G2/G3: fast ALLOW spawns spec-review detached + unref'd with abs path + ab
   assert.equal(spy.calls.length, 1, "fast ALLOW must spawn spec-review exactly once");
   const { cmd, args, opts } = spy.calls[0];
   assert.equal(cmd, process.execPath, "must spawn node (process.execPath)");
-  assert.equal(args[1], "spec-review", "subcommand must be spec-review");
-  assert.ok(args.includes(specFile), `must pass the absolute spec path; got ${JSON.stringify(args)}`);
+  // FIX 1 (deploy-parity): the worker is the SIBLING global-hooks/spec-review-run.mjs,
+  // not `bench-runner.mjs spec-review` (scripts/ is never deployed). args[0] = worker path.
+  assert.match(args[0], /spec-review-run\.mjs$/, `args[0] must be the spec-review-run worker; got ${JSON.stringify(args)}`);
+  assert.ok(fs.existsSync(args[0]), `the spawned worker must actually exist on disk; got ${args[0]}`);
+  assert.equal(args[1], specFile, "args[1] must be the absolute spec path");
   const wsIdx = args.indexOf("--ws");
   assert.ok(wsIdx >= 0 && args[wsIdx + 1] === ws, `must pass --ws <abs ws>; got ${JSON.stringify(args)}`);
   assert.ok(path.isAbsolute(args[wsIdx + 1]), "ws must be absolute");
@@ -302,8 +305,8 @@ test("G2/G3: fast ALLOW spawns spec-review detached + unref'd with abs path + ab
   assert.equal(opts.stdio, "ignore", "stdio must be ignore");
   assert.equal(spy.unrefCount(), 1, "child must be unref'd");
 
-  // The debounce marker must now be set for this content hash.
-  assert.equal(isDeepDebounced(ws, contentHash(body)), true, "debounce marker must be set after launch");
+  // The debounce marker must now be set for this (file, content) deep key (FIX 4).
+  assert.equal(isDeepDebounced(ws, deepKey(specFile, body)), true, "debounce marker must be set after launch");
 });
 
 test("G3: identical-content re-save within the interval → NOT spawned (debounced)", async () => {
@@ -389,4 +392,44 @@ test("G2: spawn failure does not break the gate (fail-open, ALLOW still emitted)
   }
   const parsed = JSON.parse(lines.find((l) => l.trim()));
   assert.match(parsed.systemMessage || "", /ALLOW/, "ALLOW must still be emitted even if the deep launch throws");
+});
+
+// ===========================================================================
+// FIX 1 — deploy-parity: the deep spec-review worker must resolve its imports in
+// the DEPLOYED FLAT layout (~/.claude/hooks/), where ONLY global-hooks/*.mjs are
+// copied and scripts/ is NEVER present. We copy global-hooks/*.mjs flat into a temp
+// dir and run the worker — it may fail-open (no real reviewers), but it MUST NOT
+// die with a module-resolution error (which a scripts/ import would cause).
+// ===========================================================================
+
+test("FIX 1: spec-review-run.mjs is present and resolves all imports in a FLAT deployed layout", () => {
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const hooksSrc = path.join(here, "..", "global-hooks");
+
+  // Simulate the deployed flat layout: copy ONLY global-hooks/*.mjs (no scripts/).
+  const flat = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flat-"));
+  for (const f of fs.readdirSync(hooksSrc).filter((f) => f.endsWith(".mjs"))) {
+    fs.copyFileSync(path.join(hooksSrc, f), path.join(flat, f));
+  }
+
+  // (a) the worker must be present in the flat copy
+  const worker = path.join(flat, "spec-review-run.mjs");
+  assert.ok(fs.existsSync(worker), "spec-review-run.mjs must be deployed flat alongside the other hooks");
+
+  // (b) running the worker in the flat layout must NOT fail with a module-resolution error.
+  const benchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flat-root-"));
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flat-ws-"));
+  const someFile = path.join(ws, "specs", "s.md");
+  fs.mkdirSync(path.dirname(someFile), { recursive: true });
+  fs.writeFileSync(someFile, "# Spec\n\nflat layout deploy-parity check.\n");
+
+  const result = spawnSync(process.execPath, [worker, someFile, "--ws", ws], {
+    encoding: "utf8",
+    env: { ...process.env, BENCH_ROOT: benchRoot }
+  });
+
+  assert.doesNotMatch(result.stderr || "", /ERR_MODULE_NOT_FOUND/, `worker must resolve all sibling imports in a flat layout; stderr: ${result.stderr}`);
+  assert.doesNotMatch(result.stderr || "", /Cannot find module/, `worker must not have an unresolved import in a flat layout; stderr: ${result.stderr}`);
+  // Fail-open: a missing API key etc. is fine; the process must not look like a crash from a bad import.
+  assert.equal(result.status, 0, `worker fails open (exit 0); got ${result.status}, stderr: ${result.stderr}`);
 });

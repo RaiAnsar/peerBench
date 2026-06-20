@@ -21,6 +21,14 @@ export function contentHash(content) {
   return createHash("sha256").update(String(content ?? "")).digest("hex").slice(0, 16);
 }
 
+// FIX 4: the deep debounce/result key. Keyed on (filePath, content) so two DIFFERENT
+// spec files with byte-identical content do NOT collide (which would skip the second
+// deep pass and clobber the first's result file). Use this everywhere a deep key is
+// derived (launch debounce, the result hash, and the stale-check).
+export function deepKey(filePath, content) {
+  return contentHash(`${String(filePath)} ${String(content)}`);
+}
+
 export function severityRank(sev) {
   return SEVERITY_RANK[String(sev ?? "none").toLowerCase()] ?? 0;
 }
@@ -97,7 +105,15 @@ export function readLatestDeepResult(ws) {
   });
   const file = path.join(dir, files[0]);
   try {
-    return { file, result: JSON.parse(fs.readFileSync(file, "utf8")) };
+    // FIX 3: defensively cap the read — an absurdly large result file is treated as corrupt
+    // (a deep-result is small structured JSON; megabytes means something went wrong).
+    if (fs.statSync(file).size > 256 * 1024) throw new Error("deep-result too large");
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    // FIX 2: valid JSON `null` (or an array/non-object) parses fine but would crash
+    // surfaceDeepResult at `result.specPath`, leaving the file undeleted → the gate
+    // re-throws every future stop. Require a non-null plain object so the catch drops it.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("deep-result not an object");
+    return { file, result: parsed };
   } catch {
     // Corrupt result file — remove it so it never wedges the stop gate.
     try { fs.rmSync(file, { force: true }); } catch { /* noop */ }

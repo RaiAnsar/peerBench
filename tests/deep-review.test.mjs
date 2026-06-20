@@ -12,7 +12,8 @@ process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "deep-root-"));
 import {
   contentHash, severityRank, summarizeSpecReview, shouldRewake,
   deepResultPath, deepDebouncePath, isDeepDebounced, markDeepDebounce,
-  writeDeepResult, readLatestDeepResult, deleteDeepResult, DEEP_REWAKE_SEVERITY
+  writeDeepResult, readLatestDeepResult, deleteDeepResult, DEEP_REWAKE_SEVERITY,
+  deepKey
 } from "../global-hooks/deep-review.mjs";
 import { specReviewCommand } from "../scripts/bench-runner.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
@@ -86,6 +87,66 @@ test("deepDebouncePath / deepResultPath live under workspaceStateDir", () => {
   assert.ok(deepResultPath(ws, "abc").startsWith(workspaceStateDir(ws)));
 });
 
+// ── FIX 4: deepKey is (path + content) keyed — distinct files with identical content do not collide ──
+test("FIX 4: deepKey keys on (path, content) so byte-identical content in two files does NOT collide", () => {
+  const same = "# identical body\n";
+  const a = "/repo/specs/a.md";
+  const b = "/repo/specs/b.md";
+  // Same path + same content → stable.
+  assert.equal(deepKey(a, same), deepKey(a, same));
+  // Different path, identical content → distinct key (the collision FIX 4 fixes).
+  assert.notEqual(deepKey(a, same), deepKey(b, same), "distinct files with identical content must produce distinct keys");
+  // Same path, different content → distinct key (still content-sensitive).
+  assert.notEqual(deepKey(a, "# v1\n"), deepKey(a, "# v2\n"));
+});
+
+test("FIX 4: debounce keyed via deepKey does not collide across files with identical content", () => {
+  const ws = freshWs();
+  const body = "# same body for two files\n";
+  const a = path.join(ws, "specs", "a.md");
+  const b = path.join(ws, "specs", "b.md");
+  const keyA = deepKey(a, body);
+  const keyB = deepKey(b, body);
+  // A launches and is debounced for its own key…
+  markDeepDebounce(ws, keyA);
+  assert.equal(isDeepDebounced(ws, keyA), true, "A is debounced after launch");
+  assert.equal(isDeepDebounced(ws, keyB), false, "B (different file, identical content) must NOT be debounced");
+});
+
+// ── FIX 2: a null / non-object deep-result file must not wedge the stop gate ──
+test("FIX 2: deep-result file containing JSON null → readLatestDeepResult returns null AND deletes the file", () => {
+  const ws = freshWs();
+  const dir = workspaceStateDir(ws);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "deep-result-deadbeef.json");
+  fs.writeFileSync(file, "null");   // valid JSON, but null — would crash surfaceDeepResult via result.specPath
+  assert.equal(readLatestDeepResult(ws), null, "a null deep-result must be treated as corrupt → null");
+  assert.equal(fs.existsSync(file), false, "the corrupt (null) deep-result file must be deleted so it never wedges the gate");
+});
+
+test("FIX 2: deep-result file containing a JSON array → treated as corrupt (null + deleted)", () => {
+  const ws = freshWs();
+  const dir = workspaceStateDir(ws);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "deep-result-cafef00d.json");
+  fs.writeFileSync(file, "[1,2,3]");
+  assert.equal(readLatestDeepResult(ws), null, "an array deep-result is not a valid result object → null");
+  assert.equal(fs.existsSync(file), false, "the array deep-result file must be deleted");
+});
+
+// ── FIX 3: oversized deep-result file is dropped (defensive read cap) ──
+test("FIX 3: oversized (>256KB) deep-result file → dropped (returns null, file deleted)", () => {
+  const ws = freshWs();
+  const dir = workspaceStateDir(ws);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "deep-result-bignum.json");
+  const huge = JSON.stringify({ hash: "h", summary: "x".repeat(1024 * 1024), reviewers: [], findingCount: 0, maxSeverity: "none" });
+  fs.writeFileSync(file, huge);
+  assert.ok(fs.statSync(file).size > 256 * 1024, "fixture must actually exceed the cap");
+  assert.equal(readLatestDeepResult(ws), null, "an oversized deep-result must be treated as corrupt → null");
+  assert.equal(fs.existsSync(file), false, "the oversized deep-result file must be deleted");
+});
+
 // ── G1/G4: the spec-review subcommand ─────────────────────────────────────────
 
 test("G1: specReviewCommand writes a gate:'spec-review' trace and returns the structured result", async () => {
@@ -126,7 +187,7 @@ test("G4: specReviewCommand writes deep-result-<hash>.json on completion (hash, 
   const file = path.join(planDir, "s2.md");
   const body = "# Spec 2\n\nbody two\n";
   fs.writeFileSync(file, body);
-  const h = contentHash(body);
+  const h = deepKey(file, body);   // FIX 4: deep key is (path, content)-keyed
 
   const panelImpl = async () => [
     { name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }
@@ -136,7 +197,7 @@ test("G4: specReviewCommand writes deep-result-<hash>.json on completion (hash, 
 
   const found = readLatestDeepResult(ws);
   assert.ok(found, "deep-result file must be written on completion");
-  assert.equal(found.result.hash, h, "deep-result must carry the content hash");
+  assert.equal(found.result.hash, h, "deep-result must carry the (path,content) deep key");
   assert.ok(found.result.traceId, "deep-result must carry the trace id");
   assert.equal(typeof found.result.badge, "string");
   assert.equal(typeof found.result.summary, "string");

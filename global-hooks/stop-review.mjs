@@ -10,7 +10,7 @@ import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled, workspaceStateDir } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { readLatestDeepResult, deleteDeepResult, contentHash, shouldRewake } from "./deep-review.mjs";
+import { readLatestDeepResult, deleteDeepResult, deepKey, shouldRewake } from "./deep-review.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
 const MAX_STOP_LOOPS = 4;                  // cap CONSECUTIVE bench blocks → then allow, to avoid a runaway re-review loop
@@ -42,6 +42,26 @@ function git(args, cwd) {
   }
 }
 
+// FIX 5 — invocation-scoped emit-once guard. Claude Code reads only the FIRST line on
+// stdout, so a second stdout emit in the same invocation is silently dropped. surfaceDeepResult
+// emits a 'surfaced' note, then runMain continues and would emit AGAIN (ALLOW / loop-cap /
+// fail-open) — the surfaced note must win that single slot. MUST be created per runMain
+// invocation: a module-level flag would suppress later invocations in the same process and
+// break the suite. The BLOCK / rewake paths use stderr + exit 2 (NOT stdout) and are unaffected.
+export function createEmitter() {
+  let emitted = false;
+  return {
+    hasEmitted: () => emitted,
+    emit(payload) {
+      if (emitted) return false;
+      emitted = true;
+      process.stdout.write(`${JSON.stringify(payload)}\n`);
+      return true;
+    }
+  };
+}
+
+// Bare emit kept for any default callers (e.g. surfaceDeepResult when used standalone in tests).
 function emit(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
 }
@@ -61,14 +81,17 @@ export function surfaceDeepResult(ws, { emit: emitFn = emit } = {}) {
   if (result.specPath && result.hash) {
     try {
       const current = fs.readFileSync(result.specPath, "utf8");
-      stale = contentHash(current) !== result.hash;
+      // FIX 4: recompute via the (path,content) deep key so the stale-check matches how the
+      // result hash was derived (distinct files with identical content stay distinct).
+      stale = deepKey(result.specPath, current) !== result.hash;
     } catch {
       stale = true;   // spec gone/unreadable → the result is necessarily stale
     }
   }
   const traceNote = result.traceId ? ` (trace ${result.traceId})` : "";
   const staleNote = stale ? " — note: the spec changed since this pass ran, result may be stale" : "";
-  const line = `⛩ deep spec review: ${result.badge || "?"} ${result.summary || ""}${traceNote}${staleNote}`;
+  // FIX 3: cap the interpolated summary (every other emit site caps ~220–250).
+  const line = `⛩ deep spec review: ${result.badge || "?"} ${String(result.summary || "").slice(0, 220)}${traceNote}${staleNote}`;
 
   if (!stale && shouldRewake({ maxSeverity: result.maxSeverity, findingCount: result.findingCount })) {
     deleteDeepResult(file);
@@ -115,8 +138,12 @@ export async function runMain({
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
   env = process.env,
-  input: inputOverride
+  input: inputOverride,
+  emitter = createEmitter()
 } = {}) {
+  // FIX 5 — ALL stdout emits in this invocation (the surfaced deep note AND every runMain
+  // emit below) route through one emit-once guard so only the FIRST line reaches the harness.
+  const emit = (obj) => emitter.emit(obj);
   const input = inputOverride ?? readInput();
   const cwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);
@@ -127,8 +154,9 @@ export async function runMain({
 
   // G5 — surface any COMPLETED deep spec-review BEFORE the loop-cap / no-diff returns,
   // so a quiet turn never swallows it. High-severity findings rewake (exit 2); otherwise
-  // a note is emitted and the gate continues with the normal turn review.
-  const deep = surfaceDeepResult(ws);
+  // a note is emitted (through THIS invocation's guard, so it wins the single stdout slot)
+  // and the gate continues with the normal turn review.
+  const deep = surfaceDeepResult(ws, { emit });
   if (deep && deep.kind === "rewake") {
     process.stderr.write(`${deep.text}\n\nAddress these deep spec-review findings (see /bench:status for the full report) before ending the session.`);
     process.exit(2);

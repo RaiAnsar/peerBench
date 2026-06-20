@@ -12,7 +12,7 @@ import path from "node:path";
 const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt } from "../global-hooks/stop-review.mjs";
+import { runMain, buildPrompt, surfaceDeepResult } from "../global-hooks/stop-review.mjs";
 import { setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
@@ -642,6 +642,124 @@ test("G5: high-severity deep findings → REWAKE (exit 2) with findings on stder
 
   assert.equal(result.status, 2, `high-severity deep findings must rewake (exit 2); stderr=${result.stderr} stdout=${result.stdout}`);
   assert.match(result.stderr, /deep spec review|critical design flaw/i, "rewake findings on stderr");
+});
+
+// ---------------------------------------------------------------------------
+// FIX 2 — a null / non-object deep-result must not wedge the stop gate:
+// surfaceDeepResult returns null without throwing (readLatestDeepResult drops it).
+// ---------------------------------------------------------------------------
+
+test("FIX 2: a null deep-result file → surfaceDeepResult returns null without throwing", () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fix2-"));
+  process.env.BENCH_ROOT = root;
+  try {
+    const dir = workspaceStateDir(ws);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "deep-result-nulltest.json");
+    fs.writeFileSync(file, "null");
+    const emitted = [];
+    const res = surfaceDeepResult(ws, { emit: (o) => emitted.push(o) });
+    assert.equal(res, null, "null deep-result must surface as null (no TypeError on result.specPath)");
+    assert.equal(emitted.length, 0, "nothing should be emitted for a corrupt null result");
+    assert.equal(fs.existsSync(file), false, "the null result file must be dropped so it never wedges the gate");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// FIX 3 — surfaced summary is length-capped (no unbounded output).
+// ---------------------------------------------------------------------------
+
+test("FIX 3: oversized summary → surfaced line is bounded (or the file is dropped)", () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fix3-"));
+  process.env.BENCH_ROOT = root;
+  try {
+    // A modest result whose summary is large but the FILE stays under the 256KB read cap,
+    // so it is read and surfaced — the EMITTED line must be bounded by the .slice(0,220).
+    const dir = workspaceStateDir(ws);
+    fs.mkdirSync(dir, { recursive: true });
+    const big = "Z".repeat(5000);
+    writeDeepResult(ws, { hash: contentHash("x"), badge: "Kimi✓", summary: big, traceId: "tid-big", findingCount: 0, maxSeverity: "none", reviewers: [] });
+    const emitted = [];
+    const res = surfaceDeepResult(ws, { emit: (o) => emitted.push(o) });
+    if (res) {
+      // surfaced → the emitted systemMessage line must be bounded
+      assert.equal(emitted.length, 1, "exactly one note emitted");
+      assert.ok(emitted[0].systemMessage.length <= 320, `surfaced line must be bounded; got ${emitted[0].systemMessage.length}`);
+    } else {
+      // dropped as oversized is also acceptable
+      assert.equal(emitted.length, 0);
+    }
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// FIX 5 — invocation-scoped emit-once: a turn with BOTH a completed deep-result
+// AND a real diff emits EXACTLY ONE systemMessage on stdout (the surfaced note
+// wins); two separate runMain invocations in one process each emit (no module-level
+// suppression).
+// ---------------------------------------------------------------------------
+
+test("FIX 5: deep-result + real diff → exactly ONE stdout systemMessage (surfaced wins)", async () => {
+  const ws = freshRepo({ withChange: true });   // real diff this turn
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fix5-"));
+  process.env.BENCH_ROOT = root;
+
+  writeDeepResult(ws, { hash: contentHash("x"), badge: "Kimi✓ MiMo✓", summary: "deep ok", traceId: "tid-once", findingCount: 0, maxSeverity: "none", reviewers: [] });
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW"), fakeReviewer("MiMo", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, last_assistant_message: "wrote code" }
+    });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  const sysLines = lines.filter((l) => { try { return !!JSON.parse(l).systemMessage; } catch { return false; } });
+  assert.equal(sysLines.length, 1, `exactly one systemMessage line on stdout (surfaced wins); got ${sysLines.length}: ${lines.join(" | ")}`);
+  assert.match(JSON.parse(sysLines[0]).systemMessage, /deep spec review/i, "the surfaced deep note must win the single stdout slot");
+});
+
+test("FIX 5: two separate runMain invocations in one process each emit (no module-level suppression)", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fix5b-"));
+  process.env.BENCH_ROOT = root;
+
+  const run = async () => {
+    const ws = freshRepo({ withChange: true });
+    const { lines, restore } = captureEmit(() => {});
+    try {
+      await runMain({
+        resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+        writeTraceImpl: () => {},
+        isBenchDisabledImpl: () => false,
+        env: process.env,
+        input: { cwd: ws, last_assistant_message: "wrote code" }
+      });
+    } finally {
+      restore();
+    }
+    return lines.filter((l) => { try { return !!JSON.parse(l).systemMessage; } catch { return false; } });
+  };
+
+  try {
+    const first = await run();
+    const second = await run();
+    assert.equal(first.length, 1, "first invocation emits its ALLOW note");
+    assert.equal(second.length, 1, "second invocation also emits — emit-once must be per-invocation, not module-level");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
 });
 
 test("buildPrompt: user does not contain BLOCK guidance; system does", () => {

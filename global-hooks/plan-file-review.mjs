@@ -12,7 +12,7 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { contentHash, isDeepDebounced, markDeepDebounce } from "./deep-review.mjs";
+import { deepKey, isDeepDebounced, markDeepDebounce } from "./deep-review.mjs";
 import { execFileSync, spawn as defaultSpawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -21,28 +21,29 @@ function workspaceRoot(cwd) {
   catch { return cwd; }
 }
 
-// Resolve the bench-runner CLI relative to this hook file (works both in-repo and
-// in the deployed ~/.claude/hooks copy, where bench-runner.mjs is alongside).
-function resolveBenchRunner() {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    path.resolve(here, "..", "scripts", "bench-runner.mjs"),   // in-repo layout
-    path.resolve(here, "bench-runner.mjs")                       // deployed alongside the hooks
-  ];
-  for (const c of candidates) { try { if (fs.existsSync(c)) return c; } catch { /* keep looking */ } }
-  return candidates[0];
+// FIX 1 (deploy-parity): the deep spec-review WORKER is a SIBLING global-hooks file.
+// Deployed hooks live flat in ~/.claude/hooks/ — only global-hooks/*.mjs are copied
+// there; scripts/ is never deployed. Resolving the worker relative to this file works
+// BOTH in-repo and in the deployed flat layout.
+function resolveDeepWorker() {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "spec-review-run.mjs");
 }
 
 // G2/G3 — after a fast ALLOW (NOT a dedup-hit), launch the deep spec-review pass
-// detached + unref'd, debounced on the content hash so an identical re-save within
-// the interval does not relaunch. Never throws — the fast gate has already allowed.
+// detached + unref'd, debounced on the (path,content) key so an identical re-save
+// within the interval does not relaunch. Never throws — the fast gate has already allowed.
 export function launchDeepReview(ws, filePath, content, { spawnImpl = defaultSpawn, now = Date.now() } = {}) {
   try {
-    const hash = contentHash(content);
-    if (isDeepDebounced(ws, hash, { now })) return false;   // a deep pass for this exact content ran/launched recently
-    markDeepDebounce(ws, hash, { now });
-    const runner = resolveBenchRunner();
-    const child = spawnImpl(process.execPath, [runner, "spec-review", filePath, "--ws", ws], { detached: true, stdio: "ignore" });
+    const worker = resolveDeepWorker();
+    if (!fs.existsSync(worker)) {
+      // Loud, never a silent no-op: the fast review stands but the deep pass is skipped.
+      process.stderr.write("⛩ plan gate: deep spec-review worker missing; fast review stands.\n");
+      return false;
+    }
+    const key = deepKey(filePath, content);   // FIX 4: (path,content)-keyed — distinct files with identical content don't collide
+    if (isDeepDebounced(ws, key, { now })) return false;   // a deep pass for this exact (file,content) ran/launched recently
+    markDeepDebounce(ws, key, { now });
+    const child = spawnImpl(process.execPath, [worker, filePath, "--ws", ws], { detached: true, stdio: "ignore" });
     if (child && typeof child.unref === "function") child.unref();
     return true;
   } catch (e) {
