@@ -13,7 +13,7 @@ const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt } from "../global-hooks/stop-review.mjs";
-import { setBenchDisabled } from "../global-hooks/config-store.mjs";
+import { setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "stop-review.mjs");
@@ -108,14 +108,14 @@ test("no diff → runMain returns early without trace or emit", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test: stop_hook_active loop guard → no-op
+// Test: reviews regardless of the SHARED stop_hook_active flag (must not be
+// starved when another Stop hook — e.g. the codex gate — is looping).
 // ---------------------------------------------------------------------------
 
-test("stop_hook_active → runMain returns early (loop guard)", async () => {
+test("reviews even when stop_hook_active=true (decoupled from the shared Stop flag)", async () => {
   const ws = freshRepo({ withChange: true });
-
-  let reviewersCalled = false;
-  const resolveReviewersImpl = () => { reviewersCalled = true; return []; };
+  let called = false;
+  const resolveReviewersImpl = () => { called = true; return [fakeReviewer("Kimi", "ALLOW")]; };
 
   await runMain({
     resolveReviewersImpl,
@@ -125,7 +125,30 @@ test("stop_hook_active → runMain returns early (loop guard)", async () => {
     input: { cwd: ws, stop_hook_active: true }
   });
 
-  assert.equal(reviewersCalled, false, "reviewers must NOT be called when stop_hook_active is set");
+  assert.equal(called, true, "must review even when stop_hook_active is set — the shared flag must not starve this gate");
+});
+
+// ---------------------------------------------------------------------------
+// Test: own consecutive-block cap → allows without reviewing after MAX_STOP_LOOPS
+// ---------------------------------------------------------------------------
+
+test("caps its own consecutive blocks → allows without reviewing once the cap is hit", async () => {
+  const ws = freshRepo({ withChange: true });
+  fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
+  fs.writeFileSync(path.join(workspaceStateDir(ws), "stop-loop"), JSON.stringify({ count: 4, ts: Date.now() }));
+
+  let called = false;
+  const resolveReviewersImpl = () => { called = true; return [fakeReviewer("Kimi", "BLOCK")]; };
+
+  await runMain({
+    resolveReviewersImpl,
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, stop_hook_active: false }
+  });
+
+  assert.equal(called, false, "after MAX_STOP_LOOPS consecutive blocks the gate allows without reviewing (loop broken)");
 });
 
 // ---------------------------------------------------------------------------

@@ -5,12 +5,15 @@
 // On ALLOW: emit systemMessage + exit 0. Fails OPEN on any error.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
-import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, workspaceStateDir } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
+const MAX_STOP_LOOPS = 4;                  // cap CONSECUTIVE bench blocks → then allow, to avoid a runaway re-review loop
+const LOOP_WINDOW_MS = 10 * 60 * 1000;     // …only count blocks within this window as "consecutive"
 
 function readInput() {
   try {
@@ -76,17 +79,26 @@ export async function runMain({
   input: inputOverride
 } = {}) {
   const input = inputOverride ?? readInput();
-
-  // Loop guard: if a prior stop-hook block is already being processed, skip.
-  if (input.stop_hook_active) {
-    return;
-  }
-
   const cwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);
 
   if (isBenchDisabledImpl(ws)) {
     process.exit(0);
+  }
+
+  // Loop protection scoped to THIS gate. We deliberately do NOT key off `stop_hook_active`: that
+  // flag is SHARED across all Stop hooks, so another asyncRewake gate (e.g. the codex gate) looping
+  // would starve this one — it would skip on every turn. Instead, cap our OWN consecutive blocks.
+  const loopFile = path.join(workspaceStateDir(ws), "stop-loop");
+  let priorBlocks = 0;
+  try {
+    const j = JSON.parse(fs.readFileSync(loopFile, "utf8"));
+    if (Date.now() - j.ts < LOOP_WINDOW_MS) priorBlocks = j.count || 0;
+  } catch { /* no marker yet */ }
+  if (priorBlocks >= MAX_STOP_LOOPS) {
+    try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
+    emit({ systemMessage: `⛩ bench stop: ${MAX_STOP_LOOPS} consecutive blocks — allowing to avoid a loop. Address remaining findings manually, or /bench:off.` });
+    return;
   }
 
   const status = git(["status", "--short", "--untracked-files=all"], ws);
@@ -127,11 +139,14 @@ export async function runMain({
   }
 
   if (panel.decision === "fail-open") {
+    try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }   // not a block — reset the loop counter
     emit({ systemMessage: `⛩ bench stop: review failed (turn allowed) — ${panel.summary.slice(0, 250)}` });
     return;
   }
 
   if (panel.decision === "block") {
+    // Record this block so a runaway re-review loop is capped (see MAX_STOP_LOOPS above).
+    try { fs.mkdirSync(workspaceStateDir(ws), { recursive: true }); fs.writeFileSync(loopFile, JSON.stringify({ count: priorBlocks + 1, ts: Date.now() })); } catch { /* noop */ }
     // asyncRewake: write findings to STDERR and exit 2 so the harness wakes
     // Claude with them instead of blocking the turn inline.
     process.stderr.write(
@@ -142,7 +157,8 @@ export async function runMain({
     process.exit(2);
   }
 
-  // allow
+  // allow — clear the loop counter
+  try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
   emit({ systemMessage: `⛩ bench stop: ALLOW — ${panel.summary.slice(0, 220)}` });
 }
 
