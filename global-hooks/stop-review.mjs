@@ -161,7 +161,7 @@ export async function runMain({
   // and the gate continues with the normal turn review.
   const deep = surfaceDeepResult(ws, { emit });
   if (deep && deep.kind === "rewake") {
-    process.stderr.write(`${deep.text}\n\nAddress these deep spec-review findings (see /bench:status for the full report) before ending the session.`);
+    process.stderr.write(`${deep.text}\n\nAddress these deep review findings (see /bench:status for the full report) before ending the session.`);
     process.exit(2);
   }
 

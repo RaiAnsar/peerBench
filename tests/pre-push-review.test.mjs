@@ -888,7 +888,9 @@ test("H: fast ALLOW launches the deep push-review worker — args [<spec-review-
   assert.match(args[0], /spec-review-run\.mjs$/, `args[0] must be the spec-review-run worker; got ${JSON.stringify(args)}`);
   assert.ok(fs.existsSync(args[0]), `the spawned worker must actually exist on disk (deploy-parity); got ${args[0]}`);
   assert.equal(args[1], "--push", "args[1] must be --push");
-  assert.match(args[2], /\.\.HEAD$|\.\.main$|\.\./, `args[2] must be the resolved range; got ${args[2]}`);
+  // Race fix (H): the range must be PINNED to concrete SHAs at launch, not symbolic <ref>..HEAD
+  // (which the push would empty before the detached worker runs).
+  assert.match(args[2], /^[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}$/, `args[2] must be a SHA-pinned range; got ${args[2]}`);
   assert.equal(args[3], "--ws", "args[3] must be --ws");
   assert.equal(args[4], wsReal, "args[4] must be the absolute ws");
   assert.ok(path.isAbsolute(args[4]), "ws must be absolute");
@@ -897,6 +899,27 @@ test("H: fast ALLOW launches the deep push-review worker — args [<spec-review-
   assert.equal(opts.detached, true, "must be detached");
   assert.equal(opts.stdio, "ignore", "stdio must be ignore");
   assert.equal(spy.unrefCount(), 1, "child must be unref'd");
+});
+
+test("H: launchPushReview pins the range to SHAs so it survives the push advancing the remote ref (the race)", () => {
+  const { ws } = freshPushRepo();   // one commit ahead of origin/main
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hrace-")));
+  process.env.BENCH_ROOT = root;
+  const spy = pushSpawnSpy();
+  try {
+    launchPushReview(ws, "origin/main..HEAD", { spawnImpl: spy.impl });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  const range = spy.calls[0].args[2];
+  assert.match(range, /^[0-9a-f]{40}\.\.[0-9a-f]{40}$/, `range must be SHA-pinned; got ${range}`);
+
+  // Simulate what `git push origin main` does: advance the remote-tracking ref to HEAD.
+  execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: ws });
+  const symbolic = execFileSync("git", ["log", "--oneline", "origin/main..HEAD"], { cwd: ws, encoding: "utf8" }).trim();
+  const pinned = execFileSync("git", ["log", "--oneline", range], { cwd: ws, encoding: "utf8" }).trim();
+  assert.equal(symbolic, "", "the SYMBOLIC range is empty after the push (this is the race that was reviewing nothing)");
+  assert.ok(pinned.length > 0, "the PINNED SHA range still contains the pushed commit (race fixed)");
 });
 
 test("H: BLOCK → does NOT launch the deep push-review (push denied)", async () => {

@@ -40,7 +40,19 @@ export function launchPushReview(ws, range, { spawnImpl = defaultSpawn, gitImpl 
     const key = deepKey(`push:${range}`, headSha);
     if (isDeepDebounced(ws, key, { now })) return false;   // same push reviewed/launched recently
     markDeepDebounce(ws, key, { now });
-    const child = spawnImpl(process.execPath, [worker, "--push", range, "--ws", ws], { detached: true, stdio: "ignore" });
+    // PIN the range to concrete SHAs NOW — before the push runs. We launch (PreToolUse) BEFORE the
+    // actual `git push`, which then advances the remote-tracking ref (@{u}/origin/<branch>) to HEAD;
+    // a SYMBOLIC `<ref>..HEAD` would resolve to EMPTY by the time the detached worker runs, reviewing
+    // nothing. SHAs are immutable, so the worker reviews the exact pushed commits regardless of timing.
+    // (deepKey above keeps the symbolic range for stable dedupe.)
+    let reviewRange = range;
+    const dd = range.indexOf("..");
+    if (dd > 0) {
+      const [baseSha, baseOk] = gitImpl(["rev-parse", range.slice(0, dd)], ws);
+      const [srcSha, srcOk] = gitImpl(["rev-parse", range.slice(dd + 2)], ws);
+      if (baseOk && srcOk && baseSha && srcSha) reviewRange = `${baseSha}..${srcSha}`;
+    }
+    const child = spawnImpl(process.execPath, [worker, "--push", reviewRange, "--ws", ws], { detached: true, stdio: "ignore" });
     if (child && typeof child.unref === "function") child.unref();
     return true;
   } catch (e) {
