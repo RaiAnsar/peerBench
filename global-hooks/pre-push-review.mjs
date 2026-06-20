@@ -403,8 +403,9 @@ export async function runMain({
       userPrompt: user,
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""]))
     });
-  } catch {
-    // trace is best-effort — never block a push over it
+  } catch (e) {
+    // trace is best-effort — never block a push over it, but say so instead of swallowing (D3).
+    process.stderr.write(`⛩ pre-push: trace write failed (${e instanceof Error ? e.message : String(e)}); push review continues.\n`);
   }
 
   const rangeNoteSuffix = rangeNote ? ` (${rangeNote})` : "";

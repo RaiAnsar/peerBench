@@ -12,8 +12,8 @@ process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-runner-roo
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { reviewersCommand, setupStatus, statusCommand } from "../scripts/bench-runner.mjs";
-import { resolveConfig } from "../global-hooks/config-store.mjs";
+import { reviewersCommand, setupStatus, statusCommand, huntCommand } from "../scripts/bench-runner.mjs";
+import { resolveConfig, workspaceStateDir } from "../global-hooks/config-store.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 
 const RUNNER = fileURLToPath(new URL("../scripts/bench-runner.mjs", import.meta.url));
@@ -182,4 +182,43 @@ test("F: bench-runner review --json includes the badge", () => {
   const res = spawnSync(process.execPath, [RUNNER, "review", "--json"], { cwd: ws, env, encoding: "utf8" });
   const obj = JSON.parse(res.stdout.trim().split("\n").pop());
   assert.equal(obj.badge, "Kimi!", `--json must include badge; got: ${JSON.stringify(obj)}`);
+});
+
+// ── Task 9 — D3: trace-write failures emit a ⛩ note and still produce output ──
+
+test("D3: huntCommand trace-write failure emits a ⛩ note and still returns findings", async () => {
+  const ws = freshWs();
+  const stderrChunks = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
+  let out;
+  try {
+    out = await huntCommand(ws, "some symptom", {
+      huntImpl: async () => [{ name: "Kimi", findings: "found a bug at x:1" }],
+      writeTraceImpl: () => { throw new Error("disk full"); }
+    });
+  } finally {
+    process.stderr.write = origErr;
+  }
+  assert.match(stderrChunks.join(""), /⛩ .*trace write failed/i, "expected a ⛩ trace-write-failed note on stderr");
+  assert.match(out, /found a bug at x:1/, "must still return the findings despite the trace failure");
+});
+
+test("D3: review trace-write failure emits a ⛩ note and still allows (subprocess)", () => {
+  const { ws, env } = reviewSandbox();
+  // Force writeTrace to throw inside the subprocess: plant a FILE where the
+  // traces/ directory should be so mkdirSync(recursive) throws EEXIST.
+  const stateDir = workspaceStateDir(ws);   // computed with this process's BENCH_ROOT...
+  // ...but the subprocess uses env.BENCH_ROOT (from reviewSandbox). Recompute under that root.
+  const prevRoot = process.env.BENCH_ROOT;
+  process.env.BENCH_ROOT = env.BENCH_ROOT;
+  let subStateDir;
+  try { subStateDir = workspaceStateDir(ws); } finally { process.env.BENCH_ROOT = prevRoot; }
+  fs.mkdirSync(subStateDir, { recursive: true });
+  fs.writeFileSync(path.join(subStateDir, "traces"), "i am a file, not a dir");
+
+  const res = spawnSync(process.execPath, [RUNNER, "review"], { cwd: ws, env, encoding: "utf8" });
+  assert.match(res.stderr, /⛩ .*trace write failed/i, `expected a ⛩ trace-write-failed note on stderr; got: ${res.stderr}`);
+  const resultLine = res.stdout.split("\n").find((l) => l.startsWith("Result:"));
+  assert.ok(resultLine, `review must still produce a Result line; got stdout=${res.stdout}`);
 });

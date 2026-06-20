@@ -779,3 +779,37 @@ test("E2: malformed stdin → ⛩ stderr note (treated as empty)", () => {
   assert.equal(result.status, 0, "malformed stdin must not crash (fail-open)");
   assert.match(result.stderr, /⛩ pre-push: could not parse hook input/, "should emit a visible ⛩ note");
 });
+
+// ===========================================================================
+// Task 9 — D3: trace-write failure emits a ⛩ note and still allows (fail-open)
+// ===========================================================================
+
+test("D3: pre-push trace write failure emits a ⛩ note and still allows", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-d3-")));
+  process.env.BENCH_ROOT = root;
+
+  const stderrChunks = [];
+  const stdoutLines = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  const origOut = process.stdout.write.bind(process.stdout);
+  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) stdoutLines.push(chunk.trim()); return origOut(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => { throw new Error("disk full"); },
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.stderr.write = origErr;
+    process.stdout.write = origOut;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.match(stderrChunks.join(""), /⛩ .*trace write failed/i, "expected a ⛩ trace-write-failed note on stderr");
+  const parsed = JSON.parse(stdoutLines.find((l) => l.trim()));
+  assert.equal(parsed.hookSpecificOutput?.permissionDecision, "allow", "must still allow despite trace failure");
+});

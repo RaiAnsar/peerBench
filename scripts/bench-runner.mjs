@@ -111,7 +111,10 @@ async function main() {
         userPrompt: user.slice(0, 2000),
         rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || r.error || ""]))
       });
-    } catch { /* trace is best-effort */ }
+    } catch (e) {
+      // trace is best-effort — but say so on stderr instead of swallowing (D3); /bench:status needs it.
+      process.stderr.write(`⛩ bench review: trace write failed (${e instanceof Error ? e.message : String(e)}); review continues.\n`);
+    }
 
     if (flags.json) {
       process.stdout.write(JSON.stringify({ decision: panel.decision, badge: panel.badge, summary: panel.summary, findings: panel.findings, results }) + "\n");
@@ -201,20 +204,23 @@ const HUNT_MODES = {
   investigate: { deep: true,  system: HUNT_SYSTEM,  buildUser: buildHuntUser,  header: (s) => s ? `Investigation — focus: ${s}` : "Investigation — broad sweep" },
   debug:       { deep: false, system: DEBUG_SYSTEM, buildUser: buildDebugUser, header: (s) => `Debug — ${s || "(no failure described)"}` },
 };
-export async function huntCommand(cwd, seed, { huntImpl = huntPanel, deep = false, mode } = {}) {
+export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceImpl = writeTrace, deep = false, mode } = {}) {
   const key = mode || (deep ? "investigate" : "hunt");           // back-compat: deep:true → investigate
   const m = HUNT_MODES[key] || HUNT_MODES.hunt;
   const results = await huntImpl({ cwd, seed, deep: m.deep, system: m.system, user: m.buildUser(seed) });
   // record a trace so `/bench:status <id>` can show the full findings later
   let traceId = null;
   try {
-    traceId = writeTrace(cwd, {
+    traceId = writeTraceImpl(cwd, {
       gate: key, ws: cwd,
       reviewers: results.map((r) => ({ name: r.name, model: r.model, error: r.error || null, diag: r.diag || null })),
       systemPrompt: m.system, userPrompt: m.buildUser(seed),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
     });
-  } catch { /* trace is best-effort */ }
+  } catch (e) {
+    // trace is best-effort — but say so on stderr instead of swallowing (D3); /bench:status needs it.
+    process.stderr.write(`⛩ bench ${key}: trace write failed (${e instanceof Error ? e.message : String(e)}); findings still returned.\n`);
+  }
   const blocks = results.map((r) =>
     `═══ ${r.name} ═══\n${r.findings?.trim() || `(no findings — ${r.error || "empty"})`}`);
   const header = m.header(seed?.trim() || "");

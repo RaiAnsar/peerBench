@@ -144,8 +144,9 @@ export async function runMain({
       userPrompt: user,
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""]))
     });
-  } catch {
-    // trace is best-effort
+  } catch (e) {
+    // trace is best-effort — but say so on stderr instead of swallowing (D3).
+    process.stderr.write(`⛩ bench stop: trace write failed (${e instanceof Error ? e.message : String(e)}); review continues.\n`);
   }
 
   if (panel.decision === "fail-open") {

@@ -22,12 +22,21 @@ function workspaceRoot(cwd) {
 const MAX_PLAN_BYTES = 64 * 1024;
 export const PLAN_PATH_RE = /(^|\/)(plans|specs)\/[^/]*\.md$/i;
 
-function emit(obj) {
-  process.stdout.write(`${JSON.stringify(obj)}\n`);
-}
-
-function failOpen(note) {
-  emit({ systemMessage: `⛩ plan gate: review skipped — ${String(note).slice(0, 250)}` });
+// Invocation-scoped emit-once guard. Claude Code reads only the FIRST line on stdout, so a second
+// emit (e.g. the shim's failOpen firing after runMain already emitted) is silently dropped. MUST be
+// created per runMain invocation — a module-level flag would suppress later invocations in the same
+// process and break the suite (H1/A4 pattern — found by the bench's own hunt).
+export function createEmitter() {
+  let emitted = false;
+  return {
+    hasEmitted: () => emitted,
+    emit(payload) {
+      if (emitted) return false;
+      emitted = true;
+      process.stdout.write(`${JSON.stringify(payload)}\n`);
+      return true;
+    }
+  };
 }
 
 export function buildPrompt(filePath, content) {
@@ -55,8 +64,13 @@ export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
-  input: inputOverride
+  input: inputOverride,
+  emitter = createEmitter()
 } = {}) {
+  // All stdout emits route through this invocation's emit-once guard (H1).
+  const emit = (obj) => emitter.emit(obj);
+  const failOpen = (note) => emit({ systemMessage: `⛩ plan gate: review skipped — ${String(note).slice(0, 250)}` });
+
   const input = inputOverride ?? readInput();
 
   const rawFilePath = String(input.tool_input?.file_path ?? "");
@@ -153,8 +167,9 @@ export async function runMain({
       userPrompt: user,
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""]))
     });
-  } catch {
-    // trace is best-effort
+  } catch (e) {
+    // trace is best-effort — but say so on stderr instead of swallowing (D3).
+    process.stderr.write(`⛩ plan-file-review: trace write failed (${e instanceof Error ? e.message : String(e)}); review continues.\n`);
   }
 
   if (panel.decision === "fail-open") {
@@ -184,6 +199,16 @@ export async function runMain({
   emit({ systemMessage: `⛩ plan panel: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) runMain().catch((error) => {
-  failOpen(error instanceof Error ? error.message : String(error));
-});
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const emitter = createEmitter();
+  runMain({ emitter }).catch((error) => {
+    // Top-level catch → fail OPEN with a visible note. Only emit if runMain hasn't already
+    // emitted — a 2nd stdout line would be dropped by the harness (H1). Else log to stderr.
+    const msg = error instanceof Error ? error.message : String(error);
+    if (!emitter.hasEmitted()) {
+      emitter.emit({ systemMessage: `⛩ plan gate: review skipped — ${msg.slice(0, 250)}` });
+    } else {
+      process.stderr.write(`⛩ plan-file-review: error after emit already done — ${msg}\n`);
+    }
+  });
+}

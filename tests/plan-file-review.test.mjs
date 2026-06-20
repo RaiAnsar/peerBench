@@ -12,7 +12,7 @@ import { spawnSync } from "node:child_process";
 const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, PLAN_PATH_RE } from "../global-hooks/plan-file-review.mjs";
+import { runMain, buildPrompt, PLAN_PATH_RE, createEmitter } from "../global-hooks/plan-file-review.mjs";
 
 // ---------------------------------------------------------------------------
 // P0 — make plan-file-review.mjs injectable: runMain is exported and accepts
@@ -160,4 +160,93 @@ test("malformed stdin emits a ⛩ plan-file-review stderr note", () => {
     /⛩ plan-file-review: could not parse hook input/,
     `expected ⛩ note on stderr; got stderr=${JSON.stringify(res.stderr)} stdout=${JSON.stringify(res.stdout)}`
   );
+});
+
+// ===========================================================================
+// Task 9 — emit-once: invocation-scoped emitter for plan-file-review
+// ===========================================================================
+
+test("emit-once: createEmitter is exported and invocation-scoped", () => {
+  assert.equal(typeof createEmitter, "function", "createEmitter must be exported");
+  const e1 = createEmitter();
+  const captured = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) captured.push(chunk.trim()); return orig(chunk, ...rest); };
+  try {
+    assert.equal(e1.emit({ a: 1 }), true);
+    assert.equal(e1.emit({ a: 2 }), false, "second emit suppressed");
+    const e2 = createEmitter();
+    assert.equal(e2.emit({ b: 1 }), true, "fresh emitter emits again");
+  } finally {
+    process.stdout.write = orig;
+  }
+  assert.equal(captured.length, 2);
+});
+
+test("emit-once: a second emit within one plan-file runMain writes no second stdout line", async () => {
+  // ALLOW path emits the badge systemMessage exactly once.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-emitonce-"));
+  const planDir = path.join(ws, "plans");
+  fs.mkdirSync(planDir, { recursive: true });
+  fs.writeFileSync(path.join(planDir, "p.md"), "# Plan\n\nbody emit-once\n");
+
+  const lines = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return orig(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [{ name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) }],
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { file_path: "plans/p.md" } }
+    });
+  } finally {
+    process.stdout.write = orig;
+  }
+  assert.equal(lines.filter(Boolean).length, 1, "exactly one stdout line per invocation");
+});
+
+test("emit-once: entrypoint .catch routes a post-emit error to stderr (no 2nd stdout line)", () => {
+  // A malformed-stdin run reaches the shim; with no path match it returns without emitting.
+  // Smoke for the shim wiring: at most one stdout line, never a crash.
+  const hookPath = path.resolve("global-hooks/plan-file-review.mjs");
+  const res = spawnSync(process.execPath, [hookPath], {
+    input: JSON.stringify({ cwd: process.cwd(), tool_input: { file_path: "not-a-plan.txt" } }),
+    encoding: "utf8",
+    env: { ...process.env, BENCH_ROOT: TEMP_GCR }
+  });
+  const stdoutLines = res.stdout.split("\n").filter((l) => l.trim());
+  assert.ok(stdoutLines.length <= 1, "no spurious stdout lines");
+});
+
+// ===========================================================================
+// Task 9 — D3: trace-write failure emits a ⛩ note and still allows (fail-open)
+// ===========================================================================
+
+test("D3: plan-file trace write failure emits a ⛩ note and still allows", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-d3-"));
+  const planDir = path.join(ws, "plans");
+  fs.mkdirSync(planDir, { recursive: true });
+  fs.writeFileSync(path.join(planDir, "p.md"), "# Plan\n\nbody d3 trace\n");
+
+  const stderrChunks = [];
+  const stdoutLines = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  const origOut = process.stdout.write.bind(process.stdout);
+  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) stdoutLines.push(chunk.trim()); return origOut(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [{ name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) }],
+      writeTraceImpl: () => { throw new Error("disk full"); },
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { file_path: "plans/p.md" } }
+    });
+  } finally {
+    process.stderr.write = origErr;
+    process.stdout.write = origOut;
+  }
+  assert.match(stderrChunks.join(""), /⛩ .*trace write failed/i, "expected a ⛩ trace-write-failed note on stderr");
+  const parsed = JSON.parse(stdoutLines.find((l) => l.trim()));
+  assert.match(parsed.systemMessage || "", /ALLOW/, "must still emit the ALLOW systemMessage despite trace failure");
 });

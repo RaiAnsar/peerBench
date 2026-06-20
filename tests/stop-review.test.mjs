@@ -449,6 +449,40 @@ test("E2: malformed stdin → ⛩ stderr note (treated as empty)", () => {
   assert.match(result.stderr, /⛩ bench stop: could not parse hook input/, "should emit a visible ⛩ note");
 });
 
+// ---------------------------------------------------------------------------
+// Task 9 — D3: trace-write failure emits a ⛩ note and still allows (fail-open)
+// ---------------------------------------------------------------------------
+
+test("D3: stop trace write failure emits a ⛩ note and still allows", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-d3-"));
+  process.env.BENCH_ROOT = root;
+
+  const stderrChunks = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW", "ALLOW: ok")]),
+      writeTraceImpl: () => { throw new Error("disk full"); },
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, last_assistant_message: "wrote code" }
+    });
+  } finally {
+    restore();
+    process.stderr.write = origErr;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.match(stderrChunks.join(""), /⛩ .*trace write failed/i, "expected a ⛩ trace-write-failed note on stderr");
+  assert.ok(lines.length > 0, "must still emit the ALLOW systemMessage despite trace failure");
+  const parsed = JSON.parse(lines[0]);
+  assert.match(parsed.systemMessage, /ALLOW/i, "still allows");
+});
+
 test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
   const { system, user } = buildPrompt("M changed.js", "diff --git ...", "new-file.js contents", "did some work");
   // "BLOCK only" instruction must be in system, NOT in user
