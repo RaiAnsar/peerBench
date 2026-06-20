@@ -1,157 +1,181 @@
-# peerbench Gate Reliability & Auto-Review — Design Spec
+# peerbench Gate Reliability & Auto-Review — Design Spec (v2)
 
 **Date:** 2026-06-20
-**Status:** Approved for planning
+**Status:** Approved for planning (v2 incorporates the deep `/bench` panel review)
 **Repo:** github.com/RaiAnsar/peerBench (private)
 
 ## Goal
 
-Make the four peerbench review gates (plan, plan-file, pre-push, stop) **provably active and visibly honest** in every git project — eliminate the paths where a gate silently no-ops, reviews the wrong thing, or *looks* inactive when it ran — and add automatic deep (repo-aware) review of specs/plans on save.
+Make the four peerbench review gates (plan, plan-file, pre-push, stop) **provably active and visibly honest** in every git project — eliminate the paths where a gate silently no-ops, reviews the wrong thing/repo/range, or *looks* inactive when it ran — and add automatic deep (repo-aware) review of specs/plans on save.
 
-## Background
+## Revision note (v1 → v2)
 
-A `/bench:hunt` self-review surfaced 15 silent-failure candidates; an adversarial per-finding verification pass (15 agents, isolated temp repos, concrete repros) confirmed **14** and refuted **1** (`codex-missing-failopen` — the fail-open path is actually loud, so not a bug). Two further issues came from a live session in a real client project (`/Users/rai/Desktop/Work/Clients4_0/Ryan-Persitza/adversaries`):
-
-- The user believed the panel "didn't trigger" on spec edits. Trace evidence proved it **did** — 7 plan-file reviews, full `Codex+Kimi+MiMo+GLM` panel, all ALLOW. The cause was the **ALLOW summary truncating** before the cheap reviewers showed (→ finding **F**).
-- The user expected the **deep repo-aware review** to run automatically on saving a spec; today only the fast content gate is automatic and the deep pass is manual (→ capability **G**).
+v1 was reviewed by the deep `/bench` panel (Codex + Kimi + MiMo + GLM) against the real code. All 14 verified bugs stand, but the panel found completeness gaps, three suite-breaking implementer traps, and an unworkable G architecture. v2 folds in every consensus correction and adds three findings v1 missed (X1 double-emit, X3 plan-file testability, status-id). Iterated plan-file gate reviews further tightened the spec: a G5 ordering contradiction; A2's explicit-refspec handling (source ref + named remote, not hardcoded `origin`); and A4/H1's emit-once guard being **invocation-scoped**, not module-level. Line numbers below are indicative — implementers must re-confirm against the working tree.
 
 ## Principles / Global Constraints
 
-1. **Loud, fail-open.** No gate ever changes its allow/deny *direction* on an internal error — a gate bug must never block a turn or a push. Every previously-silent degradation path instead emits a `⛩ …` diagnostic (stderr and/or `systemMessage`). No fail-closed conversions.
-2. **TDD.** Every fix gets a failing test first; the verification repros become test cases. The suite (currently **145**, `node --test 'tests/*.test.mjs'`) must stay green and grow.
-3. **Deploy parity.** Hooks run from `~/.claude/hooks` (deployed copies). After changes, `node scripts/deploy-global-hooks.mjs` re-syncs; tests target the repo sources.
-4. **No Claude commit trailers** on this repo (see memory `no-claude-trailers`).
-5. **Same-file edits stay sequential** (one task per file or ordered) to avoid conflicts during execution.
+1. **Loud, fail-open.** No gate ever changes its allow/deny *direction* on an internal error — a gate bug must never block a turn or a push. Previously-silent degradations emit a `⛩ …` diagnostic (stderr and/or `systemMessage`). No fail-closed conversions.
+2. **Don't break the suite.** Current suite is **146** `test(` declarations (`node --test 'tests/*.test.mjs'`). Every change keeps it green and adds tests. The panel flagged three changes that would break existing tests if implemented naively (A1, A3, C1) — their specs below carry explicit guardrails.
+3. **TDD**, `process.env.BENCH_ROOT` isolation in every test (never touch real `~/.claude/plugins/data`). Verification/panel repros become fixtures.
+4. **Deploy parity.** After changes, `node scripts/deploy-global-hooks.mjs` re-syncs `~/.claude/hooks`; tests target repo sources.
+5. **No Claude commit trailers** (memory `no-claude-trailers`).
+6. **Same-file edits sequential** during execution.
 
 ---
 
-## Part 1 — Correctness & Visibility Fixes (15 items)
+## Part 0 — Prerequisite refactor (X3, blocks B2/F/G testing)
+
+- **P0 — make `plan-file-review.mjs` injectable.**
+  *Why:* unlike `stop-review.mjs` and `pre-push-review.mjs` (which export `runMain({resolveReviewersImpl, writeTraceImpl, isBenchDisabledImpl, input})`), `plan-file-review.mjs` has a bare `main()` calling module-level singletons — so B2, F, and G can't be unit-tested with mocks.
+  *Do:* extract `main()` into an exported `runMain({...impls, input})` mirroring the other two gates; keep the `import.meta.main` shim. No behavior change.
+  *Test:* a smoke test invoking `runMain` with injected impls + a temp repo (proves the seam) — must pass before B2/F/G land.
+
+---
+
+## Part 1 — Correctness & Visibility Fixes
 
 ### Work-stream A — pre-push gate (`global-hooks/pre-push-review.mjs`)
 
-- **A1 — spaces in repo path break push detection (HIGH).**
-  *Symptom:* `git -C "/tmp/Ryan P/repo" push` is treated as "not a git push" → no review (verified: detector returns `false`).
-  *Mechanism:* `isGitPushSegment` tokenizes with `split(/\s+/)`; a quoted path with a space splits into two tokens, so the `-C` value-skip lands on the wrong token and never sees `push`.
-  *Fix:* add a quote-aware `shellTokenize(text)` (respects single/double quotes) and use it in `isGitPushSegment` instead of `split(/\s+/)`.
-  *Test:* detector returns `true` for `git -C "/tmp/Ryan P/repo" push`, `git -C '/a b/r' push`, `git -c user.name="John Doe" push`; existing cases (`git push`, `git -C /tmp/repo push`, `cd /x && git push`) still pass.
+- **A1 — spaces in repo path break push detection AND review the wrong repo (HIGH).**
+  *Symptom:* `git -C "/tmp/Ryan P/repo" push` → `isGitPushSegment` returns `false` (verified) → no review. *And* (panel/Codex) even once detected, `runMain` derives the review cwd only from preceding `cd` segments (`cdTargetBeforePush`), ignoring `git -C`, so it would review the wrong repo.
+  *Mechanism:* `isGitPushSegment` tokenizes with `split(/\s+/)`; a quoted path splits in two, so the `-C` value-skip lands wrong and never sees `push`.
+  *Fix:* add `shellTokenize(text)` that **strips** surrounding quotes and yields clean tokens (`git -C "/a b/r" push` → `["git","-C","/a b/r","push"]`); use it in `isGitPushSegment`. Then **apply `git -C <dir>`** (in order, like git) to the resolved review cwd: parse `-C` values from the push segment and resolve them after the shell `cd` cwd in `runMain`.
+  *Guardrails (panel):* keep `git pushx` / `git push --help` / `git push --dry-run` rejected; keep `cdTargetBeforePush`'s quoted-path handling working (its own regex stays, or is unified onto `shellTokenize` — either way its existing test must pass).
+  *Test:* detector true for `git -C "/tmp/Ryan P/repo" push`, `git -c user.name="John Doe" push`; the resolved review cwd equals the `-C` target; existing negatives + quoted-`cd` test still pass.
 
 - **A2 — wrong/empty push range (MED-HIGH).**
-  *Symptom:* a repo with `origin/master` only (no `@{u}`, no `origin/HEAD`, no `origin/main`) → `resolvePushRange` returns `ok:false` → early "nothing to push" allow with real commits unreviewed. Also a git *error* is indistinguishable from "no commits."
-  *Mechanism:* fallback chain is `@{u} → origin/HEAD → origin/main`, missing `origin/master`; `git()` maps all failures to `""`.
-  *Fix:* add `origin/master` to the fallback chain (after `origin/main`); when falling back to a guessed base, attach an explicit note; use `gitTry` for the commits/diff lookups so a git error is reported (loud) rather than read as "nothing to push."
-  *Test:* repo with only `origin/master` → range resolves to `origin/master..HEAD`; git-error path emits a `⛩` note and still fails open.
+  *Symptom:* a repo with only `origin/master` (no `@{u}`/`origin/HEAD`/`origin/main`) → `resolvePushRange` returns `ok:false` → early "nothing to push" allow with real commits unreviewed; a feature branch with no `@{u}` is silently diffed against `origin/main`/`origin/HEAD` (wrong divergence); and an explicit refspec push (`git push origin HEAD:main`, `git push upstream feature:release`) is diffed against the wrong base, source, **or remote**.
+  *Mechanism:* fallback is `@{u} → origin/HEAD → origin/main`; the **range resolution already uses `gitTry`** — but `resolvePushRange(ws)` never sees the command (remote/refspec), and the `git log`/`git diff` *content* lookups use `git()`, which maps a git **error** to `""` (indistinguishable from "no commits").
+  *Fix:* thread the parsed push command (remote + ordered refspec list + flags) into `resolvePushRange`. Determine `<remote>` = the named remote (`git push <remote> …`), defaulting to `origin` when unnamed. Resolve range as `<base>..<source>` (NOT always `..HEAD`), using the **named remote's** tracking refs (`<remote>/…`, never hardcoded `origin/…`):
+    - **`<src>:<dst>`** → source = the local `<src>` ref/commit (resolve it; `HEAD` if `<src>` is `HEAD`); base = `<remote>/<dst>` when that remote-tracking ref exists (else the base chain below). Range = `<base>..<src>`. Explicit refspecs **take precedence over** `@{u}` and `<remote>/<current-branch>`.
+    - **`HEAD:<dst>`** → `<remote>/<dst>..HEAD`.
+    - **bare `<ref>`** (`git push <remote> <ref>`) → src = dst = `<ref>` → `<remote>/<ref>..<ref>`.
+    - **delete refspec `:<dst>`** → pushes no commits → clean allow, no review.
+    - **no explicit refspec** (`git push` / `git push <remote>`) → source = `HEAD`; resolve base by precedence on the named remote: `@{u}` → `<remote>/<current-branch>` → `<remote>/HEAD` → `<remote>/main` → `<remote>/master`; range = `<base>..HEAD`.
+    - **multiple refspecs** → review the union of their ranges; if it can't be resolved cleanly, fail-open with a visible `⛩` limitation note.
+    - **`--all` / `--tags` / `--mirror`** (push many refs at once) → out of clean-scope → fail-open with a visible `⛩` limitation note.
+    - any unresolvable source/base ref → fail-open with a visible `⛩` note.
+    Attach a `note` whenever a guessed (non-explicit, non-`@{u}`) base is used. Convert the `git log`/`git diff` content lookups to `gitTry`; on a git **error** (not empty), emit a `⛩` note and fail-open — "no commits" stays a clean allow.
+  *Test:* `git push origin HEAD:main` → `origin/main..HEAD`; `git push origin feature:release` → `origin/release..feature` (source = `feature`, not HEAD); `git push upstream feature:release` → `upstream/release..feature` (named remote); `git push origin topic` → `origin/topic..topic`; `git push origin :stale` (delete) → clean allow, no review; `git push --tags` → visible fail-open note; two refspecs → union reviewed (or visible fail-open note); only-`origin/master` repo, no refspec → `origin/master..HEAD`; feature branch with `origin/<branch>` and no explicit refspec → that range, not `origin/main`; git-error path emits a note and allows; "no commits" stays a silent clean allow.
 
-- **A3 — undetected push forms emit no decision (LOW).**
-  *Symptom:* `(git push)`, `eval "git push"` → `findPushSegment` returns `null` → silent return, no decision.
-  *Fix (loud/fail-open):* when the command plausibly contains a `git push` (both `git` and `push` word-tokens present) but can't be parsed cleanly, emit an explicit `allow` with an uncertainty note. A plain non-git command (`npm test`) still returns silently (no note).
-  *Test:* `(git push)` → allow decision **with** uncertainty note; `npm test` → silent allow (no note).
+- **A3 — wrapped push forms undetected (LOW).**
+  *Symptom:* `(git push)` is not detected → silent allow.
+  *Fix (narrowed per panel):* in detection, strip a balanced leading `(` / trailing `)` on a segment and re-check `isGitPushSegment`, so subshell `(git push)` is **detected and reviewed**. Do **not** add a loose "git+push tokens present" heuristic (it false-positives on `echo "remember to git push" && git status`, which an existing test asserts must stay `null`). `eval "git push"` is an explicit, documented out-of-scope limitation (reliably re-parsing eval'd strings is brittle).
+  *Test:* `(git push)` detected; all existing negatives (`echo "…git push" && git status`, `git push --help`, `git pushx`) still `null`.
+
+- **A4 (X1) — emit-once guard, INVOCATION-SCOPED (MED).**
+  *Symptom:* the top-level `.catch` calls `decision("allow", …)` even when `runMain` already emitted a decision; Claude Code reads only the **first** JSON line, so the error is silently dropped (violates "loud").
+  *Fix:* an **invocation-scoped** emitter created per `runMain` call (e.g. `createEmitter()` returning `{ emit, hasEmitted }`, where `emit` writes only the first payload and returns `false` thereafter), or one passed into `runMain`. `decision()`/`emit()` route through that invocation's emitter. **Must NOT be module-level** — a module-global `emitted` flag would suppress emits on later `runMain` calls in the same Node process and break the suite (which invokes `runMain` repeatedly). The production `import.meta.main` shim creates the emitter, hands it to `runMain`, and its `.catch` emits the fallback only if `!emitter.hasEmitted()` (else writes the error to stderr).
+  *Test:* within one invocation a second `decision()` writes no second stdout line; **two separate `runMain` invocations in one process each emit normally** (no cross-invocation suppression); an error after emit goes to stderr.
 
 ### Work-stream B — plan-file gate (`global-hooks/plan-file-review.mjs`)
 
-- **B1 — root-relative plan/spec paths skipped (MED).**
-  *Symptom:* a `file_path` of `plans/p.md` / `specs/s.md` (no leading slash) is silently skipped.
-  *Mechanism:* `PLAN_PATH_RE = /\/(plans|specs)\/[^/]*\.md$/i` requires a leading slash.
-  *Fix:* `PLAN_PATH_RE = /(^|\/)(plans|specs)\/[^/]*\.md$/i`.
-  *Test:* matches `plans/p.md`, `docs/plans/p.md`, `/repo/specs/s.md`; rejects `notplans/p.md`, `plans/sub/p.md`.
+- **B1 — root-relative plan/spec paths skipped + relative read fails (MED).**
+  *Symptom:* `file_path: "plans/p.md"` (no leading slash) → regex skip; *and* (panel/Codex) even with the regex fixed, `fs.statSync/readFileSync(filePath)` run before `cwd/ws` is resolved, so a relative path is read against the hook process cwd and fails → silent return.
+  *Fix:* (a) `PLAN_PATH_RE = /(^|\/)(plans|specs)\/[^/]*\.md$/i`; (b) resolve a non-absolute `file_path` against `input.cwd || CLAUDE_PROJECT_DIR || process.cwd()` **before** stat/read and before computing the approval-key path context.
+  *Test:* matches `plans/p.md`, `docs/plans/p.md`, `/repo/specs/s.md`; rejects `notplans/p.md`, `plans/sub/p.md`; a relative `file_path` with `input.cwd` set is read from the resolved absolute path.
 
 - **B2 — silent on malformed stdin (MED).**
-  *Symptom:* bad stdin JSON → bare `return`, no stderr/trace/decision (unlike `plan-review.mjs`).
-  *Fix:* on the catch, emit `⛩ plan-file-review: could not parse hook input (<msg>); treating as empty.` to stderr and continue (let the existing path/content checks handle the empty state).
+  *Symptom:* bad stdin JSON → bare `return`, no stderr/trace/decision.
+  *Fix:* emit a `⛩ plan-file-review: could not parse hook input (<msg>); treating as empty.` stderr note (the diagnostic `plan-review.mjs` already writes), then return on the empty input (the path check rejects `""`) — fail-open with a **visible** note. (This returns after the note rather than continuing as `plan-review.mjs` does; both are fail-open — the goal is the visible diagnostic, not identical control flow.)
   *Test:* malformed stdin → non-empty stderr note.
 
 ### Work-stream C — enable/disable correctness (`scripts/bench-runner.mjs`, `global-hooks/config-store.mjs`)
 
-- **C1 — `/bench:on` lies after a global disable (HIGH).**
-  *Symptom:* after `/bench:off --global`, plain `/bench:on` prints `bench: enabled (workspace)` but `isBenchDisabled` is still `true` (global marker untouched) → every gate no-ops.
-  *Fix (conservative refuse — user's choice):* plain `on` clears the workspace marker; if the **global** marker is still present it does **not** clear it (no silent global re-enable) and returns a loud, accurate message: `bench: workspace re-enabled, but STILL DISABLED GLOBALLY — run /bench:on --global to clear it.` `on --global` clears the global marker as today.
-  *Test:* `off --global` then `on` → `isBenchDisabled` stays `true` **and** the message says still-disabled-globally; `on --global` → `isBenchDisabled` false.
+- **C1 — `/bench:on` lies (both directions) (HIGH).**
+  *Symptom:* after `off --global`, plain `on` prints `enabled (workspace)` while `isBenchDisabled` stays `true`; symmetrically, `on --global` after a workspace `off` prints `enabled (global)` while the workspace marker still disables.
+  *Fix:* `gateToggleCommand` **always clears the selected scope's marker first**, then derives its message from a fresh `isBenchDisabled(ws)`: if still disabled, name the remaining source (`workspace re-enabled, but STILL DISABLED GLOBALLY — run /bench:on --global` / the symmetric message). Forward the `root` option for test isolation. Conservative refuse: a workspace `on` never clears the global marker.
+  *Implementer trap (panel):* do **not** add an early `return` that skips clearing the selected scope's marker — the existing `off→on (workspace) → isBenchDisabled false` test must still pass.
+  *Test:* `off --global` then `on` → `isBenchDisabled` true **and** message says still-disabled-globally; `off` then `on` (no global) → `isBenchDisabled` false (unchanged); `off` then `off --global` then `on --global` → message names the remaining workspace disable.
 
-- **C2 — `isBenchDisabled` swallows FS errors (LOW).**
-  *Symptom:* `fs.existsSync` throwing (e.g. `EACCES`) is caught and treated as "no marker."
-  *Fix (loud/fail-open):* keep returning `false` (enabled — a review gate that runs is the safe direction) but emit a `⛩` stderr warning naming the error.
-  *Test:* `existsSync` stubbed to throw → returns `false` **and** warns.
+- **C2 — `isBenchDisabled` swallows FS errors (LOW).** Keep fail-open (`false`/enabled) but emit a `⛩` stderr warning naming the error. *Test:* `existsSync` stubbed to throw → returns `false` + warns.
 
-- **C3 — `/bench:reviewers <bad>` failure invisible to stdout (LOW).**
-  *Symptom:* `setReviewers` throws → error only on stderr; stdout-only consumers assume success.
-  *Fix:* wrap the call in `reviewersCommand`; write `Error: <msg>` to stdout and set `process.exitCode = 1`.
-  *Test:* bad name → stdout contains `Error:`, exit code 1, reviewer list unchanged.
+- **C3 — `/bench:reviewers <bad>` invisible to stdout (LOW).** Wrap `setReviewers` in `reviewersCommand`; write `Error: <msg>` to stdout, set `process.exitCode = 1`; list unchanged (validation precedes write — verified). *Test:* bad name → stdout `Error:`, exit 1.
 
 ### Work-stream D — deploy / install / observability
 
-- **D1 — deploy can bury `stop-review` in a matcher-scoped block (HIGH).** (`scripts/deploy-global-hooks.mjs`)
-  *Symptom:* if the first `Stop` block in `settings.json` carries an unrelated `matcher`, `register()` injects `stop-review` into it → the gate only fires for that tool's Stop events, never normal turns.
-  *Mechanism:* the `matcher === undefined` arm does `list.find(b => Array.isArray(b.hooks))` regardless of `b.matcher`.
-  *Fix:* prefer a block that has `hooks` **and** no `matcher`; if none, create a fresh matcher-less block. Never inject into a matcher-scoped block.
-  *Test:* `settings.json` pre-seeded with `{matcher:"SomeTool",hooks:[…]}` first → after sync, `stop-review` lands in a matcher-less block.
+- **D1 — deploy buries `stop-review` in a matcher-scoped block (HIGH).** (`scripts/deploy-global-hooks.mjs`)
+  *Mechanism (corrected):* it is **order-dependent**, not unconditional — the `matcher===undefined` arm does `list.find(b => Array.isArray(b.hooks))`, returning the *first* hooks-block; if that block carries a `matcher`, `stop-review` lands in it and only fires for that tool's Stop events.
+  *Fix:* `list.find(b => Array.isArray(b.hooks) && !b.matcher)`; if none, push a fresh matcher-less block. The de-dupe loop already scans all blocks (keep it); empty-block cleanup already handles a vacated matcher block (verified).
+  *Test:* settings pre-seeded with a `{matcher:"SomeTool",hooks:[…]}` Stop block **first** → after sync, `stop-review` is in a matcher-less block; idempotent on re-run.
 
 - **D2 — fresh install has commands but no gates (HIGH).** (`README.md`, `scripts/bench-runner.mjs` setup)
-  *Symptom:* the documented install never runs `deploy-global-hooks.mjs` (the only place the 4 gates get registered); `/bench:setup` reports reviewers/keys/disabled but not hook registration, so it looks healthy while review is inactive.
-  *Fix:* (a) README install path gains an explicit `node <abs>/scripts/deploy-global-hooks.mjs` step; (b) `/bench:setup` inspects `~/.claude/settings.json` and reports which of the 4 gates are registered (`ExitPlanMode→plan-review`, `Bash→pre-push-review`, `Write|Edit→plan-file-review`, `Stop→stop-review`), with a pointer to the deploy script if any are missing.
-  *Test:* setup run against a settings file missing hooks reports each gate's present/missing status.
+  *Fix:* (a) README install path gains an explicit `node <abs>/scripts/deploy-global-hooks.mjs` step; (b) `/bench:setup` inspects `~/.claude/settings.json` and reports each gate's registration by **event + matcher + correct hook file** (`ExitPlanMode→plan-review`, `Bash→pre-push-review`, `Write|Edit→plan-file-review`, `Stop(matcher-less)→stop-review`) — so a hook trapped in the wrong matcher block (D1 class) reports as misregistered, not "present." Unreadable/malformed settings → report "unable to check" and fail-open (no crash).
+  *Test:* setup against settings missing hooks / with a mis-scoped stop hook reports the correct per-gate status.
 
-- **D3 — trace-write failures swallowed (LOW).** (`global-hooks/trace-store.mjs` + 4 gate callers)
-  *Symptom:* disk-full / read-only / permission errors vanish; `/bench:status` shows no history with no reason.
-  *Fix (loud/fail-open):* keep best-effort (never throw out of a gate), but each gate's trace `catch` emits a `⛩ … trace write failed` stderr note.
-  *Test:* `writeTrace` stubbed to throw → gate emits the note and still allows.
+- **D3 — trace-write failures swallowed (LOW).** (`trace-store.mjs` callers)
+  *Fix:* each caller's trace `catch` emits a `⛩ … trace write failed` stderr note (still best-effort, never throws). Scope includes the **four gates *and* `bench-runner.mjs`** hunt/review trace writes (panel: honest `/bench:status` needs all of them).
+  *Test:* `writeTrace` stubbed to throw → caller emits the note and still allows.
+
+- **D4 — `/bench:status <id>` promised but unimplemented (LOW).** (`scripts/bench-runner.mjs`, README, `commands/status.md`)
+  *Symptom:* README/commands say `/bench:status [id]` expands a trace, but `status` ignores args (`readTrace` already exists in `trace-store.mjs`); G's surfacing message references `(trace <id>)`.
+  *Fix:* implement id expansion (read `rest` args, `readTrace(ws, id)`, print the stored trace's reviewers + prompts/responses); fall back to the list when no id.
+  *Test:* `status <known-id>` prints that trace's contents; unknown id → friendly "not found".
 
 ### Work-stream E — stop gate + cleanup (`global-hooks/stop-review.mjs`, `global-hooks/panel-lib.mjs`)
 
-- **E1 — staged-only changes in a fresh repo skip review (MED).**
-  *Symptom:* a repo with no commits and all changes `git add`ed → `git diff HEAD` empty + no untracked → stop gate early-returns.
-  *Fix:* include `git diff --cached` in change detection **and** in the reviewed content (merge staged into the diff block with a label).
-  *Test:* fresh repo, staged-only change → stop gate reviews (does not skip).
+- **E1 — staged-only fresh repo skips review (MED).**
+  *Symptom:* no commits + all changes staged → `git diff HEAD` empty + no untracked → early return.
+  *Fix (de-dup-safe per panel):* add a staged diff **only as a fallback** — when `git diff HEAD` is empty/unavailable (no HEAD), use `git diff --cached` for both the change-detection condition and the reviewed content (labelled, e.g. a `<staged_diff>` block or `[STAGED]` prefix). Do **not** append `--cached` unconditionally (in a normal repo `git diff HEAD` already includes staged-vs-HEAD → duplication). Reuse the proven pattern from the (to-be-removed) `workspaceFingerprint`.
+  *Test:* fresh repo, staged-only change → reviewed; normal repo with a staged modification → diff is **not** duplicated.
 
-- **E2 — `readInput` silent on malformed stdin (LOW).** (`stop-review.mjs` + `pre-push-review.mjs`)
-  *Symptom:* bad stdin → `{}` → `cwd` silently falls back to `process.cwd()` (possibly wrong workspace).
-  *Fix:* on parse failure, emit a `⛩` stderr note before returning `{}`.
-  *Test:* malformed stdin → non-empty stderr note (both files).
+- **E2 — `readInput` silent on malformed stdin (LOW).** (stop + pre-push) Emit a `⛩` stderr note before returning `{}` (fallback to `process.cwd()` stays — fail-open — but now visible). *Test:* malformed stdin → note (both files).
 
-- **E3 — delete dead `workspaceFingerprint` (cleanup).**
-  *Symptom:* `workspaceFingerprint` returns `null` on any git error; verification found it is **never imported** (orphaned at Grok removal) and untested.
-  *Fix:* delete the function; remove any references/tests.
-  *Test:* `grep` confirms no imports; suite passes after removal.
+- **E3 — remove dead `workspaceFingerprint` (cleanup, grep-gated).**
+  *Panel correction:* the "dead" claim must be **grep-verified** (`rg workspaceFingerprint`) — the first verification pass found no runtime imports, but its staged-diff logic is exactly what E1 needs.
+  *Fix:* confirm zero imports; land **E1 first** (reusing the staged-diff pattern), then delete the now-redundant `workspaceFingerprint` and its export. If a grep ever shows a consumer, keep + add error logging instead.
+  *Test:* `rg` shows no imports; suite passes after removal.
 
-### Work-stream F — verdict visibility, all gates (`global-hooks/panel-lib.mjs` + 4 gate emit sites)
+### Work-stream F — verdict visibility, all gates + consumers (`global-hooks/panel-lib.mjs` + emit sites + `bench-runner.mjs`)
 
-- **F — ALLOW/BLOCK summary hides which reviewers ran (the adversaries confusion).**
-  *Symptom:* the summary is `Codex: <≤100c> · Kimi: <≤100c> · MiMo … · GLM …` then truncated (`slice(0, ~220)`), so MiMo/GLM get chopped and it reads as Codex-only.
-  *Fix:* `combinePanel` returns a compact `badge` string of per-reviewer verdict glyphs (e.g. `Codex✓ Kimi✓ MiMo✓ GLM✗`, `✗` = skipped/errored); every gate leads its message with the badge **before** the truncated reasons: `⛩ <gate>: ALLOW [Codex✓ Kimi✓ MiMo✓ GLM✓] — <summary…>`. The badge survives truncation, so the panel's participation is always visible.
-  *Test:* `combinePanel` exposes `badge`; a 4-reviewer ALLOW renders all four glyphs; an errored reviewer shows `✗`.
+- **F — ALLOW/BLOCK/fail-open summary hides which reviewers ran (the adversaries confusion).**
+  *Symptom:* summary is `Codex: … · Kimi: … · MiMo … · GLM …` then `slice(0,~220)` → MiMo/GLM chopped → reads as Codex-only.
+  *Fix:* `combinePanel` **always** returns a `badge` covering **every** decision branch (allow, block, fail-open). Glyphs are distinct: `✓` = ALLOW, `✗` = BLOCK, **`!`** = errored/skipped (matches the statusline's error glyph; avoids reusing `✗` for two meanings). Every emit site (`stop-review`, `pre-push-review`, `plan-file-review`, **`plan-review`** which only sets `permissionDecisionReason`, and **`bench-runner` `review`** output) leads with the badge **before** the truncated reasons. The badge lists only reviewers that were *meant to run for that gate* — the stop gate deliberately excludes Codex, so its badge shows `Kimi✓ MiMo✓ GLM✓` (no Codex glyph), never a misleading absence.
+  *Test:* `combinePanel` exposes `badge` on allow/block/fail-open; a 4-reviewer ALLOW → four `✓`; a mixed Kimi-ALLOW/MiMo-BLOCK/GLM-error → `Kimi✓ MiMo✗ GLM!`; stop-gate badge omits Codex.
+
+### Work-stream H — plan gate robustness (`global-hooks/plan-review.mjs`)
+
+- **H1 (X1) — invocation-scoped emit-once guard for plan-review** (same pattern as A4 — per-invocation emitter, **never** module-level): guard the top-level catch so it doesn't emit a second decision after one was already emitted (dropped by the harness). Apply the **same invocation-scoped guard to `pre-push-review` (A4) and `plan-file-review`'s `failOpen()` path** (after P0; lower-harm there — `systemMessage`, not `permissionDecision` — but consistent). *Test:* no double-emit within an invocation; two separate invocations in one process each emit (no module-level suppression).
 
 ---
 
-## Part 2 — Auto deep-review on spec/plan save (capability G)
+## Part 2 — Auto deep-review on spec/plan save (capability G, redesigned)
 
-**What:** today the fast **content-only** plan-file gate auto-fires on every spec/plan save; the **deep repo-aware** pass (the `/bench:hunt`-style review that scours the codebase against the spec) is manual. G makes the deep pass fire automatically on save, in the background.
+The panel showed v1's G was unworkable (no spec-review engine; race-y surfacing; wrong-ws risk; "complete" lie). v2 redesign:
 
-**Trigger:** in `plan-file-review.mjs`, after the fast content review returns **ALLOW** (and after the existing content-dedup check), launch the deep pass. (On a fast-gate BLOCK, skip — the content has issues to fix first.)
+**G1 — a real deep spec-review subcommand.** Add `bench-runner.mjs spec-review <abs-path> --ws <abs-ws>`: runs the panel (repo-aware, read-only) seeded with the file's content **and** a repo-aware system prompt, writes a trace with `gate:"spec-review"`, and returns a **structured result** (machine-readable: per-reviewer verdict + a finding count / max-severity), not free-form text. (The existing `huntCommand`/`investigate` is a bug-hunt with a seed and returns human text — insufficient.)
 
-**Mechanism:** spawn the existing deep engine (`bench-runner.mjs`, deep/repo-aware mode) **detached and unref'd**, seeded with the saved spec/plan path, read-only. The hook returns immediately — the save is never blocked.
+**G2 — trigger.** In `plan-file-review.runMain`, **after** the fast content review returns ALLOW (and after the dedup-skip path — do not launch from a dedup hit), spawn `spec-review` **detached + unref'd**, passing the resolved **absolute spec path and absolute `ws`** explicitly (so the child resolves the *same* `workspaceStateDir` as the hook — avoids the wrong-state-dir silent failure). The hook returns immediately; the save is never blocked.
 
-**Debounce / cost control:** a per-workspace marker keyed on the spec's content hash (reuse the plan-file gate's approval-key machinery) records the last deep run. Before launching: skip if a deep pass for this exact content hash already ran or is in flight, and enforce a minimum interval per workspace. This prevents stacking on rapid saves and re-scanning identical content.
+**G3 — debounce.** A dedicated `deep-debounce` marker keyed on the spec's content hash + a minimum interval per workspace. Skip launch if a deep pass for this exact content hash has run or is in flight. This is separate from the fast gate's `allowMarker`; both are cleared/updated consistently (document the two-marker lifecycle).
 
-**Surfacing findings:** PostToolUse hooks cannot `asyncRewake`. The detached deep pass writes (a) a trace (`gate: "spec-review"`) and (b) a `deep-pending.json` in the workspace state dir. The next `stop-review` invocation (start of the next turn) checks for `deep-pending.json`, emits `⛩ deep spec review complete — <badge> <summary> (trace …)` as a `systemMessage` (or rewakes on findings), and clears the file. This guarantees findings reach the user without blocking any save.
+**G4 — completion-marker, not pending.** The detached pass writes its results to `deep-result-<hash>.json` **on completion** (with the content hash + trace id + structured badge/summary). There is no "pending" lie — absence means "not done yet."
 
-**Tests:** (a) fast ALLOW save → a detached deep run is launched (mock the spawn; assert invoked with the spec path); (b) identical-content re-save within the interval → not launched; (c) `deep-pending.json` present at next stop → findings surfaced and file cleared.
+**G5 — surfacing in stop-review, disable-first (ordering fixed per plan-file gate review).** At the top of `stop-review.runMain`: **first** check `isBenchDisabled(ws)` — if disabled, do **not** surface deep results (consistent with gates being off) and take the normal disabled exit. Otherwise, **before** the loop-cap / no-diff early returns, check for a completed `deep-result-*.json`, emit `⛩ deep spec review: <badge> <summary> (trace <id>)` (or rewake if the structured result flags findings at/above a threshold), and delete the file. If the spec's content hash no longer matches the current file, note the result may be stale.
+
+**G6 — known limitations (documented, not hidden).** Detached-child survival across the hook runner's process-group teardown is POSIX-`detached:true`+`unref()` and is harness-dependent; the unit test mocks the spawn (asserts invocation + args + ws), and a **manual smoke test** verifies real survival. Surfacing is "next stop after completion" — if the user never stops again, findings wait in the result file (visible via `/bench:status`).
+
+**Tests:** (a) fast ALLOW → detached `spec-review` spawned with abs path + abs ws (mocked spawn); (b) identical-content re-save within interval → not launched; (c) a completed `deep-result` present at next stop (even with no diff / loop-capped, while enabled) → surfaced and deleted before the no-diff return; (d) content-hash mismatch → "stale" note; (e) `/bench:off` (disabled) → not surfaced (disable checked first).
 
 ---
 
 ## Non-goals
 
-- No changes to panel/reviewer/model selection or prompts (beyond F's badge and G's deep seed).
+- No panel/reviewer/model or prompt changes beyond F's badge and G's spec-review seed/contract.
 - No new user-facing gates beyond G.
-- No fail-closed conversions anywhere (Principle 1).
-- No refactor beyond the E3 dead-code deletion.
+- No fail-closed conversions (Principle 1).
+- `eval "…git push…"` detection (A3) and reliable verification of detached-child survival in unit tests (G6) are explicitly out of scope (documented limitations).
 
 ## Test strategy
 
-Per-item unit tests in the existing `tests/*.test.mjs` (`node --test`), with `process.env.BENCH_ROOT` isolation so no test touches real `~/.claude/plugins/data`. Verification repros become fixtures (Ryan-P spaces path, `origin/master` range, matcher-scoped Stop block, root-relative plan path, staged-only fresh repo, truncated-summary badge). Suite stays green (≥145, growing).
+Per-item unit tests in `tests/*.test.mjs` with `BENCH_ROOT` isolation; panel/verification repros as fixtures (Ryan-P spaces path **and** `-C` review-cwd, `origin/master`+feature-branch range, explicit refspec source/dst/remote, matcher-scoped-first Stop block, root-relative + relative-read plan path, staged-only-vs-normal repo, badge across allow/block/fail-open, C1 both directions, invocation-scoped double-emit guard, `spec-review` spawn + surfacing). Suite stays green (≥146, growing). P0 (plan-file DI) lands before B2/F/G.
 
 ## Rollout
 
-1. Land Part 1 (fast, low-risk) → `deploy-global-hooks.mjs` → verify suite + a live stop/push/plan smoke check.
-2. Land Part 2 (G) → deploy → verify a spec save auto-launches the deep pass and findings surface next turn.
+1. **P0** (plan-file DI refactor) → suite green.
+2. **Part 1** (A–F, H) → `deploy-global-hooks.mjs` → suite + live stop/push/plan smoke.
+3. **Part 2** (G) → deploy → verify a spec save auto-launches `spec-review` and the result surfaces at the next stop.
 
 ## Verification against the real-world case (adversaries / Ryan-Persitza)
 
-After Part 1: editing `specs/orders-new-unified-form.md` shows `⛩ plan panel: ALLOW [Codex✓ Kimi✓ MiMo✓ GLM✓] — …` (F), and a `git -C "/…/Ryan-Persitza/…" push` is detected and reviewed (A1). After Part 2: saving that spec auto-launches the deep repo-aware pass with no manual trigger (G).
+After Part 1: editing `specs/orders-new-unified-form.md` shows `⛩ plan panel: ALLOW [Codex✓ Kimi✓ MiMo✓ GLM✓] — …` (F); a `git -C "/…/Ryan-Persitza/…" push` is detected **and reviewed against that repo** (A1). After Part 2: saving that spec auto-launches the deep repo-aware pass with no manual trigger, and the findings surface on the next stop (G).
