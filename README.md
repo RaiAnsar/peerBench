@@ -145,6 +145,18 @@ This repo doubles as a local-directory marketplace (`rai-tools`). In
 
 Restart Claude Code; the `/bench:*` commands appear.
 
+Then register the four review gates (one-time — copies the hooks into
+`~/.claude/hooks` and wires them into `~/.claude/settings.json`):
+
+```bash
+node /absolute/path/to/bench/scripts/deploy-global-hooks.mjs
+```
+
+This registers the Stop gate (matcher-less), the ExitPlanMode plan gate, the
+`Write|Edit` plan-file gate, and the `Bash` pre-push gate. Re-run it any time to
+re-sync; it is idempotent and de-dupes existing entries. Without this step the
+commands work but the automatic gates do not fire.
+
 ## Test
 
 ```bash

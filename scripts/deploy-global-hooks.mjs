@@ -77,7 +77,9 @@ function register(list, matcher, absCmd, extra = {}) {
     const block = list.find((b) => b.matcher === matcher);
     if (block) { block.hooks = block.hooks || []; block.hooks.push(cmd); } else list.push({ matcher, hooks: [cmd] });
   } else {
-    const block = list.find((b) => Array.isArray(b.hooks));
+    // matcher-less (Stop-style): only a MATCHER-LESS hooks-block is a valid home — a matcher-scoped
+    // block (e.g. {matcher:"SomeTool"}) would bury this hook so it only fires for that tool's events.
+    const block = list.find((b) => Array.isArray(b.hooks) && !b.matcher);
     if (block) { block.hooks = block.hooks || []; block.hooks.push(cmd); } else list.push({ hooks: [cmd] });
   }
 }

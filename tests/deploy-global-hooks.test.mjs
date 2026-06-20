@@ -153,6 +153,45 @@ test("syncSettings does not remove a pre-existing unrelated Stop hook", () => {
   assert.ok(allStopCmds.some((c) => c.includes("stop-review.mjs")), "stop-review must also be registered");
 });
 
+test("syncSettings: stop-review lands in a MATCHER-LESS Stop block even when a matcher-scoped Stop block comes first (D1); idempotent", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-d1-"));
+  const settingsPath = path.join(hooks, "settings.json");
+  // Pre-seed a matcher-SCOPED Stop block FIRST. The old code's list.find(b => Array.isArray(b.hooks))
+  // returns this block and buries stop-review in it, so it only fires for SomeTool's Stop events.
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    hooks: {
+      Stop: [
+        { matcher: "SomeTool", hooks: [{ type: "command", command: 'node "/x/.claude/hooks/some-scoped-stop.mjs"' }] }
+      ]
+    }
+  }, null, 2));
+  syncSettings({ hooksDir: hooks, settingsPath });
+  let s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+
+  const scopedBlock = s.hooks.Stop.find((b) => b.matcher === "SomeTool");
+  const matcherlessBlock = s.hooks.Stop.find((b) => !b.matcher && Array.isArray(b.hooks));
+  // stop-review MUST be in the matcher-less block, NOT in the SomeTool-scoped block.
+  assert.ok(matcherlessBlock, "a matcher-less Stop block must exist");
+  assert.ok(
+    matcherlessBlock.hooks.some((h) => h.command.includes("stop-review.mjs")),
+    "stop-review must be registered in the matcher-less Stop block"
+  );
+  assert.ok(
+    !scopedBlock.hooks.some((h) => h.command.includes("stop-review.mjs")),
+    "stop-review must NOT be buried in the matcher-scoped (SomeTool) block"
+  );
+  // the scoped block's own hook is preserved
+  assert.ok(scopedBlock.hooks.some((h) => h.command.includes("some-scoped-stop.mjs")), "scoped Stop hook preserved");
+
+  // Idempotent on a second sync: still exactly one stop-review, still matcher-less.
+  syncSettings({ hooksDir: hooks, settingsPath });
+  s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  const allStop = s.hooks.Stop.flatMap((b) => b.hooks || []);
+  assert.equal(allStop.filter((h) => h.command.includes("stop-review.mjs")).length, 1, "stop-review appears exactly once after re-sync");
+  const stopOwner = s.hooks.Stop.find((b) => (b.hooks || []).some((h) => h.command.includes("stop-review.mjs")));
+  assert.ok(!stopOwner.matcher, "stop-review still in a matcher-less block after re-sync");
+});
+
 test("syncSettings DE-DUPES pre-existing stop/pre-push entries across path forms ($HOME vs absolute)", () => {
   const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-dedup-"));
   const settingsPath = path.join(hooks, "settings.json");
