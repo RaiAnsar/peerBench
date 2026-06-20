@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { parseSeverity, severityRank } from "./deep-review.mjs";
+import { parseSeverity, severityRank, SEVERITY_RANK } from "./deep-review.mjs";
 
 export function parseVerdict(rawOutput) {
   const raw = String(rawOutput ?? "").trim();
@@ -114,7 +114,9 @@ function sideSeverity(s) {
 // sub-threshold against "high" — safe.
 function isAdvisoryBlock(s, blockMinSeverity) {
   if (!blockMinSeverity || !s || s.error || s.verdict !== "BLOCK") return false;
-  return severityRank(sideSeverity(s)) < severityRank(blockMinSeverity);
+  const sev = sideSeverity(s);
+  if (SEVERITY_RANK[sev] == null) return false;   // unknown/corrupt severity → STRICT (hard block), never advisory
+  return severityRank(sev) < severityRank(blockMinSeverity);
 }
 
 // Per-reviewer verdict badge, in the order they appear (only reviewers that were

@@ -145,6 +145,15 @@ test("severity-gate: a high-severity BLOCK → decision block + badge ✗", () =
   assert.equal(r.badge, "Kimi✓ MiMo✗", "high BLOCK renders as ✗");
 });
 
+test("severity-gate: a BLOCK with an unknown/corrupt severity → STRICT (block + ✗), never advisory", () => {
+  // Defense-in-depth: a non-standard severity must not let a real BLOCK slip through as ~.
+  const r = combinePanel([
+    { name: "Codex", verdict: "BLOCK", firstLine: "BLOCK: x", raw: "BLOCK: x", severity: "bogus" }
+  ], { blockMinSeverity: "high" });
+  assert.equal(r.decision, "block", "unknown severity is treated strictly → blocks");
+  assert.equal(r.badge, "Codex✗", "unknown-severity BLOCK renders as ✗, not ~");
+});
+
 test("severity-gate: a critical BLOCK → block (above the high threshold)", () => {
   const r = combinePanel([
     { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: data loss", raw: "BLOCK: data loss\nSEVERITY: critical\n- drops rows" }

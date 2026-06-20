@@ -7,6 +7,7 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
+import { parseSeverity } from "./deep-review.mjs";
 import { execFileSync } from "node:child_process";
 
 function workspaceRoot(cwd) {

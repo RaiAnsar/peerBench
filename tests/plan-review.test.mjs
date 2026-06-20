@@ -98,6 +98,29 @@ test("severity-gate: a MEDIUM-severity BLOCK does NOT deny the plan (allows with
   assert.match(parsed.systemMessage || "", /advisor/i, "an advisory note is surfaced");
 });
 
+test("severity-gate: plan-review persists per-reviewer severity in the trace (regression: parseSeverity must be imported)", async () => {
+  const ws = prRepo();
+  let captured = null;
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [prReviewer("Kimi", "ALLOW"), prSevReviewer("MiMo", "BLOCK", "medium")],
+      writeTraceImpl: (_ws, trace) => { captured = trace; },
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { plan: "do a thing" } }
+    });
+  } finally {
+    process.stdout.write = orig;
+  }
+  // A missing `parseSeverity` import throws while BUILDING the trace object (inside the best-effort
+  // try/catch), so the trace is silently never written — captured stays null. This asserts it IS written.
+  assert.ok(captured, "a trace must be written (a missing parseSeverity import would throw → no trace)");
+  const mimo = (captured.reviewers || []).find((r) => r.name === "MiMo");
+  assert.equal(mimo?.severity, "medium", "the BLOCK reviewer's severity is persisted so the statusline can render ~");
+  assert.equal(mimo?.raw, undefined, "raw is stripped from the trace");
+});
+
 test("severity-gate: a HIGH-severity BLOCK still denies the plan", async () => {
   const parsed = await runPlanCapture([prReviewer("Kimi", "ALLOW"), prSevReviewer("MiMo", "BLOCK", "high")]);
   const out = parsed.hookSpecificOutput;
