@@ -150,7 +150,7 @@ export async function runMain({
 
   if (panel.decision === "fail-open") {
     try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }   // not a block — reset the loop counter
-    emit({ systemMessage: `⛩ bench stop: review failed (turn allowed) — ${panel.summary.slice(0, 250)}` });
+    emit({ systemMessage: `⛩ bench stop: review failed (turn allowed) [${panel.badge}] — ${panel.summary.slice(0, 250)}` });
     return;
   }
 
@@ -160,7 +160,7 @@ export async function runMain({
     // asyncRewake: write findings to STDERR and exit 2 so the harness wakes
     // Claude with them instead of blocking the turn inline.
     process.stderr.write(
-      `Review panel blocked the turn:\n\n${panel.findings}\n\n` +
+      `Review panel blocked the turn [${panel.badge}]:\n\n${panel.findings}\n\n` +
       `${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}` +
       `Address ALL findings before ending the session.`
     );
@@ -169,7 +169,7 @@ export async function runMain({
 
   // allow — clear the loop counter
   try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
-  emit({ systemMessage: `⛩ bench stop: ALLOW — ${panel.summary.slice(0, 220)}` });
+  emit({ systemMessage: `⛩ bench stop: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

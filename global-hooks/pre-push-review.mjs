@@ -414,8 +414,8 @@ export async function runMain({
     // All reviewers errored — fail OPEN with a visible note.
     decision(
       "allow",
-      `Pre-push panel unavailable (${panel.summary}); push allowed without review.`,
-      `⛩ bench pre-push: panel skipped — ${panel.summary.slice(0, 200)}`
+      `[${panel.badge}] Pre-push panel unavailable (${panel.summary}); push allowed without review.`,
+      `⛩ bench pre-push: panel skipped [${panel.badge}] — ${panel.summary.slice(0, 200)}`
     );
     return;
   }
@@ -423,7 +423,7 @@ export async function runMain({
   if (panel.decision === "block") {
     decision(
       "deny",
-      `Review panel found issues that must be fixed before pushing:\n\n${panel.findings}\n\n` +
+      `[${panel.badge}] Review panel found issues that must be fixed before pushing:\n\n${panel.findings}\n\n` +
       `${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}` +
       `Fix the issues above, then run git push again.`
     );
@@ -431,7 +431,7 @@ export async function runMain({
   }
 
   // allow
-  decision("allow", `⛩ bench pre-push: ALLOW — ${panel.summary}${rangeNoteSuffix}`, `⛩ bench pre-push: ALLOW — ${panel.summary.slice(0, 220)}`);
+  decision("allow", `⛩ bench pre-push: ALLOW [${panel.badge}] — ${panel.summary}${rangeNoteSuffix}`, `⛩ bench pre-push: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

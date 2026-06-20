@@ -73,3 +73,46 @@ test("combinePanel: N=3 with one error, one block -> block", () => {
   assert.equal(r.decision, "block");
   assert.match(r.summary, /MiMo: BLOCK/);
 });
+
+// --- F: verdict badge across all decision branches ---
+
+test("F: combinePanel badge — 4-reviewer ALLOW → Codex✓ Kimi✓ MiMo✓ GLM✓", () => {
+  const r = combinePanel([
+    { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "GLM", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }
+  ]);
+  assert.equal(r.decision, "allow");
+  assert.equal(r.badge, "Codex✓ Kimi✓ MiMo✓ GLM✓");
+});
+
+test("F: combinePanel badge — mixed Kimi-ALLOW/MiMo-BLOCK/GLM-error → Kimi✓ MiMo✗ GLM!", () => {
+  const r = combinePanel([
+    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\n- x" },
+    { name: "GLM", error: "down" }
+  ]);
+  assert.equal(r.decision, "block");
+  assert.equal(r.badge, "Kimi✓ MiMo✗ GLM!");
+});
+
+test("F: combinePanel badge — fail-open (all error) → all !", () => {
+  const r = combinePanel([
+    { name: "Kimi", error: "quota" },
+    { name: "MiMo", error: "down" },
+    { name: "GLM", error: "timeout" }
+  ]);
+  assert.equal(r.decision, "fail-open");
+  assert.equal(r.badge, "Kimi! MiMo! GLM!");
+});
+
+test("F: combinePanel badge — stop-gate (no Codex) omits the Codex glyph", () => {
+  const r = combinePanel([
+    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "GLM", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }
+  ]);
+  assert.equal(r.badge, "Kimi✓ MiMo✓ GLM✓");
+  assert.doesNotMatch(r.badge, /Codex/);
+});

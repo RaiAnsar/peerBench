@@ -197,6 +197,8 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
   assert.ok(hookOut, "hookSpecificOutput must be present");
   assert.equal(hookOut.hookEventName, "PreToolUse", "hookEventName must be PreToolUse");
   assert.equal(hookOut.permissionDecision, "allow", "panel ALLOW → permissionDecision=allow");
+  // F: the emitted reason leads with the verdict badge.
+  assert.match(hookOut.permissionDecisionReason, /\[Kimi✓ MiMo✓\]/, "reason should lead with the badge");
 
   assert.ok(traceRecord !== null, "trace should be written");
   assert.equal(traceRecord.gate, "push", "trace gate must be 'push'");

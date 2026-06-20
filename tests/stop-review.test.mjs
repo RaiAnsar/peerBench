@@ -220,6 +220,38 @@ test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async ()
 });
 
 // ---------------------------------------------------------------------------
+// F: stop-gate ALLOW systemMessage leads with the verdict badge (Codex excluded)
+// ---------------------------------------------------------------------------
+
+test("F: stop ALLOW systemMessage leads with the badge, omitting Codex", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-badge-"));
+  process.env.BENCH_ROOT = root;
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([
+        fakeReviewer("Kimi", "ALLOW", "ALLOW: looks fine"),
+        fakeReviewer("MiMo", "ALLOW", "ALLOW: no issues"),
+        fakeReviewer("GLM", "ALLOW", "ALLOW: clean")
+      ]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, last_assistant_message: "wrote some code" }
+    });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  const parsed = JSON.parse(lines[0]);
+  assert.match(parsed.systemMessage, /\[Kimi✓ MiMo✓ GLM✓\]/, "systemMessage should lead with the badge");
+  assert.doesNotMatch(parsed.systemMessage, /Codex/, "stop badge must not mention Codex");
+});
+
+// ---------------------------------------------------------------------------
 // Test: BLOCK → exit code 2, findings on stderr
 // ---------------------------------------------------------------------------
 

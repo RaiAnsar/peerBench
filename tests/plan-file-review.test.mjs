@@ -109,6 +109,40 @@ test("relative file_path is resolved against input.cwd before read", async () =>
 });
 
 // ---------------------------------------------------------------------------
+// F — the ALLOW systemMessage leads with the verdict badge.
+// ---------------------------------------------------------------------------
+
+test("F: plan-file ALLOW systemMessage leads with the badge", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-badge-"));
+  const planDir = path.join(ws, "plans");
+  fs.mkdirSync(planDir, { recursive: true });
+  fs.writeFileSync(path.join(planDir, "p.md"), "# Plan\n\nbody\n");
+
+  const resolveReviewersImpl = () => [
+    { name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) },
+    { name: "MiMo", run: async () => ({ name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) },
+    { name: "GLM", run: async () => ({ name: "GLM", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) }
+  ];
+
+  const lines = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string") lines.push(chunk); return orig(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { file_path: "plans/p.md" } }
+    });
+  } finally {
+    process.stdout.write = orig;
+  }
+
+  const parsed = JSON.parse(lines.find((l) => l.trim()));
+  assert.match(parsed.systemMessage, /\[Kimi✓ MiMo✓ GLM✓\]/, "systemMessage should lead with the badge");
+});
+
+// ---------------------------------------------------------------------------
 // B2 — malformed stdin must emit a visible ⛩ stderr note (not silent return).
 // ---------------------------------------------------------------------------
 

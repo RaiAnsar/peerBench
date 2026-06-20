@@ -114,13 +114,13 @@ async function main() {
     } catch { /* trace is best-effort */ }
 
     if (flags.json) {
-      process.stdout.write(JSON.stringify({ decision: panel.decision, summary: panel.summary, findings: panel.findings, results }) + "\n");
+      process.stdout.write(JSON.stringify({ decision: panel.decision, badge: panel.badge, summary: panel.summary, findings: panel.findings, results }) + "\n");
     } else {
       for (const r of results) {
         const line = r.error ? `${r.name}: skipped (${r.error})` : `${r.name}: ${r.firstLine || r.verdict}`;
         process.stdout.write(line + "\n");
       }
-      process.stdout.write(`\nResult: ${panel.decision.toUpperCase()} — ${panel.summary}\n`);
+      process.stdout.write(`\nResult: ${panel.decision.toUpperCase()} [${panel.badge}] — ${panel.summary}\n`);
       if (panel.findings) process.stdout.write("\n" + panel.findings + "\n");
     }
     process.exitCode = panel.decision === "block" ? 1 : 0;

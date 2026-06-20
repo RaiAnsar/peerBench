@@ -73,19 +73,19 @@ async function main() {
   }
 
   if (panel.decision === "fail-open") {
-    decision("allow", `Review panel unavailable (${panel.summary}); plan allowed without review.`, `⛩ plan panel skipped: ${panel.summary.slice(0, 200)}`);
+    decision("allow", `[${panel.badge}] Review panel unavailable (${panel.summary}); plan allowed without review.`, `⛩ plan panel skipped [${panel.badge}]: ${panel.summary.slice(0, 200)}`);
     return;
   }
 
   if (panel.decision === "block") {
     decision(
       "deny",
-      `Review panel found issues that must be fixed before this plan can be presented:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address these findings, then call ExitPlanMode again.`
+      `[${panel.badge}] Review panel found issues that must be fixed before this plan can be presented:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address these findings, then call ExitPlanMode again.`
     );
     return;
   }
 
-  decision("allow", `Review panel approved the plan. ${panel.summary}`);
+  decision("allow", `[${panel.badge}] Review panel approved the plan. ${panel.summary}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) main().catch((error) => {

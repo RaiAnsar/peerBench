@@ -10,9 +10,31 @@ import path from "node:path";
 // Isolate BENCH_ROOT before importing so trace/config writes never touch real data.
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-runner-root-"));
 
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { reviewersCommand, setupStatus, statusCommand } from "../scripts/bench-runner.mjs";
 import { resolveConfig } from "../global-hooks/config-store.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
+
+const RUNNER = fileURLToPath(new URL("../scripts/bench-runner.mjs", import.meta.url));
+
+// Build an isolated git workspace with a committed change and a config that
+// selects a single reviewer (kimi) with NO api key → deterministic fail-open.
+function reviewSandbox() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "br-review-root-"));
+  fs.writeFileSync(path.join(root, "companion.json"), JSON.stringify({ reviewers: ["kimi"] }));
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "br-review-ws-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
+  spawnSync("git", ["config", "user.email", "t@t.t"], { cwd: ws });
+  spawnSync("git", ["config", "user.name", "t"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "a.txt"), "v1\n");
+  spawnSync("git", ["add", "-A"], { cwd: ws });
+  spawnSync("git", ["commit", "-qm", "init"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "a.txt"), "v2 changed\n");
+  const env = { ...process.env, BENCH_ROOT: root };
+  delete env.KIMI_API_KEY; delete env.MIMO_API_KEY; delete env.GLM_API_KEY;
+  return { ws, env };
+}
 
 function freshWs() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "br-ws-"));
@@ -144,4 +166,20 @@ test("D2b: missing settings file → 'unable to check' (no crash)", () => {
   let out;
   assert.doesNotThrow(() => { out = setupStatus(p); });
   assert.match(out, /unable to check/i);
+});
+
+// ── F: review output leads with the verdict badge ───────────────────────────
+test("F: bench-runner review human output leads with the badge", () => {
+  const { ws, env } = reviewSandbox();
+  const res = spawnSync(process.execPath, [RUNNER, "review"], { cwd: ws, env, encoding: "utf8" });
+  const resultLine = res.stdout.split("\n").find((l) => l.startsWith("Result:"));
+  assert.ok(resultLine, `must have a Result line; got: ${res.stdout}`);
+  assert.match(resultLine, /\[Kimi!\]/, `Result line should lead with the badge; got: ${resultLine}`);
+});
+
+test("F: bench-runner review --json includes the badge", () => {
+  const { ws, env } = reviewSandbox();
+  const res = spawnSync(process.execPath, [RUNNER, "review", "--json"], { cwd: ws, env, encoding: "utf8" });
+  const obj = JSON.parse(res.stdout.trim().split("\n").pop());
+  assert.equal(obj.badge, "Kimi!", `--json must include badge; got: ${JSON.stringify(obj)}`);
 });

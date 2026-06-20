@@ -158,7 +158,7 @@ export async function runMain({
   }
 
   if (panel.decision === "fail-open") {
-    failOpen(panel.summary);
+    failOpen(`[${panel.badge}] ${panel.summary}`);
     return;
   }
 
@@ -171,7 +171,7 @@ export async function runMain({
     // asyncRewake: write findings to STDERR and exit 2 so the harness WAKES
     // Claude with them (exit-2 blocking feedback is read from stderr, not
     // stdout) instead of blocking the turn.
-    process.stderr.write(`Review panel blocked the plan file ${filePath}:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address ALL findings, then save it as ONE complete rewrite using a single Write call. Do NOT apply fixes as multiple incremental Edits — each save triggers another background review.`);
+    process.stderr.write(`[${panel.badge}] Review panel blocked the plan file ${filePath}:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address ALL findings, then save it as ONE complete rewrite using a single Write call. Do NOT apply fixes as multiple incremental Edits — each save triggers another background review.`);
     process.exit(2);
   }
 
@@ -181,7 +181,7 @@ export async function runMain({
   } catch {
     // skip-marker is best-effort
   }
-  emit({ systemMessage: `⛩ plan panel: ALLOW — ${panel.summary.slice(0, 220)}` });
+  emit({ systemMessage: `⛩ plan panel: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) runMain().catch((error) => {
