@@ -13,8 +13,9 @@ import {
   contentHash, severityRank, summarizeSpecReview, shouldRewake,
   deepResultPath, deepDebouncePath, isDeepDebounced, markDeepDebounce,
   writeDeepResult, readLatestDeepResult, deleteDeepResult, DEEP_REWAKE_SEVERITY,
-  deepKey
+  deepKey, parseSeverity
 } from "../global-hooks/deep-review.mjs";
+import { combinePanel } from "../global-hooks/panel-lib.mjs";
 import { specReviewCommand } from "../scripts/bench-runner.mjs";
 import { runPushReview } from "../global-hooks/spec-review-run.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
@@ -37,6 +38,30 @@ test("severityRank orders none<low<medium<high<critical", () => {
   assert.ok(severityRank("medium") < severityRank("high"));
   assert.ok(severityRank("high") < severityRank("critical"));
   assert.equal(severityRank("bogus"), 0);
+});
+
+// ── FIX 1 (worst-wins): parseSeverity takes the MAX-rank SEVERITY across ALL lines ──
+test("FIX 1: parseSeverity is worst-wins — SEVERITY: low BEFORE SEVERITY: critical → critical", () => {
+  const raw = "BLOCK: data loss\nSEVERITY: low\n- a minor note\nSEVERITY: critical\n- drops every row";
+  assert.equal(parseSeverity(raw, "BLOCK"), "critical", "an earlier low must NOT downgrade a later critical");
+  // Order-independent: critical first, low last → still critical.
+  assert.equal(parseSeverity("SEVERITY: critical\nSEVERITY: low", "BLOCK"), "critical");
+  // A BLOCK with NO SEVERITY line defaults to high (safe); a clean ALLOW → none.
+  assert.equal(parseSeverity("BLOCK: bad\n- finding", "BLOCK"), "high");
+  assert.equal(parseSeverity("ALLOW: ok", "ALLOW"), "none");
+});
+
+test("FIX 1: worst-wins severity propagates to combinePanel — low-then-critical BLOCK still blocks", () => {
+  // The reviewer's raw declares SEVERITY: low BEFORE SEVERITY: critical. combinePanel must
+  // read the WORST (critical) so a high-threshold gate still BLOCKS (worst-wins guarantee) —
+  // not silently downgrade to advisory off the first echoed `SEVERITY: low`.
+  const raw = "BLOCK: data loss\nSEVERITY: low\n- echoed lower note\nSEVERITY: critical\n- drops every row";
+  const r = combinePanel(
+    [{ name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: data loss", raw }],
+    { blockMinSeverity: "high" }
+  );
+  assert.equal(r.decision, "block", "worst-wins: a later critical must keep the BLOCK blocking despite an earlier low");
+  assert.equal(r.badge, "MiMo✗", "a real (>= high) BLOCK renders ✗, not the advisory ~");
 });
 
 test("summarizeSpecReview produces the structured contract", () => {

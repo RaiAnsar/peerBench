@@ -12,7 +12,7 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { deepKey, isDeepDebounced, markDeepDebounce } from "./deep-review.mjs";
+import { deepKey, isDeepDebounced, markDeepDebounce, parseSeverity } from "./deep-review.mjs";
 import { execFileSync, spawn as defaultSpawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -201,7 +201,9 @@ export async function runMain({
     writeTraceImpl(ws, {
       gate: "plan-file",
       ws,
-      reviewers: results.map(({ raw, ...m }) => m),
+      // FIX 3: attach the parsed severity so the statusline can render a sub-threshold
+      // plan-file BLOCK as `~` (advisory) rather than `✗` (mirrors spec-review-run's trace).
+      reviewers: results.map(({ raw, ...m }) => ({ ...m, severity: parseSeverity(raw, m.verdict) })),
       systemPrompt: system,
       userPrompt: user,
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""]))

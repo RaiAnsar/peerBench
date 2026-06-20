@@ -272,10 +272,12 @@ test("severity-gate: a MEDIUM-severity BLOCK does NOT block the save (allows wit
   let exited = false;
   const origExit = process.exit;
   process.exit = () => { exited = true; throw new Error("__exit__"); };
+  // FIX 3/FIX 4: capture the persisted trace to prove the BLOCK reviewer carries its severity.
+  let persistedTrace = null;
   try {
     await runMain({
       resolveReviewersImpl,
-      writeTraceImpl: () => {},
+      writeTraceImpl: (_ws, trace) => { persistedTrace = trace; },
       isBenchDisabledImpl: () => false,
       spawnImpl: () => ({ unref() {} }),
       input: { cwd: ws, tool_input: { file_path: path.join(planDir, "s.md") } }
@@ -289,6 +291,15 @@ test("severity-gate: a MEDIUM-severity BLOCK does NOT block the save (allows wit
   assert.match(parsed.systemMessage || "", /ALLOW/, "the save is allowed");
   assert.match(parsed.systemMessage || "", /MiMo~/, "badge shows MiMo~ (advisory)");
   assert.match(parsed.systemMessage || "", /advisor/i, "an advisory note is surfaced");
+
+  // FIX 3 end-to-end: the persisted trace's BLOCK reviewer entry must carry severity "medium"
+  // (NOT dropped) so the statusline can render `~` for a sub-threshold plan-file BLOCK.
+  assert.ok(persistedTrace, "a trace must have been written");
+  const mimoEntry = persistedTrace.reviewers.find((r) => r.name === "MiMo");
+  assert.ok(mimoEntry, "the persisted trace must contain the MiMo reviewer entry");
+  assert.equal(mimoEntry.verdict, "BLOCK", "MiMo's persisted verdict is BLOCK");
+  assert.equal(mimoEntry.severity, "medium", "the persisted BLOCK reviewer must carry severity 'medium' (FIX 3 — not dropped)");
+  assert.equal(mimoEntry.raw, undefined, "raw must still be stripped from the persisted trace reviewer");
 });
 
 test("severity-gate: a HIGH-severity BLOCK still blocks (rewake, exit 2)", async () => {

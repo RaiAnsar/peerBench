@@ -40,8 +40,17 @@ export function severityRank(sev) {
 // and a non-BLOCK with no line is "none". `verdict` is the already-parsed ALLOW/BLOCK.
 export function parseSeverity(raw, verdict) {
   const s = String(raw ?? "");
-  const m = s.match(/^\s*SEVERITY:\s*(none|low|medium|high|critical)\b/im);
-  if (m) return m[1].toLowerCase();
+  // Worst-wins: scan ALL line-start SEVERITY tokens and take the max-rank one, so a
+  // genuine high/critical can never be silently downgraded by an earlier echoed/intermediate
+  // `SEVERITY: none|low|medium` line (honors the "worst severity declared" contract).
+  const matches = [...s.matchAll(/^\s*SEVERITY:\s*(none|low|medium|high|critical)\b/gim)];
+  if (matches.length) {
+    let best = "none";
+    for (const m of matches) {
+      if (severityRank(m[1]) > severityRank(best)) best = m[1].toLowerCase();
+    }
+    return best;
+  }
   return verdict === "BLOCK" ? "high" : "none";
 }
 

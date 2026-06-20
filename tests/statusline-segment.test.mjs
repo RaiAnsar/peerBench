@@ -34,6 +34,17 @@ test("BLOCK with NO severity (stop/pre-push trace) → ✗ (strict, unchanged)",
   const s = renderSegment({ gate: "stop", reviewers: [{ name: "MiMo", verdict: "BLOCK" }] });
   assert.match(s, /MiMo✗/);
 });
+// FIX 5: an UNKNOWN/malformed severity ranks 0 (< high) but must be treated as STRICT (✗),
+// never softened to the advisory ~ — a corrupt severity must not hide a real BLOCK.
+test("FIX 5: BLOCK with an UNKNOWN/malformed severity → ✗ (strict, not ~)", () => {
+  const s = renderSegment({ gate: "spec-review", reviewers: [{ name: "MiMo", verdict: "BLOCK", severity: "bogus" }] });
+  assert.match(s, /MiMo✗/, "an unknown severity must render the strict ✗");
+  assert.doesNotMatch(s, /MiMo~/, "an unknown severity must NOT render the advisory ~");
+});
+test("FIX 5: BLOCK with an empty-string severity → ✗ (strict)", () => {
+  const s = renderSegment({ gate: "spec-review", reviewers: [{ name: "MiMo", verdict: "BLOCK", severity: "" }] });
+  assert.match(s, /MiMo✗/, "an empty severity is unknown → strict ✗");
+});
 test("errored reviewer → !", () => {
   const s = renderSegment({ gate: "plan", reviewers: [{ name: "Kimi", error: "timeout" }, { name: "MiMo", verdict: "ALLOW" }] });
   assert.match(s, /Kimi!/);

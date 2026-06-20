@@ -2,16 +2,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { workspaceStateDir } from "./config-store.mjs";
-import { severityRank } from "./deep-review.mjs";
+import { severityRank, SEVERITY_RANK } from "./deep-review.mjs";
 
 const C = { ALLOW: 48, BLOCK: 196, error: 208, advisory: 245 };   // 256-color codes (match gate-status.py palette); advisory = dim grey
 const col = (code, s) => `\x1b[38;5;${code}m${s}\x1b[0m`;
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
 const GATE_LABEL = { "plan-file": "plan", "pre-push": "push" };  // shorten; others pass through
-// A BLOCK is ADVISORY (sub-threshold) when it carries an explicit severity BELOW high — the
-// plan/spec gates surface those without blocking. A BLOCK with NO severity (stop/pre-push
-// traces) is strict → ✗.
-const isAdvisoryBlock = (r) => r.verdict === "BLOCK" && r.severity != null && severityRank(r.severity) < severityRank("high");
+// A BLOCK is ADVISORY (sub-threshold) when it carries a KNOWN explicit severity BELOW high —
+// the plan/spec gates surface those without blocking. A BLOCK with NO severity (stop/pre-push
+// traces) is strict → ✗. FIX 5: an UNKNOWN/malformed severity string also ranks 0, but must be
+// treated as STRICT (✗), not advisory — so gate on the severity being a KNOWN rank, not merely
+// non-null (else a corrupt "bogus" severity would silently soften a real BLOCK to `~`).
+const isAdvisoryBlock = (r) =>
+  r.verdict === "BLOCK" &&
+  r.severity != null &&
+  SEVERITY_RANK[String(r.severity).toLowerCase()] != null &&
+  severityRank(r.severity) < severityRank("high");
 // ✗ real block; ~ sub-threshold/advisory block; ! errored/skipped; ✓ allow OR hunt-success
 const glyph = (r) => (r.verdict === "BLOCK" ? (isAdvisoryBlock(r) ? "~" : "✗") : (r.error && r.verdict !== "ALLOW") ? "!" : "✓");
 const rColor = (r) => (r.verdict === "BLOCK" ? (isAdvisoryBlock(r) ? C.advisory : C.BLOCK) : (r.error && r.verdict !== "ALLOW") ? C.error : C.ALLOW);

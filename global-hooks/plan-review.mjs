@@ -94,7 +94,9 @@ export async function runMain({
     writeTraceImpl(ws, {
       gate: "plan",
       ws,
-      reviewers: results.map(({ raw, ...m }) => m),
+      // FIX 3: attach the parsed severity so the statusline can render a sub-threshold
+      // plan BLOCK as `~` (advisory) rather than `✗` (mirrors spec-review-run's trace).
+      reviewers: results.map(({ raw, ...m }) => ({ ...m, severity: parseSeverity(raw, m.verdict) })),
       systemPrompt: system,
       userPrompt: user,
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""]))

@@ -59,7 +59,12 @@ export function parseSpecFindings(text) {
   const v = extractVerdict(s);
   const verdict = v?.verdict ?? null;
   let severity = parseSeverity(s, verdict);   // shared severity extractor (deep-review.mjs)
-  const findingCount = (s.match(/^\s*-\s+\S/gm) || []).length;
+  const bulletCount = (s.match(/^\s*-\s+\S/gm) || []).length;
+  // FIX 2 (deep-path consistency): a BLOCK phrased in PROSE (no `- ` bullets) yields
+  // bulletCount 0, which would make shouldRewake (it needs findingCount > 0) skip the
+  // rewake even at high severity — inconsistent with the fast gate, which blocks. Count a
+  // BLOCK verdict as at least one finding so any high BLOCK rewakes on the deep path too.
+  const findingCount = Math.max(bulletCount, verdict === "BLOCK" ? 1 : 0);
   if (severity === "none" && findingCount > 0 && verdict !== "BLOCK") severity = "low";
   return { verdict, severity, findingCount };
 }
