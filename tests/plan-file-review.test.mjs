@@ -250,3 +250,143 @@ test("D3: plan-file trace write failure emits a ⛩ note and still allows", asyn
   const parsed = JSON.parse(stdoutLines.find((l) => l.trim()));
   assert.match(parsed.systemMessage || "", /ALLOW/, "must still emit the ALLOW systemMessage despite trace failure");
 });
+
+// ===========================================================================
+// Task 10 — G2/G3: fast ALLOW → debounced detached spec-review spawn
+// ===========================================================================
+
+import { workspaceStateDir } from "../global-hooks/config-store.mjs";
+import { isDeepDebounced, contentHash } from "../global-hooks/deep-review.mjs";
+
+function allowReviewers() {
+  return () => [{ name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) }];
+}
+
+// A spawn spy that records calls and returns a child-like object with unref().
+function spawnSpy() {
+  const calls = [];
+  let unrefCount = 0;
+  const impl = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    return { unref: () => { unrefCount += 1; } };
+  };
+  return { impl, calls, unrefCount: () => unrefCount };
+}
+
+test("G2/G3: fast ALLOW spawns spec-review detached + unref'd with abs path + abs ws", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g2-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "s.md");
+  const body = "# Spec\n\nG2 body content.\n";
+  fs.writeFileSync(specFile, body);
+
+  const spy = spawnSpy();
+  await runMain({
+    resolveReviewersImpl: allowReviewers(),
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    spawnImpl: spy.impl,
+    input: { cwd: ws, tool_input: { file_path: specFile } }
+  });
+
+  assert.equal(spy.calls.length, 1, "fast ALLOW must spawn spec-review exactly once");
+  const { cmd, args, opts } = spy.calls[0];
+  assert.equal(cmd, process.execPath, "must spawn node (process.execPath)");
+  assert.equal(args[1], "spec-review", "subcommand must be spec-review");
+  assert.ok(args.includes(specFile), `must pass the absolute spec path; got ${JSON.stringify(args)}`);
+  const wsIdx = args.indexOf("--ws");
+  assert.ok(wsIdx >= 0 && args[wsIdx + 1] === ws, `must pass --ws <abs ws>; got ${JSON.stringify(args)}`);
+  assert.ok(path.isAbsolute(args[wsIdx + 1]), "ws must be absolute");
+  assert.equal(opts.detached, true, "must be detached");
+  assert.equal(opts.stdio, "ignore", "stdio must be ignore");
+  assert.equal(spy.unrefCount(), 1, "child must be unref'd");
+
+  // The debounce marker must now be set for this content hash.
+  assert.equal(isDeepDebounced(ws, contentHash(body)), true, "debounce marker must be set after launch");
+});
+
+test("G3: identical-content re-save within the interval → NOT spawned (debounced)", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g3-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "s.md");
+  fs.writeFileSync(specFile, "# Spec\n\nsame body.\n");
+
+  const spy = spawnSpy();
+  const opts = {
+    resolveReviewersImpl: allowReviewers(),
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    spawnImpl: spy.impl,
+    input: { cwd: ws, tool_input: { file_path: specFile } }
+  };
+  await runMain(opts);
+  assert.equal(spy.calls.length, 1, "first ALLOW spawns");
+
+  // Remove the fast-gate allowMarker so the SECOND save re-reviews (otherwise the
+  // dedup-skip path returns before reaching the deep launch). This isolates the
+  // deep-debounce behaviour: same content re-reviewed → fast ALLOW again → but
+  // the deep pass must NOT relaunch because the debounce marker is fresh.
+  // (Distinct lock dir each call: mtime changes per write, so locks don't collide.)
+  fs.writeFileSync(specFile, "# Spec\n\nsame body.\n");
+  // Clear the fast allow marker so we re-review.
+  const { createHash } = await import("node:crypto");
+  const locksRoot = path.join(os.tmpdir(), "plan-gate-locks");
+  const fileKey = createHash("sha1").update(specFile).digest("hex");
+  try { fs.rmSync(path.join(locksRoot, `allow-${fileKey}`), { force: true }); } catch { /* noop */ }
+  // Also clear any lock dir so we don't get the in-flight lock early-return.
+  await runMain(opts);
+  assert.equal(spy.calls.length, 1, "identical content within interval must NOT relaunch the deep pass");
+});
+
+test("G2: dedup-hit (content identical to last approved) → NOT spawned", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g2dedup-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "s.md");
+  fs.writeFileSync(specFile, "# Spec\n\ndedup body.\n");
+
+  const spy = spawnSpy();
+  const opts = {
+    resolveReviewersImpl: allowReviewers(),
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    spawnImpl: spy.impl,
+    input: { cwd: ws, tool_input: { file_path: specFile } }
+  };
+  // First ALLOW sets the fast allowMarker AND launches the deep pass.
+  await runMain(opts);
+  assert.equal(spy.calls.length, 1);
+
+  // Second save, IDENTICAL content → hits the dedup-skip path (approvalKey matches).
+  // The deep pass must NOT launch from a dedup hit (spec G2), regardless of debounce.
+  const spy2 = spawnSpy();
+  await runMain({ ...opts, spawnImpl: spy2.impl });
+  assert.equal(spy2.calls.length, 0, "dedup-hit must not launch a deep pass");
+});
+
+test("G2: spawn failure does not break the gate (fail-open, ALLOW still emitted)", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g2err-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "s.md");
+  fs.writeFileSync(specFile, "# Spec\n\nspawn err body.\n");
+
+  const lines = [];
+  const orig = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return orig(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl: allowReviewers(),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      spawnImpl: () => { throw new Error("spawn EACCES"); },
+      input: { cwd: ws, tool_input: { file_path: specFile } }
+    });
+  } finally {
+    process.stdout.write = orig;
+  }
+  const parsed = JSON.parse(lines.find((l) => l.trim()));
+  assert.match(parsed.systemMessage || "", /ALLOW/, "ALLOW must still be emitted even if the deep launch throws");
+});

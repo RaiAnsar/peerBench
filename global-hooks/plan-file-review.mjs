@@ -12,11 +12,43 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { execFileSync } from "node:child_process";
+import { contentHash, isDeepDebounced, markDeepDebounce } from "./deep-review.mjs";
+import { execFileSync, spawn as defaultSpawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 function workspaceRoot(cwd) {
   try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
   catch { return cwd; }
+}
+
+// Resolve the bench-runner CLI relative to this hook file (works both in-repo and
+// in the deployed ~/.claude/hooks copy, where bench-runner.mjs is alongside).
+function resolveBenchRunner() {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(here, "..", "scripts", "bench-runner.mjs"),   // in-repo layout
+    path.resolve(here, "bench-runner.mjs")                       // deployed alongside the hooks
+  ];
+  for (const c of candidates) { try { if (fs.existsSync(c)) return c; } catch { /* keep looking */ } }
+  return candidates[0];
+}
+
+// G2/G3 — after a fast ALLOW (NOT a dedup-hit), launch the deep spec-review pass
+// detached + unref'd, debounced on the content hash so an identical re-save within
+// the interval does not relaunch. Never throws — the fast gate has already allowed.
+export function launchDeepReview(ws, filePath, content, { spawnImpl = defaultSpawn, now = Date.now() } = {}) {
+  try {
+    const hash = contentHash(content);
+    if (isDeepDebounced(ws, hash, { now })) return false;   // a deep pass for this exact content ran/launched recently
+    markDeepDebounce(ws, hash, { now });
+    const runner = resolveBenchRunner();
+    const child = spawnImpl(process.execPath, [runner, "spec-review", filePath, "--ws", ws], { detached: true, stdio: "ignore" });
+    if (child && typeof child.unref === "function") child.unref();
+    return true;
+  } catch (e) {
+    process.stderr.write(`⛩ plan gate: deep spec-review launch failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
+    return false;
+  }
 }
 
 const MAX_PLAN_BYTES = 64 * 1024;
@@ -64,6 +96,7 @@ export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
+  spawnImpl = defaultSpawn,
   input: inputOverride,
   emitter = createEmitter()
 } = {}) {
@@ -196,6 +229,9 @@ export async function runMain({
   } catch {
     // skip-marker is best-effort
   }
+  // G2/G3 — fast ALLOW (and NOT a dedup-hit: that path returned above): launch the
+  // detached, debounced deep spec-review against the real repo. Never blocks the save.
+  launchDeepReview(ws, filePath, content, { spawnImpl });
   emit({ systemMessage: `⛩ plan panel: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
 }
 

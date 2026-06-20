@@ -483,6 +483,167 @@ test("D3: stop trace write failure emits a ⛩ note and still allows", async () 
   assert.match(parsed.systemMessage, /ALLOW/i, "still allows");
 });
 
+// ---------------------------------------------------------------------------
+// Task 10 — G5: surface a completed deep-result at the next stop (disable-first)
+// ---------------------------------------------------------------------------
+
+import { writeDeepResult, readLatestDeepResult, contentHash } from "../global-hooks/deep-review.mjs";
+
+/** A deep-result file representing a low-severity completed pass for `ws`. */
+function plantDeepResult(ws, { hash = contentHash("spec body"), badge = "Kimi✓ MiMo✓", summary = "no major issues", traceId = "trace-xyz", findingCount = 0, maxSeverity = "none", reviewers = [{ name: "Kimi", verdict: "ALLOW" }] } = {}) {
+  return writeDeepResult(ws, { hash, badge, summary, traceId, findingCount, maxSeverity, reviewers });
+}
+
+test("G5: completed deep-result is surfaced + deleted at stop, even with NO diff (enabled)", async () => {
+  const ws = freshRepo({ withChange: false });   // no diff this turn
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-g5-"));
+  process.env.BENCH_ROOT = root;
+
+  const file = plantDeepResult(ws, { traceId: "tid-1", summary: "spec looks fine", badge: "Kimi✓ MiMo✓" });
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  const surfaced = lines.map((l) => { try { return JSON.parse(l).systemMessage; } catch { return ""; } }).join("\n");
+  assert.match(surfaced, /deep spec review/i, "must surface the deep spec review note even with no diff");
+  assert.match(surfaced, /Kimi✓ MiMo✓/, "must include the badge");
+  assert.match(surfaced, /spec looks fine/, "must include the summary");
+  assert.match(surfaced, /tid-1/, "must include the trace id");
+  assert.equal(fs.existsSync(file), false, "deep-result must be deleted after surfacing");
+});
+
+test("G5: completed deep-result is surfaced even when loop-capped", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-g5cap-"));
+  process.env.BENCH_ROOT = root;
+  // Force the loop cap so a normal review would not run.
+  fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
+  fs.writeFileSync(path.join(workspaceStateDir(ws), "stop-loop"), JSON.stringify({ count: 4, ts: Date.now() }));
+
+  const file = plantDeepResult(ws, { traceId: "tid-cap", summary: "capped surface" });
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "BLOCK")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, stop_hook_active: false }
+    });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  const surfaced = lines.map((l) => { try { return JSON.parse(l).systemMessage; } catch { return ""; } }).join("\n");
+  assert.match(surfaced, /deep spec review/i, "must surface even when loop-capped (before the loop-cap return)");
+  assert.equal(fs.existsSync(file), false, "deep-result deleted after surfacing");
+});
+
+test("G5: bench DISABLED → deep-result is NOT surfaced (disable checked first)", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-g5dis-"));
+  process.env.BENCH_ROOT = root;
+
+  const file = plantDeepResult(ws, { traceId: "tid-dis" });
+
+  const { lines, restore } = captureEmit(() => {});
+  let exited = false;
+  const origExit = process.exit;
+  process.exit = () => { exited = true; throw new Error("__exit__"); };   // disabled path calls process.exit(0)
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => true,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } catch (e) {
+    if (!/__exit__/.test(String(e && e.message))) throw e;
+  } finally {
+    process.exit = origExit;
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(exited, true, "disabled path must take the normal disabled exit");
+  const surfaced = lines.map((l) => { try { return JSON.parse(l).systemMessage; } catch { return ""; } }).join("\n");
+  assert.doesNotMatch(surfaced, /deep spec review/i, "must NOT surface a deep result when bench is disabled");
+  assert.ok(fs.existsSync(file), "deep-result must remain (not consumed) when disabled");
+});
+
+test("G5: content-hash mismatch → surfaced with a 'stale' note", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-g5stale-"));
+  process.env.BENCH_ROOT = root;
+  // Write a spec file whose CURRENT content differs from the deep-result hash.
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  fs.writeFileSync(path.join(specDir, "s.md"), "# current content\n");
+
+  const file = plantDeepResult(ws, { hash: contentHash("OLD DIFFERENT CONTENT"), specPath: path.join(specDir, "s.md"), traceId: "tid-stale", summary: "old summary" });
+  // ensure the result records which spec it reviewed so the gate can re-hash it
+  const rec = JSON.parse(fs.readFileSync(file, "utf8"));
+  rec.specPath = path.join(specDir, "s.md");
+  fs.writeFileSync(file, JSON.stringify(rec));
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  const surfaced = lines.map((l) => { try { return JSON.parse(l).systemMessage; } catch { return ""; } }).join("\n");
+  assert.match(surfaced, /deep spec review/i, "stale result is still surfaced");
+  assert.match(surfaced, /stale/i, "must note the result may be stale on a hash mismatch");
+  assert.equal(fs.existsSync(file), false, "stale deep-result is deleted too");
+});
+
+test("G5: high-severity deep findings → REWAKE (exit 2) with findings on stderr", () => {
+  // Subprocess: plant a high-severity deep-result, then run the hook on a no-diff repo.
+  const ws = freshRepo({ withChange: false });
+  const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sr-g5rewake-root-"));
+  // Plant the deep-result under the SUBPROCESS's BENCH_ROOT.
+  const prevRoot = process.env.BENCH_ROOT;
+  process.env.BENCH_ROOT = wrapperRoot;
+  let file;
+  try {
+    file = writeDeepResult(ws, { hash: contentHash("x"), badge: "Kimi✗", summary: "critical design flaw", traceId: "tid-rewake", findingCount: 2, maxSeverity: "critical", reviewers: [{ name: "Kimi", verdict: "BLOCK" }] });
+  } finally {
+    process.env.BENCH_ROOT = prevRoot;
+  }
+
+  const result = spawnSync(process.execPath, [HOOK], {
+    input: JSON.stringify({ cwd: ws }),
+    encoding: "utf8",
+    env: { ...process.env, BENCH_ROOT: wrapperRoot }
+  });
+
+  assert.equal(result.status, 2, `high-severity deep findings must rewake (exit 2); stderr=${result.stderr} stdout=${result.stdout}`);
+  assert.match(result.stderr, /deep spec review|critical design flaw/i, "rewake findings on stderr");
+});
+
 test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
   const { system, user } = buildPrompt("M changed.js", "diff --git ...", "new-file.js contents", "did some work");
   // "BLOCK only" instruction must be in system, NOT in user

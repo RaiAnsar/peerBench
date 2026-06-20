@@ -17,8 +17,10 @@ import { fileURLToPath } from "node:url";
 import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers } from "../global-hooks/config-store.mjs";
 import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
-import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
+import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser, specReviewPanel, SPEC_REVIEW_SYSTEM, buildSpecReviewUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
+import { panelBadge } from "../global-hooks/panel-lib.mjs";
+import { contentHash, summarizeSpecReview, writeDeepResult } from "../global-hooks/deep-review.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -184,6 +186,26 @@ async function main() {
     return;
   }
 
+  if (sub === "spec-review") {
+    // Usage: spec-review <abs-path> --ws <abs-ws>
+    // Detached deep pass launched by the plan-file gate (G2). Resolves the SAME
+    // workspaceStateDir as the hook by taking --ws explicitly. Never throws to the
+    // caller (it's detached + unref'd) — failures are noted on stderr only.
+    let filePath = null, ws = null;
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--ws" && i + 1 < rest.length) { ws = rest[++i]; continue; }
+      if (!filePath) filePath = rest[i];
+    }
+    if (!filePath) { process.stderr.write("⛩ spec-review: missing <abs-path>.\n"); process.exitCode = 1; return; }
+    if (!ws) ws = workspaceRoot(path.dirname(filePath));
+    try {
+      await specReviewCommand(filePath, ws);
+    } catch (e) {
+      process.stderr.write(`⛩ spec-review: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+    return;
+  }
+
   if (sub === "debug") {
     const seed = rest.join(" ").trim();
     if (!seed) {
@@ -196,7 +218,7 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|hunt|investigate|debug|off|on`);
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|hunt|investigate|debug|spec-review|off|on`);
 }
 
 const HUNT_MODES = {
@@ -225,6 +247,54 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceI
     `═══ ${r.name} ═══\n${r.findings?.trim() || `(no findings — ${r.error || "empty"})`}`);
   const header = m.header(seed?.trim() || "");
   return `${header}\n\n${blocks.join("\n\n")}${traceId ? `\n\n(trace ${traceId} — expand later with /bench:${key} ${traceId})` : ""}`;
+}
+
+// G1/G4 — deep spec/plan review against the real repo. Runs the panel (repo-aware,
+// read-only) seeded with the file content, writes a gate:"spec-review" trace, and
+// writes deep-result-<hash>.json ON COMPLETION (G4 — absence means "not done yet").
+// Returns the structured result { reviewers:[{name,verdict}], findingCount, maxSeverity }.
+export async function specReviewCommand(filePath, ws, {
+  panelImpl = specReviewPanel,
+  writeTraceImpl = writeTrace,
+  writeDeepResultImpl = writeDeepResult,
+  now = Date.now()
+} = {}) {
+  let content = "";
+  try { content = fs.readFileSync(filePath, "utf8"); } catch (e) {
+    throw new Error(`could not read ${filePath}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const hash = contentHash(content);
+  const results = await panelImpl({ cwd: ws, filePath, content, env: process.env });
+
+  const structured = summarizeSpecReview(results);   // { reviewers, findingCount, maxSeverity }
+  const badge = panelBadge(results.map((r) => ({ name: r.name, error: r.error, verdict: r.verdict })));
+  const summary = structured.findingCount > 0
+    ? `${structured.findingCount} finding(s), max severity ${structured.maxSeverity}`
+    : "no blocking findings";
+
+  let traceId = null;
+  try {
+    traceId = writeTraceImpl(ws, {
+      gate: "spec-review", ws,
+      reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null, severity: r.severity, findingCount: r.findingCount })),
+      systemPrompt: SPEC_REVIEW_SYSTEM,
+      userPrompt: buildSpecReviewUser(filePath, content),
+      rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
+    }, { now });
+  } catch (e) {
+    process.stderr.write(`⛩ spec-review: trace write failed (${e instanceof Error ? e.message : String(e)}); result still written.\n`);
+  }
+
+  try {
+    writeDeepResultImpl(ws, {
+      hash, traceId, badge, summary, specPath: filePath, ts: new Date(now).toISOString(),
+      reviewers: structured.reviewers, findingCount: structured.findingCount, maxSeverity: structured.maxSeverity
+    });
+  } catch (e) {
+    process.stderr.write(`⛩ spec-review: deep-result write failed (${e instanceof Error ? e.message : String(e)}).\n`);
+  }
+
+  return { ...structured, traceId, badge, summary, hash };
 }
 
 export function gateToggleCommand(ws, args, { root } = {}) {

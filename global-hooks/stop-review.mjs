@@ -10,6 +10,7 @@ import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled, workspaceStateDir } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
+import { readLatestDeepResult, deleteDeepResult, contentHash, shouldRewake } from "./deep-review.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
 const MAX_STOP_LOOPS = 4;                  // cap CONSECUTIVE bench blocks → then allow, to avoid a runaway re-review loop
@@ -43,6 +44,39 @@ function git(args, cwd) {
 
 function emit(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
+}
+
+// G5 — surface a COMPLETED deep spec-review at the next stop, BEFORE the loop-cap /
+// no-diff early returns (so it's never starved by a quiet turn). Returns:
+//   "rewake" — high-severity findings: caller must write findings to stderr + exit 2
+//   "surfaced" — emitted a note (allow continues)
+//   null — nothing to surface.
+// On a content-hash mismatch (the spec changed since the pass ran) it notes "may be stale".
+// The result file is deleted once consumed.
+export function surfaceDeepResult(ws, { emit: emitFn = emit } = {}) {
+  const found = readLatestDeepResult(ws);
+  if (!found) return null;
+  const { file, result } = found;
+  let stale = false;
+  if (result.specPath && result.hash) {
+    try {
+      const current = fs.readFileSync(result.specPath, "utf8");
+      stale = contentHash(current) !== result.hash;
+    } catch {
+      stale = true;   // spec gone/unreadable → the result is necessarily stale
+    }
+  }
+  const traceNote = result.traceId ? ` (trace ${result.traceId})` : "";
+  const staleNote = stale ? " — note: the spec changed since this pass ran, result may be stale" : "";
+  const line = `⛩ deep spec review: ${result.badge || "?"} ${result.summary || ""}${traceNote}${staleNote}`;
+
+  if (!stale && shouldRewake({ maxSeverity: result.maxSeverity, findingCount: result.findingCount })) {
+    deleteDeepResult(file);
+    return { kind: "rewake", text: line };
+  }
+  emitFn({ systemMessage: line });
+  deleteDeepResult(file);
+  return { kind: "surfaced", text: line };
 }
 
 export function buildPrompt(status, diff, untracked, lastMsg, staged = "") {
@@ -88,7 +122,16 @@ export async function runMain({
   const ws = workspaceRoot(cwd);
 
   if (isBenchDisabledImpl(ws)) {
-    process.exit(0);
+    process.exit(0);   // disabled-first: do NOT surface deep results when gates are off (G5)
+  }
+
+  // G5 — surface any COMPLETED deep spec-review BEFORE the loop-cap / no-diff returns,
+  // so a quiet turn never swallows it. High-severity findings rewake (exit 2); otherwise
+  // a note is emitted and the gate continues with the normal turn review.
+  const deep = surfaceDeepResult(ws);
+  if (deep && deep.kind === "rewake") {
+    process.stderr.write(`${deep.text}\n\nAddress these deep spec-review findings (see /bench:status for the full report) before ending the session.`);
+    process.exit(2);
   }
 
   // Loop protection scoped to THIS gate. We deliberately do NOT key off `stop_hook_active`: that

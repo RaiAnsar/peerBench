@@ -27,6 +27,23 @@ gets the findings and fixes them); **ALLOW** shows a brief status line.
 The panel is **AND-pass**: any reviewer's `BLOCK:` blocks; if a reviewer errors, the
 others decide; only if all error does the gate fail open (with a visible note).
 
+**Auto deep-review on spec save (capability G).** When the fast plan/spec gate ALLOWs a
+`**/plans/*.md` · `**/specs/*.md` save, it also launches a **detached, debounced** deep pass
+(`bench-runner.mjs spec-review <abs-path> --ws <abs-ws>`) that reviews the plan **against the
+real repository** (repo-aware, read-only). It never blocks the save. The pass writes
+`deep-result-<contentHash>.json` to the workspace state dir **on completion** (absence means
+"not done yet" — no "pending" lie). At your **next stop**, the Stop gate surfaces
+`⛩ deep spec review: <badge> <summary> (trace <id>)` and deletes the file — or rewakes (exit 2)
+if findings are high-severity. If the spec changed since the pass ran, the note says it may be
+**stale**. Disabling the bench (`/bench:off`) suppresses surfacing too (checked first).
+
+> **Manual smoke test (G6).** Detached-child survival across the hook runner's process-group
+> teardown is POSIX `detached:true` + `unref()` and is harness-dependent — the unit tests mock
+> `spawn`. To verify real survival end-to-end after a deploy: save a `specs/x.md` file, confirm
+> the fast `⛩ plan panel: ALLOW …` line, wait for the background pass to finish (a
+> `deep-result-*.json` appears under the workspace state dir), then end a turn and confirm the
+> `⛩ deep spec review: …` line surfaces and the result file is consumed.
+
 **2. Bug hunt (on demand).** `/bench:hunt [focus]` runs the panel **agentically** —
 each reviewer explores the repository read-only via tools (read_file, grep, glob,
 list_dir), then reports concrete findings with `file:line`. Results are shown

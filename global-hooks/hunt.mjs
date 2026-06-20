@@ -2,7 +2,7 @@ import { resolveConfig } from "./config-store.mjs";
 import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { runCodexTask } from "./panel-lib.mjs";
-import { latestCodexRoot, CODEX_DATA } from "./reviewers.mjs";
+import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
 import path from "node:path";
 
 const displayName = (name) => ({ kimi: "Kimi", mimo: "MiMo", glm: "GLM", codex: "Codex" }[name] || name);
@@ -31,6 +31,59 @@ export const DEBUG_SYSTEM =
 
 export function buildDebugUser(seed) {
   return `Debug this specific failure — trace it to the root cause and propose the minimal fix:\n\n${String(seed ?? "").trim() || "(no failure described)"}`;
+}
+
+// Spec-review mode (capability G) — a DEEP, repo-aware review of an implementation
+// plan/spec document. Unlike the fast content-only plan-file gate, the reviewer may
+// read the repo to judge the plan against the real code. Produces a VERDICT line plus
+// a structured findings tail the runner can parse into {findingCount, severity}.
+export const SPEC_REVIEW_SYSTEM =
+  "You are reviewing an implementation plan/spec document AGAINST the real repository, READ-ONLY, via the provided tools. " +
+  "Verify the plan's claims (file paths, function names, behaviors, dependencies, ordering) against the actual code. " +
+  "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>` — BLOCK only for issues that would cause wrong behavior, " +
+  "significant rework, or a broken build if executed as written. " +
+  "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
+  "Then list each concrete finding on its own line starting with `- ` (file:line + the precise problem). " +
+  "Ground every claim in code you actually read — no speculation.";
+
+export function buildSpecReviewUser(filePath, content) {
+  return `<plan_document file="${filePath}">\n${String(content ?? "")}\n</plan_document>\n\n` +
+    "Review this plan/spec against the repository. Read whatever files you need to verify it.";
+}
+
+// Parse a single reviewer's spec-review output into { verdict, severity, findingCount }.
+// Falls back gracefully when the model omits the structured tail.
+export function parseSpecFindings(text) {
+  const s = String(text ?? "");
+  const v = extractVerdict(s);
+  const verdict = v?.verdict ?? null;
+  const sevMatch = s.match(/^\s*SEVERITY:\s*(none|low|medium|high|critical)\b/im);
+  let severity = sevMatch ? sevMatch[1].toLowerCase() : (verdict === "BLOCK" ? "high" : "none");
+  const findingCount = (s.match(/^\s*-\s+\S/gm) || []).length;
+  if (severity === "none" && findingCount > 0 && verdict !== "BLOCK") severity = "low";
+  return { verdict, severity, findingCount };
+}
+
+// Run the full configured panel deep on a spec, returning per-reviewer
+// { name, verdict, severity, findingCount, findings }. Repo-aware (uses huntPanel's
+// agentic tools) but seeded with the spec text and a verdict-producing system prompt.
+export async function specReviewPanel({ cwd, filePath, content, env = process.env, deep = true } = {}) {
+  const results = await huntPanel({
+    cwd, env, deep,
+    system: SPEC_REVIEW_SYSTEM,
+    user: buildSpecReviewUser(filePath, content)
+  });
+  return results.map((r) => {
+    const parsed = parseSpecFindings(r.findings);
+    return {
+      name: r.name,
+      verdict: r.error ? null : parsed.verdict,
+      severity: r.error ? "none" : parsed.severity,
+      findingCount: r.error ? 0 : parsed.findingCount,
+      findings: r.findings || "",
+      error: r.error || null
+    };
+  });
 }
 
 // hunt budget is larger than a gate review (open-ended exploration)
