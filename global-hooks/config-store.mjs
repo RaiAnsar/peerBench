@@ -26,7 +26,9 @@ export function sharedRoot() {
 }
 export function workspaceStateDir(ws) {
   let canonical = ws; try { canonical = fs.realpathSync.native(ws); } catch { canonical = ws; }
-  const slug = (path.basename(ws) || "workspace").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
+  // Slug AND hash both come from the CANONICAL path, so a workspace reached via a differently-named
+  // symlink resolves to the same state dir (otherwise the slug differed while the hash matched → split).
+  const slug = (path.basename(canonical) || "workspace").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 16);
   return path.join(sharedRoot(), "state", `${slug}-${hash}`);
 }

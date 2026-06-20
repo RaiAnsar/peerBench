@@ -39,6 +39,12 @@ test("workspaceStateDir lands under the env-independent shared root", () => {
   assert.ok(dir.startsWith(sharedRoot()));
   assert.ok(/\/state\/workspace-[0-9a-f]{16}$/.test(dir));
 });
+test("workspaceStateDir maps a symlinked workspace to the SAME state dir as the real path (no split)", () => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ws-sym-")));
+  const real = path.join(base, "realname"); fs.mkdirSync(real);
+  const link = path.join(base, "linkname"); fs.symlinkSync(real, link);   // differently-named symlink → real
+  assert.equal(workspaceStateDir(link), workspaceStateDir(real), "symlink + real path must resolve to one state dir");
+});
 test("reviewers override allows codex-only selection", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["codex"] });
   assert.deepEqual(cfg.reviewers, ["codex"]);
