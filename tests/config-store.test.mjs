@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root-"));
-import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers } from "../global-hooks/config-store.mjs";
+import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers, isBenchDisabled } from "../global-hooks/config-store.mjs";
 
 test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => {
   const base = { KIMI_API_KEY: "mk", MIMO_API_KEY: "xk" };
@@ -93,4 +93,21 @@ test("resolveConfig normalizes empty string thinking to null", () => {
 test("resolveConfig mimo defaults: thinking null", () => {
   const cfg = resolveConfig({ env: { MIMO_API_KEY: "m" } });
   assert.equal(cfg.providers.mimo.thinking, null);
+});
+test("C2: isBenchDisabled stays fail-open (false) AND warns on existsSync error", () => {
+  const realExistsSync = fs.existsSync;
+  const realWrite = process.stderr.write.bind(process.stderr);
+  let warned = "";
+  fs.existsSync = () => { throw Object.assign(new Error("boom"), { code: "EIO" }); };
+  process.stderr.write = (chunk) => { warned += chunk; return true; };
+  try {
+    const result = isBenchDisabled("/some/workspace");
+    assert.equal(result, false, "must stay fail-open (enabled) on FS error");
+  } finally {
+    fs.existsSync = realExistsSync;
+    process.stderr.write = realWrite;
+  }
+  assert.match(warned, /⛩/, "must emit a ⛩ stderr warning");
+  assert.match(warned, /bench/i, "warning should mention bench");
+  assert.match(warned, /EIO|boom/, "warning should name the error");
 });

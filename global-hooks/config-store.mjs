@@ -51,8 +51,10 @@ const WS_DISABLE = (ws) => path.join(workspaceStateDir(ws), "disabled");
 
 // Disabled if the global marker exists OR this workspace's marker exists.
 export function isBenchDisabled(ws, { root } = {}) {
-  try { if (fs.existsSync(GLOBAL_DISABLE(root))) return true; } catch { /* noop */ }
-  try { if (ws && fs.existsSync(WS_DISABLE(ws))) return true; } catch { /* noop */ }
+  try { if (fs.existsSync(GLOBAL_DISABLE(root))) return true; }
+  catch (err) { process.stderr.write(`⛩ bench: could not check disable marker (${err.code || err}); treating as enabled.\n`); }
+  try { if (ws && fs.existsSync(WS_DISABLE(ws))) return true; }
+  catch (err) { process.stderr.write(`⛩ bench: could not check disable marker (${err.code || err}); treating as enabled.\n`); }
   return false;
 }
 
