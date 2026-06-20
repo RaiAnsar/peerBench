@@ -670,11 +670,31 @@ test("A2: resolvePushRange — delete refspec :stale → clean allow, no review"
   assert.ok(!r.note || !/fail-open|limitation/i.test(r.note), "delete push is a clean allow");
 });
 
-test("A2: resolvePushRange — --tags → visible fail-open note", () => {
+test("A2: resolvePushRange — --tags falls back to reviewing current-branch commits (not skipped)", () => {
   const { ws } = repoWithRemoteRefs("origin", ["main"], "main");
   const r = resolvePushRange(ws, parsePushCommand("git push --tags"));
-  assert.equal(r.ok, false);
-  assert.ok(r.note && /⛩/.test(r.note), "should carry a visible ⛩ fail-open note");
+  assert.equal(r.ok, true, "--tags now reviews the current branch's ahead-commits instead of skipping");
+  assert.match(r.range, /\.\.HEAD$/, "range targets HEAD (current-branch ahead-commits)");
+  assert.ok(r.note && /--tags/.test(r.note), "note explains the --tags fallback");
+});
+
+test("A2: resolvePushRange — multiple refspecs (deploy push) are REVIEWED, not skipped", () => {
+  // Real-world bug: `git push beta main develop` (a deploy form seen in VisualSentinel + Ryan P)
+  // used to skip review entirely. It must now review the current branch's ahead-commits.
+  const { ws } = repoWithRemoteRefs("beta", ["main"], "main");
+  const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
+  assert.equal(r.ok, true, "multi-refspec deploy push is now reviewed");
+  assert.match(r.range, /\.\.HEAD$/, "reviews current-branch ahead-commits");
+  assert.ok(r.note && /2 refspecs/.test(r.note), "note explains the multi-refspec fallback");
+});
+
+test("A2: resolvePushRange — multiple refspecs with NO resolvable base → fail-open note (true last resort)", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-norefs-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base"], { cwd: ws });
+  const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
+  assert.equal(r.ok, false, "no @{u} and no remote-tracking ref anywhere → cannot review");
+  assert.ok(r.note && /⛩/.test(r.note), "carries a visible fail-open note");
 });
 
 // ===========================================================================

@@ -218,62 +218,72 @@ function refExists(ref, cwd) {
 //  - :<dst>       → delete → no commits → clean allow (deleteOnly).
 //  - no refspec   → source = HEAD; base chain: @{u} → <remote>/<branch> → <remote>/HEAD →
 //                   <remote>/main → <remote>/master → <remote>/master..HEAD as last resort.
-//  - --all/--tags/--mirror, or >1 refspec we can't union cleanly → fail-open ⛩ note.
+//  - --all/--tags/--mirror, or >1 refspec → can't scope an EXACT range, so review the current
+//    branch's ahead-commits (fallbackRange) as a best effort rather than skipping review.
 export function resolvePushRange(cwd, parsed) {
   const { remote = "origin", refspecs = [], flags = [] } = parsed || {};
 
-  // Out-of-clean-scope flags push many refs at once → fail-open with a visible note.
-  for (const f of ["--all", "--tags", "--mirror"]) {
-    if (flags.includes(f)) {
-      return { range: "", ok: false, note: `⛩ pre-push: ${f} pushes multiple refs — out of review scope; push allowed without review.` };
-    }
+  // A single delete refspec (:<dst>) pushes no commits → clean allow, no review.
+  if (refspecs.length === 1 && refspecs[0].startsWith(":")) {
+    return { range: "", ok: false, deleteOnly: true };
   }
 
-  if (refspecs.length > 1) {
-    return { range: "", ok: false, note: "⛩ pre-push: multiple refspecs — could not resolve a single review range; push allowed without review." };
+  // Cases where an EXACT push range can't be scoped — multiple refspecs (`git push beta main develop`,
+  // a common deploy form) or whole-ref flags (--all/--tags/--mirror). Previously these SKIPPED review
+  // entirely, which left real deploy pushes unreviewed. Instead fall back to reviewing the current
+  // branch's ahead-commits — always review SOMETHING; only truly skip if even that can't resolve.
+  const wholeRefFlag = ["--all", "--tags", "--mirror"].find((f) => flags.includes(f));
+  if (wholeRefFlag || refspecs.length > 1) {
+    const why = wholeRefFlag ? `${wholeRefFlag} pushes multiple refs` : `${refspecs.length} refspecs`;
+    const fb = fallbackRange(cwd, remote);
+    if (fb.ok) return { ...fb, note: `⛩ pre-push: ${why} — reviewing current-branch commits (${fb.range}); exact push set not range-resolved.` };
+    return { range: "", ok: false, note: `⛩ pre-push: ${why} and no branch base resolved; push allowed without review.` };
   }
 
-  // Explicit refspec.
+  // Single explicit refspec.
   if (refspecs.length === 1) {
     const spec = refspecs[0];
     const colon = spec.indexOf(":");
     if (colon >= 0) {
       const src = spec.slice(0, colon);
       const dst = spec.slice(colon + 1);
-      if (src === "") {
-        // delete refspec :<dst> — pushes no commits.
-        return { range: "", ok: false, deleteOnly: true };
-      }
       const source = src === "HEAD" ? "HEAD" : src;
       const baseRef = `${remote}/${dst}`;
-      const base = refExists(baseRef, cwd) ? baseRef : null;
-      if (!base) {
-        // No remote-tracking ref for the dst — fall back to base chain, but keep the explicit source.
-        const chain = baseChain(cwd, remote);
-        if (!chain) return { range: "", ok: false, note: `⛩ pre-push: could not resolve a base for ${spec}; push allowed without review.` };
-        return { range: `${chain}..${source}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
-      }
-      return { range: `${base}..${source}`, ok: true };
+      if (refExists(baseRef, cwd)) return { range: `${baseRef}..${source}`, ok: true };
+      // No remote-tracking ref for the dst — keep the explicit source against a guessed base, else fall back.
+      const chain = baseChain(cwd, remote);
+      if (chain) return { range: `${chain}..${source}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
+      const fb = fallbackRange(cwd, remote);
+      return fb.ok
+        ? { ...fb, note: `⛩ pre-push: could not resolve a base for ${spec} — reviewing current-branch commits (${fb.range}).` }
+        : { range: "", ok: false, note: `⛩ pre-push: could not resolve a base for ${spec}; push allowed without review.` };
     }
     // bare <ref> → src = dst = <ref>
     const baseRef = `${remote}/${spec}`;
     if (refExists(baseRef, cwd)) return { range: `${baseRef}..${spec}`, ok: true };
     const chain = baseChain(cwd, remote);
-    if (!chain) return { range: "", ok: false, note: `⛩ pre-push: no remote-tracking ref for ${spec}; push allowed without review.` };
-    return { range: `${chain}..${spec}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
+    if (chain) return { range: `${chain}..${spec}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
+    const fb = fallbackRange(cwd, remote);
+    return fb.ok
+      ? { ...fb, note: `⛩ pre-push: no remote-tracking ref for ${spec} — reviewing current-branch commits (${fb.range}).` }
+      : { range: "", ok: false, note: `⛩ pre-push: no remote-tracking ref for ${spec}; push allowed without review.` };
   }
 
-  // No explicit refspec → source = HEAD; resolve base by precedence.
-  // 1. @{u} (configured upstream for current branch).
+  // No explicit refspec → review the current branch's ahead-commits.
+  const fb = fallbackRange(cwd, remote);
+  return fb.ok ? fb : { range: "", ok: false, note: "⛩ pre-push: no upstream to diff against; push allowed without review." };
+}
+
+// Current branch's ahead-commits: @{u}..HEAD, else <remote>/<branch|HEAD|main|master>..HEAD.
+// The always-available best-effort review range when an EXACT push range can't be scoped — these
+// are the committed-but-unpushed commits a push will transmit (NOT uncommitted work, which a push
+// never carries and which the stop gate already reviews).
+function fallbackRange(cwd, remote) {
   const [upstreamFull, upOk] = gitTry(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
   if (upOk && upstreamFull) return { range: "@{u}..HEAD", ok: true };
-
   const chain = baseChain(cwd, remote);
-  if (chain) {
-    const note = `pre-push: guessed base ${chain} (no @{u})`;
-    return { range: `${chain}..HEAD`, ok: true, note };
-  }
-  return { range: "", ok: false, note: "⛩ pre-push: no upstream to diff against; push allowed without review." };
+  if (chain) return { range: `${chain}..HEAD`, ok: true, note: `pre-push: guessed base ${chain} (no @{u})` };
+  return { range: "", ok: false };
 }
 
 // Base-ref precedence for a named remote with no explicit refspec / no @{u}:
