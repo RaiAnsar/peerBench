@@ -86,6 +86,48 @@ export async function specReviewPanel({ cwd, filePath, content, env = process.en
   });
 }
 
+// Push-review mode (capability H) — a DEEP, repo-aware review of the commits ABOUT TO BE
+// PUSHED, given as a commit list + diff. Unlike the fast content-only pre-push gate, the
+// reviewer may read the repo READ-ONLY to catch cross-file bugs / regressions these commits
+// introduce. Same VERDICT+SEVERITY+findings contract as the spec-review so the runner parses
+// it identically via parseSpecFindings.
+export const PUSH_REVIEW_SYSTEM =
+  "You are reviewing the commits ABOUT TO BE PUSHED, provided as a commit list + diff, AGAINST the real repository, READ-ONLY, via the provided tools. " +
+  "Scour the repo for cross-file bugs, regressions, or unsafe changes these commits introduce — read whatever files you need to confirm a claim. " +
+  "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>` — BLOCK only for a concrete bug, regression, security issue, or unsafe change " +
+  "that must be fixed before these commits are pushed. " +
+  "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
+  "Then list each concrete finding on its own line starting with `- ` (file:line + the precise problem). " +
+  "Ground every claim in code you actually read — no speculation.";
+
+export function buildPushReviewUser(range, content) {
+  return `<push range="${range}">\n${String(content ?? "")}\n</push>\n\n` +
+    "Review these about-to-be-pushed commits against the repository. Read whatever files you need to verify them.";
+}
+
+// Run the full configured panel deep on a set of pushed commits, returning per-reviewer
+// { name, verdict, severity, findingCount, findings }. Repo-aware (huntPanel's agentic tools)
+// but seeded with the commit list + diff and the push verdict-producing system prompt. The
+// shape mirrors specReviewPanel exactly so spec-review-run can reuse the same summarizer.
+export async function pushReviewPanel({ cwd, range, content, env = process.env, deep = true } = {}) {
+  const results = await huntPanel({
+    cwd, env, deep,
+    system: PUSH_REVIEW_SYSTEM,
+    user: buildPushReviewUser(range, content)
+  });
+  return results.map((r) => {
+    const parsed = parseSpecFindings(r.findings);
+    return {
+      name: r.name,
+      verdict: r.error ? null : parsed.verdict,
+      severity: r.error ? "none" : parsed.severity,
+      findingCount: r.error ? 0 : parsed.findingCount,
+      findings: r.findings || "",
+      error: r.error || null
+    };
+  });
+}
+
 // hunt budget is larger than a gate review (open-ended exploration)
 const HUNT_MAX_STEPS = 40;
 const HUNT_TIMEOUT_MS = 12 * 60 * 1000;

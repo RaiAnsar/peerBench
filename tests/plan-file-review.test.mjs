@@ -433,3 +433,36 @@ test("FIX 1: spec-review-run.mjs is present and resolves all imports in a FLAT d
   // Fail-open: a missing API key etc. is fine; the process must not look like a crash from a bad import.
   assert.equal(result.status, 0, `worker fails open (exit 0); got ${result.status}, stderr: ${result.stderr}`);
 });
+
+// ===========================================================================
+// H — deploy-parity for the PUSH mode: `node <flat>/spec-review-run.mjs --push <range>
+// --ws <ws>` must resolve all sibling imports (pushReviewPanel etc.) in the deployed
+// FLAT layout, with NO scripts/ present. It may fail-open (no reviewers / git), but must
+// NOT die with a module-resolution error.
+// ===========================================================================
+
+test("H: spec-review-run.mjs --push <range> resolves all imports in a FLAT deployed layout", () => {
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const hooksSrc = path.join(here, "..", "global-hooks");
+
+  // Simulate the deployed flat layout: copy ONLY global-hooks/*.mjs (no scripts/).
+  const flat = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flatpush-"));
+  for (const f of fs.readdirSync(hooksSrc).filter((f) => f.endsWith(".mjs"))) {
+    fs.copyFileSync(path.join(hooksSrc, f), path.join(flat, f));
+  }
+  const worker = path.join(flat, "spec-review-run.mjs");
+  assert.ok(fs.existsSync(worker), "spec-review-run.mjs must be deployed flat");
+
+  const benchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flatpush-root-"));
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flatpush-ws-"));
+
+  const result = spawnSync(process.execPath, [worker, "--push", "@{u}..HEAD", "--ws", ws], {
+    encoding: "utf8",
+    env: { ...process.env, BENCH_ROOT: benchRoot }
+  });
+
+  assert.doesNotMatch(result.stderr || "", /ERR_MODULE_NOT_FOUND/, `push worker must resolve all sibling imports in a flat layout; stderr: ${result.stderr}`);
+  assert.doesNotMatch(result.stderr || "", /Cannot find module/, `push worker must not have an unresolved import in a flat layout; stderr: ${result.stderr}`);
+  // Fail-open: missing reviewers / no real repo is fine; the process must exit 0, not crash on a bad import.
+  assert.equal(result.status, 0, `push worker fails open (exit 0); got ${result.status}, stderr: ${result.stderr}`);
+});

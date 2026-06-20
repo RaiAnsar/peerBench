@@ -669,6 +669,58 @@ test("FIX 2: a null deep-result file → surfaceDeepResult returns null without 
 });
 
 // ---------------------------------------------------------------------------
+// H — surfaceDeepResult is label-aware: a kind:"push" result (NO specPath) surfaces
+// as "deep push review", skips the file-based stale check (no false 'stale' note), and
+// a high-severity push result rewakes.
+// ---------------------------------------------------------------------------
+
+test("H: surfaceDeepResult surfaces a kind:'push' result with the 'deep push review' label and NO stale note", () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-hpush-"));
+  process.env.BENCH_ROOT = root;
+  try {
+    const file = writeDeepResult(ws, {
+      hash: contentHash("push:@{u}..HEAD deadbeef"), kind: "push", range: "@{u}..HEAD",
+      badge: "Kimi✓ MiMo✓", summary: "no blocking findings", traceId: "tid-push",
+      findingCount: 0, maxSeverity: "none", reviewers: [{ name: "Kimi", verdict: "ALLOW" }]
+    });
+    const emitted = [];
+    const res = surfaceDeepResult(ws, { emit: (o) => emitted.push(o) });
+    assert.equal(res.kind, "surfaced", "push result must surface");
+    assert.equal(emitted.length, 1, "exactly one note emitted");
+    const msg = emitted[0].systemMessage;
+    assert.match(msg, /deep push review/i, "must use the 'deep push review' label, not 'spec'");
+    assert.doesNotMatch(msg, /deep spec review/i, "must NOT use the spec label for a push result");
+    assert.doesNotMatch(msg, /stale/i, "a push result has no specPath → the file-based stale check is skipped (no false stale note)");
+    assert.match(msg, /tid-push/, "must include the trace id");
+    assert.equal(fs.existsSync(file), false, "consumed push deep-result is deleted");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+});
+
+test("H: a high-severity kind:'push' deep-result returns rewake", () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-hpushrw-"));
+  process.env.BENCH_ROOT = root;
+  try {
+    const file = writeDeepResult(ws, {
+      hash: contentHash("push:rw"), kind: "push", range: "@{u}..HEAD",
+      badge: "Kimi✗", summary: "2 finding(s), max severity high", traceId: "tid-push-rw",
+      findingCount: 2, maxSeverity: "high", reviewers: [{ name: "Kimi", verdict: "BLOCK" }]
+    });
+    const emitted = [];
+    const res = surfaceDeepResult(ws, { emit: (o) => emitted.push(o) });
+    assert.equal(res.kind, "rewake", "a high-severity push result must rewake (exit 2 at the stop gate)");
+    assert.match(res.text, /deep push review/i, "rewake text uses the push label");
+    assert.equal(emitted.length, 0, "rewake path does not emit on stdout (it goes to stderr + exit 2)");
+    assert.equal(fs.existsSync(file), false, "consumed push deep-result is deleted on rewake too");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+});
+
+// ---------------------------------------------------------------------------
 // FIX 3 — surfaced summary is length-capped (no unbounded output).
 // ---------------------------------------------------------------------------
 

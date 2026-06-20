@@ -14,8 +14,9 @@ import path from "node:path";
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange } from "../global-hooks/pre-push-review.mjs";
+import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview } from "../global-hooks/pre-push-review.mjs";
 import { setBenchDisabled } from "../global-hooks/config-store.mjs";
+import { deepKey, isDeepDebounced } from "../global-hooks/deep-review.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "pre-push-review.mjs");
@@ -832,4 +833,254 @@ test("D3: pre-push trace write failure emits a ⛩ note and still allows", async
   assert.match(stderrChunks.join(""), /⛩ .*trace write failed/i, "expected a ⛩ trace-write-failed note on stderr");
   const parsed = JSON.parse(stdoutLines.find((l) => l.trim()));
   assert.equal(parsed.hookSpecificOutput?.permissionDecision, "allow", "must still allow despite trace failure");
+});
+
+// ===========================================================================
+// H — auto deep-review on push: a fast ALLOW launches the deep, repo-aware
+// push-review worker detached + unref'd, debounced; NEVER on block/fail-open/
+// disabled/empty-range/deleteOnly/debounced.
+// ===========================================================================
+
+/** A spawn spy that records calls and returns a child-like object with unref(). */
+function pushSpawnSpy() {
+  const calls = [];
+  let unrefCount = 0;
+  const impl = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    return { unref: () => { unrefCount += 1; } };
+  };
+  return { impl, calls, unrefCount: () => unrefCount };
+}
+
+/** A launchImpl spy — records (ws, range) so we can assert WHETHER a launch was attempted. */
+function launchSpy() {
+  const calls = [];
+  const impl = (ws, range) => { calls.push({ ws, range }); return true; };
+  return { impl, calls };
+}
+
+test("H: fast ALLOW launches the deep push-review worker — args [<spec-review-run.mjs>, --push, <range>, --ws, <ws>], detached+unref'd, worker exists on disk", async () => {
+  const { ws } = freshPushRepo();
+  // runMain resolves the ws via `git rev-parse --show-toplevel`, which returns the realpath
+  // (macOS /tmp is a symlink to /private/tmp), so compare against the realpath form.
+  const wsReal = fs.realpathSync(ws);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hlaunch-")));
+  process.env.BENCH_ROOT = root;
+
+  const spy = pushSpawnSpy();
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW"), fakeReviewer("MiMo", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      spawnImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(spy.calls.length, 1, "fast ALLOW must launch the deep push-review exactly once");
+  const { cmd, args, opts } = spy.calls[0];
+  assert.equal(cmd, process.execPath, "must spawn node (process.execPath)");
+  // deploy-parity: the worker is the SIBLING global-hooks/spec-review-run.mjs (scripts/ never deployed).
+  assert.match(args[0], /spec-review-run\.mjs$/, `args[0] must be the spec-review-run worker; got ${JSON.stringify(args)}`);
+  assert.ok(fs.existsSync(args[0]), `the spawned worker must actually exist on disk (deploy-parity); got ${args[0]}`);
+  assert.equal(args[1], "--push", "args[1] must be --push");
+  assert.match(args[2], /\.\.HEAD$|\.\.main$|\.\./, `args[2] must be the resolved range; got ${args[2]}`);
+  assert.equal(args[3], "--ws", "args[3] must be --ws");
+  assert.equal(args[4], wsReal, "args[4] must be the absolute ws");
+  assert.ok(path.isAbsolute(args[4]), "ws must be absolute");
+  // Full arg shape: [worker, --push, range, --ws, ws]
+  assert.deepEqual(args.slice(1), ["--push", args[2], "--ws", wsReal], `arg shape must be [--push, <range>, --ws, <ws>]; got ${JSON.stringify(args)}`);
+  assert.equal(opts.detached, true, "must be detached");
+  assert.equal(opts.stdio, "ignore", "stdio must be ignore");
+  assert.equal(spy.unrefCount(), 1, "child must be unref'd");
+});
+
+test("H: BLOCK → does NOT launch the deep push-review (push denied)", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hblock-")));
+  process.env.BENCH_ROOT = root;
+
+  const spy = launchSpy();
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "BLOCK")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      launchImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(spy.calls.length, 0, "a BLOCK must not launch a deep push-review");
+});
+
+test("H: fail-open (all reviewers errored) → does NOT launch the deep push-review", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hfo-")));
+  process.env.BENCH_ROOT = root;
+
+  const spy = launchSpy();
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeErrorReviewer("Kimi")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      launchImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(spy.calls.length, 0, "a fail-open (panel unavailable) must not launch a deep push-review");
+});
+
+test("H: bench DISABLED → does NOT launch the deep push-review", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hdis-")));
+  process.env.BENCH_ROOT = root;
+
+  const spy = launchSpy();
+  const origExit = process.exit;
+  process.exit = () => { throw new Error("__exit__"); };   // disabled path calls process.exit(0)
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => true,
+      launchImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } catch (e) {
+    if (!/__exit__/.test(String(e && e.message))) throw e;
+  } finally {
+    process.exit = origExit;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(spy.calls.length, 0, "disabled bench must not launch a deep push-review");
+});
+
+test("H: nothing to push (no commits ahead) → does NOT launch the deep push-review", async () => {
+  const { ws } = freshPushedRepo();   // nothing ahead of origin/main
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hempty-")));
+  process.env.BENCH_ROOT = root;
+
+  const spy = launchSpy();
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      launchImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(spy.calls.length, 0, "an empty push range (nothing to push) must not launch a deep push-review");
+});
+
+test("H: deleteOnly (:branch) → does NOT launch the deep push-review", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hdel-")));
+  process.env.BENCH_ROOT = root;
+
+  const spy = launchSpy();
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      launchImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin :stale-branch" } }
+    });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(spy.calls.length, 0, "a delete refspec pushes no commits → no deep push-review");
+});
+
+test("H: debounced — same push (range+HEAD) within the window → does NOT relaunch", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hdebounce-")));
+  process.env.BENCH_ROOT = root;
+
+  const spy = pushSpawnSpy();
+  try {
+    // First ALLOW launches and marks the debounce.
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      spawnImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+    assert.equal(spy.calls.length, 1, "first ALLOW launches");
+
+    // Second identical push (same HEAD, same range) within the window → debounced, no relaunch.
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      spawnImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+    assert.equal(spy.calls.length, 1, "identical push within the interval must NOT relaunch the deep pass");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+});
+
+test("H: launchPushReview never blocks the push — a spawn throw is swallowed (returns false, ⛩ note)", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hthrow-")));
+  process.env.BENCH_ROOT = root;
+
+  const stderrChunks = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
+  let ret;
+  try {
+    ret = launchPushReview(ws, "@{u}..HEAD", { spawnImpl: () => { throw new Error("spawn EACCES"); } });
+  } finally {
+    process.stderr.write = origErr;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(ret, false, "a spawn throw must be swallowed (returns false), never propagated to block the push");
+  assert.match(stderrChunks.join(""), /⛩ pre-push: deep push-review launch failed/i, "must note the launch failure on stderr");
+});
+
+test("H: launchPushReview is debounced via deepKey(push:<range>, headSha)", () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hkey-")));
+  process.env.BENCH_ROOT = root;
+  try {
+    const range = "@{u}..HEAD";
+    const head = "0123456789abcdef";
+    const gitImpl = (args) => (args[0] === "rev-parse" && args[1] === "HEAD") ? [head, true] : ["", true];
+    const spy = pushSpawnSpy();
+
+    const first = launchPushReview(ws, range, { spawnImpl: spy.impl, gitImpl });
+    assert.equal(first, true, "first launch proceeds");
+    assert.equal(spy.calls.length, 1);
+    // The debounce marker must be set for the (push:range, headSha) key.
+    assert.equal(isDeepDebounced(ws, deepKey(`push:${range}`, head)), true, "debounce keyed on deepKey(push:<range>, headSha)");
+
+    const second = launchPushReview(ws, range, { spawnImpl: spy.impl, gitImpl });
+    assert.equal(second, false, "second launch within the window is debounced");
+    assert.equal(spy.calls.length, 1, "no relaunch while debounced");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
 });

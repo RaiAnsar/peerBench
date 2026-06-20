@@ -16,6 +16,7 @@ import {
   deepKey
 } from "../global-hooks/deep-review.mjs";
 import { specReviewCommand } from "../scripts/bench-runner.mjs";
+import { runPushReview } from "../global-hooks/spec-review-run.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 import { listTraces, readTrace } from "../global-hooks/trace-store.mjs";
 
@@ -203,4 +204,110 @@ test("G4: specReviewCommand writes deep-result-<hash>.json on completion (hash, 
   assert.equal(typeof found.result.summary, "string");
   assert.ok(Array.isArray(found.result.reviewers));
   assert.equal(typeof found.result.findingCount, "number");
+});
+
+// ── H: runPushReview — the deep, repo-aware push-review worker ─────────────────
+
+// A gitImpl stub returning fixed commits/diff/headSha so no real repo is needed.
+function gitStub({ commits = "abc123 add feature", diff = "+const x = 1;", head = "deadbeefcafef00d" } = {}) {
+  const calls = [];
+  const impl = (args) => {
+    calls.push(args);
+    if (args[0] === "log") return [commits, true];
+    if (args[0] === "diff") return [diff, true];
+    if (args[0] === "rev-parse" && args[1] === "HEAD") return [head, true];
+    return ["", true];
+  };
+  return { impl, calls };
+}
+
+test("H: runPushReview writes a gate:'push-review' trace and returns the structured result", async () => {
+  const ws = freshWs();
+  const range = "@{u}..HEAD";
+  const stub = gitStub({ commits: "c1 first\nc2 second", diff: "+broken();" });
+
+  let seeded = null;
+  const panelImpl = async ({ cwd, range: r, content }) => {
+    seeded = { cwd, range: r, content };
+    return [
+      { name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" },
+      { name: "MiMo", verdict: "BLOCK", findings: "- cross-file regression", findingCount: 1, severity: "high" }
+    ];
+  };
+
+  const result = await runPushReview(range, ws, { panelImpl, gitImpl: stub.impl });
+
+  // Panel is seeded with the commit list + diff as content.
+  assert.equal(seeded.cwd, ws);
+  assert.equal(seeded.range, range);
+  assert.match(seeded.content, /c1 first/, "content must include the commit list");
+  assert.match(seeded.content, /\+broken\(\)/, "content must include the diff");
+
+  assert.deepEqual(result.reviewers, [{ name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }]);
+  assert.equal(result.findingCount, 1);
+  assert.equal(result.maxSeverity, "high");
+  assert.match(result.badge, /Kimi✓ MiMo✗/, "badge reflects per-reviewer verdicts");
+
+  // Trace written with gate:"push-review".
+  const [latest] = listTraces(ws, 1);
+  assert.ok(latest, "a trace must be written");
+  assert.equal(latest.gate, "push-review");
+  const t = readTrace(ws, latest.id);
+  assert.equal(t.gate, "push-review");
+});
+
+test("H: runPushReview writes a deep-result with kind:'push', range, NO specPath, hashed via deepKey(push:range, headSha)", async () => {
+  const ws = freshWs();
+  const range = "origin/main..HEAD";
+  const head = "feedface12345678";
+  const stub = gitStub({ head });
+  const expectedHash = deepKey(`push:${range}`, head);
+
+  const panelImpl = async () => [
+    { name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }
+  ];
+
+  await runPushReview(range, ws, { panelImpl, gitImpl: stub.impl });
+
+  const found = readLatestDeepResult(ws);
+  assert.ok(found, "deep-result file must be written on completion");
+  assert.equal(found.result.kind, "push", "deep-result must be kind:'push'");
+  assert.equal(found.result.range, range, "deep-result must carry the push range");
+  assert.equal(found.result.specPath, undefined, "push deep-result must NOT carry a specPath (skips file-based stale check)");
+  assert.equal(found.result.hash, expectedHash, "deep-result must be hashed via deepKey(push:<range>, headSha)");
+  assert.ok(found.result.traceId, "deep-result must carry the trace id");
+  assert.equal(typeof found.result.badge, "string");
+  assert.equal(typeof found.result.summary, "string");
+  assert.ok(Array.isArray(found.result.reviewers));
+  assert.equal(typeof found.result.findingCount, "number");
+});
+
+test("H: runPushReview dedupes on HEAD — same range+HEAD → identical deep key (re-push of same HEAD)", async () => {
+  const ws = freshWs();
+  const range = "@{u}..HEAD";
+  const head = "cafef00dbaadf00d";
+  const stub = gitStub({ head });
+  const panelImpl = async () => [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }];
+
+  const r1 = await runPushReview(range, ws, { panelImpl, gitImpl: stub.impl });
+  const r2 = await runPushReview(range, ws, { panelImpl, gitImpl: stub.impl });
+  assert.equal(r1.hash, r2.hash, "same range + same HEAD → same deep key (dedupe)");
+  assert.equal(r1.hash, deepKey(`push:${range}`, head));
+});
+
+test("H: runPushReview caps the diff at ~200KB", async () => {
+  const ws = freshWs();
+  const huge = "+x".repeat(300_000);   // way over the 200KB cap
+  const stub = gitStub({ diff: huge });
+  let captured = null;
+  const panelImpl = async ({ content }) => { captured = content; return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }]; };
+
+  await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
+  assert.ok(captured.includes("diff truncated"), "oversized diff must be truncated with a marker");
+  assert.ok(captured.length < 220_000, "content must be bounded near the 200KB cap");
+});
+
+test("H: runPushReview throws on a missing range", async () => {
+  const ws = freshWs();
+  await assert.rejects(() => runPushReview("", ws, { panelImpl: async () => [], gitImpl: gitStub().impl }), /missing range/);
 });

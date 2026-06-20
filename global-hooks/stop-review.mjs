@@ -90,8 +90,11 @@ export function surfaceDeepResult(ws, { emit: emitFn = emit } = {}) {
   }
   const traceNote = result.traceId ? ` (trace ${result.traceId})` : "";
   const staleNote = stale ? " — note: the spec changed since this pass ran, result may be stale" : "";
+  // H — label-aware: a kind:"push" result reviewed pushed commits (no specPath → the stale
+  // check above is skipped, so no false 'stale' note); everything else is a spec review.
+  const label = result.kind === "push" ? "deep push review" : "deep spec review";
   // FIX 3: cap the interpolated summary (every other emit site caps ~220–250).
-  const line = `⛩ deep spec review: ${result.badge || "?"} ${String(result.summary || "").slice(0, 220)}${traceNote}${staleNote}`;
+  const line = `⛩ ${label}: ${result.badge || "?"} ${String(result.summary || "").slice(0, 220)}${traceNote}${staleNote}`;
 
   if (!stale && shouldRewake({ maxSeverity: result.maxSeverity, findingCount: result.findingCount })) {
     deleteDeepResult(file);
