@@ -9,9 +9,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { combinePanel } from "./panel-lib.mjs";
-import { isBenchDisabled } from "./config-store.mjs";
-import { resolveReviewers } from "./reviewers.mjs";
-import { writeTrace } from "./trace-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
+import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
+import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { execFileSync } from "node:child_process";
 
 function workspaceRoot(cwd) {
@@ -39,14 +39,24 @@ export function buildPrompt(filePath, content) {
   };
 }
 
-async function main() {
+function readInput() {
   let input = {};
   try {
     const raw = fs.readFileSync(0, "utf8").trim();
     if (raw) input = JSON.parse(raw);
   } catch {
-    return;
+    return {};
   }
+  return input;
+}
+
+export async function runMain({
+  resolveReviewersImpl = defaultResolveReviewers,
+  writeTraceImpl = defaultWriteTrace,
+  isBenchDisabledImpl = defaultIsBenchDisabled,
+  input: inputOverride
+} = {}) {
+  const input = inputOverride ?? readInput();
 
   const filePath = String(input.tool_input?.file_path ?? "");
   if (!PLAN_PATH_RE.test(filePath)) {
@@ -67,7 +77,7 @@ async function main() {
 
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);              // git top-level — matches /bench:off marker + the other gates
-  if (isBenchDisabled(ws)) process.exit(0);    // bench layer disabled — no-op before any lock/review
+  if (isBenchDisabledImpl(ws)) return;         // bench layer disabled — no-op before any lock/review
 
   const locksRoot = path.join(os.tmpdir(), "plan-gate-locks");
   // Context-complete approval key: identical plan text must NOT skip review
@@ -125,11 +135,11 @@ async function main() {
 
   const { system, user } = buildPrompt(filePath, content);
 
-  const results = await Promise.all(resolveReviewers().map((r) => r.run({ system, user, cwd: ws })));
+  const results = await Promise.all(resolveReviewersImpl().map((r) => r.run({ system, user, cwd: ws })));
   const panel = combinePanel(results);
 
   try {
-    writeTrace(ws, {
+    writeTraceImpl(ws, {
       gate: "plan-file",
       ws,
       reviewers: results.map(({ raw, ...m }) => m),
@@ -168,6 +178,6 @@ async function main() {
   emit({ systemMessage: `⛩ plan panel: ALLOW — ${panel.summary.slice(0, 220)}` });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main().catch((error) => {
+if (import.meta.url === `file://${process.argv[1]}`) runMain().catch((error) => {
   failOpen(error instanceof Error ? error.message : String(error));
 });
