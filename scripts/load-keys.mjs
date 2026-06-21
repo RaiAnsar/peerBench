@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { sharedRoot } from "../global-hooks/config-store.mjs";
+import { sharedRoot, PROVIDER_NAMES } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const keysPath = process.argv[2] || path.join(ROOT, ".keys");
@@ -25,7 +25,7 @@ function parseKeys(text) {
   return env;
 }
 
-const PROVIDERS = ["kimi", "mimo", "glm"];
+const PROVIDERS = PROVIDER_NAMES;   // derived from config-store DEFAULTS — adding a model needs no edit here
 function buildProvider(env, name) {
   const P = name.toUpperCase();
   const out = {};

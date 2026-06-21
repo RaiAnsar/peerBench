@@ -1,12 +1,11 @@
 // global-hooks/reviewers.mjs
 import { parseVerdict, runCodexReview } from "./panel-lib.mjs";
-import { resolveConfig } from "./config-store.mjs";
+import { resolveConfig, displayName } from "./config-store.mjs";
 import { review as defaultReview } from "./review-client.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const NAMES = { kimi: "Kimi", mimo: "MiMo", glm: "GLM", codex: "Codex" };
 const STRICT = "\n\nIMPORTANT: respond with ONLY a first line of `ALLOW: <reason>` or `BLOCK: <reason>`. No preamble, no code fences.";
 
 const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");
@@ -52,7 +51,7 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
   return cfg.reviewers.map((name) => {
     if (name === "codex") return codexAdapter();
     const p = cfg.providers[name];
-    const display = NAMES[name] || name;
+    const display = displayName(name);
     return {
       name,
       async run({ system, user, cwd, env: runEnv }) {

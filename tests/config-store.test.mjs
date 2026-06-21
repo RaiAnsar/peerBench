@@ -4,7 +4,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root-"));
-import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers, isBenchDisabled } from "../global-hooks/config-store.mjs";
+import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers, isBenchDisabled, displayName, PROVIDER_NAMES } from "../global-hooks/config-store.mjs";
+
+test("registry: display names + KNOWN_REVIEWERS + PROVIDER_NAMES all derive from the single DEFAULTS source", () => {
+  // Adding/swapping a model is one DEFAULTS entry — these are derived, not hand-maintained lists.
+  assert.deepEqual(PROVIDER_NAMES, ["kimi", "mimo", "glm", "qwen"]);
+  assert.deepEqual(KNOWN_REVIEWERS, ["kimi", "mimo", "glm", "qwen", "codex"]);
+  assert.equal(displayName("kimi"), "Kimi");
+  assert.equal(displayName("mimo"), "MiMo");
+  assert.equal(displayName("glm"), "GLM");
+  assert.equal(displayName("qwen"), "Qwen");
+  assert.equal(displayName("codex"), "Codex");
+  assert.equal(displayName("whatever"), "whatever", "unknown names pass through unchanged");
+});
 
 test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => {
   const base = { KIMI_API_KEY: "mk", MIMO_API_KEY: "xk" };
@@ -17,15 +29,28 @@ test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => 
   assert.match(a.providers.kimi.headers["User-Agent"], /claude-cli/);
   assert.equal(a.providers.mimo.apiKey, "xk");
   assert.equal(a.providers.mimo.temperature, 0);
-  // glm provider is defined (selectable) but NOT a default reviewer
+  // glm provider is defined and now part of the default fallback set
   assert.equal(a.providers.glm.baseURL, "https://api.z.ai/api/coding/paas/v4");
   assert.equal(a.providers.glm.model, "glm-5.2");
-  assert.deepEqual(a.reviewers, ["kimi", "mimo"]);
+  // Default fallback is kimi+glm (mimo disabled — quota-exhausted — but still wired/selectable).
+  assert.deepEqual(a.reviewers, ["kimi", "glm"]);
   assert.deepEqual(a, b);
 });
-test("glm is selectable (KNOWN) but not in the default reviewer set", () => {
-  assert.ok(KNOWN_REVIEWERS.includes("glm"), "glm must be KNOWN/selectable");
-  assert.ok(!resolveConfig({ env: {} }).reviewers.includes("glm"), "glm must not be active by default");
+test("mimo is selectable (KNOWN, integration retained) but NOT in the default set", () => {
+  assert.ok(KNOWN_REVIEWERS.includes("mimo"), "mimo must stay KNOWN/selectable (disabled, not removed)");
+  assert.ok(!resolveConfig({ env: {} }).reviewers.includes("mimo"), "mimo must not be active by default");
+});
+test("qwen is wired as a KNOWN/selectable provider with its DashScope defaults", () => {
+  assert.ok(KNOWN_REVIEWERS.includes("qwen"), "qwen must be KNOWN/selectable");
+  const a = resolveConfig({ env: { QWEN_API_KEY: "qk" } });
+  assert.equal(a.providers.qwen.apiKey, "qk");
+  assert.equal(a.providers.qwen.model, "qwen3.7-plus");
+  assert.match(a.providers.qwen.baseURL, /maas\.aliyuncs\.com\/compatible-mode/);
+});
+test("QWEN_MODEL / QWEN_BASE_URL env overrides win (quick-swap without code edits)", () => {
+  const a = resolveConfig({ env: { QWEN_API_KEY: "qk", QWEN_MODEL: "qwen-max", QWEN_BASE_URL: "https://example/v1" } });
+  assert.equal(a.providers.qwen.model, "qwen-max");
+  assert.equal(a.providers.qwen.baseURL, "https://example/v1");
 });
 test("companion.json can override temperature/headers (via file param seam)", () => {
   // resolveConfig reads companion.json from sharedRoot; we can't write there in a unit test,

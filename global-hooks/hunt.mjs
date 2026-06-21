@@ -1,12 +1,10 @@
-import { resolveConfig } from "./config-store.mjs";
+import { resolveConfig, displayName } from "./config-store.mjs";
 import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { runCodexTask } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
 import { parseSeverity } from "./deep-review.mjs";
 import path from "node:path";
-
-const displayName = (name) => ({ kimi: "Kimi", mimo: "MiMo", glm: "GLM", codex: "Codex" }[name] || name);
 
 export const HUNT_SYSTEM =
   "You are an expert bug hunter exploring a repository READ-ONLY via the provided tools. " +

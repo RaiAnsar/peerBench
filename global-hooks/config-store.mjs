@@ -5,21 +5,40 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+// SINGLE SOURCE OF TRUTH for API-backed reviewers. Adding or swapping a model is ONE entry here
+// (+ its <NAME>_API_KEY in .keys, then `node scripts/load-keys.mjs`). Everything downstream —
+// KNOWN_REVIEWERS, display names, the keys loaded by load-keys, the provider config — is DERIVED
+// from this object, so there are no parallel lists to keep in sync. Disable a model by dropping it
+// from the active set (companion.json `reviewers` / `/bench:reviewers`); its config stays here.
 const DEFAULTS = {
-  kimi: { baseURL: "https://api.kimi.com/coding/v1", model: "kimi-k2.6", keyEnv: "KIMI_API_KEY",
+  kimi: { displayName: "Kimi", baseURL: "https://api.kimi.com/coding/v1", model: "kimi-k2.6", keyEnv: "KIMI_API_KEY",
           temperature: 0.6, thinking: "disabled", thinkingEnv: "KIMI_THINKING",
           headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
           timeoutMs: 300_000 },  // 5 min
-  mimo: { baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
+  // MiMo (Xiaomi) — currently DISABLED (token plan exhausted) but kept wired so it's a one-word
+  // re-add (`/bench:reviewers ... mimo`). Earned its slot: uniquely caught secret/PII/deploy-hygiene issues.
+  mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
           headers: {}, timeoutMs: 180_000 },  // 3 min
   // GLM (z.ai coding plan) — OpenAI-compatible /chat/completions.
-  glm: { baseURL: "https://api.z.ai/api/coding/paas/v4", model: "glm-5.2", keyEnv: "GLM_API_KEY",
+  glm: { displayName: "GLM", baseURL: "https://api.z.ai/api/coding/paas/v4", model: "glm-5.2", keyEnv: "GLM_API_KEY",
          temperature: 0.6, thinking: "disabled", thinkingEnv: "GLM_THINKING",
-         headers: {}, timeoutMs: 300_000 }  // 5 min
+         headers: {}, timeoutMs: 300_000 },  // 5 min
+  // Qwen (Alibaba MaaS, ap-southeast-1) — OpenAI-compatible /compatible-mode (NOT the /apps/anthropic
+  // endpoint; our review-client speaks OpenAI /chat/completions). Trial slot. Override
+  // QWEN_BASE_URL / QWEN_MODEL in .keys if your key targets a different workspace or model id.
+  qwen: { displayName: "Qwen", baseURL: "https://ws-ru3nnvzuxful2dou.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-plus", keyEnv: "QWEN_API_KEY",
+          temperature: 0.6, thinking: "disabled", thinkingEnv: "QWEN_THINKING",
+          headers: {}, timeoutMs: 300_000 }  // 5 min
 };
-const DEFAULT_REVIEWERS = ["kimi", "mimo"];
-export const KNOWN_REVIEWERS = ["kimi", "mimo", "codex", "glm"];
+// Codex has no API-key config (it shells out to the codex plugin), so it is a valid reviewer but
+// lives outside DEFAULTS.
+const CODEX = "codex";
+export const PROVIDER_NAMES = Object.keys(DEFAULTS);                 // API-backed providers (for load-keys)
+export const KNOWN_REVIEWERS = [...PROVIDER_NAMES, CODEX];
+const DISPLAY = { ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => [k, v.displayName || k])), [CODEX]: "Codex" };
+export function displayName(name) { return DISPLAY[name] || name; }
+const DEFAULT_REVIEWERS = ["kimi", "glm"];   // fallback only (mimo disabled); the active set lives in companion.json
 export function sharedRoot() {
   return process.env.BENCH_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
