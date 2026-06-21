@@ -194,15 +194,26 @@ export function cdTargetBeforePush(command, fallbackCwd) {
 }
 
 // Resolve the repo a git command actually OPERATES in: follow `cd` segments up to the FIRST git
-// segment, then apply that segment's `git -C <dir>` targets. Mirrors the push path's cwd resolution
-// but generalized to any git subcommand, so the reviewed-head bootstrap marks the repo the command
-// TOUCHES (`git -C /other commit`, `cd /other && git add`) — not a stale input.cwd (the wrong repo).
+// segment, then apply that segment's redirects (`GIT_WORK_TREE=`, `git -C <dir>`). Mirrors the push
+// path's cwd resolution but generalized to any git subcommand, so the reviewed-head bootstrap marks
+// the repo the command TOUCHES — not a stale input.cwd (the wrong repo).
 export function commandCwd(command, fallbackCwd) {
   const segs = shellSegments(command);
   let cwd = fallbackCwd;
   for (let k = 0; k < segs.length; k++) {
     const toks = shellTokenize(segs[k].text).filter(Boolean);
-    if (toks[0] === "git") {
+    // Skip leading `NAME=value` env-assignment prefixes so `FOO=bar git …` / `GIT_WORK_TREE=/b git …`
+    // are still recognized as git invocations (matches how isGitPushSegment/dashCTargets locate git).
+    let g = 0; const envs = {};
+    while (g < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[g])) {
+      const eq = toks[g].indexOf("="); envs[toks[g].slice(0, eq)] = toks[g].slice(eq + 1); g++;
+    }
+    if (toks[g] === "git") {
+      // GIT_WORK_TREE explicitly names the work tree (the repo root we want) → it wins outright;
+      // otherwise the first git segment's `-C <dir>` targets apply, resolved on the running cwd.
+      if (envs.GIT_WORK_TREE) {
+        return path.isAbsolute(envs.GIT_WORK_TREE) ? envs.GIT_WORK_TREE : path.resolve(cwd, envs.GIT_WORK_TREE);
+      }
       for (const target of dashCTargets(segs[k].text)) cwd = path.isAbsolute(target) ? target : path.resolve(cwd, target);
       return cwd;                                  // resolve to the first git segment (where work lands)
     }

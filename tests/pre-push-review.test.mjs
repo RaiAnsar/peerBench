@@ -199,6 +199,17 @@ test("commandCwd: `cd <dir> && git …` resolves to the cd'd dir", () => {
 test("commandCwd: `git -C` within the git segment wins over a prior cd", () => {
   assert.equal(commandCwd("cd /a && git -C /b commit", "/main"), "/b");
 });
+test("commandCwd: env-prefixed git command is still recognized (`-C` applied)", () => {
+  assert.equal(commandCwd("FOO=bar git -C /b commit -m x", "/main"), "/b");
+  assert.equal(commandCwd("A=1 B=2 git status", "/main"), "/main");
+});
+test("commandCwd: GIT_WORK_TREE redirects the repo root", () => {
+  assert.equal(commandCwd("GIT_WORK_TREE=/b git commit -m x", "/main"), "/b");
+  assert.equal(commandCwd("GIT_WORK_TREE=wt git commit", "/main"), "/main/wt");   // relative
+});
+test("commandCwd: `git` as a mere argument is NOT treated as an invocation", () => {
+  assert.equal(commandCwd("echo git push", "/main"), "/main");
+});
 
 test("bootstrap: marks the repo the command TOUCHES via -C, not input.cwd (Codex finding)", async () => {
   const { ws: repoA } = freshPushRepo();
@@ -212,6 +223,21 @@ test("bootstrap: marks the repo the command TOUCHES via -C, not input.cwd (Codex
     input: { cwd: repoA, tool_input: { command: `git -C ${repoB} status` } }
   });
   assert.equal(readReviewedHead(repoB), headB, "the -C target repo is the one bootstrapped");
+  assert.equal(readReviewedHead(repoA), null, "input.cwd's repo is NOT wrongly marked");
+});
+
+test("bootstrap: an ENV-PREFIXED `git -C <repoB>` still marks repoB, not input.cwd (Codex finding)", async () => {
+  const { ws: repoA } = freshPushRepo();
+  const { ws: repoB } = freshPushRepo();
+  const headB = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoB, encoding: "utf8" }).trim();
+  await runMain({
+    resolveReviewersImpl: () => [],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: repoA, tool_input: { command: `GIT_SSH_COMMAND=ssh git -C ${repoB} status` } }
+  });
+  assert.equal(readReviewedHead(repoB), headB, "env-prefixed command resolves the -C target repo");
   assert.equal(readReviewedHead(repoA), null, "input.cwd's repo is NOT wrongly marked");
 });
 
