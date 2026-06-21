@@ -43,7 +43,7 @@ No `detached`/`unref`/`stdio:"ignore"` anywhere. The runner process IS the revie
 
 ### Job lifecycle — crash-safe; no DELIVERY counter
 
-A job is a file under `workspaceStateDir(ws)/deep-queue/`. `jobKey` = the existing `deepKey` (spec) / range-SHA hash (push) → identical content/range isn't queued twice. States move by **atomic rename**:
+A job is a file under `workspaceStateDir(ws)/deep-queue/`. `jobKey` = the content key — `specContentKey(path, content)` for spec, `deepKey("push:<range>", headSha)` for push → identical content/range isn't queued twice. `specContentKey` caps the content at `SPEC_KEY_BYTES` (64 KB) BEFORE hashing and is the SINGLE key function used at enqueue, at the deep run, AND at the retire-check — so a spec larger than the cap hashes identically everywhere and is never falsely seen as "changed" (which would wrongly retire its `.blocked` HIGH block). States move by **atomic rename**:
 
 ```
 <jobKey>.json            queued (written by the sync gate; may carry a bounded `attempts` count)

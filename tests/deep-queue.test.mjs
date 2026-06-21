@@ -6,11 +6,27 @@ import fs from "node:fs"; import os from "node:os"; import path from "node:path"
 process.env.BENCH_ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "dq-root-")));
 
 import { enqueue, listJobs, listBlocked, claim, requeue, recoverOrphans, markBlocked, deleteJob, currentContentKey } from "../global-hooks/deep-queue.mjs";
-import { deepKey } from "../global-hooks/deep-review.mjs";
+import { deepKey, specContentKey, SPEC_KEY_BYTES } from "../global-hooks/deep-review.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 function freshWs() { return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "dq-ws-"))); }
 const qdir = (ws) => path.join(workspaceStateDir(ws), "deep-queue");
+
+// Regression (stop gate, 2026-06-22): a spec LARGER than the key cap must NOT be falsely seen as
+// "changed" at the retire-check — else its .blocked HIGH block is wrongly retired (deleted). The
+// enqueue key (specContentKey on full content) and currentContentKey's recompute must be identical.
+test("large spec (> SPEC_KEY_BYTES): currentContentKey == enqueue key for unchanged content (no false retire)", () => {
+  const ws = freshWs();
+  const file = path.join(ws, "big.md");
+  const big = "x".repeat(SPEC_KEY_BYTES + 5000);   // beyond the cap
+  fs.writeFileSync(file, big);
+  const enqKey = specContentKey(file, big);                 // how the plan-file gate keys it (full → capped inside)
+  const cur = currentContentKey(ws, { kind: "spec", specPath: file, contentKey: enqKey });
+  assert.equal(cur, enqKey, "recompute must equal the enqueue key for a large unchanged spec");
+  // and a change WITHIN the cap is still detected (real retire still works)
+  fs.writeFileSync(file, "y".repeat(SPEC_KEY_BYTES + 5000));
+  assert.notEqual(currentContentKey(ws, { kind: "spec", specPath: file, contentKey: enqKey }), enqKey, "a real content change is still detected");
+});
 
 test("enqueue writes a <contentKey>.json job and dedupes by contentKey", () => {
   const ws = freshWs();

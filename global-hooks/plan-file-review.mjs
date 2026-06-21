@@ -12,7 +12,7 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { deepKey, parseSeverity } from "./deep-review.mjs";
+import { specContentKey, parseSeverity } from "./deep-review.mjs";
 import { enqueue } from "./deep-queue.mjs";
 import { execFileSync } from "node:child_process";
 
@@ -22,12 +22,14 @@ function workspaceRoot(cwd) {
 }
 
 // After a fast ALLOW, ENQUEUE a deep spec-review job for the asyncRewake Stop runner
-// (deep-review-runner.mjs). No detached spawn, no inline review — enqueue dedupes by the
-// (path,content) key so an identical re-save doesn't double-queue. Never throws (the fast gate
-// has already allowed). Returns true if newly enqueued, false if deduped.
+// (deep-review-runner.mjs). No detached spawn, no inline review — enqueue dedupes by the contentKey
+// so an identical re-save doesn't double-queue. `content` MUST be the FULL file content (NOT the
+// review-capped slice): specContentKey applies the single SPEC_KEY_BYTES cap, so the key matches
+// deep-queue.currentContentKey's recompute exactly — otherwise a spec larger than the cap is falsely
+// seen as "changed" and its .blocked HIGH block is wrongly retired. Never throws (fast gate allowed).
 export function enqueueDeepReview(ws, filePath, content) {
   try {
-    return enqueue(ws, { kind: "spec", specPath: filePath, contentKey: deepKey(filePath, content) });
+    return enqueue(ws, { kind: "spec", specPath: filePath, contentKey: specContentKey(filePath, content) });
   } catch (e) {
     process.stderr.write(`⛩ plan gate: deep-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
     return false;
@@ -103,10 +105,13 @@ export async function runMain({
   const filePath = path.isAbsolute(rawFilePath) ? rawFilePath : path.resolve(cwd, rawFilePath);
 
   let content = "";
+  let fullContent = "";   // uncapped — used ONLY for the deep-review contentKey (specContentKey caps it
+                          // identically to the retire-check, so a large spec isn't falsely "changed")
   let mtimeMs = 0;
   try {
     mtimeMs = fs.statSync(filePath).mtimeMs;
-    content = fs.readFileSync(filePath, "utf8").slice(0, MAX_PLAN_BYTES);
+    fullContent = fs.readFileSync(filePath, "utf8");
+    content = fullContent.slice(0, MAX_PLAN_BYTES);   // capped for the review prompt
   } catch {
     return;
   }
@@ -221,7 +226,7 @@ export async function runMain({
   }
   // Fast ALLOW (and NOT a dedup-hit: that path returned above): ENQUEUE the deep spec-review
   // for the asyncRewake Stop runner. Never blocks the save; never spawns a detached worker.
-  try { enqueueDeepReviewImpl(ws, filePath, content); }
+  try { enqueueDeepReviewImpl(ws, filePath, fullContent); }   // FULL content → specContentKey caps consistently w/ the retire-check
   catch (e) { process.stderr.write(`⛩ plan gate: deep-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`); }
   // Sub-threshold BLOCKs (medium/low) allow the save but surface as advisories, not a block.
   const advisoryNote = panel.advisories && panel.advisories.length

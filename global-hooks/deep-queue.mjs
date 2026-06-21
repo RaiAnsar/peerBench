@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { workspaceStateDir } from "./config-store.mjs";
-import { deepKey } from "./deep-review.mjs";
+import { deepKey, specContentKey } from "./deep-review.mjs";
 
 const queueDir = (ws) => path.join(workspaceStateDir(ws), "deep-queue");
 const TMP = (f) => `${f}.tmp.${process.pid}`;
@@ -141,8 +141,9 @@ export function currentContentKey(ws, job, { gitImpl = gitDefault, readImpl = (p
     if (!ok || !head) return null;
     return deepKey(`push:${job.range}`, head);
   }
-  // spec (default)
+  // spec (default) — specContentKey caps consistently with the enqueue/run side so a spec LARGER
+  // than the cap is not falsely seen as "changed" (which would retire a still-valid .blocked).
   let content;
   try { content = readImpl(job.specPath); } catch { return null; }
-  return deepKey(job.specPath, content);
+  return specContentKey(job.specPath, content);
 }
