@@ -12,7 +12,7 @@ import path from "node:path";
 const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, surfaceDeepResult } from "../global-hooks/stop-review.mjs";
+import { runMain, buildPrompt, surfaceDeepResult, resolveReviewBase, readReviewedHead, writeReviewedHead } from "../global-hooks/stop-review.mjs";
 import { setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
@@ -827,4 +827,145 @@ test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
   // user must not contain format instructions
   assert.doesNotMatch(user, /first line must be/i, "user must not have format instructions");
   assert.doesNotMatch(user, /Review the code changes/i, "user must not have review instructions");
+});
+
+// ===========================================================================
+// GAP FIX: review changes COMMITTED since the last review, not just the working
+// tree. A session that commits (50 things) leaves `git diff HEAD` empty → the
+// old gate skipped and the committed work escaped review entirely (VisualSentinel).
+// ===========================================================================
+
+function gitC(ws, ...args) {
+  return execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd: ws, encoding: "utf8" });
+}
+
+test("resolveReviewBase: marker that is an ancestor of HEAD → diff since the marker", () => {
+  const ws = freshRepo({ withChange: false });
+  writeReviewedHead(ws, "MARK");
+  const fakeGit = (args) => (args[0] === "merge-base" && args[1] === "MARK" ? "MARK\n" : "");
+  assert.equal(resolveReviewBase(ws, "HEADSHA", fakeGit), "MARK");
+});
+
+test("resolveReviewBase: marker == HEAD → returns HEAD (only the working tree is reviewed)", () => {
+  const ws = freshRepo({ withChange: false });
+  writeReviewedHead(ws, "SAME");
+  assert.equal(resolveReviewBase(ws, "SAME", () => "boom"), "SAME");
+});
+
+test("resolveReviewBase: no marker but an upstream exists → merge-base with upstream (unpushed commits)", () => {
+  const ws = freshRepo({ withChange: false });   // no marker written
+  const fakeGit = (args) => {
+    if (args[0] === "rev-parse" && args.includes("@{upstream}")) return "UP\n";
+    if (args[0] === "merge-base" && args[1] === "UP") return "UP\n";
+    return "";
+  };
+  assert.equal(resolveReviewBase(ws, "HEADSHA", fakeGit), "UP");
+});
+
+test("resolveReviewBase: no marker, no upstream → HEAD (working tree only, safe default)", () => {
+  const ws = freshRepo({ withChange: false });
+  assert.equal(resolveReviewBase(ws, "HEADSHA", () => ""), "HEADSHA");
+});
+
+test("resolveReviewBase: a stale/orphaned marker (not an ancestor) falls back, never diffs garbage", () => {
+  const ws = freshRepo({ withChange: false });
+  writeReviewedHead(ws, "ORPHAN");
+  const fakeGit = (args) => {
+    if (args[0] === "merge-base" && args[1] === "ORPHAN") return "SOMETHINGELSE\n"; // mb != ORPHAN → not ancestor
+    return "";  // no upstream
+  };
+  assert.equal(resolveReviewBase(ws, "HEADSHA", fakeGit), "HEADSHA");
+});
+
+test("GAP FIX: a turn that COMMITTED its work (clean working tree) is still reviewed", async () => {
+  const ws = freshRepo({ withChange: false });
+  const initial = gitC(ws, "rev-parse", "HEAD").trim();
+  writeReviewedHead(ws, initial);                 // initial commit already reviewed
+  // Commit a change — working tree ends CLEAN (the exact gap: nothing in `git diff HEAD`).
+  fs.writeFileSync(path.join(ws, "feature.js"), "export const danger = eval('1 + 1');\n");
+  gitC(ws, "add", "-A");
+  gitC(ws, "commit", "-qm", "feat: committed work");
+  assert.equal(gitC(ws, "status", "--short").trim(), "", "precondition: working tree is clean");
+
+  const seen = {};
+  const recording = { name: "Kimi", async run({ user }) { seen.user = user; seen.called = true; return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }; } };
+  let trace = null;
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [recording],
+      writeTraceImpl: (_ws, t) => { trace = t; },
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally { restore(); }
+
+  assert.equal(seen.called, true, "the committed-but-clean-tree turn MUST be reviewed (the gap)");
+  assert.match(seen.user, /feature\.js/, "the committed diff is included in the review prompt");
+  assert.match(seen.user, /<committed_diff>/, "committed changes are surfaced in their own section");
+  assert.ok(trace, "a trace is written for the reviewed committed work");
+});
+
+test("GAP FIX: the marker ADVANCES to HEAD on a clean ALLOW (no re-review next turn)", async () => {
+  const ws = freshRepo({ withChange: false });
+  const initial = gitC(ws, "rev-parse", "HEAD").trim();
+  writeReviewedHead(ws, initial);
+  fs.writeFileSync(path.join(ws, "f.js"), "export const y = 2;\n");
+  gitC(ws, "add", "-A");
+  gitC(ws, "commit", "-qm", "feat");
+  const head = gitC(ws, "rev-parse", "HEAD").trim();
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW")],
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally { restore(); }
+
+  assert.equal(readReviewedHead(ws), head, "marker advanced to HEAD after a clean ALLOW");
+});
+
+test("GAP FIX: the marker does NOT advance on fail-open (range is re-reviewed until clean)", async () => {
+  const ws = freshRepo({ withChange: false });
+  const initial = gitC(ws, "rev-parse", "HEAD").trim();
+  writeReviewedHead(ws, initial);
+  fs.writeFileSync(path.join(ws, "g.js"), "export const z = 3;\n");
+  gitC(ws, "add", "-A");
+  gitC(ws, "commit", "-qm", "feat");
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [fakeErrorReviewer("Kimi")],   // all error → fail-open
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally { restore(); }
+
+  assert.equal(readReviewedHead(ws), initial, "marker stays put on fail-open so the range is re-reviewed");
+});
+
+test("GAP FIX: a genuine no-op turn keeps the baseline current (sets marker to HEAD) and skips", async () => {
+  const ws = freshRepo({ withChange: false });   // clean tree, no marker
+  const head = gitC(ws, "rev-parse", "HEAD").trim();
+  let called = false;
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { called = true; return [fakeReviewer("Kimi", "ALLOW")]; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally { restore(); }
+  assert.equal(called, false, "no changes → no review");
+  assert.equal(readReviewedHead(ws), head, "baseline marker established at HEAD for the next committing turn");
 });

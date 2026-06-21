@@ -42,6 +42,39 @@ function git(args, cwd) {
   }
 }
 
+// --- reviewed-head marker -------------------------------------------------------------------
+// The last HEAD this gate stop-reviewed up to. WITHOUT this, a turn that COMMITS its work leaves
+// an empty `git diff HEAD`, so the gate's no-diff early-return fires and the committed changes
+// escape review entirely — a session that commits 50 things gets ZERO review (the VisualSentinel
+// gap). With it, every change is reviewed exactly once: committed-this-session AND uncommitted.
+function reviewedHeadFile(ws) { return path.join(workspaceStateDir(ws), "reviewed-head"); }
+export function readReviewedHead(ws) {
+  try { return fs.readFileSync(reviewedHeadFile(ws), "utf8").trim() || null; } catch { return null; }
+}
+export function writeReviewedHead(ws, sha) {
+  if (!sha) return;
+  try { fs.mkdirSync(workspaceStateDir(ws), { recursive: true }); fs.writeFileSync(reviewedHeadFile(ws), `${sha}\n`); } catch { /* best-effort marker */ }
+}
+// The base commit to diff HEAD against = "everything not yet reviewed". Prefer the last-reviewed
+// marker when it is a valid ANCESTOR of HEAD; else fall back to the upstream (unpushed commits) so
+// even the FIRST stop of a session that committed-but-didn't-push is reviewed; else HEAD (review
+// the working tree only — first run with no upstream, or a rebase that orphaned the marker).
+export function resolveReviewBase(ws, curHead, gitImpl = git) {
+  if (!curHead) return "";
+  const last = readReviewedHead(ws);
+  if (last === curHead) return curHead;                          // already reviewed up to HEAD
+  if (last) {
+    const mb = gitImpl(["merge-base", last, curHead], ws).trim();
+    if (mb === last) return last;                                // marker is an ancestor → diff since it
+  }
+  const up = gitImpl(["rev-parse", "--verify", "--quiet", "@{upstream}"], ws).trim();
+  if (up) {
+    const mb = gitImpl(["merge-base", up, curHead], ws).trim();
+    if (mb && mb !== curHead) return mb;                         // unpushed commits
+  }
+  return curHead;                                                // nothing better → working tree only
+}
+
 // FIX 5 — invocation-scoped emit-once guard. Claude Code reads only the FIRST line on
 // stdout, so a second stdout emit in the same invocation is silently dropped. surfaceDeepResult
 // emits a 'surfaced' note, then runMain continues and would emit AGAIN (ALLOW / loop-cap /
@@ -105,10 +138,12 @@ export function surfaceDeepResult(ws, { emit: emitFn = emit } = {}) {
   return { kind: "surfaced", text: line };
 }
 
-export function buildPrompt(status, diff, untracked, lastMsg, staged = "") {
+export function buildPrompt(status, diff, untracked, lastMsg, staged = "", committed = "") {
   const system =
     "You are reviewing the code changes from a Claude turn. Review based ONLY on the content " +
     "provided in this message. Do NOT use any tools or explore the filesystem. " +
+    "Changes may be ALREADY COMMITTED this session (<committed_diff>) and/or UNCOMMITTED in the " +
+    "working tree (<git_diff>/<staged_diff>) — review ALL of them. " +
     "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`. " +
     "BLOCK only if there is a concrete bug, regression, or unsafe change that should be fixed " +
     "before the session ends; otherwise ALLOW (minor notes may follow the first line).";
@@ -120,6 +155,10 @@ export function buildPrompt(status, diff, untracked, lastMsg, staged = "") {
     "<git_status>",
     status,
     "</git_status>",
+    "",
+    "<committed_diff>",
+    committed,
+    "</committed_diff>",
     "",
     "<git_diff>",
     diff,
@@ -181,6 +220,13 @@ export async function runMain({
   }
 
   const status = git(["status", "--short", "--untracked-files=all"], ws);
+  const curHead = git(["rev-parse", "HEAD"], ws).trim();   // "" on an unborn HEAD (fresh repo)
+  // GAP FIX: review changes COMMITTED since the last review, not just the working tree. A turn that
+  // commits (and/or pushes) all its work leaves `git diff HEAD` empty; without this the gate would
+  // skip and the committed changes would never be reviewed.
+  const base = resolveReviewBase(ws, curHead);
+  const committed = (base && curHead && base !== curHead)
+    ? git(["diff", `${base}..${curHead}`], ws).slice(0, MAX_DIFF_BYTES) : "";
   const diff = git(["diff", "HEAD"], ws).slice(0, MAX_DIFF_BYTES);
   // Staged-diff FALLBACK only: on an unborn HEAD (fresh repo, no commits) `git diff HEAD`
   // is empty, so a staged-only change would be missed. Use `git diff --cached` only when
@@ -189,13 +235,15 @@ export async function runMain({
   const staged = diff.trim() ? "" : git(["diff", "--cached"], ws).slice(0, MAX_DIFF_BYTES);
   const untracked = untrackedBlock(ws);
 
-  if (!diff.trim() && !staged.trim() && !untracked.trim()) {
-    // No code changes this turn (status/report-only) — nothing to review.
+  if (!committed.trim() && !diff.trim() && !staged.trim() && !untracked.trim()) {
+    // Nothing changed since the last review (status/report-only) — keep the baseline current so
+    // the NEXT committing turn diffs from here, then skip.
+    writeReviewedHead(ws, curHead);
     return;
   }
 
   const lastMsg = String(input.last_assistant_message ?? "").slice(0, 4000);
-  const { system, user } = buildPrompt(status, diff, untracked, lastMsg, staged);
+  const { system, user } = buildPrompt(status, diff, untracked, lastMsg, staged, committed);
 
   // (c) Codex reviews each turn via its OWN agentic gate (codex-plugin), where it scours files;
   // this content-only gate adds just the cheap reviewers. To make this the sole per-turn gate
@@ -242,8 +290,11 @@ export async function runMain({
     process.exit(2);
   }
 
-  // allow — clear the loop counter
+  // allow — clear the loop counter and ADVANCE the reviewed-head marker so this range isn't
+  // re-reviewed next turn (committed work is reviewed exactly once). We deliberately do NOT advance
+  // on block/fail-open above: a blocked or unreviewed range must be re-reviewed until it's clean.
   try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
+  writeReviewedHead(ws, curHead);
   emit({ systemMessage: `⛩ bench stop: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
 }
 
