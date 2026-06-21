@@ -15,23 +15,20 @@ export function contentHash(content) {
   return createHash("sha256").update(String(content ?? "")).digest("hex").slice(0, 16);
 }
 
-// FIX 4: the deep dedup key. Keyed on (filePath, content) so two DIFFERENT spec files with
-// byte-identical content do NOT collide. Use this everywhere a deep key is derived.
+// The deep dedup / content key. Keyed on (filePath, content) so two DIFFERENT spec files with
+// byte-identical content do NOT collide.
+//
+// CRITICAL invariant (2026-06-22): the spec contentKey must be keyed on the FULL file content —
+// the SAME bytes the deep review (`runSpecReview` → `panelImpl`) actually evaluates — and computed
+// the SAME way at enqueue (plan-file gate), at the run, and at the retire-check
+// (deep-queue.currentContentKey). Do NOT cap the key independently of what the review reads:
+//   - capping at enqueue but not at recompute → a large spec is falsely seen as "changed" → its
+//     `.blocked` HIGH block is wrongly RETIRED (first stop-gate finding);
+//   - capping the key but reviewing full → an edit beyond the cap changes the reviewed content but
+//     not the key → a stale review is deduped / a stale `.blocked` stays "current" (pre-push finding).
+// So: `deepKey(filePath, fullContent)` everywhere a spec key is derived.
 export function deepKey(filePath, content) {
   return contentHash(`${String(filePath)} ${String(content)}`);
-}
-
-// SPEC content key — the SINGLE source of truth for a spec job's contentKey, used identically at
-// ENQUEUE (plan-file gate), at the deep run (spec-review-run), and at the retire-check
-// (deep-queue.currentContentKey). It caps the content at SPEC_KEY_BYTES BEFORE hashing so the key
-// is computed the SAME way regardless of which caller read more/less of the file — otherwise a spec
-// LARGER than the cap hashes differently at enqueue (capped review content) vs recompute (full file),
-// and the runner falsely concludes "content changed" and RETIRES (deletes) a still-valid `.blocked`
-// HIGH block (bug caught by the stop gate, 2026-06-22). Pass the FULL file content; the cap is applied
-// here so every call site is byte-for-byte consistent.
-export const SPEC_KEY_BYTES = 64 * 1024;
-export function specContentKey(filePath, content) {
-  return deepKey(filePath, String(content ?? "").slice(0, SPEC_KEY_BYTES));
 }
 
 export function severityRank(sev) {

@@ -6,26 +6,37 @@ import fs from "node:fs"; import os from "node:os"; import path from "node:path"
 process.env.BENCH_ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "dq-root-")));
 
 import { enqueue, listJobs, listBlocked, claim, requeue, recoverOrphans, markBlocked, deleteJob, currentContentKey } from "../global-hooks/deep-queue.mjs";
-import { deepKey, specContentKey, SPEC_KEY_BYTES } from "../global-hooks/deep-review.mjs";
+import { deepKey } from "../global-hooks/deep-review.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 function freshWs() { return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "dq-ws-"))); }
 const qdir = (ws) => path.join(workspaceStateDir(ws), "deep-queue");
 
-// Regression (stop gate, 2026-06-22): a spec LARGER than the key cap must NOT be falsely seen as
-// "changed" at the retire-check — else its .blocked HIGH block is wrongly retired (deleted). The
-// enqueue key (specContentKey on full content) and currentContentKey's recompute must be identical.
-test("large spec (> SPEC_KEY_BYTES): currentContentKey == enqueue key for unchanged content (no false retire)", () => {
+const LARGE = 64 * 1024 + 5000;   // larger than the old review-prompt cap (no key cap exists now)
+
+// Regression (stop gate + pre-push gate, 2026-06-22): the spec contentKey is keyed on the FULL file
+// content, identically at enqueue and at the retire-check, so (a) a large UNCHANGED spec is not
+// falsely seen as "changed" (no wrongful .blocked retire), and (b) a change ANYWHERE — including
+// beyond any prompt cap — IS detected (no stale review deduped past a key cap).
+test("large spec: currentContentKey == enqueue key for unchanged content (no false retire)", () => {
   const ws = freshWs();
   const file = path.join(ws, "big.md");
-  const big = "x".repeat(SPEC_KEY_BYTES + 5000);   // beyond the cap
+  const big = "x".repeat(LARGE);
   fs.writeFileSync(file, big);
-  const enqKey = specContentKey(file, big);                 // how the plan-file gate keys it (full → capped inside)
-  const cur = currentContentKey(ws, { kind: "spec", specPath: file, contentKey: enqKey });
-  assert.equal(cur, enqKey, "recompute must equal the enqueue key for a large unchanged spec");
-  // and a change WITHIN the cap is still detected (real retire still works)
-  fs.writeFileSync(file, "y".repeat(SPEC_KEY_BYTES + 5000));
-  assert.notEqual(currentContentKey(ws, { kind: "spec", specPath: file, contentKey: enqKey }), enqKey, "a real content change is still detected");
+  const enqKey = deepKey(file, big);   // how the plan-file gate keys it (full content)
+  assert.equal(currentContentKey(ws, { kind: "spec", specPath: file, contentKey: enqKey }), enqKey,
+    "recompute must equal the enqueue key for a large unchanged spec");
+});
+
+test("large spec: a change BEYOND the old prompt cap is still detected (no stale review)", () => {
+  const ws = freshWs();
+  const file = path.join(ws, "big.md");
+  const head = "x".repeat(LARGE);
+  fs.writeFileSync(file, head + "ORIGINAL_TAIL");
+  const enqKey = deepKey(file, head + "ORIGINAL_TAIL");
+  fs.writeFileSync(file, head + "EDITED_TAIL");   // only the tail (well past 64KB) changed
+  assert.notEqual(currentContentKey(ws, { kind: "spec", specPath: file, contentKey: enqKey }), enqKey,
+    "an edit beyond the prompt cap still changes the key (the key covers the full reviewed content)");
 });
 
 test("enqueue writes a <contentKey>.json job and dedupes by contentKey", () => {

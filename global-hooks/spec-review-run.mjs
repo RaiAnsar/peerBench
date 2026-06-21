@@ -15,7 +15,7 @@ import { execFileSync } from "node:child_process";
 import { specReviewPanel, SPEC_REVIEW_SYSTEM, buildSpecReviewUser, pushReviewPanel, PUSH_REVIEW_SYSTEM, buildPushReviewUser } from "./hunt.mjs";
 import { panelBadge } from "./panel-lib.mjs";
 import { writeTrace } from "./trace-store.mjs";
-import { summarizeSpecReview, deepKey, specContentKey, DEEP_REWAKE_SEVERITY, aggregateFindings, shouldRewake } from "./deep-review.mjs";
+import { summarizeSpecReview, deepKey, DEEP_REWAKE_SEVERITY, aggregateFindings, shouldRewake } from "./deep-review.mjs";
 
 // Cap the reviewed push diff so a huge changeset doesn't blow up the prompt. Mirrors the pre-push gate.
 const MAX_PUSH_DIFF_BYTES = 200_000;
@@ -39,7 +39,7 @@ export async function runSpecReview(filePath, ws, {
   try { content = fs.readFileSync(filePath, "utf8"); } catch (e) {
     throw new Error(`could not read ${filePath}: ${e instanceof Error ? e.message : String(e)}`);
   }
-  const hash = specContentKey(filePath, content);   // consistent cap w/ enqueue + retire-check (no false retire on large specs)
+  const hash = deepKey(filePath, content);   // FULL content — same bytes the panel reviews + the enqueue/retire-check key on
   const results = await panelImpl({ cwd: ws, filePath, content, env: process.env });
 
   const structured = summarizeSpecReview(results);   // { reviewers, findingCount, maxSeverity }

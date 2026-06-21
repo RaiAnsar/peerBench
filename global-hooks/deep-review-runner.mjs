@@ -65,7 +65,11 @@ export async function runMain({
   for (const b of safe(() => listBlocked(ws), [])) {
     let cur = null;
     try { cur = currentContentKey(ws, b); } catch { cur = null; }
-    if (cur !== b.contentKey) { deleteJob(b._path); continue; }   // content changed (or target gone) → retired
+    // Retire ONLY on a CONFIRMED content change: a valid current key that DIFFERS from the stored one.
+    // `cur === null` means we could NOT determine the current key (transient `git rev-parse` failure
+    // for a push job, or an unreadable spec) — do NOT delete a durable completed block on uncertainty
+    // (that would lose a HIGH finding on a transient error); keep it and re-check next Stop.
+    if (cur !== null && cur !== b.contentKey) { deleteJob(b._path); continue; }   // confirmed change → retired
     const findings = b.findings || b.summary || "(deep block)";
     if ((now - (Number(b.firstBlockedTs) || 0)) < WAKE_WINDOW_MS) wake.push(findings);
     else advisory.push(findings);   // KEEP the file — never deleted by elapsed time
