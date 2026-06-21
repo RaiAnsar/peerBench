@@ -203,9 +203,12 @@ test("commandCwd: env-prefixed git command is still recognized (`-C` applied)", 
   assert.equal(commandCwd("FOO=bar git -C /b commit -m x", "/main"), "/b");
   assert.equal(commandCwd("A=1 B=2 git status", "/main"), "/main");
 });
-test("commandCwd: GIT_WORK_TREE redirects the repo root", () => {
-  assert.equal(commandCwd("GIT_WORK_TREE=/b git commit -m x", "/main"), "/b");
-  assert.equal(commandCwd("GIT_WORK_TREE=wt git commit", "/main"), "/main/wt");   // relative
+test("commandCwd: does NOT follow GIT_WORK_TREE / GIT_DIR redirects (stays at cwd, like the stop gate)", () => {
+  // GIT_WORK_TREE points at a work tree whose .git is elsewhere; `git rev-parse` run without those
+  // env vars can't resolve it, and the stop gate doesn't follow them either — so honoring them would
+  // bootstrap the wrong workspace or none. The env prefix is skipped only to recognize the invocation.
+  assert.equal(commandCwd("GIT_WORK_TREE=/b git commit -m x", "/main"), "/main");
+  assert.equal(commandCwd("GIT_DIR=/b/.git git commit", "/main"), "/main");
 });
 test("commandCwd: `git` as a mere argument is NOT treated as an invocation", () => {
   assert.equal(commandCwd("echo git push", "/main"), "/main");
