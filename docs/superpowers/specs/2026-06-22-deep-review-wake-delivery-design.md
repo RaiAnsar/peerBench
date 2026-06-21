@@ -8,123 +8,147 @@
 
 The deep reviews are launched fire-and-forget and surfaced passively, so their findings can never reach an idle agent:
 
-- `plan-file-review.mjs:46` spawns the deep spec-review worker with `{ detached: true, stdio: "ignore" }` + `child.unref()`.
+- `plan-file-review.mjs` spawns the deep spec-review worker with `{ detached: true, stdio: "ignore" }` + `child.unref()`.
 - `pre-push-review.mjs` launches the deep push-review the same detached way.
 - The result is read ONLY by `stop-review.mjs`'s `surfaceDeepResult()` — i.e., at the *next* Stop hook.
 
-Verified against the official docs (claude-code-guide research, 2026-06-22):
+Verified against the official Claude Code docs (claude-code-guide research, 2026-06-22):
 
 1. "Hook output is delivered on the next conversation turn. If the session is idle, the response waits until the next user interaction. **Exception: an `asyncRewake` hook that exits with code 2 wakes Claude immediately even when the session is idle.**"
 2. A process spawned `detached + unref'd + stdio:"ignore"` is **invisible to the harness** — it cannot trigger a rewake; its only delivery channel is a file read by a *later* hook invocation.
-3. `asyncRewake` is a `type:"command"` hook field, valid on all events; default command-hook timeout is 600 s.
+3. `asyncRewake` is a `type:"command"` hook field, valid on all events; default command-hook timeout is 600 s (overridable per hook).
 
-So: agent writes a spec → fast panel ALLOWs → detached deep worker launches → agent presents and **goes idle** → deep worker finishes minutes later with a HIGH block → **no Stop fires while idle → the block sits in a file unseen.** Observed live: a 28-finding HIGH block on this very spec series reached the agent only because the user manually noticed.
+So: agent writes a spec → fast panel ALLOWs → detached deep worker launches → agent presents and **goes idle** → deep worker finishes minutes later with a HIGH block → **no Stop fires while idle → the block sits in a file unseen.** Observed live repeatedly on this very spec series.
 
 ## Goal
 
-Deliver a blocking deep-review finding to the agent **reliably, even when the agent has gone idle after its turn** — for both the spec review (G) and the push review (H). Non-blocking (ALLOW) results stay quiet. No detached/invisible workers.
+Deliver a blocking deep-review finding to the agent **reliably, even when the agent has gone idle after its turn**, and **never lose a queued review or a completed blocking result even if the runner is killed at any point** — for spec (G) and push (H). Non-blocking (ALLOW) results stay quiet. No detached/invisible workers.
 
 ## Non-goals
 
 - Changing what the deep reviews analyze (unchanged: agentic, repo-grounded).
-- Making the deep review synchronous/blocking on the edit or push (it must stay background — Claude continues working; only a *block* re-engages it).
-- Reworking the fast content-only panels (plan-file fast panel, pre-push fast gate) — they keep their current synchronous behavior.
+- Making the deep review synchronous/blocking on the edit or push (it stays background — Claude keeps working; only a *block* re-engages it).
+- **Changing the fast gates' synchronous behavior.** `plan-file-review.mjs` and `pre-push-review.mjs` keep their current synchronous fast-panel feedback exactly as today (async would forfeit that gating — a regression). Their only change is to *enqueue* a deep-review job instead of spawning a detached worker.
 
 ## Core mechanism
 
-Run each deep review inside a **harness-tracked `asyncRewake` command hook** that:
-- runs the review in the background (Claude continues immediately),
-- on a HIGH-severity block: writes the findings to **stderr and exits 2** → the harness wakes the agent immediately, even if idle (with `rewakeMessage` as the lead-in),
-- otherwise: exits 0 (silent; or an advisory `additionalContext` on stdout for non-blocking notes).
+Two roles, exactly **one** async hook:
 
-No `detached`/`unref`/`stdio:"ignore"`. The hook process IS the review; the harness tracks its exit.
+- **The fast gates stay SYNCHRONOUS and behaviorally unchanged.** They keep their inline fast-panel feedback; their ONLY change is to **enqueue a deep-review job** instead of launching a detached worker. They do NOT become `asyncRewake`; they do NOT run the deep review inline.
+- **One harness-tracked `asyncRewake` Stop hook — `deep-review-runner.mjs` (new)** is the sole async host. At each turn end it claims a bounded batch of queued jobs, runs them concurrently in the background (Claude keeps working), and on a HIGH-severity block writes the findings to **stderr and exits 2** → the harness wakes the agent immediately, even if idle (`rewakeMessage` lead-in).
+
+No `detached`/`unref`/`stdio:"ignore"` anywhere. The runner process IS the review; the harness tracks its exit. This is the docs' supported "async work must re-engage an idle agent" pattern (Stop + `asyncRewake` + exit 2), symmetric for G and H.
 
 ## Design
 
-### Piece G — spec review (the easy half)
+### Job lifecycle — crash-safe, NO delivery counter
 
-**Current state (verified `deploy-global-hooks.mjs:111`):** `plan-file-review.mjs` is registered with **only `statusMessage`** — it is NOT `asyncRewake`, has no `timeout`, no `rewakeMessage`. (Only `stop-review.mjs` is `asyncRewake:true`.) So the wake mechanism does NOT exist for plan-file yet and must be ADDED.
+A job is a file under `workspaceStateDir(ws)/deep-queue/`. `jobKey` = the existing `deepKey` (spec) / range-SHA hash (push) → identical content/range isn't queued twice. States move by **atomic rename**:
 
-Changes:
-1. **Registration (deploy):** add `asyncRewake:true`, `timeout:600`, and a `rewakeMessage` to plan-file's registration. Without `asyncRewake:true` the exit-2 wake cannot reach an idle agent — this is the linchpin.
-2. **Hook logic**, after the synchronous fast panel:
-   - Fast panel HIGH block → stderr + `exit 2` (wake) immediately; skip the deep pass.
-   - Fast panel ALLOW/advisory → run the deep spec-review **inline**, wrapped in try/catch: `try { result = await runSpecReview(...) } catch (e) { stderr note; exit 0 }` — `runSpecReview` THROWS on an unreadable spec (`spec-review-run.mjs:37`), so the catch is mandatory to honor fail-open.
-   - Deep review HIGH block → stderr + `exit 2` (wake, even idle). Else → `exit 0`.
+```
+<jobKey>.json            queued (written by the sync gate)
+<jobKey>.claimed.<pid>   a runner is reviewing it
+<jobKey>.blocked         review found a HIGH block (DURABLE; stores {kind, findings, contentKey, firstBlockedTs})
+(file removed)           ONLY on a CLEAN result, or when a .blocked job's content CHANGES (agent addressed it)
+```
 
-Remove `launchDeepReview`'s detached spawn. The deep review no longer writes a `deep-result` file for next-stop surfacing — delivery is the exit-2 wake.
+**There is NO delivery counter, ever.** A counter is unsafe: a crash after incrementing but before the wake is confirmed would consume an attempt and could eventually delete an undelivered HIGH block. A `.blocked` file is therefore retired by exactly one durable, crash-proof signal — **its content changed** (the agent edited the spec, or the push range is no longer current). It is NEVER deleted by elapsed time or attempt count. Re-*waking* is bounded by TIME (a `.blocked` past `WAKE_WINDOW` downgrades from an exit-2 wake to a non-waking advisory note) but the file is **kept** until content-change, so a finding is never lost — only, eventually, made less intrusive.
 
-### Piece H — push review (the hard half)
+Crash-safety by window:
+- Crash before claim → stays `.json` → next runner claims it.
+- Crash while reviewing (`.claimed.<pid>`) → orphan-recovery requeues it (runner step 1).
+- Review finishes BLOCK → atomically rename `.claimed` → `.blocked` (durable) **before** any `exit 2`. A crash after the review but before/during the wake leaves `.blocked` on disk → re-delivered next Stop. No delete-before-delivery window; no counter to corrupt.
+- Review finishes CLEAN → delete the claim (nothing to lose).
 
-`pre-push-review.mjs` is a **synchronous** `PreToolUse` hook — it must return a fast allow/deny to gate the push, so it cannot host a minutes-long async review. Instead:
+### Runner — `deep-review-runner.mjs` (new)
 
-1. The pre-push hook keeps its synchronous fast gate, and **enqueues** a deep-push-review request: write a small pending-job file under `workspaceStateDir(ws)/deep-queue/<rangeShaHash>.json` containing the SHA-pinned range (range pinning already exists) + a content key. No detached worker.
-2. A **dedicated `asyncRewake` Stop hook** — `deep-review-runner.mjs` (new, registered on `Stop`, `asyncRewake: true`, `timeout: 600`) — fires at each turn end, claims any pending deep-queue jobs (atomic rename to avoid double-run), runs them inline in the background, and on a HIGH block writes findings to stderr + `exit 2` (wake, even idle). Jobs with no block are removed silently.
-3. Debounce/dedupe by the existing `deepKey`/range hash so the same push isn't reviewed twice; a per-job "claimed" marker prevents two runners racing.
+Registered on `Stop`, `asyncRewake:true`, `timeout:1320`, `rewakeMessage`. Constants: `CLAIM_LIMIT = 2`, `DEEP_BUDGET = 20 min` (`INVESTIGATE_TIMEOUT_MS`), `WAKE_WINDOW = 30 min`. `timeout (1320s) > DEEP_BUDGET`, and the claimed batch runs CONCURRENTLY, so wall-clock ≈ one review regardless of batch size. Each turn end:
 
-This Stop-hosted runner is the supported "async work must re-engage an idle agent" pattern from the docs. It also gives G a fallback host if ever needed, but G's primary path stays the inline plan-file hook.
+1. **Recover orphans.** Requeue any `<jobKey>.claimed.<pid>` whose `pid` is dead OR whose mtime exceeds a 25-min staleness window (`> timeout`) by renaming back to `<jobKey>.json`. (Self-heals a killed/timed-out runner.)
+2. **Re-deliver pending blocks.** For each `<jobKey>.blocked`, recompute the target's current content key:
+   - content **changed** (agent addressed it) → delete the `.blocked` file (retired). It is gone because the agent acted, not because of time/count.
+   - content **unchanged** and `now - firstBlockedTs < WAKE_WINDOW` → include its stored `findings` in this run's **wake** set.
+   - content **unchanged** and `now - firstBlockedTs ≥ WAKE_WINDOW` → include its stored `findings` in this run's **advisory** set (non-waking), and KEEP the file (still surfaced every turn as a note until content changes; never deleted by time).
+3. **Claim** at most `CLAIM_LIMIT` `<jobKey>.json` jobs by atomic rename → `<jobKey>.claimed.<pid>`. Surplus jobs are left UNCLAIMED (untouched `.json`) for a later Stop — never claimed-and-orphaned.
+4. **Run** the claimed batch CONCURRENTLY (`Promise.all`), each `runSpecReview`/`runPushReview` wrapped in try/catch (fail-open: on error, requeue that job to `.json` and continue — a transient reviewer/API error must not drop a job).
+5. **Persist results before delivering:** for each finished job — CLEAN → delete its claim; BLOCK → atomically rename its claim → `<jobKey>.blocked` storing `{kind, findings, contentKey, firstBlockedTs: now}`, and add its findings to this run's **wake** set.
+6. **Deliver:** if the wake set is non-empty → write all those findings to **stderr + `exit 2`** (wake, even idle). Else if the advisory set is non-empty → write those to **stdout** as a systemMessage note and `exit 0`. Else → `exit 0`. (`.blocked` files are deleted ONLY in step 2 on content-change — never here, never by time/count — so a crash anywhere re-processes the durable file next Stop.)
+
+No step advances any durable counter; the only durable mutations are: requeue-on-orphan (rename), claim (rename), CLEAN-delete (the result is empty, nothing to lose), BLOCK-persist (rename to `.blocked`), and content-change-retire (delete after the agent acted). Every one is crash-safe.
+
+### Piece G — spec review
+
+`plan-file-review.mjs` stays **synchronous and behaviorally unchanged** (fast panel, inline ALLOW/deny, registration `statusMessage`-only — NO `asyncRewake`). The ONLY change: replace `launchDeepReview`'s detached spawn with **enqueuing a `kind:"spec"` job** (`<jobKey>.json`; no spawn, no inline review).
+
+### Piece H — push review
+
+`pre-push-review.mjs` stays **synchronous and behaviorally unchanged** (fast allow/deny gate). The ONLY change: replace `launchPushReview`'s detached spawn with **enqueuing a `kind:"push"` job** carrying the SHA-pinned range. Identical runner mechanism to G.
 
 ### Shared refactor — `spec-review-run.mjs`
 
-`runSpecReview` / `runPushReview` are refactored to **return** the review result to the caller, and to write the per-run trace (gate `spec-review` / `push-review`) as today. The caller (plan-file hook for G; deep-review-runner for H) decides delivery (exit 2 vs 0). They no longer write a `deep-result` file as the delivery channel.
+`runSpecReview` / `runPushReview` **return** the result to the runner and write the per-run trace (gate `spec-review`/`push-review`) as today; they no longer write a `deep-result` file.
 
-- **Return shape must include an aggregate `findings` string.** Currently the structured result holds only `{ reviewers, findingCount, maxSeverity }` (+ `traceId, badge, summary, hash`). Add a combined `findings` field (the per-reviewer blocking findings text, as `combinePanel` produces) so the exit-2 wake delivers the actual findings, not just the summary line. Both `runSpecReview` and `runPushReview` must populate it (push findings exist per-reviewer pre-summarization in the hunt panel).
-- **Git errors must fail open.** `runPushReview` currently ignores the `ok` flag from `gitImpl(["log","--oneline",range])` and `gitImpl(["diff",range])`; on a git failure it would review empty/placeholder content. Check the `ok` flags and, on failure, return a fail-open result (no block) so the caller exits 0 rather than waking on a phantom review.
-- **`bench-runner spec-review` subcommand must print the result.** It currently calls `await runSpecReview(...)` and returns with no stdout. Update it to print the returned result so the manual path isn't silent.
-
-**CLI entry + `spec-review` subcommand:** the standalone `spec-review-run.mjs` worker CLI is no longer spawned by any hook after this change. Retarget it to the new delivery contract — it runs the review and exits 2 on a HIGH block / 0 otherwise (so it stays usable as a manual `node spec-review-run.mjs <path> --ws` invocation and by the deep-review-runner) — rather than left as dead code. The `bench-runner spec-review` subcommand (which delegates to `runSpecReview`) keeps working against the new return contract (it prints the returned result).
+- **Return an aggregate `findings` string.** The structured result currently holds only `{ reviewers, findingCount, maxSeverity }` (+ `traceId, badge, summary, hash`). Add a combined `findings`. CONTRACT: the hunt deep-panel result objects (`hunt.mjs` ~79/~121) carry a per-reviewer `findings` field but NOT `raw`/`firstLine`, while `combinePanel` (`panel-lib.mjs` ~151/152) builds from `s.firstLine`/`s.raw` — so do NOT route deep results through `combinePanel`; aggregate the `findings` of each blocking reviewer directly.
+- **Git errors fail open.** `runPushReview` ignores the `ok` flag from `gitImpl(["log","--oneline",range])` / `gitImpl(["diff",range])`; check both and on failure return a fail-open (no-block) result so the runner requeues/clears rather than waking on phantom content.
+- **CLI entry retargeted.** Standalone `node spec-review-run.mjs <path> --ws` runs the review and `exit 2` on a HIGH block / `exit 0` otherwise (manual use). The runner imports + calls the exported functions in-process — no shell-out.
+- **`bench-runner spec-review`** prints the returned result (currently silent).
 
 ### Retire the next-stop surfacing path
 
-`surfaceDeepResult()` + the `deep-result-*.json` files become obsolete (delivery is now the exit-2 wake). `stop-review.mjs` stops importing/calling `surfaceDeepResult`; `deep-review.mjs`'s `writeDeepResult`/`readLatestDeepResult`/`deleteDeepResult` are removed. This deletes the buggy passive path entirely rather than leaving dead code.
-
-### Loop safety
-
-An exit-2 wake delivers the findings; the agent fixes and re-saves the spec / re-pushes, which re-enqueues a review. Reuse the existing `deepKey` debounce so identical content isn't re-reviewed, and add a per-workspace consecutive-deep-wake cap (mirroring `stop-loop`, MAX≈4 within a window) so a stubborn finding can't wake-loop forever — on cap, downgrade to an advisory note and stop waking.
+`surfaceDeepResult()` + `deep-result-*.json` become obsolete. `stop-review.mjs` stops importing/calling `surfaceDeepResult` (its committed-diff + reviewed-head logic untouched); `deep-review.mjs`'s `writeDeepResult`/`readLatestDeepResult`/`deleteDeepResult` are removed. `deepKey`/`parseSeverity`/`severityRank`/`shouldRewake` stay.
 
 ## Data flow
 
 ```
-Spec save  → plan-file hook (asyncRewake): fast panel → [block? exit2 wake]
-                                            → inline deep spec-review → [HIGH block? exit2 wake : exit0]
-git push   → pre-push hook (sync): fast gate (allow/deny) + ENQUEUE deep-push job (SHA-pinned)
-Turn end   → deep-review-runner (Stop, asyncRewake): claim queued jobs → run inline
-                                            → [HIGH block? stderr+exit2 wake (even idle) : remove job, exit0]
+Spec/plan save → plan-file-review (SYNC, unchanged): fast panel inline ALLOW/deny + enqueue {kind:"spec"}.json
+git push       → pre-push-review (SYNC, unchanged): fast allow/deny gate    + enqueue {kind:"push", SHA-pinned}.json
+Turn end       → deep-review-runner (Stop, asyncRewake, timeout 1320s):
+                   1 recover orphaned .claimed → .json
+                   2 for each .blocked: content changed? delete : (age<WAKE_WINDOW? wake-set : advisory-set, keep file)
+                   3 claim ≤ CLAIM_LIMIT .json → .claimed.<pid>   (surplus left queued)
+                   4 run batch CONCURRENTLY (errors requeue → .json)
+                   5 CLEAN→delete claim ; BLOCK→rename claim→.blocked (DURABLE) + add to wake-set
+                   6 wake-set? stderr+EXIT 2 : advisory-set? stdout note+exit 0 : exit 0
+                 (no counter; .blocked deleted ONLY on content-change; crash anywhere → re-processed next Stop)
 ```
 
 ## Error handling
 
-Every path fails OPEN: a review/network/git error → one-line `⛩` stderr note + exit 0 (never wedge an edit, push, or turn). The deep-review-runner claiming/running a job that errors removes the job and exits 0. Exit 2 is used ONLY to deliver a real HIGH block.
+Every path fails OPEN — an edit, push, or turn is never wedged. A review that throws (unreadable spec, git failure, reviewer/API error) requeues that job to `.json` (retries, never drops) with a one-line `⛩` stderr note. `exit 2` only ever delivers a real HIGH block. Empty/unreadable queue → exit 0. A `.blocked` file is never deleted except on content-change, so no crash can lose a completed block.
 
 ## Testing
 
-- **G:** plan-file hook with a HIGH-block deep result → process exits 2 with findings on stderr; ALLOW deep result → exit 0; fast-panel HIGH block → exit 2 without running the deep pass; deep review invoked INLINE (no detached spawn — assert the spawn impl is never called, `runSpecReview` is awaited).
-- **H:** pre-push hook enqueues a SHA-pinned job file on a real push and does NOT spawn a detached worker; the deep-review-runner claims a queued job (atomic — a second runner finds none), runs it, exits 2 on a HIGH block / exit 0 + removes the job otherwise.
-- **Shared:** `runSpecReview`/`runPushReview` return the structured result and write a `spec-review`/`push-review` trace; no `deep-result` file is written.
-- **Loop cap:** N consecutive deep-wakes within the window → downgrade to advisory, no exit 2.
-- **Fail-open:** reviewer/git errors on every path → exit 0.
-- The actual idle-wake is harness behavior (verified by docs), not unit-tested; tests assert the exit-code + stderr contract that drives it.
+Injected reviewers + temp git repos (no real API calls); the idle-wake itself is harness behavior (verified by docs) — tests assert the exit-code/stderr/file-state contract that drives it.
+
+- **Piece G/H:** the sync gate writes a `deep-queue/<key>.json` of the right `kind` and does NOT spawn a detached worker / run inline; fast-panel decision unchanged.
+- **Runner happy path:** claims `.json` (atomic; a 2nd runner finds none); CLEAN → claim deleted + `exit 0`; BLOCK → claim becomes `.blocked` (stores findings/contentKey/firstBlockedTs) + `exit 2` with findings; empty queue → `exit 0`.
+- **Crash-safety (key):** a pre-existing `.blocked` (simulating crash after review, before/during wake) is RE-DELIVERED on the next invocation (`exit 2`, findings present) and is NOT deleted before that delivery.
+- **No counter / time downgrade:** a `.blocked` with unchanged content and `firstBlockedTs` older than `WAKE_WINDOW` is delivered as a stdout ADVISORY (exit 0, no `exit 2`) and the FILE STILL EXISTS afterward (never deleted by time).
+- **Content-change retirement:** a `.blocked` whose target content changed is deleted (retired) and NOT re-delivered.
+- **Claim bound:** 3 queued + `CLAIM_LIMIT=2` → exactly 2 claimed+run, the 3rd left untouched `.json`, processed next invocation; claimed jobs run concurrently.
+- **Orphan recovery:** a `.claimed.<deadpid>`/stale-mtime is requeued to `.json` then processed.
+- **Resilience:** a review that throws requeues its job to `.json` (not dropped); runner exits 0.
+- **Shared refactor:** `runSpecReview`/`runPushReview` return a non-empty `findings` aggregated from blocking reviewers' `findings` (not via `combinePanel`); write a `spec-review`/`push-review` trace; write NO `deep-result`; push review returns fail-open when `gitImpl` reports `ok=false`. `bench-runner spec-review` prints the result.
+
+## Test migration (existing tests this change rewrites)
+
+- `tests/plan-file-review.test.mjs` — G2/G3 detached-spawn asserts → assert it ENQUEUES a `kind:"spec"` job (no spawn/inline), fast panel unchanged.
+- `tests/pre-push-review.test.mjs` — H detached-spawn asserts → assert it ENQUEUES a `kind:"push"` job (no spawn).
+- `tests/stop-review.test.mjs` — G5/H `surfaceDeepResult`/deep-result tests → removed (path retired); reviewed-head + committed-diff tests kept.
+- `tests/deep-review.test.mjs` — `writeDeepResult`/`readLatestDeepResult`/`deleteDeepResult` tests → removed; `parseSeverity`/`severityRank`/`shouldRewake`/`deepKey` kept.
+- New `tests/deep-review-runner.test.mjs` — the runner cases above.
 
 ## Deployment
 
 `deploy-global-hooks.mjs`:
-- **ADD** `asyncRewake:true`, `timeout:600`, and a `rewakeMessage` to the `plan-file-review.mjs` registration (it currently has ONLY `statusMessage` — this is a NEW addition, not a "keep").
-- **Register** the new `Stop` → `deep-review-runner.mjs` with `asyncRewake:true, timeout:600, rewakeMessage` (a second matcher-less Stop block alongside `stop-review.mjs`).
-- `pre-push` stays synchronous (it only enqueues now) — registration unchanged except it no longer launches a detached worker in code.
+- `plan-file-review.mjs` registration **unchanged** (`PostToolUse Write|Edit`, `statusMessage` only — NOT `asyncRewake`).
+- `pre-push-review.mjs` registration **unchanged** (`PreToolUse Bash`, `if:"Bash(git *)"`, `statusMessage`).
+- **Register `Stop` → `deep-review-runner.mjs`** with `asyncRewake:true, timeout:1320, statusMessage, rewakeMessage`. The `register(s.hooks.Stop, undefined, …)` helper appends matcher-less Stop hooks to the first matcher-less Stop block, so the runner becomes a second hook ENTRY there alongside `stop-review.mjs` (both fire on Stop, run in parallel, each with its own per-entry opts). Confirm the helper preserves distinct per-entry `asyncRewake`/`timeout`/`rewakeMessage`; if not, fix the helper.
 
-`bench-runner.mjs`: the `SETUP_GATES` list (`bench-runner.mjs:~348`, currently hardcoded "the four gates": plan-review, plan-file-review, pre-push-review, stop-review) gains the `deep-review-runner.mjs` Stop gate so `bench:setup` reports it.
+`bench-runner.mjs`: the hardcoded `SETUP_GATES` (plan-review, plan-file-review, pre-push-review, stop-review) gains the `deep-review-runner.mjs` Stop gate so `bench:setup` reports it.
 
 Deploy parity verified for the new (`deep-review-runner.mjs`) + changed (`plan-file-review`, `pre-push-review`, `stop-review`, `spec-review-run`, `deep-review`) hooks.
 
-## Test migration (existing tests this change rewrites)
-
-This change deliberately removes the detached-spawn + `deep-result` + `surfaceDeepResult` machinery, so the tests asserting that machinery must be rewritten to the new exit-2/return contract (not left to break the build):
-- `tests/plan-file-review.test.mjs` — G2/G3 tests assert the detached `launchDeepReview` spawn shape → rewrite to assert inline `runSpecReview` + exit-2-on-block / exit-0-on-allow / exit-0-on-error (fail-open).
-- `tests/pre-push-review.test.mjs` — H tests assert the detached `launchPushReview` spawn → rewrite to assert the pre-push hook ENQUEUES a SHA-pinned job file (no spawn).
-- `tests/stop-review.test.mjs` — G5/H tests exercise `surfaceDeepResult`/deep-result surfacing → remove (path retired); keep the reviewed-head + committed-diff tests untouched.
-- `tests/deep-review.test.mjs` — `writeDeepResult`/`readLatestDeepResult`/`deleteDeepResult` tests → remove (functions deleted); keep `parseSeverity`/`severityRank`/`shouldRewake`/`deepKey` tests.
-- New `tests/deep-review-runner.test.mjs` — the Stop runner: claims a queued job (atomic; a second runner finds none), runs it, exits 2 on a HIGH block / exit 0 + removes the job otherwise, fail-open on error, loop-cap downgrades to advisory.
-
 ## Rollout note / lesson
 
-Until this ships, the deep review can still miss an idle agent. Interim behavior: after writing a spec/plan, the agent must **check for the deep-review result (e.g., `/bench:status` or the trace) before declaring it good** rather than going idle — the manual workaround for the very gap this spec closes.
+Until this ships, the deep review can still miss an idle agent. Interim behavior: after writing a spec/plan, the agent must **check for the deep-review result (poll the trace / `/bench:status`) before declaring it good** rather than going idle — the manual workaround for the very gap this spec closes. (This spec was hardened across many deep-review rounds — false-async-premise, sync-behavior, contradiction, timeout, unbounded-batch, delete-before-delivery, and the delivery-counter race — each landing only because the agent stayed engaged instead of idling. Strong evidence the deep review is valuable and this wake fix is the right priority.)
