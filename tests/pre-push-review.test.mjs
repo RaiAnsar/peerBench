@@ -14,7 +14,7 @@ import path from "node:path";
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview } from "../global-hooks/pre-push-review.mjs";
+import { runMain, buildPrompt, cdTargetBeforePush, commandCwd, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview } from "../global-hooks/pre-push-review.mjs";
 import { setBenchDisabled, readReviewedHead, writeReviewedHead } from "../global-hooks/config-store.mjs";
 import { deepKey, isDeepDebounced } from "../global-hooks/deep-review.mjs";
 
@@ -182,6 +182,37 @@ test("bootstrap: skipped when bench is disabled (no marker written)", async () =
     input: { cwd: ws, tool_input: { command: "git add -A" } }
   });
   assert.equal(readReviewedHead(ws), null, "disabled → no baseline written");
+});
+
+// commandCwd: resolve the repo a git command actually operates in (cd + `git -C`).
+test("commandCwd: plain git command → fallback cwd", () => {
+  assert.equal(commandCwd("git commit -m x", "/main"), "/main");
+  assert.equal(commandCwd("git status", "/main"), "/main");
+});
+test("commandCwd: `git -C <dir>` resolves to that dir", () => {
+  assert.equal(commandCwd("git -C /other commit -m x", "/main"), "/other");
+});
+test("commandCwd: `cd <dir> && git …` resolves to the cd'd dir", () => {
+  assert.equal(commandCwd("cd /other && git add -A", "/main"), "/other");
+  assert.equal(commandCwd("cd sub && git status", "/main"), "/main/sub");   // relative cd resolves on fallback
+});
+test("commandCwd: `git -C` within the git segment wins over a prior cd", () => {
+  assert.equal(commandCwd("cd /a && git -C /b commit", "/main"), "/b");
+});
+
+test("bootstrap: marks the repo the command TOUCHES via -C, not input.cwd (Codex finding)", async () => {
+  const { ws: repoA } = freshPushRepo();
+  const { ws: repoB } = freshPushRepo();
+  const headB = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoB, encoding: "utf8" }).trim();
+  await runMain({
+    resolveReviewersImpl: () => [],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: repoA, tool_input: { command: `git -C ${repoB} status` } }
+  });
+  assert.equal(readReviewedHead(repoB), headB, "the -C target repo is the one bootstrapped");
+  assert.equal(readReviewedHead(repoA), null, "input.cwd's repo is NOT wrongly marked");
 });
 
 // ---------------------------------------------------------------------------

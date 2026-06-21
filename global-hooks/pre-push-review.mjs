@@ -193,6 +193,29 @@ export function cdTargetBeforePush(command, fallbackCwd) {
   return cwd;
 }
 
+// Resolve the repo a git command actually OPERATES in: follow `cd` segments up to the FIRST git
+// segment, then apply that segment's `git -C <dir>` targets. Mirrors the push path's cwd resolution
+// but generalized to any git subcommand, so the reviewed-head bootstrap marks the repo the command
+// TOUCHES (`git -C /other commit`, `cd /other && git add`) — not a stale input.cwd (the wrong repo).
+export function commandCwd(command, fallbackCwd) {
+  const segs = shellSegments(command);
+  let cwd = fallbackCwd;
+  for (let k = 0; k < segs.length; k++) {
+    const toks = shellTokenize(segs[k].text).filter(Boolean);
+    if (toks[0] === "git") {
+      for (const target of dashCTargets(segs[k].text)) cwd = path.isAbsolute(target) ? target : path.resolve(cwd, target);
+      return cwd;                                  // resolve to the first git segment (where work lands)
+    }
+    const m = segs[k].text.match(/^cd\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*$/);
+    if (m) {
+      const target = m[1] || m[2] || m[3];
+      const next = segs[k + 1];
+      if (!(next && next.joiner === "||")) cwd = path.isAbsolute(target) ? target : path.resolve(cwd, target);
+    }
+  }
+  return cwd;
+}
+
 function readInput() {
   try {
     const raw = fs.readFileSync(0, "utf8").trim();
@@ -385,10 +408,11 @@ export async function runMain({
   // 0. Bootstrap the stop gate's reviewed-head baseline on the FIRST `git` command of a session
   // (this hook fires on every `git *` via its matcher), BEFORE any commit lands — so that
   // committed-AND-pushed work is still reviewed on the first stop, where `@{upstream}` would
-  // already have advanced past it. Only WRITES when the marker is missing; best-effort, and never
-  // affects the git command itself.
+  // already have advanced past it. Resolve the repo the command actually TOUCHES (cd + `git -C`),
+  // not a stale input.cwd. Only WRITES when the marker is missing; best-effort, never affects the
+  // git command itself.
   try {
-    const bootWs = workspaceRoot(input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd());
+    const bootWs = workspaceRoot(commandCwd(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd()));
     if (!isBenchDisabledImpl(bootWs) && !readReviewedHead(bootWs)) {
       const [head, ok] = gitTry(["rev-parse", "HEAD"], bootWs);
       if (ok && head.trim()) writeReviewedHead(bootWs, head.trim());
