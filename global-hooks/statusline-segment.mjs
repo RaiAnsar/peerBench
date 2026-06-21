@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { workspaceStateDir } from "./config-store.mjs";
+import { workspaceStateDir, wsKey } from "./config-store.mjs";
 import { severityRank, SEVERITY_RANK } from "./deep-review.mjs";
 
 const C = { ALLOW: 48, BLOCK: 196, error: 208, advisory: 245 };   // 256-color codes (match gate-status.py palette); advisory = dim grey
@@ -45,16 +45,19 @@ export function renderSegment(trace, { now = Date.now() } = {}) {
 // filter would also pick up stray non-trace files. Validate the shape so only real traces count.
 const TRACE_RE = /^(\d+)-[0-9a-f]+\.json$/i;
 function fileTs(name) { const m = TRACE_RE.exec(name); return m ? Number(m[1]) : -1; }
-export function latestTrace(tracesDir) {
+// Return the newest trace in `tracesDir` that BELONGS to `expectedWsKey`. The ownership guard skips
+// any trace whose stamped `wsKey` is for a DIFFERENT workspace (a misplaced/leaked trace) so the
+// statusline can never surface another project's gate verdict. Legacy traces (no wsKey) are accepted.
+export function latestTrace(tracesDir, expectedWsKey = null) {
   let files;
   try { files = fs.readdirSync(tracesDir); } catch { return null; }
-  let bestName = null, bestTs = -1;
-  for (const f of files) {
-    const ts = fileTs(f);
-    if (ts >= 0 && ts > bestTs) { bestTs = ts; bestName = f; }
+  const newestFirst = files.map((f) => [f, fileTs(f)]).filter(([, ts]) => ts >= 0).sort((a, b) => b[1] - a[1]);
+  for (const [name] of newestFirst) {
+    let t; try { t = JSON.parse(fs.readFileSync(path.join(tracesDir, name), "utf8")); } catch { continue; }
+    if (expectedWsKey && t && t.wsKey && t.wsKey !== expectedWsKey) continue;   // misplaced → skip
+    return t;
   }
-  if (!bestName) return null;
-  try { return JSON.parse(fs.readFileSync(path.join(tracesDir, bestName), "utf8")); } catch { return null; }
+  return null;
 }
 
 // A trace's own chronological key — the numeric ms prefix of its id (`<ts>-<hex>`).
@@ -70,27 +73,31 @@ export function latestTraceForDir(dir, gitTopFn) {
   if (dir && dir !== top) roots.push(dir);
   let best = null;
   for (const ws of roots) {
-    const t = latestTrace(path.join(workspaceStateDir(ws), "traces"));
+    // Read each root's traces with that root's OWN key as the ownership filter — a trace surfaces
+    // only if it genuinely belongs to the dir it sits in (never another project's leaked trace).
+    const t = latestTrace(path.join(workspaceStateDir(ws), "traces"), wsKey(ws));
     if (t && (!best || traceTs(t) > traceTs(best))) best = t;
   }
   return best;
 }
 
-// Resolve the project dir for the statusline. The wrapper passes the open project as argv[2]
-// (from stdin's workspace.current_dir). If that is missing/empty OR the literal jq sentinels
-// "null"/"undefined" (what `jq -r` emits when the key is absent), we must NOT fall through to a
-// single shared dir for every project — that is exactly the "same statusline under all projects"
-// bug. Fall back to CLAUDE_PROJECT_DIR, then cwd; reject the sentinels so a bad argv can't
-// silently collapse every window onto one state dir.
-export function resolveDir(argv2, env = process.env, cwd = process.cwd()) {
+// Resolve the project dir for the statusline from a PER-WINDOW signal only. The wrapper passes the
+// open project as argv[2] (from stdin's workspace.current_dir); CLAUDE_PROJECT_DIR is the per-session
+// env fallback. Both identify the WINDOW being rendered. We deliberately do NOT fall back to the
+// process cwd: the statusline is a single GLOBAL process, so its cwd is the LAUNCHING project, not
+// the window — guessing from it surfaces one project's gate badge in every other window (the
+// cross-project mixup Rai hit). Reject the jq sentinels ("null"/"undefined"); return null when there
+// is no reliable per-window signal, so the caller renders NOTHING rather than the wrong project.
+export function resolveDir(argv2, env = process.env) {
   const bad = (v) => !v || v === "null" || v === "undefined";
   if (!bad(argv2)) return argv2;
   if (!bad(env?.CLAUDE_PROJECT_DIR)) return env.CLAUDE_PROJECT_DIR;
-  return cwd;
+  return null;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const dir = resolveDir(process.argv[2], process.env, process.cwd());
+  const dir = resolveDir(process.argv[2], process.env);
+  if (!dir) process.exit(0);   // no reliable per-window project → render nothing (never guess via cwd)
   // stdio: ignore git's stderr ("fatal: not a git repository") so a non-repo dir stays silent.
   const gitTop = (d) => { try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: d, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return null; } };
   const seg = renderSegment(latestTraceForDir(dir, gitTop));

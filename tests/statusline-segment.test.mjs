@@ -88,21 +88,23 @@ test("latestTrace returns newest by filename", () => {
 // DISTINCT project per call and never collapse onto one shared dir on bad input.
 // ===========================================================================
 
-// --- resolveDir: a bad/missing argv must never collapse every project onto one dir ---
+// --- resolveDir: only a PER-WINDOW signal; never guess via the global process cwd ---
 test("resolveDir: a valid argv2 passes through", () => {
-  assert.equal(resolveDir("/a/b", {}, "/cwd"), "/a/b");
+  assert.equal(resolveDir("/a/b", {}), "/a/b");
 });
-test("resolveDir: missing/empty argv2 → CLAUDE_PROJECT_DIR, then cwd", () => {
-  assert.equal(resolveDir("", { CLAUDE_PROJECT_DIR: "/proj" }, "/cwd"), "/proj");
-  assert.equal(resolveDir(undefined, {}, "/cwd"), "/cwd");
+test("resolveDir: missing/empty argv2 → CLAUDE_PROJECT_DIR, then NULL (never cwd)", () => {
+  assert.equal(resolveDir("", { CLAUDE_PROJECT_DIR: "/proj" }), "/proj");
+  // No per-window signal at all → null, so the caller renders NOTHING rather than the launching
+  // project's badge. The process cwd is the GLOBAL statusline's cwd (the launching project), not the
+  // window being rendered — guessing from it is exactly the cross-project mixup.
+  assert.equal(resolveDir(undefined, {}), null);
 });
 test("resolveDir: the jq sentinels 'null'/'undefined' are rejected (the same-statusline bug)", () => {
-  // `jq -r` on an absent .workspace.current_dir emits the literal string "null". If that were
-  // treated as a real path, EVERY project would resolve to the same (nonexistent) state dir →
-  // the same statusline everywhere. It must be rejected like an empty arg.
-  assert.equal(resolveDir("null", { CLAUDE_PROJECT_DIR: "/proj" }, "/cwd"), "/proj");
-  assert.equal(resolveDir("undefined", {}, "/cwd"), "/cwd");
-  assert.equal(resolveDir("null", {}, "/cwd"), "/cwd");
+  // `jq -r` on an absent .workspace.current_dir emits the literal string "null". If treated as a
+  // real path, EVERY project would resolve to the same dir. Reject like an empty arg.
+  assert.equal(resolveDir("null", { CLAUDE_PROJECT_DIR: "/proj" }), "/proj");
+  assert.equal(resolveDir("undefined", {}), null);
+  assert.equal(resolveDir("null", {}), null);
 });
 
 // --- latestTrace: numeric (not lexical) ordering + filename validation (Kimi findings) ---
@@ -159,6 +161,36 @@ test("latestTraceForDir picks the chronologically-newest across git-top and cwd 
     write(sub, "300-ccc");
     // gitTop(sub) → top; roots = [top, sub]; newest id (300) wins, compared numerically.
     assert.equal(latestTraceForDir(sub, () => top).id, "300-ccc");
+  } finally {
+    if (prev === undefined) delete process.env.BENCH_ROOT; else process.env.BENCH_ROOT = prev;
+  }
+});
+
+// --- ownership guard: a trace whose wsKey is for ANOTHER project is never surfaced ---
+test("latestTrace: ownership guard skips a misplaced trace (wsKey ≠ expected) and falls through to a legit one", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "trown-"));
+  // newest file belongs to ANOTHER workspace (leaked into this dir); older one belongs here.
+  fs.writeFileSync(path.join(d, "200-bbb.json"), JSON.stringify({ id: "200-bbb", wsKey: "other-deadbeef", gate: "stop", reviewers: [{ name: "K", verdict: "BLOCK" }] }));
+  fs.writeFileSync(path.join(d, "100-aaa.json"), JSON.stringify({ id: "100-aaa", wsKey: "mine-cafef00d", gate: "plan", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
+  assert.equal(latestTrace(d, "mine-cafef00d").id, "100-aaa", "skips the newer foreign-stamped trace, returns the owned one");
+  assert.equal(latestTrace(d, "nobody-00000000"), null, "no trace owned by the expected key → null (never surface a foreign one)");
+  assert.equal(latestTrace(d).id, "200-bbb", "no expectedWsKey → no filtering (back-compat)");
+});
+test("latestTrace: a legacy trace with NO wsKey is still accepted (back-compat)", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "trleg-"));
+  fs.writeFileSync(path.join(d, "100-aaa.json"), JSON.stringify({ id: "100-aaa", gate: "plan", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
+  assert.equal(latestTrace(d, "mine-cafef00d").id, "100-aaa", "unstamped legacy traces are not filtered out");
+});
+test("latestTraceForDir: a foreign-stamped trace sitting in this project's dir is NOT surfaced (mixup guard)", () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "sl-own-")));
+  const prev = process.env.BENCH_ROOT; process.env.BENCH_ROOT = root;
+  try {
+    const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "wsOwn-")));
+    const td = path.join(workspaceStateDir(ws), "traces");
+    fs.mkdirSync(td, { recursive: true });
+    // A trace stamped for a DIFFERENT workspace somehow landed in ws's dir — must be ignored.
+    fs.writeFileSync(path.join(td, "999-zzz.json"), JSON.stringify({ id: "999-zzz", wsKey: "peerbench-deadbeefdeadbeef", gate: "stop", reviewers: [{ name: "K", verdict: "BLOCK" }] }));
+    assert.equal(latestTraceForDir(ws, (d) => d), null, "a foreign-stamped trace in this dir is never shown as this project's verdict");
   } finally {
     if (prev === undefined) delete process.env.BENCH_ROOT; else process.env.BENCH_ROOT = prev;
   }

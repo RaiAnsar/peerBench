@@ -1,14 +1,17 @@
 // global-hooks/trace-store.mjs
 import { randomBytes } from "node:crypto";
 import fs from "node:fs"; import path from "node:path";
-import { workspaceStateDir } from "./config-store.mjs";
+import { workspaceStateDir, wsKey } from "./config-store.mjs";
 const CAP = 64 * 1024;
 const cap = (s) => (typeof s === "string" ? s.slice(0, CAP) : s);
 export function writeTrace(ws, trace, { now = Date.now() } = {}) {
   const dir = path.join(workspaceStateDir(ws), "traces");
   fs.mkdirSync(dir, { recursive: true });
   const id = `${now}-${randomBytes(6).toString("hex")}`; // 48-bit random suffix: same-ms collision is negligible
-  const record = { id, ts: new Date(now).toISOString(), gate: trace.gate, ws: trace.ws, reviewers: trace.reviewers || [],
+  // Stamp the canonical owning workspace KEY into the record so a surfacing path can verify the
+  // trace belongs to the workspace it's being shown for (cross-project mixup guard). `ws` keeps the
+  // raw path for display; `wsKey` is the ownership identity that survives symlinks/relative paths.
+  const record = { id, ts: new Date(now).toISOString(), gate: trace.gate, ws: trace.ws, wsKey: wsKey(ws), reviewers: trace.reviewers || [],
     systemPrompt: cap(trace.systemPrompt), userPrompt: cap(trace.userPrompt),
     rawResponses: Object.fromEntries(Object.entries(trace.rawResponses || {}).map(([k, v]) => [k, cap(v)])) };
   fs.writeFileSync(path.join(dir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);

@@ -43,13 +43,20 @@ export function sharedRoot() {
   return process.env.BENCH_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
 }
-export function workspaceStateDir(ws) {
+// The canonical per-workspace KEY (`<slug>-<hash>`) — the ownership identity of a workspace's
+// state. Slug AND hash both come from the CANONICAL path, so a workspace reached via a
+// differently-named symlink resolves to the same key (otherwise the slug differed while the hash
+// matched → split). Exported so surfacing paths (the statusline) can VERIFY a trace/finding belongs
+// to the workspace it's being shown for, instead of trusting the directory it was read from — the
+// guard against cross-project finding mixups.
+export function wsKey(ws) {
   let canonical = ws; try { canonical = fs.realpathSync.native(ws); } catch { canonical = ws; }
-  // Slug AND hash both come from the CANONICAL path, so a workspace reached via a differently-named
-  // symlink resolves to the same state dir (otherwise the slug differed while the hash matched → split).
   const slug = (path.basename(canonical) || "workspace").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 16);
-  return path.join(sharedRoot(), "state", `${slug}-${hash}`);
+  return `${slug}-${hash}`;
+}
+export function workspaceStateDir(ws) {
+  return path.join(sharedRoot(), "state", wsKey(ws));
 }
 function readFileConfig() { try { return JSON.parse(fs.readFileSync(path.join(sharedRoot(), "companion.json"), "utf8")); } catch { return {}; } }
 // Persist the active reviewer selection to the env-independent companion.json (atomic).
