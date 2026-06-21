@@ -12,7 +12,7 @@ process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-runner-roo
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { reviewersCommand, setupStatus, statusCommand, huntCommand } from "../scripts/bench-runner.mjs";
+import { reviewersCommand, setupStatus, statusCommand, huntCommand, gradeCommand } from "../scripts/bench-runner.mjs";
 import { resolveConfig, workspaceStateDir } from "../global-hooks/config-store.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 
@@ -221,4 +221,38 @@ test("D3: review trace-write failure emits a ⛩ note and still allows (subproce
   assert.match(res.stderr, /⛩ .*trace write failed/i, `expected a ⛩ trace-write-failed note on stderr; got: ${res.stderr}`);
   const resultLine = res.stdout.split("\n").find((l) => l.startsWith("Result:"));
   assert.ok(resultLine, `review must still produce a Result line; got stdout=${res.stdout}`);
+});
+
+// ── grade subcommand: parse `<traceId> Reviewer:grade [...] --note --ws` ──────
+test("gradeCommand parses pairs + note via the recordImpl seam", () => {
+  const calls = [];
+  const out = captureStdout(() =>
+    gradeCommand(["1782-abc", "MiMo:tp", "Kimi:fp", "--note", "leaked token caught"], { recordImpl: (e) => calls.push(e) })
+  );
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((c) => `${c.reviewer}:${c.grade}`), ["MiMo:tp", "Kimi:fp"]);
+  assert.equal(calls[0].traceId, "1782-abc");
+  assert.equal(calls[0].note, "leaked token caught");
+  assert.match(out, /Graded 1782-abc/);
+});
+
+test("gradeCommand with no args → usage + exit 1", () => {
+  const prev = process.exitCode;
+  const out = captureStdout(() => gradeCommand([], { recordImpl: () => { throw new Error("should not record"); } }));
+  assert.match(out, /Usage: grade/);
+  assert.equal(process.exitCode, 1);
+  process.exitCode = prev;
+});
+
+test("gradeCommand surfaces a bad grade error but keeps the good ones", () => {
+  const prev = process.exitCode;
+  const calls = [];
+  const out = captureStdout(() =>
+    gradeCommand(["t1", "MiMo:tp", "Kimi:bogus"], {
+      recordImpl: (e) => { if (e.grade === "bogus") throw new Error("grade must be one of tp|fp|miss"); calls.push(e); }
+    })
+  );
+  assert.equal(calls.length, 1, "the valid grade still records");
+  assert.match(out, /Error grading 'Kimi:bogus'/);
+  process.exitCode = prev;
 });

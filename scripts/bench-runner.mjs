@@ -20,6 +20,7 @@ import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
 import { runSpecReview } from "../global-hooks/spec-review-run.mjs";
+import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -169,6 +170,16 @@ async function main() {
     return reviewersCommand(rest);
   }
 
+  if (sub === "scorecard") {
+    process.stdout.write(`${renderScorecard(computeScorecard())}\n`);
+    return;
+  }
+
+  if (sub === "grade") {
+    // Usage: grade <traceId> <Reviewer>:<tp|fp|miss> [<Reviewer>:<...> ...] [--note "..."] [--ws <ws>]
+    return gradeCommand(rest);
+  }
+
   if (sub === "hunt") {
     const seed = rest.join(" ").trim();
     const ws = workspaceRoot(cwd);
@@ -217,7 +228,7 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|hunt|investigate|debug|spec-review|off|on`);
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|scorecard|grade|hunt|investigate|debug|spec-review|off|on`);
 }
 
 const HUNT_MODES = {
@@ -292,6 +303,40 @@ export function reviewersCommand(args) {
     return;
   }
   process.stdout.write(`Reviewers set to: ${saved.join(", ")}\nTakes effect on the next gate run.\n`);
+}
+
+// `bench grade <traceId> <Reviewer>:<tp|fp|miss> [...] [--note "..."] [--ws <ws>]`
+// Claude calls this after VERIFYING a panel's findings (the judgment layer). Cross-project:
+// it writes to the shared scorecard regardless of which repo it's invoked from.
+export function gradeCommand(args, { recordImpl = recordGrade } = {}) {
+  let note = "", ws = null;
+  const positionals = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--note" && i + 1 < args.length) { note = args[++i]; continue; }
+    if (args[i] === "--ws" && i + 1 < args.length) { ws = args[++i]; continue; }
+    positionals.push(args[i]);
+  }
+  const traceId = positionals.shift();
+  const pairs = positionals.flatMap((a) => a.split(/\s+/)).filter(Boolean);
+  if (!traceId || !pairs.length) {
+    process.stdout.write("Usage: grade <traceId> <Reviewer>:<tp|fp|miss> [...] [--note \"why\"] [--ws <ws>]\n");
+    process.exitCode = 1;
+    return;
+  }
+  const recorded = [];
+  for (const pair of pairs) {
+    const i = pair.lastIndexOf(":");
+    if (i < 0) { process.stdout.write(`Skipped '${pair}' (expected Reviewer:grade)\n`); continue; }
+    const reviewer = pair.slice(0, i), grade = pair.slice(i + 1);
+    try {
+      recordImpl({ traceId, reviewer, grade, note, ws });
+      recorded.push(`${reviewer}:${grade}`);
+    } catch (err) {
+      process.stdout.write(`Error grading '${pair}': ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exitCode = 1;
+    }
+  }
+  if (recorded.length) process.stdout.write(`Graded ${traceId}: ${recorded.join(", ")}${note ? ` — ${note}` : ""}\n`);
 }
 
 // The four gates, keyed by event + matcher + hook file (mirror deploy-global-hooks.mjs).
