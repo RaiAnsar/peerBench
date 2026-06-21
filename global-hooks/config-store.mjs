@@ -27,7 +27,7 @@ const DEFAULTS = {
   // Qwen (Alibaba MaaS token-plan, ap-southeast-1) — OpenAI-compatible /compatible-mode (NOT the
   // /apps/anthropic endpoint; our review-client speaks OpenAI /chat/completions). Override
   // QWEN_BASE_URL / QWEN_MODEL in .keys if your key targets a different plan/workspace or model id.
-  qwen: { displayName: "Qwen", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-plus", keyEnv: "QWEN_API_KEY",
+  qwen: { displayName: "Qwen", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-max", keyEnv: "QWEN_API_KEY",
           temperature: 0.6, thinking: "disabled", thinkingEnv: "QWEN_THINKING",
           headers: {}, timeoutMs: 300_000 }  // 5 min
 };

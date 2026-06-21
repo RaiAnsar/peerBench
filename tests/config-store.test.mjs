@@ -44,7 +44,7 @@ test("qwen is wired as a KNOWN/selectable provider with its DashScope defaults",
   assert.ok(KNOWN_REVIEWERS.includes("qwen"), "qwen must be KNOWN/selectable");
   const a = resolveConfig({ env: { QWEN_API_KEY: "qk" } });
   assert.equal(a.providers.qwen.apiKey, "qk");
-  assert.equal(a.providers.qwen.model, "qwen3.7-plus");
+  assert.equal(a.providers.qwen.model, "qwen3.7-max");
   assert.match(a.providers.qwen.baseURL, /maas\.aliyuncs\.com\/compatible-mode/);
 });
 test("QWEN_MODEL / QWEN_BASE_URL env overrides win (quick-swap without code edits)", () => {
