@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { combinePanel } from "./panel-lib.mjs";
-import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, readReviewedHead, writeReviewedHead } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { deepKey, isDeepDebounced, markDeepDebounce } from "./deep-review.mjs";
@@ -381,6 +381,19 @@ export async function runMain({
   const input = inputOverride ?? readInput();
 
   const command = String(input.tool_input?.command ?? "");
+
+  // 0. Bootstrap the stop gate's reviewed-head baseline on the FIRST `git` command of a session
+  // (this hook fires on every `git *` via its matcher), BEFORE any commit lands — so that
+  // committed-AND-pushed work is still reviewed on the first stop, where `@{upstream}` would
+  // already have advanced past it. Only WRITES when the marker is missing; best-effort, and never
+  // affects the git command itself.
+  try {
+    const bootWs = workspaceRoot(input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd());
+    if (!isBenchDisabledImpl(bootWs) && !readReviewedHead(bootWs)) {
+      const [head, ok] = gitTry(["rev-parse", "HEAD"], bootWs);
+      if (ok && head.trim()) writeReviewedHead(bootWs, head.trim());
+    }
+  } catch { /* baseline bootstrap is best-effort — must not affect the push gate */ }
 
   // 1. Only act on a real `git push` (not help/dry-run, not another git command, not a quoted mention).
   const pushSeg = findPushSegment(command);

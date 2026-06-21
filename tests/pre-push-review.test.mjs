@@ -15,7 +15,7 @@ const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root
 process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt, cdTargetBeforePush, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview } from "../global-hooks/pre-push-review.mjs";
-import { setBenchDisabled } from "../global-hooks/config-store.mjs";
+import { setBenchDisabled, readReviewedHead, writeReviewedHead } from "../global-hooks/config-store.mjs";
 import { deepKey, isDeepDebounced } from "../global-hooks/deep-review.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
@@ -137,6 +137,51 @@ test("non-git-push command → allow no-op (git status)", async () => {
   assert.equal(reviewersCalled, false, "reviewers must NOT be called for non-push command");
   assert.equal(traceWritten, false, "no trace should be written for non-push command");
   assert.equal(emittedLines.length, 0, "no output for non-push command");
+});
+
+// ---------------------------------------------------------------------------
+// Bootstrap: the FIRST git command of a session records the reviewed-head baseline
+// (BEFORE any commit) so committed-AND-pushed work is still reviewed on the first stop —
+// the gap where @{upstream} has already advanced past the pushed commits.
+// ---------------------------------------------------------------------------
+
+test("bootstrap: a non-push git command records the reviewed-head baseline when missing", async () => {
+  const { ws } = freshPushRepo();
+  assert.equal(readReviewedHead(ws), null, "precondition: no marker yet");
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ws, encoding: "utf8" }).trim();
+  await runMain({
+    resolveReviewersImpl: () => [],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, tool_input: { command: "git add -A" } }
+  });
+  assert.equal(readReviewedHead(ws), head, "first git command sets the baseline to HEAD (pre-commit)");
+});
+
+test("bootstrap: does NOT overwrite an existing marker (preserves a cross-session unreviewed range)", async () => {
+  const { ws } = freshPushRepo();
+  writeReviewedHead(ws, "PREEXISTING");
+  await runMain({
+    resolveReviewersImpl: () => [],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, tool_input: { command: "git status" } }
+  });
+  assert.equal(readReviewedHead(ws), "PREEXISTING", "existing marker preserved (bootstrap only fills a gap)");
+});
+
+test("bootstrap: skipped when bench is disabled (no marker written)", async () => {
+  const { ws } = freshPushRepo();
+  await runMain({
+    resolveReviewersImpl: () => [],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => true,
+    env: process.env,
+    input: { cwd: ws, tool_input: { command: "git add -A" } }
+  });
+  assert.equal(readReviewedHead(ws), null, "disabled → no baseline written");
 });
 
 // ---------------------------------------------------------------------------

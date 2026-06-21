@@ -68,6 +68,19 @@ export function setReviewers(list, { root = sharedRoot() } = {}) {
 const GLOBAL_DISABLE = (root) => path.join(root || sharedRoot(), "disabled-global");
 const WS_DISABLE = (ws) => path.join(workspaceStateDir(ws), "disabled");
 
+// reviewed-head marker: the last HEAD the stop gate reviewed up to. Shared by the stop gate
+// (advances it on a clean ALLOW; diffs HEAD against it) AND the pre-push gate (bootstraps it on
+// the first `git` command of a session, BEFORE any commit — so committed-and-pushed work is still
+// reviewed on the first stop, where `@{upstream}` would already have advanced past it).
+const REVIEWED_HEAD = (ws) => path.join(workspaceStateDir(ws), "reviewed-head");
+export function readReviewedHead(ws) {
+  try { return fs.readFileSync(REVIEWED_HEAD(ws), "utf8").trim() || null; } catch { return null; }
+}
+export function writeReviewedHead(ws, sha) {
+  if (!sha) return;
+  try { fs.mkdirSync(workspaceStateDir(ws), { recursive: true }); fs.writeFileSync(REVIEWED_HEAD(ws), `${sha}\n`); } catch { /* best-effort marker */ }
+}
+
 // Disabled if the global marker exists OR this workspace's marker exists.
 export function isBenchDisabled(ws, { root } = {}) {
   try { if (fs.existsSync(GLOBAL_DISABLE(root))) return true; }

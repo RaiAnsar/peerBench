@@ -7,7 +7,8 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
-import { isBenchDisabled as defaultIsBenchDisabled, workspaceStateDir } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, workspaceStateDir, readReviewedHead, writeReviewedHead } from "./config-store.mjs";
+export { readReviewedHead, writeReviewedHead };   // re-exported so tests + siblings share one impl
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { readLatestDeepResult, deleteDeepResult, deepKey, shouldRewake } from "./deep-review.mjs";
@@ -42,19 +43,14 @@ function git(args, cwd) {
   }
 }
 
-// --- reviewed-head marker -------------------------------------------------------------------
+// --- reviewed-head marker (helpers live in config-store, shared with the pre-push gate) -------
 // The last HEAD this gate stop-reviewed up to. WITHOUT this, a turn that COMMITS its work leaves
 // an empty `git diff HEAD`, so the gate's no-diff early-return fires and the committed changes
 // escape review entirely — a session that commits 50 things gets ZERO review (the VisualSentinel
 // gap). With it, every change is reviewed exactly once: committed-this-session AND uncommitted.
-function reviewedHeadFile(ws) { return path.join(workspaceStateDir(ws), "reviewed-head"); }
-export function readReviewedHead(ws) {
-  try { return fs.readFileSync(reviewedHeadFile(ws), "utf8").trim() || null; } catch { return null; }
-}
-export function writeReviewedHead(ws, sha) {
-  if (!sha) return;
-  try { fs.mkdirSync(workspaceStateDir(ws), { recursive: true }); fs.writeFileSync(reviewedHeadFile(ws), `${sha}\n`); } catch { /* best-effort marker */ }
-}
+// The pre-push gate bootstraps the marker on the first `git` command (before any commit) so even
+// committed-AND-pushed work is reviewed on the first stop (where @{upstream} has already advanced).
+//
 // The base commit to diff HEAD against = "everything not yet reviewed". Prefer the last-reviewed
 // marker when it is a valid ANCESTOR of HEAD; else fall back to the upstream (unpushed commits) so
 // even the FIRST stop of a session that committed-but-didn't-push is reviewed; else HEAD (review
