@@ -90,21 +90,33 @@ test("NO COUNTER / time downgrade: a .blocked older than WAKE_WINDOW → advisor
   assert.equal(listBlocked(ws).length, 1, "file KEPT (never deleted by elapsed time — only content-change retires it)");
 });
 
-test("TRANSIENT-SAFE: when the current content key can't be determined (null), a .blocked is KEPT + re-delivered, never deleted", async () => {
-  // null = couldn't determine (transient `git rev-parse` failure for a push job, or an unreadable
-  // spec) — NOT a confirmed content change. Deleting on null would lose a completed HIGH block on a
-  // transient error (the bug the wake-runner itself caught). Exercised here via a spec whose file is
-  // gone → currentContentKey returns null (same code path the push-git-failure hits).
+test("TRANSIENT-SAFE: an UNCERTAIN key (present but unreadable → null) KEEPS + re-delivers the block, never deletes", async () => {
+  // null = couldn't determine (transient: a failed `git rev-parse` for a push job, or a present-but-
+  // unreadable spec) — NOT a confirmed change. Deleting on null would lose a completed HIGH block on
+  // a transient error (the bug the wake-runner itself caught). Exercised via a DIRECTORY at specPath:
+  // it EXISTS (so not GONE) but readFileSync throws → currentContentKey returns null.
   const ws = freshWs();
-  const file = path.join(ws, "gone.md");
+  const target = path.join(ws, "unreadable");
+  fs.mkdirSync(target);
+  const ck = "ck-transient";
+  markBlocked(ws, ck, { kind: "spec", specPath: target, contentKey: ck, findings: "[MiMo]\n- a real block", firstBlockedTs: Date.now() });
+  const { exit, err } = await runRunner(ws);
+  assert.equal(exit, 2, "uncertain (null) → keep + re-deliver (exit 2), never silently retire on a transient error");
+  assert.match(err, /a real block/, "the durable block is re-delivered");
+  assert.equal(listBlocked(ws).length, 1, ".blocked KEPT (not deleted on uncertainty)");
+});
+
+test("GONE retire: a DELETED spec file → block retired (deleted), NOT re-woken forever", async () => {
+  const ws = freshWs();
+  const file = path.join(ws, "deleted.md");
   fs.writeFileSync(file, "spec body");
   const ck = deepKey(file, "spec body");
-  markBlocked(ws, ck, { kind: "spec", specPath: file, contentKey: ck, findings: "[MiMo]\n- a real block", firstBlockedTs: Date.now() });
-  fs.rmSync(file);   // → currentContentKey null (uncertain), must NOT be treated as a content change
+  markBlocked(ws, ck, { kind: "spec", specPath: file, contentKey: ck, findings: "- stale block for a gone spec", firstBlockedTs: Date.now() });
+  fs.rmSync(file);   // spec deleted → definitively gone → block is moot → must retire (not re-wake)
   const { exit, err } = await runRunner(ws);
-  assert.equal(exit, 2, "uncertain current key → keep + re-deliver (exit 2), never silently retire");
-  assert.match(err, /a real block/, "the durable block is re-delivered");
-  assert.equal(listBlocked(ws).length, 1, ".blocked KEPT (not deleted on uncertainty — no loss on transient failure)");
+  assert.equal(exit, 0, "gone target → retire, no re-wake");
+  assert.equal(listBlocked(ws).length, 0, ".blocked retired — a deleted spec must not re-wake stale blocks forever");
+  assert.doesNotMatch(err, /stale block/, "not re-delivered");
 });
 
 test("CONTENT-CHANGE retirement: a .blocked whose content changed → deleted, NOT re-delivered", async () => {

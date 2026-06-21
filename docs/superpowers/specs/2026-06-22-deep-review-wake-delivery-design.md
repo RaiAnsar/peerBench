@@ -1,6 +1,6 @@
 # Deep-review wake delivery — never let a blocking review rot while the agent is idle
 
-**Status:** design (awaiting approval)
+**Status:** IMPLEMENTED & shipped (65e3f20 → dd13b5c → ee2f576 + follow-up fixes). This documents the **as-built** design — sections phrased as "currently X → change to Y" record the change that *was made*; the code is now in the Y state.
 **Date:** 2026-06-22
 **Priority:** HIGH — live reliability bug in the existing deep reviews (Capabilities G + H).
 
@@ -32,10 +32,10 @@ Deliver a blocking deep-review finding to the agent **reliably, even when the ag
 
 ## Core mechanism
 
-Two roles, exactly **one** async hook:
+Two roles. Deep-review delivery uses exactly **one dedicated** async hook (note: the per-turn `stop-review.mjs` gate is ALSO `asyncRewake` — for its own code-block rewake — so there are two `asyncRewake` Stop hooks in the repo; the runner below is the only one responsible for DEEP-review delivery):
 
 - **The fast gates stay SYNCHRONOUS and behaviorally unchanged.** They keep their inline fast-panel feedback; their ONLY change is to **enqueue a deep-review job** instead of launching a detached worker. They do NOT become `asyncRewake`; they do NOT run the deep review inline.
-- **One harness-tracked `asyncRewake` Stop hook — `deep-review-runner.mjs` (new)** is the sole async host. At each turn end it claims a batch of queued jobs, runs them concurrently in the background (Claude keeps working), and on a HIGH-severity block writes the findings to **stderr and exits 2** → the harness wakes the agent immediately, even if idle (`rewakeMessage` lead-in).
+- **The harness-tracked `asyncRewake` Stop hook `deep-review-runner.mjs`** is the async host for deep-review delivery. At each turn end it claims a batch of queued jobs, runs them concurrently in the background (Claude keeps working), and on a HIGH-severity block writes the findings to **stderr and exits 2** → the harness wakes the agent immediately, even if idle (`rewakeMessage` lead-in).
 
 No `detached`/`unref`/`stdio:"ignore"` anywhere. The runner process IS the review; the harness tracks its exit. This is the docs' supported "async work must re-engage an idle agent" pattern (Stop + `asyncRewake` + exit 2), symmetric for G and H.
 

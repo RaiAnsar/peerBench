@@ -5,7 +5,7 @@ import fs from "node:fs"; import os from "node:os"; import path from "node:path"
 
 process.env.BENCH_ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "dq-root-")));
 
-import { enqueue, listJobs, listBlocked, claim, requeue, recoverOrphans, markBlocked, deleteJob, currentContentKey } from "../global-hooks/deep-queue.mjs";
+import { enqueue, listJobs, listBlocked, claim, requeue, recoverOrphans, markBlocked, deleteJob, currentContentKey, GONE } from "../global-hooks/deep-queue.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 
@@ -115,7 +115,7 @@ test("deleteJob removes a file", () => {
   assert.equal(listJobs(ws).length, 0);
 });
 
-test("currentContentKey: spec re-reads the file; push uses HEAD; missing file → null", () => {
+test("currentContentKey: spec re-reads the file; DELETED spec → GONE; push uses HEAD; git fail → null", () => {
   const ws = freshWs();
   const file = path.join(ws, "s.md");
   fs.writeFileSync(file, "v1");
@@ -123,7 +123,19 @@ test("currentContentKey: spec re-reads the file; push uses HEAD; missing file �
   assert.equal(currentContentKey(ws, job), deepKey(file, "v1"));
   fs.writeFileSync(file, "v2");
   assert.equal(currentContentKey(ws, job), deepKey(file, "v2"), "reflects new content (change detection)");
-  assert.equal(currentContentKey(ws, { kind: "spec", specPath: "/no/such/file.md" }), null, "missing file → null");
+  assert.equal(currentContentKey(ws, { kind: "spec", specPath: "/no/such/file.md" }), GONE, "deleted/absent spec → GONE (definitive → retire)");
   assert.equal(currentContentKey(ws, { kind: "push", range: "a..b" }, { gitImpl: () => ["HEADSHA", true] }), deepKey("push:a..b", "HEADSHA"));
-  assert.equal(currentContentKey(ws, { kind: "push", range: "a..b" }, { gitImpl: () => ["", false] }), null, "git fail → null");
+  assert.equal(currentContentKey(ws, { kind: "push", range: "a..b" }, { gitImpl: () => ["", false] }), null, "git fail → null (transient → keep)");
+});
+
+test("recoverOrphans: a stale .claimed whose .blocked already exists is DROPPED, not requeued (markBlocked crash window)", () => {
+  const ws = freshWs();
+  const dir = qdir(ws); fs.mkdirSync(dir, { recursive: true });
+  // Simulate the crash window: markBlocked wrote .blocked but didn't delete the claim before crashing.
+  fs.writeFileSync(path.join(dir, "ck.blocked"), JSON.stringify({ kind: "spec", contentKey: "ck", findings: "x" }));
+  fs.writeFileSync(path.join(dir, "ck.claimed.999999"), JSON.stringify({ kind: "spec", contentKey: "ck" }));
+  recoverOrphans(ws, { now: Date.now() });
+  assert.equal(fs.existsSync(path.join(dir, "ck.claimed.999999")), false, "leftover claim dropped (block already persisted)");
+  assert.equal(listJobs(ws).length, 0, "NOT requeued as .json → no duplicate review");
+  assert.equal(listBlocked(ws).length, 1, "the durable .blocked is untouched");
 });

@@ -107,6 +107,11 @@ export function recoverOrphans(ws, { now = Date.now(), staleMs = 25 * 60 * 1000 
   let recovered = 0;
   for (const f of files) {
     const full = path.join(dir, f);
+    const jobKey = f.replace(/\.claimed\.\d+$/, "");
+    // If a `.blocked` for this jobKey already exists, the block was persisted but the claim wasn't
+    // yet removed (crash in markBlocked's narrow write-.blocked → delete-claim window). The block is
+    // durable; drop the leftover claim instead of requeuing it → no duplicate review of a done job.
+    if (fs.existsSync(path.join(dir, `${jobKey}.blocked`))) { try { fs.rmSync(full, { force: true }); } catch { /* noop */ } continue; }
     const pid = Number(f.match(/\.claimed\.(\d+)$/)?.[1]);
     let dead = true;
     if (pid) { try { process.kill(pid, 0); dead = false; } catch (e) { dead = e && e.code !== "EPERM"; } }  // EPERM = alive, not ours
@@ -132,19 +137,30 @@ export function markBlocked(ws, jobKey, payload, { claimedPath } = {}) {
 
 export function deleteJob(p) { try { fs.rmSync(p, { force: true }); } catch { /* best-effort */ } }
 
-// Recompute a job's CURRENT content key, to detect content-change (the ONLY retirement signal for a
-// .blocked job). spec → deepKey(specPath, currentFileContent); push → deepKey(`push:<range>`, currentHEAD).
-// Returns null when the target is gone/unreadable (treated as "changed" by the caller).
-export function currentContentKey(ws, job, { gitImpl = gitDefault, readImpl = (p) => fs.readFileSync(p, "utf8") } = {}) {
+// Sentinel: the job's target is DEFINITIVELY gone (a deleted spec file) → the block is moot and the
+// caller should RETIRE it. Distinct from `null`, which means "couldn't determine — transient error"
+// (the caller KEEPS the block on null so a transient failure never loses a completed finding).
+export const GONE = "__deep_target_gone__";
+
+// Recompute a job's CURRENT content key, to detect content-change (a retirement signal for a .blocked
+// job). spec → deepKey(specPath, currentFileContent); push → deepKey(`push:<range>`, currentHEAD).
+// Returns GONE when the target is definitively absent (deleted spec → retire), or null when it can't
+// be determined (transient: an unreadable-but-present spec, or a failed `git rev-parse` → KEEP).
+export function currentContentKey(ws, job, {
+  gitImpl = gitDefault,
+  readImpl = (p) => fs.readFileSync(p, "utf8"),
+  existsImpl = (p) => fs.existsSync(p)
+} = {}) {
   if (job.kind === "push") {
     const [head, ok] = gitImpl(["rev-parse", "HEAD"], ws);
-    if (!ok || !head) return null;
+    if (!ok || !head) return null;          // transient git failure → uncertain → KEEP (never lose on a blip)
     return deepKey(`push:${job.range}`, head);
   }
-  // spec (default) — key on the FULL current file content, identically to the enqueue + the deep
+  // spec (default) — keyed on the FULL current file content, identically to the enqueue + the deep
   // run, so an unchanged spec (any size) yields the same key (no false retire) and a change anywhere
   // (incl. beyond any prompt cap) is detected.
+  if (!existsImpl(job.specPath)) return GONE; // deleted spec → definitively gone → RETIRE (block is moot)
   let content;
-  try { content = readImpl(job.specPath); } catch { return null; }
+  try { content = readImpl(job.specPath); } catch { return null; }   // present but unreadable → transient → KEEP
   return deepKey(job.specPath, content);
 }

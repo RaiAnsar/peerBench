@@ -27,22 +27,19 @@ gets the findings and fixes them); **ALLOW** shows a brief status line.
 The panel is **AND-pass**: any reviewer's `BLOCK:` blocks; if a reviewer errors, the
 others decide; only if all error does the gate fail open (with a visible note).
 
-**Auto deep-review on spec save (capability G).** When the fast plan/spec gate ALLOWs a
-`**/plans/*.md` · `**/specs/*.md` save, it also launches a **detached, debounced** deep pass
-(`bench-runner.mjs spec-review <abs-path> --ws <abs-ws>`) that reviews the plan **against the
-real repository** (repo-aware, read-only). It never blocks the save. The pass writes
-`deep-result-<contentHash>.json` to the workspace state dir **on completion** (absence means
-"not done yet" — no "pending" lie). At your **next stop**, the Stop gate surfaces
-`⛩ deep spec review: <badge> <summary> (trace <id>)` and deletes the file — or rewakes (exit 2)
-if findings are high-severity. If the spec changed since the pass ran, the note says it may be
-**stale**. Disabling the bench (`/bench:off`) suppresses surfacing too (checked first).
-
-> **Manual smoke test (G6).** Detached-child survival across the hook runner's process-group
-> teardown is POSIX `detached:true` + `unref()` and is harness-dependent — the unit tests mock
-> `spawn`. To verify real survival end-to-end after a deploy: save a `specs/x.md` file, confirm
-> the fast `⛩ plan panel: ALLOW …` line, wait for the background pass to finish (a
-> `deep-result-*.json` appears under the workspace state dir), then end a turn and confirm the
-> `⛩ deep spec review: …` line surfaces and the result file is consumed.
+**Auto deep-review on spec save + push (capabilities G & H).** When the fast plan/spec gate ALLOWs
+a `**/plans/*.md` · `**/specs/*.md` save (**G**), or the pre-push gate clears a `git push` (**H**),
+it **enqueues** a deep-review job to a crash-safe queue (`deep-queue/`); it never blocks the
+save/push. At the next turn end, the `asyncRewake` Stop runner (`deep-review-runner.mjs`) claims
+queued jobs, runs the deep panel **against the real repository** (repo-aware, read-only)
+concurrently, and on a **high-severity** block writes the findings to stderr + **exits 2 — which
+wakes Claude immediately, even if the session has gone idle** (the key property; a detached worker
+surfaced only at the next stop could never wake an idle agent). The job lifecycle is crash-safe:
+atomic-rename states (`.json` queued → `.claimed.<pid>` running → `.blocked` durable), a completed
+block is retired ONLY when its content changes (the agent addresses it) or the target is deleted —
+never lost on a crash, transient git error, or large file. Disabling the bench (`/bench:off`) skips
+the runner. (This replaced an earlier detached-worker + `deep-result` + next-stop-surfacing design
+that could not wake an idle agent — see `docs/superpowers/specs/2026-06-22-deep-review-wake-delivery-design.md`.)
 
 **2. Bug hunt (on demand).** `/bench:hunt [focus]` runs the panel **agentically** —
 each reviewer explores the repository read-only via tools (read_file, grep, glob,

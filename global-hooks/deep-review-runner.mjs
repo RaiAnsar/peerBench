@@ -13,7 +13,7 @@ import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { shouldRewake } from "./deep-review.mjs";
 import { runSpecReview as defaultRunSpecReview, runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 import {
-  recoverOrphans, listBlocked, listJobs, claim, requeueForRetry, markBlocked, deleteJob, currentContentKey
+  recoverOrphans, listBlocked, listJobs, claim, requeueForRetry, markBlocked, deleteJob, currentContentKey, GONE
 } from "./deep-queue.mjs";
 
 export const MAX_BATCH = 3;                     // claim+run at most this many CONCURRENTLY per invocation — a safety bound
@@ -65,11 +65,12 @@ export async function runMain({
   for (const b of safe(() => listBlocked(ws), [])) {
     let cur = null;
     try { cur = currentContentKey(ws, b); } catch { cur = null; }
-    // Retire ONLY on a CONFIRMED content change: a valid current key that DIFFERS from the stored one.
-    // `cur === null` means we could NOT determine the current key (transient `git rev-parse` failure
-    // for a push job, or an unreadable spec) — do NOT delete a durable completed block on uncertainty
-    // (that would lose a HIGH finding on a transient error); keep it and re-check next Stop.
-    if (cur !== null && cur !== b.contentKey) { deleteJob(b._path); continue; }   // confirmed change → retired
+    // Retire on a DEFINITIVELY-gone target (deleted spec → GONE; the block is moot) OR a CONFIRMED
+    // content change (a valid current key that DIFFERS). `cur === null` means we could NOT determine
+    // the current key (transient `git rev-parse` failure, or a present-but-unreadable spec) — do NOT
+    // delete a durable completed block on uncertainty (that would lose a HIGH finding on a transient
+    // error); keep it and re-check next Stop.
+    if (cur === GONE || (cur !== null && cur !== b.contentKey)) { deleteJob(b._path); continue; }   // gone or confirmed change → retired
     const findings = b.findings || b.summary || "(deep block)";
     if ((now - (Number(b.firstBlockedTs) || 0)) < WAKE_WINDOW_MS) wake.push(findings);
     else advisory.push(findings);   // KEEP the file — never deleted by elapsed time
