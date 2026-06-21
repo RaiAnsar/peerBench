@@ -142,15 +142,21 @@ async function main() {
     const ws = workspaceRoot(cwd);
     const cfg = resolveConfig({ env: process.env });
     const codexFound = !!latestCodexRoot();
-    const kimiKey = !!process.env.KIMI_API_KEY;
-    const mimoKey = !!process.env.MIMO_API_KEY;
     const disabled = isBenchDisabled(ws);
     const settingsPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "settings.json");
+    // Report key status for the ACTIVE reviewers only, sourced the way the gates read them
+    // (resolveConfig merges env + companion.json/.keys). Hardcoded KIMI/MIMO env checks were
+    // misleading after the registry change — they named a disabled model and hid GLM/Qwen.
+    const keyLines = cfg.reviewers
+      .filter((name) => name !== "codex")
+      .map((name) => {
+        const p = cfg.providers[name];
+        return `  ${name}: ${p?.apiKey ? "key present" : "key MISSING"} (model ${p?.model || "?"})`;
+      });
     const lines = [
       `Active reviewers: ${cfg.reviewers.join(", ")}`,
-      `KIMI_API_KEY: ${kimiKey ? "present" : "missing"}`,
-      `MIMO_API_KEY: ${mimoKey ? "present" : "missing"}`,
       `Codex plugin: ${codexFound ? "found" : "not found"}`,
+      ...keyLines,
       `Bench disabled: ${disabled ? "yes" : "no"}`,
       setupStatus(settingsPath),
       `Hint: /bench:reviewers to change reviewers | /bench:off to disable | /bench:on to re-enable`

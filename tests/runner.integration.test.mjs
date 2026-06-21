@@ -46,9 +46,8 @@ test("setup reports bench health without throwing", () => {
   const { out } = run(["setup"]);
   assert.match(out, /Active reviewers/);
   assert.match(out, /Bench disabled/);
-  assert.match(out, /KIMI_API_KEY/);
-  assert.match(out, /MIMO_API_KEY/);
   assert.match(out, /Codex plugin/);
+  assert.match(out, /key (present|MISSING)/, "reports per-active-reviewer key status");
 });
 
 test("review subcommand runs panel and prints combined result (no-key fail-open)", () => {
