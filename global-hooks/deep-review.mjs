@@ -1,15 +1,9 @@
 // global-hooks/deep-review.mjs
-// Shared helpers for capability G — the auto deep spec/plan review.
-//
-// Two files live under workspaceStateDir(ws):
-//   deep-debounce            JSON { hash, ts } — last content hash a deep pass was launched for
-//   deep-result-<hash>.json  JSON written ON COMPLETION by the detached spec-review pass
-//
-// G4: absence of a deep-result file means "not done yet" — there is no "pending" lie.
+// Shared PURE helpers for the deep spec/plan/push review — severity parsing, the (path,content)
+// dedup key, result summarization, and the rewake threshold. The delivery mechanism (queue +
+// asyncRewake Stop runner) lives in deep-queue.mjs + deep-review-runner.mjs; the old detached
+// deep-result file channel + debounce markers were retired (they could never wake an idle agent).
 import { createHash } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import { workspaceStateDir } from "./config-store.mjs";
 
 // Severity ladder — higher rank is more severe. Unknown/none → 0.
 export const SEVERITY_RANK = { none: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -74,76 +68,13 @@ export function shouldRewake({ maxSeverity, findingCount } = {}) {
   return severityRank(maxSeverity) >= severityRank(DEEP_REWAKE_SEVERITY) && (Number(findingCount) || 0) > 0;
 }
 
-export function deepResultPath(ws, hash) {
-  return path.join(workspaceStateDir(ws), `deep-result-${hash}.json`);
-}
-
-export function deepDebouncePath(ws) {
-  return path.join(workspaceStateDir(ws), "deep-debounce");
-}
-
-// G3: skip launching a deep pass if one for this exact content hash ran/launched within `intervalMs`.
-export function isDeepDebounced(ws, hash, { intervalMs = 5 * 60 * 1000, now = Date.now() } = {}) {
-  try {
-    const j = JSON.parse(fs.readFileSync(deepDebouncePath(ws), "utf8"));
-    return j.hash === hash && (now - (j.ts || 0)) < intervalMs;
-  } catch {
-    return false;   // no marker (or unreadable) → not debounced
-  }
-}
-
-export function markDeepDebounce(ws, hash, { now = Date.now() } = {}) {
-  const file = deepDebouncePath(ws);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify({ hash, ts: now }));
-}
-
-export function writeDeepResult(ws, result) {
-  const file = deepResultPath(ws, result.hash);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  // Atomic-ish: write then rename so a reader never sees a half-written file.
-  const tmp = `${file}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, `${JSON.stringify(result, null, 2)}\n`);
-  fs.renameSync(tmp, file);
-  return file;
-}
-
-// G5: find the single most-recent completed deep-result file for this workspace.
-// Returns { file, result } or null.
-export function readLatestDeepResult(ws) {
-  const dir = workspaceStateDir(ws);
-  let files;
-  try {
-    files = fs.readdirSync(dir).filter((f) => /^deep-result-.*\.json$/.test(f) && !f.includes(".tmp."));
-  } catch {
-    return null;
-  }
-  if (!files.length) return null;
-  // Newest by mtime so the freshest completed pass surfaces first.
-  files.sort((a, b) => {
-    let ta = 0, tb = 0;
-    try { ta = fs.statSync(path.join(dir, a)).mtimeMs; } catch { /* gone */ }
-    try { tb = fs.statSync(path.join(dir, b)).mtimeMs; } catch { /* gone */ }
-    return tb - ta;
-  });
-  const file = path.join(dir, files[0]);
-  try {
-    // FIX 3: defensively cap the read — an absurdly large result file is treated as corrupt
-    // (a deep-result is small structured JSON; megabytes means something went wrong).
-    if (fs.statSync(file).size > 256 * 1024) throw new Error("deep-result too large");
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    // FIX 2: valid JSON `null` (or an array/non-object) parses fine but would crash
-    // surfaceDeepResult at `result.specPath`, leaving the file undeleted → the gate
-    // re-throws every future stop. Require a non-null plain object so the catch drops it.
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("deep-result not an object");
-    return { file, result: parsed };
-  } catch {
-    // Corrupt result file — remove it so it never wedges the stop gate.
-    try { fs.rmSync(file, { force: true }); } catch { /* noop */ }
-    return null;
-  }
-}
-
-export function deleteDeepResult(file) {
-  try { fs.rmSync(file, { force: true }); } catch { /* best-effort */ }
+// Aggregate the per-reviewer `findings` of every BLOCKING reviewer into one string for delivery.
+// NOTE: deep-panel result objects (hunt.mjs) carry `findings` (NOT `raw`/`firstLine`), so this does
+// NOT route through combinePanel — it joins the blocking reviewers' `findings` directly.
+export function aggregateFindings(results) {
+  return (Array.isArray(results) ? results : [])
+    .filter((r) => String(r.verdict).toUpperCase() === "BLOCK")
+    .map((r) => `[${r.name}]\n${String(r.findings || "").trim()}`)
+    .join("\n\n")
+    .trim();
 }

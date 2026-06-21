@@ -338,129 +338,88 @@ test("severity-gate: a HIGH-severity BLOCK still blocks (rewake, exit 2)", async
 });
 
 // ===========================================================================
-// Task 10 — G2/G3: fast ALLOW → debounced detached spec-review spawn
+// Fast ALLOW → ENQUEUE a deep spec-review job (no detached spawn, no inline review)
 // ===========================================================================
 
-import { workspaceStateDir } from "../global-hooks/config-store.mjs";
-import { isDeepDebounced, deepKey } from "../global-hooks/deep-review.mjs";
+import { deepKey } from "../global-hooks/deep-review.mjs";
+import { listJobs } from "../global-hooks/deep-queue.mjs";
 
 function allowReviewers() {
   return () => [{ name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) }];
 }
 
-// A spawn spy that records calls and returns a child-like object with unref().
-function spawnSpy() {
-  const calls = [];
-  let unrefCount = 0;
-  const impl = (cmd, args, opts) => {
-    calls.push({ cmd, args, opts });
-    return { unref: () => { unrefCount += 1; } };
-  };
-  return { impl, calls, unrefCount: () => unrefCount };
-}
-
-test("G2/G3: fast ALLOW spawns spec-review detached + unref'd with abs path + abs ws", async () => {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g2-"));
+test("fast ALLOW ENQUEUES a kind:'spec' job keyed by (path,content) — no spawn, no inline review", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enq-"));
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
-  const body = "# Spec\n\nG2 body content.\n";
+  const body = "# Spec\n\nenqueue body content.\n";
   fs.writeFileSync(specFile, body);
 
-  const spy = spawnSpy();
   await runMain({
     resolveReviewersImpl: allowReviewers(),
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
-    spawnImpl: spy.impl,
     input: { cwd: ws, tool_input: { file_path: specFile } }
   });
 
-  assert.equal(spy.calls.length, 1, "fast ALLOW must spawn spec-review exactly once");
-  const { cmd, args, opts } = spy.calls[0];
-  assert.equal(cmd, process.execPath, "must spawn node (process.execPath)");
-  // FIX 1 (deploy-parity): the worker is the SIBLING global-hooks/spec-review-run.mjs,
-  // not `bench-runner.mjs spec-review` (scripts/ is never deployed). args[0] = worker path.
-  assert.match(args[0], /spec-review-run\.mjs$/, `args[0] must be the spec-review-run worker; got ${JSON.stringify(args)}`);
-  assert.ok(fs.existsSync(args[0]), `the spawned worker must actually exist on disk; got ${args[0]}`);
-  assert.equal(args[1], specFile, "args[1] must be the absolute spec path");
-  const wsIdx = args.indexOf("--ws");
-  assert.ok(wsIdx >= 0 && args[wsIdx + 1] === ws, `must pass --ws <abs ws>; got ${JSON.stringify(args)}`);
-  assert.ok(path.isAbsolute(args[wsIdx + 1]), "ws must be absolute");
-  assert.equal(opts.detached, true, "must be detached");
-  assert.equal(opts.stdio, "ignore", "stdio must be ignore");
-  assert.equal(spy.unrefCount(), 1, "child must be unref'd");
-
-  // The debounce marker must now be set for this (file, content) deep key (FIX 4).
-  assert.equal(isDeepDebounced(ws, deepKey(specFile, body)), true, "debounce marker must be set after launch");
+  const jobs = listJobs(ws);
+  assert.equal(jobs.length, 1, "fast ALLOW must enqueue exactly one deep job");
+  assert.equal(jobs[0].kind, "spec");
+  assert.equal(jobs[0].specPath, specFile);
+  assert.equal(jobs[0].contentKey, deepKey(specFile, body), "job is keyed by (path, content)");
 });
 
-test("G3: identical-content re-save within the interval → NOT spawned (debounced)", async () => {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g3-"));
+test("enqueue dedupes — identical content re-save does not double-queue", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enqdedup-"));
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
   fs.writeFileSync(specFile, "# Spec\n\nsame body.\n");
-
-  const spy = spawnSpy();
   const opts = {
     resolveReviewersImpl: allowReviewers(),
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
-    spawnImpl: spy.impl,
     input: { cwd: ws, tool_input: { file_path: specFile } }
   };
   await runMain(opts);
-  assert.equal(spy.calls.length, 1, "first ALLOW spawns");
+  assert.equal(listJobs(ws).length, 1);
 
-  // Remove the fast-gate allowMarker so the SECOND save re-reviews (otherwise the
-  // dedup-skip path returns before reaching the deep launch). This isolates the
-  // deep-debounce behaviour: same content re-reviewed → fast ALLOW again → but
-  // the deep pass must NOT relaunch because the debounce marker is fresh.
-  // (Distinct lock dir each call: mtime changes per write, so locks don't collide.)
-  fs.writeFileSync(specFile, "# Spec\n\nsame body.\n");
-  // Clear the fast allow marker so we re-review.
+  // Re-save identical content; clear the fast allow marker so we re-review and reach enqueue again.
   const { createHash } = await import("node:crypto");
   const locksRoot = path.join(os.tmpdir(), "plan-gate-locks");
   const fileKey = createHash("sha1").update(specFile).digest("hex");
   try { fs.rmSync(path.join(locksRoot, `allow-${fileKey}`), { force: true }); } catch { /* noop */ }
-  // Also clear any lock dir so we don't get the in-flight lock early-return.
+  fs.writeFileSync(specFile, "# Spec\n\nsame body.\n");
   await runMain(opts);
-  assert.equal(spy.calls.length, 1, "identical content within interval must NOT relaunch the deep pass");
+  assert.equal(listJobs(ws).length, 1, "identical content must not double-queue (enqueue dedupes by contentKey)");
 });
 
-test("G2: dedup-hit (content identical to last approved) → NOT spawned", async () => {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g2dedup-"));
+test("dedup-hit (content identical to last approved) → deep enqueue NOT reached", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enq-deduphit-"));
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
   fs.writeFileSync(specFile, "# Spec\n\ndedup body.\n");
-
-  const spy = spawnSpy();
   const opts = {
     resolveReviewersImpl: allowReviewers(),
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
-    spawnImpl: spy.impl,
     input: { cwd: ws, tool_input: { file_path: specFile } }
   };
-  // First ALLOW sets the fast allowMarker AND launches the deep pass.
-  await runMain(opts);
-  assert.equal(spy.calls.length, 1);
-
-  // Second save, IDENTICAL content → hits the dedup-skip path (approvalKey matches).
-  // The deep pass must NOT launch from a dedup hit (spec G2), regardless of debounce.
-  const spy2 = spawnSpy();
-  await runMain({ ...opts, spawnImpl: spy2.impl });
-  assert.equal(spy2.calls.length, 0, "dedup-hit must not launch a deep pass");
+  await runMain(opts);   // first ALLOW enqueues + sets the approval marker
+  // Second save, IDENTICAL content → hits the dedup-skip path (approvalKey matches) BEFORE enqueue.
+  let enqCalled = false;
+  await runMain({ ...opts, enqueueDeepReviewImpl: () => { enqCalled = true; return true; } });
+  assert.equal(enqCalled, false, "a dedup-hit (approvalKey match) must return before the deep enqueue");
 });
 
-test("G2: spawn failure does not break the gate (fail-open, ALLOW still emitted)", async () => {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-g2err-"));
+test("enqueue failure does not break the gate (fail-open, ALLOW still emitted)", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enqerr-"));
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
-  fs.writeFileSync(specFile, "# Spec\n\nspawn err body.\n");
+  fs.writeFileSync(specFile, "# Spec\n\nenqueue err body.\n");
 
   const lines = [];
   const orig = process.stdout.write.bind(process.stdout);
@@ -470,14 +429,14 @@ test("G2: spawn failure does not break the gate (fail-open, ALLOW still emitted)
       resolveReviewersImpl: allowReviewers(),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
-      spawnImpl: () => { throw new Error("spawn EACCES"); },
+      enqueueDeepReviewImpl: () => { throw new Error("enqueue boom"); },
       input: { cwd: ws, tool_input: { file_path: specFile } }
     });
   } finally {
     process.stdout.write = orig;
   }
   const parsed = JSON.parse(lines.find((l) => l.trim()));
-  assert.match(parsed.systemMessage || "", /ALLOW/, "ALLOW must still be emitted even if the deep launch throws");
+  assert.match(parsed.systemMessage || "", /ALLOW/, "ALLOW must still be emitted even if the deep enqueue throws");
 });
 
 // ===========================================================================

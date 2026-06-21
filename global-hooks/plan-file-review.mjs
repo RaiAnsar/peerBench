@@ -12,42 +12,24 @@ import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { deepKey, isDeepDebounced, markDeepDebounce, parseSeverity } from "./deep-review.mjs";
-import { execFileSync, spawn as defaultSpawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { deepKey, parseSeverity } from "./deep-review.mjs";
+import { enqueue } from "./deep-queue.mjs";
+import { execFileSync } from "node:child_process";
 
 function workspaceRoot(cwd) {
   try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
   catch { return cwd; }
 }
 
-// FIX 1 (deploy-parity): the deep spec-review WORKER is a SIBLING global-hooks file.
-// Deployed hooks live flat in ~/.claude/hooks/ — only global-hooks/*.mjs are copied
-// there; scripts/ is never deployed. Resolving the worker relative to this file works
-// BOTH in-repo and in the deployed flat layout.
-function resolveDeepWorker() {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), "spec-review-run.mjs");
-}
-
-// G2/G3 — after a fast ALLOW (NOT a dedup-hit), launch the deep spec-review pass
-// detached + unref'd, debounced on the (path,content) key so an identical re-save
-// within the interval does not relaunch. Never throws — the fast gate has already allowed.
-export function launchDeepReview(ws, filePath, content, { spawnImpl = defaultSpawn, now = Date.now() } = {}) {
+// After a fast ALLOW, ENQUEUE a deep spec-review job for the asyncRewake Stop runner
+// (deep-review-runner.mjs). No detached spawn, no inline review — enqueue dedupes by the
+// (path,content) key so an identical re-save doesn't double-queue. Never throws (the fast gate
+// has already allowed). Returns true if newly enqueued, false if deduped.
+export function enqueueDeepReview(ws, filePath, content) {
   try {
-    const worker = resolveDeepWorker();
-    if (!fs.existsSync(worker)) {
-      // Loud, never a silent no-op: the fast review stands but the deep pass is skipped.
-      process.stderr.write("⛩ plan gate: deep spec-review worker missing; fast review stands.\n");
-      return false;
-    }
-    const key = deepKey(filePath, content);   // FIX 4: (path,content)-keyed — distinct files with identical content don't collide
-    if (isDeepDebounced(ws, key, { now })) return false;   // a deep pass for this exact (file,content) ran/launched recently
-    markDeepDebounce(ws, key, { now });
-    const child = spawnImpl(process.execPath, [worker, filePath, "--ws", ws], { detached: true, stdio: "ignore" });
-    if (child && typeof child.unref === "function") child.unref();
-    return true;
+    return enqueue(ws, { kind: "spec", specPath: filePath, contentKey: deepKey(filePath, content) });
   } catch (e) {
-    process.stderr.write(`⛩ plan gate: deep spec-review launch failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
+    process.stderr.write(`⛩ plan gate: deep-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
     return false;
   }
 }
@@ -99,7 +81,7 @@ export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
-  spawnImpl = defaultSpawn,
+  enqueueDeepReviewImpl = enqueueDeepReview,
   input: inputOverride,
   emitter = createEmitter()
 } = {}) {
@@ -237,9 +219,10 @@ export async function runMain({
   } catch {
     // skip-marker is best-effort
   }
-  // G2/G3 — fast ALLOW (and NOT a dedup-hit: that path returned above): launch the
-  // detached, debounced deep spec-review against the real repo. Never blocks the save.
-  launchDeepReview(ws, filePath, content, { spawnImpl });
+  // Fast ALLOW (and NOT a dedup-hit: that path returned above): ENQUEUE the deep spec-review
+  // for the asyncRewake Stop runner. Never blocks the save; never spawns a detached worker.
+  try { enqueueDeepReviewImpl(ws, filePath, content); }
+  catch (e) { process.stderr.write(`⛩ plan gate: deep-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`); }
   // Sub-threshold BLOCKs (medium/low) allow the save but surface as advisories, not a block.
   const advisoryNote = panel.advisories && panel.advisories.length
     ? ` — advisories (not blocking): ${panel.advisories.join(" · ").slice(0, 220)}`

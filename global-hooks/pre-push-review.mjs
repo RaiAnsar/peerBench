@@ -4,47 +4,27 @@
 // (ahead-of-remote commits) with the full panel content-only. On BLOCK: deny
 // the Bash tool with findings so Claude fixes first. Fails OPEN everywhere —
 // only a real panel BLOCK prevents the push.
-import { execFileSync, spawn as defaultSpawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled, readReviewedHead, writeReviewedHead } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { deepKey, isDeepDebounced, markDeepDebounce } from "./deep-review.mjs";
+import { deepKey } from "./deep-review.mjs";
+import { enqueue } from "./deep-queue.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
 
-// H (deploy-parity): the deep push-review WORKER is a SIBLING global-hooks file. Deployed
-// hooks live flat in ~/.claude/hooks/ — only global-hooks/*.mjs are copied there; scripts/
-// is never deployed. Resolving the worker relative to this file works BOTH in-repo and in
-// the deployed flat layout. Mirrors plan-file-review's resolveDeepWorker.
-function resolvePushWorker() {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), "spec-review-run.mjs");
-}
-
-// H — after a fast ALLOW, launch the deep, repo-aware push-review against the pushed commits
-// detached + unref'd, debounced on deepKey(`push:<range>`, headSha) so the same push isn't
-// re-reviewed within the window. NEVER blocks or delays the push (fire-and-forget); never
-// throws (the fast gate has already allowed). spawnImpl/gitImpl are injectable for tests.
-export function launchPushReview(ws, range, { spawnImpl = defaultSpawn, gitImpl = gitTry, now = Date.now() } = {}) {
+// H — after a fast ALLOW, ENQUEUE the deep, repo-aware push-review for the asyncRewake Stop runner.
+// No detached spawn. The range is PINNED to concrete SHAs NOW — we run (PreToolUse) BEFORE the actual
+// `git push`, which then advances the remote-tracking ref (@{u}/origin/<branch>) to HEAD; a SYMBOLIC
+// `<ref>..HEAD` would resolve to EMPTY by the time the runner reviews it. SHAs are immutable, so the
+// runner reviews the exact pushed commits regardless of timing. enqueue dedupes on the pinned range +
+// pushed HEAD. Never throws (the fast gate has already allowed). gitImpl is injectable for tests.
+export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now() } = {}) {
   try {
-    const worker = resolvePushWorker();
-    if (!fs.existsSync(worker)) {
-      // Loud, never a silent no-op: the fast review stands but the deep pass is skipped.
-      process.stderr.write("⛩ pre-push: deep push-review worker missing; fast review stands.\n");
-      return false;
-    }
     const [headSha] = gitImpl(["rev-parse", "HEAD"], ws);
-    const key = deepKey(`push:${range}`, headSha);
-    if (isDeepDebounced(ws, key, { now })) return false;   // same push reviewed/launched recently
-    markDeepDebounce(ws, key, { now });
-    // PIN the range to concrete SHAs NOW — before the push runs. We launch (PreToolUse) BEFORE the
-    // actual `git push`, which then advances the remote-tracking ref (@{u}/origin/<branch>) to HEAD;
-    // a SYMBOLIC `<ref>..HEAD` would resolve to EMPTY by the time the detached worker runs, reviewing
-    // nothing. SHAs are immutable, so the worker reviews the exact pushed commits regardless of timing.
-    // (deepKey above keeps the symbolic range for stable dedupe.)
     let reviewRange = range;
     const dd = range.indexOf("..");
     if (dd > 0) {
@@ -52,11 +32,10 @@ export function launchPushReview(ws, range, { spawnImpl = defaultSpawn, gitImpl 
       const [srcSha, srcOk] = gitImpl(["rev-parse", range.slice(dd + 2)], ws);
       if (baseOk && srcOk && baseSha && srcSha) reviewRange = `${baseSha}..${srcSha}`;
     }
-    const child = spawnImpl(process.execPath, [worker, "--push", reviewRange, "--ws", ws], { detached: true, stdio: "ignore" });
-    if (child && typeof child.unref === "function") child.unref();
-    return true;
+    const contentKey = deepKey(`push:${reviewRange}`, headSha);
+    return enqueue(ws, { kind: "push", range: reviewRange, contentKey }, { now });
   } catch (e) {
-    process.stderr.write(`⛩ pre-push: deep push-review launch failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
+    process.stderr.write(`⛩ pre-push: deep push-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
     return false;
   }
 }
@@ -401,7 +380,6 @@ export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
-  spawnImpl = defaultSpawn,
   launchImpl = launchPushReview,
   env = process.env,
   input: inputOverride,
@@ -537,15 +515,14 @@ export async function runMain({
     return;
   }
 
-  // allow — H: the fast content review allowed, so ALSO launch the deep, repo-aware
-  // push-review in the background (detached + unref'd, debounced). Fire-and-forget: it
-  // never blocks or delays the push, and surfaces on the NEXT stop via the G5 mechanism.
-  // Only reached on a real ALLOW (block/fail-open/disabled/empty-range/deleteOnly all
-  // returned earlier), so this is the correct boundary.
+  // allow — H: the fast content review allowed, so ALSO ENQUEUE the deep, repo-aware push-review
+  // for the asyncRewake Stop runner (SHA-pinned range, no spawn). Never blocks or delays the push.
+  // Only reached on a real ALLOW (block/fail-open/disabled/empty-range/deleteOnly all returned
+  // earlier), so this is the correct boundary.
   try {
-    launchImpl(ws, range, { spawnImpl });
+    launchImpl(ws, range);
   } catch (e) {
-    process.stderr.write(`⛩ pre-push: deep push-review launch failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
+    process.stderr.write(`⛩ pre-push: deep push-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
   }
   decision("allow", `⛩ bench pre-push: ALLOW [${panel.badge}] — ${panel.summary}${rangeNoteSuffix}`, `⛩ bench pre-push: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}`);
 }

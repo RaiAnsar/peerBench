@@ -16,7 +16,8 @@ process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt, cdTargetBeforePush, commandCwd, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview } from "../global-hooks/pre-push-review.mjs";
 import { setBenchDisabled, readReviewedHead, writeReviewedHead } from "../global-hooks/config-store.mjs";
-import { deepKey, isDeepDebounced } from "../global-hooks/deep-review.mjs";
+import { deepKey } from "../global-hooks/deep-review.mjs";
+import { listJobs } from "../global-hooks/deep-queue.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "pre-push-review.mjs");
@@ -964,66 +965,51 @@ function launchSpy() {
   return { impl, calls };
 }
 
-test("H: fast ALLOW launches the deep push-review worker — args [<spec-review-run.mjs>, --push, <range>, --ws, <ws>], detached+unref'd, worker exists on disk", async () => {
+test("H: fast ALLOW ENQUEUES a kind:'push' job with a SHA-pinned range (no detached spawn)", async () => {
   const { ws } = freshPushRepo();
-  // runMain resolves the ws via `git rev-parse --show-toplevel`, which returns the realpath
-  // (macOS /tmp is a symlink to /private/tmp), so compare against the realpath form.
   const wsReal = fs.realpathSync(ws);
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hlaunch-")));
   process.env.BENCH_ROOT = root;
 
-  const spy = pushSpawnSpy();
   try {
     await runMain({
       resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW"), fakeReviewer("MiMo", "ALLOW")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
-      spawnImpl: spy.impl,
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
+
+    const jobs = listJobs(wsReal);
+    assert.equal(jobs.length, 1, "fast ALLOW must enqueue exactly one deep push job");
+    assert.equal(jobs[0].kind, "push");
+    // Race fix (H): the range must be PINNED to concrete SHAs at enqueue, not symbolic <ref>..HEAD.
+    assert.match(jobs[0].range, /^[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}$/, `range must be SHA-pinned; got ${jobs[0].range}`);
+    assert.ok(jobs[0].contentKey, "job carries a contentKey");
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-
-  assert.equal(spy.calls.length, 1, "fast ALLOW must launch the deep push-review exactly once");
-  const { cmd, args, opts } = spy.calls[0];
-  assert.equal(cmd, process.execPath, "must spawn node (process.execPath)");
-  // deploy-parity: the worker is the SIBLING global-hooks/spec-review-run.mjs (scripts/ never deployed).
-  assert.match(args[0], /spec-review-run\.mjs$/, `args[0] must be the spec-review-run worker; got ${JSON.stringify(args)}`);
-  assert.ok(fs.existsSync(args[0]), `the spawned worker must actually exist on disk (deploy-parity); got ${args[0]}`);
-  assert.equal(args[1], "--push", "args[1] must be --push");
-  // Race fix (H): the range must be PINNED to concrete SHAs at launch, not symbolic <ref>..HEAD
-  // (which the push would empty before the detached worker runs).
-  assert.match(args[2], /^[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}$/, `args[2] must be a SHA-pinned range; got ${args[2]}`);
-  assert.equal(args[3], "--ws", "args[3] must be --ws");
-  assert.equal(args[4], wsReal, "args[4] must be the absolute ws");
-  assert.ok(path.isAbsolute(args[4]), "ws must be absolute");
-  // Full arg shape: [worker, --push, range, --ws, ws]
-  assert.deepEqual(args.slice(1), ["--push", args[2], "--ws", wsReal], `arg shape must be [--push, <range>, --ws, <ws>]; got ${JSON.stringify(args)}`);
-  assert.equal(opts.detached, true, "must be detached");
-  assert.equal(opts.stdio, "ignore", "stdio must be ignore");
-  assert.equal(spy.unrefCount(), 1, "child must be unref'd");
 });
 
-test("H: launchPushReview pins the range to SHAs so it survives the push advancing the remote ref (the race)", () => {
+test("H: launchPushReview enqueues a SHA-pinned range that survives the push advancing the remote ref (the race)", () => {
   const { ws } = freshPushRepo();   // one commit ahead of origin/main
+  const wsReal = fs.realpathSync(ws);
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hrace-")));
   process.env.BENCH_ROOT = root;
-  const spy = pushSpawnSpy();
+  let range;
   try {
-    launchPushReview(ws, "origin/main..HEAD", { spawnImpl: spy.impl });
+    launchPushReview(ws, "origin/main..HEAD");
+    range = listJobs(wsReal)[0].range;
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-  const range = spy.calls[0].args[2];
-  assert.match(range, /^[0-9a-f]{40}\.\.[0-9a-f]{40}$/, `range must be SHA-pinned; got ${range}`);
+  assert.match(range, /^[0-9a-f]{40}\.\.[0-9a-f]{40}$/, `enqueued range must be SHA-pinned; got ${range}`);
 
   // Simulate what `git push origin main` does: advance the remote-tracking ref to HEAD.
   execFileSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: ws });
   const symbolic = execFileSync("git", ["log", "--oneline", "origin/main..HEAD"], { cwd: ws, encoding: "utf8" }).trim();
   const pinned = execFileSync("git", ["log", "--oneline", range], { cwd: ws, encoding: "utf8" }).trim();
-  assert.equal(symbolic, "", "the SYMBOLIC range is empty after the push (this is the race that was reviewing nothing)");
+  assert.equal(symbolic, "", "the SYMBOLIC range is empty after the push (the race that reviewed nothing)");
   assert.ok(pinned.length > 0, "the PINNED SHA range still contains the pushed commit (race fixed)");
 });
 
@@ -1137,40 +1123,30 @@ test("H: deleteOnly (:branch) → does NOT launch the deep push-review", async (
   assert.equal(spy.calls.length, 0, "a delete refspec pushes no commits → no deep push-review");
 });
 
-test("H: debounced — same push (range+HEAD) within the window → does NOT relaunch", async () => {
+test("H: dedup — same push (range+HEAD) → enqueue does NOT double-queue", async () => {
   const { ws } = freshPushRepo();
+  const wsReal = fs.realpathSync(ws);
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hdebounce-")));
   process.env.BENCH_ROOT = root;
 
-  const spy = pushSpawnSpy();
+  const opts = {
+    resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, tool_input: { command: "git push origin main" } }
+  };
   try {
-    // First ALLOW launches and marks the debounce.
-    await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      spawnImpl: spy.impl,
-      env: process.env,
-      input: { cwd: ws, tool_input: { command: "git push origin main" } }
-    });
-    assert.equal(spy.calls.length, 1, "first ALLOW launches");
-
-    // Second identical push (same HEAD, same range) within the window → debounced, no relaunch.
-    await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      spawnImpl: spy.impl,
-      env: process.env,
-      input: { cwd: ws, tool_input: { command: "git push origin main" } }
-    });
-    assert.equal(spy.calls.length, 1, "identical push within the interval must NOT relaunch the deep pass");
+    await runMain(opts);
+    assert.equal(listJobs(wsReal).length, 1, "first ALLOW enqueues");
+    await runMain(opts);   // identical push (same HEAD, same range) → same contentKey → deduped
+    assert.equal(listJobs(wsReal).length, 1, "identical push must NOT double-queue");
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
 });
 
-test("H: launchPushReview never blocks the push — a spawn throw is swallowed (returns false, ⛩ note)", async () => {
+test("H: launchPushReview never blocks the push — an enqueue/git throw is swallowed (returns false, ⛩ note)", () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hthrow-")));
   process.env.BENCH_ROOT = root;
@@ -1180,34 +1156,35 @@ test("H: launchPushReview never blocks the push — a spawn throw is swallowed (
   process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
   let ret;
   try {
-    ret = launchPushReview(ws, "@{u}..HEAD", { spawnImpl: () => { throw new Error("spawn EACCES"); } });
+    ret = launchPushReview(ws, "@{u}..HEAD", { gitImpl: () => { throw new Error("git EACCES"); } });
   } finally {
     process.stderr.write = origErr;
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-  assert.equal(ret, false, "a spawn throw must be swallowed (returns false), never propagated to block the push");
-  assert.match(stderrChunks.join(""), /⛩ pre-push: deep push-review launch failed/i, "must note the launch failure on stderr");
+  assert.equal(ret, false, "an internal throw must be swallowed (returns false), never propagated to block the push");
+  assert.match(stderrChunks.join(""), /⛩ pre-push: deep push-review enqueue failed/i, "must note the enqueue failure on stderr");
 });
 
-test("H: launchPushReview is debounced via deepKey(push:<range>, headSha)", () => {
+test("H: launchPushReview dedupes on the (push:range, headSha) content key — second enqueue is a no-op", () => {
   const { ws } = freshPushRepo();
+  const wsReal = fs.realpathSync(ws);
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hkey-")));
   process.env.BENCH_ROOT = root;
   try {
     const range = "@{u}..HEAD";
-    const head = "0123456789abcdef";
-    const gitImpl = (args) => (args[0] === "rev-parse" && args[1] === "HEAD") ? [head, true] : ["", true];
-    const spy = pushSpawnSpy();
+    const head = "0123456789abcdef0123456789abcdef01234567";
+    // gitImpl returns a fixed HEAD and leaves the range symbolic (no "..") so it isn't re-pinned.
+    const gitImpl = (args) => (args[0] === "rev-parse" && args[1] === "HEAD") ? [head, true] : ["", false];
 
-    const first = launchPushReview(ws, range, { spawnImpl: spy.impl, gitImpl });
-    assert.equal(first, true, "first launch proceeds");
-    assert.equal(spy.calls.length, 1);
-    // The debounce marker must be set for the (push:range, headSha) key.
-    assert.equal(isDeepDebounced(ws, deepKey(`push:${range}`, head)), true, "debounce keyed on deepKey(push:<range>, headSha)");
+    const first = launchPushReview(ws, range, { gitImpl });
+    assert.equal(first, true, "first enqueue proceeds");
+    const jobs = listJobs(wsReal);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0].contentKey, deepKey(`push:${range}`, head), "job keyed on deepKey(push:<range>, headSha)");
 
-    const second = launchPushReview(ws, range, { spawnImpl: spy.impl, gitImpl });
-    assert.equal(second, false, "second launch within the window is debounced");
-    assert.equal(spy.calls.length, 1, "no relaunch while debounced");
+    const second = launchPushReview(ws, range, { gitImpl });
+    assert.equal(second, false, "second enqueue with the same content key is a no-op (deduped)");
+    assert.equal(listJobs(wsReal).length, 1, "no second job");
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }

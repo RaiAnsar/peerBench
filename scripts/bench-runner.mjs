@@ -204,9 +204,8 @@ async function main() {
 
   if (sub === "spec-review") {
     // Usage: spec-review <abs-path> --ws <abs-ws>
-    // Detached deep pass launched by the plan-file gate (G2). Resolves the SAME
-    // workspaceStateDir as the hook by taking --ws explicitly. Never throws to the
-    // caller (it's detached + unref'd) — failures are noted on stderr only.
+    // Manual deep spec-review. Resolves the SAME workspaceStateDir as the hook by taking --ws
+    // explicitly. Prints the returned result so the manual path isn't silent.
     let filePath = null, ws = null;
     for (let i = 0; i < rest.length; i++) {
       if (rest[i] === "--ws" && i + 1 < rest.length) { ws = rest[++i]; continue; }
@@ -215,7 +214,9 @@ async function main() {
     if (!filePath) { process.stderr.write("⛩ spec-review: missing <abs-path>.\n"); process.exitCode = 1; return; }
     if (!ws) ws = workspaceRoot(path.dirname(filePath));
     try {
-      await runSpecReview(filePath, ws);
+      const result = await runSpecReview(filePath, ws);
+      const head = `⛩ spec-review [${result.badge || "?"}] — ${result.summary}${result.traceId ? ` (trace ${result.traceId})` : ""}`;
+      process.stdout.write(`${head}${result.findings ? `\n\n${result.findings}` : ""}\n`);
     } catch (e) {
       process.stderr.write(`⛩ spec-review: ${e instanceof Error ? e.message : String(e)}\n`);
     }
@@ -351,7 +352,8 @@ const SETUP_GATES = [
   { event: "PreToolUse", matcher: "ExitPlanMode", file: "plan-review.mjs" },
   { event: "PostToolUse", matcher: "Write|Edit", file: "plan-file-review.mjs" },
   { event: "PreToolUse", matcher: "Bash", file: "pre-push-review.mjs" },
-  { event: "Stop", matcher: undefined, file: "stop-review.mjs" }
+  { event: "Stop", matcher: undefined, file: "stop-review.mjs" },
+  { event: "Stop", matcher: undefined, file: "deep-review-runner.mjs" }
 ];
 
 // Inspect a settings.json and report each gate's registration honestly.

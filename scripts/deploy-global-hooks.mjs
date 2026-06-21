@@ -124,6 +124,15 @@ export function syncSettings({ hooksDir, settingsPath }) {
     rewakeMessage: "⛩ bench stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
     rewakeSummary: "⛩ bench stop"
   });
+  // The deep-review runner: a SECOND matcher-less Stop entry (register appends it alongside
+  // stop-review, each entry keeping its own opts). asyncRewake + exit 2 delivers a HIGH deep-review
+  // block even to an idle agent; timeout 1320s > the 20-min deep budget. Runs concurrently with stop-review.
+  register(s.hooks.Stop, undefined, path.join(hooksDir, "deep-review-runner.mjs"), {
+    timeout: 1320, asyncRewake: true,
+    statusMessage: "⛩ bench: deep review…",
+    rewakeMessage: "⛩ bench deep review found blocking issues. Address them, then continue:",
+    rewakeSummary: "⛩ bench deep review"
+  });
   // Drop any blocks left empty by de-duping.
   for (const ev of ["PreToolUse", "PostToolUse", "Stop"]) {
     s.hooks[ev] = (s.hooks[ev] || []).filter((b) => !Array.isArray(b.hooks) || b.hooks.length > 0);
