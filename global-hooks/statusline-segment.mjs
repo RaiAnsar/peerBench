@@ -40,32 +40,59 @@ export function renderSegment(trace, { now = Date.now() } = {}) {
   return `${col(labelColor, `⛩ ${gate}:`)} ${parts.join(" ")}`;
 }
 
-// Read the newest trace (<ts>-<hex>.json, so lexical sort == chronological) from a dir.
+// Trace filenames are `<ms-timestamp>-<hex>.json`. Read the newest by NUMERIC timestamp:
+// a lexical sort mis-ranks timestamps of different digit lengths, and a bare `.endsWith(".json")`
+// filter would also pick up stray non-trace files. Validate the shape so only real traces count.
+const TRACE_RE = /^(\d+)-[0-9a-f]+\.json$/i;
+function fileTs(name) { const m = TRACE_RE.exec(name); return m ? Number(m[1]) : -1; }
 export function latestTrace(tracesDir) {
   let files;
-  try { files = fs.readdirSync(tracesDir).filter((f) => f.endsWith(".json")); } catch { return null; }
-  if (!files.length) return null;
-  files.sort();
-  try { return JSON.parse(fs.readFileSync(path.join(tracesDir, files[files.length - 1]), "utf8")); } catch { return null; }
+  try { files = fs.readdirSync(tracesDir); } catch { return null; }
+  let bestName = null, bestTs = -1;
+  for (const f of files) {
+    const ts = fileTs(f);
+    if (ts >= 0 && ts > bestTs) { bestTs = ts; bestName = f; }
+  }
+  if (!bestName) return null;
+  try { return JSON.parse(fs.readFileSync(path.join(tracesDir, bestName), "utf8")); } catch { return null; }
 }
 
-// Hooks may key a trace by git-toplevel (stop hook) OR by cwd (plan hooks); check both, take newest.
+// A trace's own chronological key — the numeric ms prefix of its id (`<ts>-<hex>`).
+function traceTs(t) { const m = /^(\d+)-/.exec(String(t?.id || "")); return m ? Number(m[1]) : -1; }
+
+// Hooks key a trace by git-toplevel; we also check the raw dir as a fallback for the rare case
+// where git resolution fails and a hook wrote under the literal cwd. Take the chronologically
+// newest across the (de-duplicated) roots, compared NUMERICALLY (not lexically) by id timestamp.
 export function latestTraceForDir(dir, gitTopFn) {
   const roots = [];
   const top = gitTopFn ? gitTopFn(dir) : null;
   if (top) roots.push(top);
-  roots.push(dir);
+  if (dir && dir !== top) roots.push(dir);
   let best = null;
   for (const ws of roots) {
     const t = latestTrace(path.join(workspaceStateDir(ws), "traces"));
-    if (t && (!best || String(t.id || "") > String(best.id || ""))) best = t;
+    if (t && (!best || traceTs(t) > traceTs(best))) best = t;
   }
   return best;
 }
 
+// Resolve the project dir for the statusline. The wrapper passes the open project as argv[2]
+// (from stdin's workspace.current_dir). If that is missing/empty OR the literal jq sentinels
+// "null"/"undefined" (what `jq -r` emits when the key is absent), we must NOT fall through to a
+// single shared dir for every project — that is exactly the "same statusline under all projects"
+// bug. Fall back to CLAUDE_PROJECT_DIR, then cwd; reject the sentinels so a bad argv can't
+// silently collapse every window onto one state dir.
+export function resolveDir(argv2, env = process.env, cwd = process.cwd()) {
+  const bad = (v) => !v || v === "null" || v === "undefined";
+  if (!bad(argv2)) return argv2;
+  if (!bad(env?.CLAUDE_PROJECT_DIR)) return env.CLAUDE_PROJECT_DIR;
+  return cwd;
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const dir = process.argv[2] || process.cwd();
-  const gitTop = (d) => { try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: d, encoding: "utf8", timeout: 3000 }).trim(); } catch { return null; } };
+  const dir = resolveDir(process.argv[2], process.env, process.cwd());
+  // stdio: ignore git's stderr ("fatal: not a git repository") so a non-repo dir stays silent.
+  const gitTop = (d) => { try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: d, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return null; } };
   const seg = renderSegment(latestTraceForDir(dir, gitTop));
   if (seg) process.stdout.write(seg);   // statusline appends this; prints nothing if no trace
 }
