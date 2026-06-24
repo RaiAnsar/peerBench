@@ -1,6 +1,7 @@
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { disableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
 
 // ONE-TIME data-dir migration: pre-rename installs kept reviewer config + traces under
 // 'grok-companion-shared'; move it to 'bench-shared' once. No-op on fresh installs or after
@@ -122,6 +123,14 @@ export function syncStatuslineSessionArg({
 }
 
 const LEGACY = ["codex-plan-review.mjs", "codex-plan-file-review.mjs"];
+const LEGACY_COMMANDS = [
+  ...LEGACY,
+  // These belong to the older openai/codex-plugin-cc stop gate. peerBench is now the single
+  // review gate; leaving these active makes Claude surface "Codex gate: ALLOW" decisions that
+  // are based on the final assistant message instead of peerBench's diff payload.
+  "codex-multirepo-gate.mjs",
+  "codex-stop-gate-autoenable.mjs"
+];
 // Register our hook canonically AND de-dupe: remove any existing entries referencing this hook
 // FILE (matched by basename, so it catches ANY path form — $HOME, absolute, different quoting),
 // then add exactly one absolute-path entry. Idempotent + self-healing against duplicates.
@@ -157,7 +166,7 @@ export function syncSettings({ hooksDir, settingsPath }) {
     for (const entry of s.hooks[ev]) {
       if (!Array.isArray(entry.hooks)) continue;
       const before = entry.hooks.length;
-      entry.hooks = entry.hooks.filter((h) => !LEGACY.some((f) => String(h.command || "").includes(f)));
+      entry.hooks = entry.hooks.filter((h) => !LEGACY_COMMANDS.some((f) => String(h.command || "").includes(f)));
       removedEntries += before - entry.hooks.length;
     }
     s.hooks[ev] = s.hooks[ev].filter((entry) => !Array.isArray(entry.hooks) || entry.hooks.length > 0); // drop now-empty entries
@@ -286,6 +295,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const snap = snapshot({ hooksDir, settingsPath, backupDir });
   const dep = deploy({ src: path.join(here, "..", "global-hooks"), dest: hooksDir });
   const sync = syncSettings({ hooksDir, settingsPath });
+  const legacyCodexGate = disableLegacyCodexStopGateStates();
   const statusline = syncStatuslineSessionArg();
   const codexSnapshot = snapshotCodex({ hooksDir: codexHooksDir, hooksPath: codexHooksPath, backupDir: path.join(backupDir, "codex") });
   const codexDeploy = deploy({ src: path.join(here, "..", "global-hooks"), dest: codexHooksDir });
@@ -294,5 +304,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     srcDir: path.join(here, "..", "codex-prompts"),
     benchRunnerPath: path.join(here, "bench-runner.mjs")
   });
-  console.log(JSON.stringify({ origin, migrate, snapshot: snap, deploy: dep, sync, statusline, codex: { snapshot: codexSnapshot, deploy: codexDeploy, sync: codexSync, prompts: codexPrompts } }, null, 2));
+  console.log(JSON.stringify({ origin, migrate, snapshot: snap, deploy: dep, sync, legacyCodexGate, statusline, codex: { snapshot: codexSnapshot, deploy: codexDeploy, sync: codexSync, prompts: codexPrompts } }, null, 2));
 }

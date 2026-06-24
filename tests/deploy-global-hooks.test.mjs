@@ -276,20 +276,25 @@ test("syncSettings is idempotent: running twice does not duplicate any gate", ()
   assert.equal(countStop, 1, "stop-review must appear exactly once after two syncSettings calls");
 });
 
-test("syncSettings does not remove a pre-existing unrelated Stop hook", () => {
+test("syncSettings removes legacy Codex stop-gate hooks but preserves unrelated Stop hooks", () => {
   const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-stoppreserve-"));
   const settingsPath = path.join(hooks, "settings.json");
-  // Seed with an existing Stop hook (e.g. a codex multi-repo gate)
   fs.writeFileSync(settingsPath, JSON.stringify({
     hooks: {
-      Stop: [{ hooks: [{ type: "command", command: 'node "/home/user/.claude/hooks/codex-multirepo-gate.mjs"' }] }]
+      SessionStart: [{ hooks: [{ type: "command", command: 'node "/home/user/.claude/hooks/codex-stop-gate-autoenable.mjs"' }] }],
+      Stop: [{ hooks: [
+        { type: "command", command: 'node "/home/user/.claude/hooks/codex-multirepo-gate.mjs"' },
+        { type: "command", command: 'node "/home/user/.claude/hooks/unrelated-stop.mjs"' }
+      ] }]
     }
   }, null, 2));
   syncSettings({ hooksDir: hooks, settingsPath });
   const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-  // Unrelated stop hook must still be present
   const allStopCmds = s.hooks.Stop.flatMap((b) => b.hooks || []).map((h) => h.command);
-  assert.ok(allStopCmds.some((c) => c.includes("codex-multirepo-gate.mjs")), "unrelated Stop hook must be preserved");
+  const allSessionStartCmds = (s.hooks.SessionStart || []).flatMap((b) => b.hooks || []).map((h) => h.command);
+  assert.ok(!allStopCmds.some((c) => c.includes("codex-multirepo-gate.mjs")), "legacy Codex multi-repo stop gate must be removed");
+  assert.ok(!allSessionStartCmds.some((c) => c.includes("codex-stop-gate-autoenable.mjs")), "legacy Codex auto-enable hook must be removed");
+  assert.ok(allStopCmds.some((c) => c.includes("unrelated-stop.mjs")), "unrelated Stop hook must be preserved");
   assert.ok(allStopCmds.some((c) => c.includes("stop-review.mjs")), "stop-review must also be registered");
 });
 
@@ -355,7 +360,7 @@ test("syncSettings DE-DUPES pre-existing stop/pre-push entries across path forms
   const push = s.hooks.PreToolUse.flatMap((b) => b.hooks || []);
   assert.equal(stop.filter((h) => h.command.includes("stop-review.mjs")).length, 1, "stop-review collapses to exactly one");
   assert.equal(push.filter((h) => h.command.includes("pre-push-review.mjs")).length, 1, "pre-push-review collapses to exactly one");
-  assert.ok(stop.some((h) => h.command.includes("codex-multirepo-gate.mjs")), "unrelated Stop hook preserved");
+  assert.ok(!stop.some((h) => h.command.includes("codex-multirepo-gate.mjs")), "legacy Codex stop gate removed");
   const stopCmd = stop.find((h) => h.command.includes("stop-review.mjs")).command;
   assert.ok(stopCmd.includes(path.join(hooks, "stop-review.mjs")) && !stopCmd.includes("$HOME"), "canonical entry uses the absolute deploy path");
 });

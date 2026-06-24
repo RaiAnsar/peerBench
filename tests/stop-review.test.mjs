@@ -522,8 +522,30 @@ test("buildPrompt: system is content-only with ALLOW:/BLOCK: instruction", () =>
   assert.doesNotMatch(system, /read access|verify.*against.*code/i);
   assert.match(system, /ALLOW:|BLOCK:/);
   assert.match(system, /Do NOT use any tools/i);
+  assert.match(system, /never use.*tail message to skip non-empty/i);
   assert.match(user, /changed\.js|git_status/i);
   assert.match(user, /did some work/);
+});
+
+test("buildPrompt: diffs appear before the assistant-message context", () => {
+  const { user } = buildPrompt(
+    "M changed.js",
+    "diff --git a/changed.js b/changed.js\n+export const changed = true;",
+    "",
+    "Final status only: done",
+    "",
+    "diff --git a/committed.js b/committed.js\n+export const committed = true;"
+  );
+  assert.ok(
+    user.indexOf("<git_status>") < user.indexOf("<previous_assistant_message_context>"),
+    "status and diffs must be primary, before the conversational tail"
+  );
+  assert.ok(
+    user.indexOf("<committed_diff>") < user.indexOf("<previous_assistant_message_context>"),
+    "committed diff must not be buried after the previous assistant message"
+  );
+  assert.match(user, /committed\.js/);
+  assert.match(user, /changed\.js/);
 });
 
 // ---------------------------------------------------------------------------

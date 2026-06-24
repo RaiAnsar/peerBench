@@ -21,6 +21,7 @@ import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } f
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
 import { runSpecReview } from "../global-hooks/spec-review-run.mjs";
 import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
+import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -276,7 +277,11 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceI
 // as an alias so the `spec-review` subcommand and existing tests keep working.
 export const specReviewCommand = runSpecReview;
 
-export function gateToggleCommand(ws, args, { root } = {}) {
+export function gateToggleCommand(ws, args, {
+  root,
+  disableLegacyCodexWorkspaceImpl = disableLegacyCodexStopGateForWorkspace,
+  disableLegacyCodexGlobalImpl = disableLegacyCodexStopGateStates
+} = {}) {
   const sub = args[0]; // "off" or "on"
   const hasGlobal = args.slice(1).includes("--global");
   const scope = hasGlobal ? "global" : "workspace";
@@ -289,12 +294,17 @@ export function gateToggleCommand(ws, args, { root } = {}) {
   // Re-enable: derive the message from a fresh read so we never claim "enabled"
   // while the OTHER scope's marker is still disabling the gates.
   const stillDisabled = isBenchDisabled(ws, { root });
-  if (!stillDisabled) return `bench: enabled (${scope}).`;
+  const legacy = scope === "global"
+    ? disableLegacyCodexGlobalImpl()
+    : disableLegacyCodexWorkspaceImpl(ws);
+  const legacyChanged = typeof legacy?.changed === "number" ? legacy.changed > 0 : Boolean(legacy?.changed);
+  const legacyNote = legacyChanged ? " Legacy Codex gate disabled." : "";
+  if (!stillDisabled) return `bench: enabled (${scope}).${legacyNote}`;
   // The cleared scope didn't fully re-enable — name the remaining source honestly.
   if (scope === "workspace") {
-    return `bench: workspace re-enabled, but STILL DISABLED GLOBALLY — run /bench:on --global to fully re-enable.`;
+    return `bench: workspace re-enabled, but STILL DISABLED GLOBALLY — run /bench:on --global to fully re-enable.${legacyNote}`;
   }
-  return `bench: global re-enabled, but STILL DISABLED in this WORKSPACE — run /bench:on to fully re-enable.`;
+  return `bench: global re-enabled, but STILL DISABLED in this WORKSPACE — run /bench:on to fully re-enable.${legacyNote}`;
 }
 
 export function reviewersCommand(args) {

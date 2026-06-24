@@ -11,6 +11,7 @@ import path from "node:path";
 // workspace-scoped setBenchDisabled writes into the user's REAL data dir. ({root} only
 // isolates the GLOBAL marker, not the per-workspace one.)
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-disable-root-"));
+process.env.CLAUDE_PLUGIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "bench-disable-codex-plugin-data-"));
 
 // Use a fresh isolated root for every test so nothing bleeds across.
 function freshRoot() {
@@ -107,6 +108,22 @@ test("gateToggleCommand on workspace: isBenchDisabled becomes false", () => {
     if (prev === undefined) delete process.env.BENCH_ROOT;
     else process.env.BENCH_ROOT = prev;
   }
+});
+
+test("gateToggleCommand on workspace disables the legacy Codex plugin gate", () => {
+  const root = freshRoot();
+  const ws = freshWs();
+  let calledWith = null;
+  const out = gateToggleCommand(ws, ["on"], {
+    root,
+    disableLegacyCodexWorkspaceImpl: (workspace) => {
+      calledWith = workspace;
+      return { changed: true };
+    }
+  });
+  assert.equal(calledWith, ws);
+  assert.match(out, /enabled.*workspace/i);
+  assert.match(out, /Legacy Codex gate disabled/i);
 });
 
 test("gateToggleCommand off --global: isBenchDisabled true for unrelated ws", () => {
