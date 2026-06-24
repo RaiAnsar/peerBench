@@ -193,7 +193,7 @@ export function syncSettings({ hooksDir, settingsPath }) {
   register(s.hooks.Stop, undefined, path.join(hooksDir, "stop-review.mjs"), {
     timeout: 900, asyncRewake: true,
     statusMessage: "⛩ bench: reviewing turn…",
-    rewakeMessage: "⛩ bench stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
+    rewakeMessage: "⛩ bench stop gate found issues in this turn's code changes. Fix them, then stop again to re-review:",
     rewakeSummary: "⛩ bench stop"
   });
   // The deep-review runner: a SECOND matcher-less Stop entry (register appends it alongside

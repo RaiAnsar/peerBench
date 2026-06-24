@@ -1,10 +1,25 @@
 {
   "name": "peerbench",
   "version": "0.3.0",
-  "private": true,
   "type": "module",
-  "description": "peerbench — a multi-model AI review panel (Codex + Kimi + MiMo + GLM) for coding agents: gating reviews, agentic read-only code review, and bug hunts. Plugin command prefix: bench (/bench:*).",
+  "description": "peerbench — a multi-model AI review panel (Codex + Kimi + GLM + Qwen + MiMo) for coding agents: gating reviews, agentic read-only code review, and bug hunts. Plugin command prefix: bench (/bench:*).",
+  "license": "MIT",
+  "author": "Rai Ansar",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RaiAnsar/peerBench.git"
+  },
+  "homepage": "https://github.com/RaiAnsar/peerBench#readme",
+  "bugs": {
+    "url": "https://github.com/RaiAnsar/peerBench/issues"
+  },
+  "bin": {
+    "peerbench": "./scripts/bench-runner.mjs",
+    "peerbench-install": "./scripts/install.mjs"
+  },
   "scripts": {
+    "setup": "node scripts/install.mjs",
+    "load-keys": "node scripts/load-keys.mjs",
     "test": "node --test 'tests/*.test.mjs'"
   }
 }

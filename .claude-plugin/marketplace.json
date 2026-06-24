@@ -1,11 +1,11 @@
 {
-  "name": "rai-tools",
+  "name": "peerbench",
   "owner": { "name": "Rai Ansar" },
   "plugins": [
     {
       "name": "bench",
       "source": "./",
-      "description": "peerbench — Codex + Kimi + MiMo + GLM review panel, agentic read-only code review, and bug hunts for Claude Code. Commands: /bench:*"
+      "description": "peerbench — Codex + Kimi + GLM + Qwen + MiMo review panel, agentic read-only code review, and bug hunts for Claude Code. Commands: /bench:*"
     }
   ]
 }

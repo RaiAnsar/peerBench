@@ -45,7 +45,7 @@ export function extractVerdict(text) {
   return null;
 }
 
-// NOTE (v1 limitation): parallel Kimi+MiMo calls fail-fast on rate limits; no backoff/retry beyond the one verdict-format retry below.
+// NOTE (v1 limitation): parallel provider calls fail-fast on rate limits; no backoff/retry beyond the one verdict-format retry below.
 export function resolveReviewers({ env = process.env, reviewImpl = defaultReview, reviewers } = {}) {
   const cfg = resolveConfig({ env, reviewers });
   return cfg.reviewers.map((name) => {

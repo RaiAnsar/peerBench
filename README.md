@@ -1,10 +1,10 @@
 # peerbench
 
 A Claude Code + Codex helper that reviews your work with a **panel of AI reviewers** —
-**Codex** (OpenAI), **Kimi** (Moonshot `kimi-k2.6`), **MiMo** (Xiaomi), and **GLM**
-(z.ai `glm-5.2`) — instead of a single reviewer. The panel runs automatically as
+**Codex** (OpenAI), **Kimi** (Moonshot `kimi-k2.6`), **GLM**
+(z.ai `glm-5.2`), **Qwen** (Alibaba MaaS), and **MiMo** (Xiaomi) — instead of a single reviewer. The panel runs automatically as
 **gates** (plans/specs, code turns, pushes) and on demand as a **bug hunt** that
-scours the repo read-only. Kimi, MiMo, and GLM are cheap; the goal is Codex-grade
+scours the repo read-only. Kimi, GLM, Qwen, and MiMo are cheap; the goal is Codex-grade
 review at a fraction of the cost, with Codex kept alongside as a benchmark you can
 drop with one command.
 
@@ -65,7 +65,10 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
 - **Kimi** — Moonshot `kimi-k2.6` on the **coding-plan** endpoint
   (`api.kimi.com/coding/v1`) with **thinking disabled** (`thinking:{type:"disabled"}`,
   `temperature:0.6`). Fast, non-thinking, tool-calling — no Open Platform key needed.
-- **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`).
+- **GLM** — z.ai `glm-5.2` on the coding endpoint. Default active reviewer with Kimi.
+- **Qwen** — Alibaba MaaS `qwen3.7-max` through the OpenAI-compatible endpoint.
+- **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`). Wired and selectable, but not
+  active by default.
 
 Switch the active panel any time with `/bench:reviewers` (for example `kimi glm qwen`,
 or `codex kimi glm`). Selectable reviewers come from the registry (`kimi`, `mimo`,
@@ -99,13 +102,14 @@ produce output:
   tool calls, latency, the underlying error cause) to stderr; the same diagnostics
   are saved into each hunt's trace for later inspection.
 
-### Thinking tiers
+### Thinking config
 
 `kimi-k2.6` supports thinking on **or** off via the `thinking` parameter:
 
-- **Default (gates, `/bench:hunt`)** — thinking **off**: fast (~3s rounds), reliable.
-- **`/bench:investigate`** — thinking **on**: deeper reasoning for hard
-  problems, with a generous budget. Same panel, opt-in depth.
+- **Default** — thinking **off**: fast and reliable for gates and hunts.
+- **Opt in** — set `KIMI_THINKING=enabled` in `.keys` and run
+  `node scripts/load-keys.mjs` if you want Kimi to use thinking. Leave it disabled
+  for the lowest-latency gates.
 
 ## Commands
 
@@ -113,8 +117,8 @@ produce output:
   `/bench:hunt a monitor never alerted me` or `/bench:hunt the auth/session code`.
 - `/bench:debug <failure>` — root-cause a SPECIFIC error / failing test / wrong output
   with the panel (read-only); each reviewer returns a root cause + minimal fix. Model-invokable.
-- `/bench:investigate <problem>` — deep tier: full panel, Kimi **thinking on**, generous
-  budget, for a hard specific problem. Slower than hunt.
+- `/bench:investigate <problem>` — deep tier: active panel, generous budget, for a
+  hard specific problem. Slower than hunt.
 - `/bench:review [--base <ref>]` — on-demand panel review of your current changes.
 - `/bench:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo` or
   `codex kimi glm qwen`). Selectable: `kimi`, `mimo`, `glm`, `qwen`, `codex`.
@@ -131,7 +135,7 @@ when a task calls for finding or root-causing a bug. The rest are user-invoked.
   `~/.claude/plugins/data/bench-shared/`) — the active `reviewers` list and
   each provider's `baseURL`, `model`, `apiKey`, `temperature`, `thinking`, headers.
 - **`.keys`** (repo, **gitignored** — never commit) — source secrets/config for the
-  providers (`KIMI_*`, `MIMO_*`).
+  providers (`KIMI_*`, `GLM_*`, `QWEN_*`, `MIMO_*`). Start from `.keys.example`.
 - `BENCH_ROOT` — override the shared dir (used for test isolation).
 - `BENCH_DEBUG=1` — verbose agentic diagnostics.
 
@@ -151,11 +155,12 @@ does not recursively trigger peerBench.
 
 ## Fallback (revert anytime)
 
-1. **Config toggle** — `/bench:reviewers kimi mimo` (or any subset of
-   `kimi mimo codex`) re-selects the active panel without redeploying.
-2. **Rollback script** — `node scripts/rollback.mjs` restores the pre-deploy hook
-   snapshot and settings.
-3. **Branch** — the work lives on a feature branch; `main` is untouched.
+1. **Config toggle** — `/bench:reviewers kimi glm` (or any subset of
+   `kimi glm qwen mimo codex`) re-selects the active panel without redeploying.
+2. **Disable gates** — `/bench:off` disables this workspace; `/bench:off --global`
+   disables everywhere. Use `/bench:on` to re-enable.
+3. **Rollback script** — `node scripts/rollback.mjs` restores the pre-install hook
+   snapshot and settings created under `~/.claude/plugins/data/bench-shared/backup-*`.
 
 ## Statusline
 
@@ -169,56 +174,99 @@ segment falls back to workspace-level trace selection for compatibility.
 ## Requirements
 
 - Node 20+ (developed on 24).
-- The `codex@openai-codex` plugin for the Codex reviewer.
-- Valid Kimi (coding-plan) and MiMo API credentials in `.keys` / `companion.json`.
+- Claude Code for `/bench:*` commands and Claude hooks.
+- Codex with hook support for direct Codex Stop reviews and `/prompts:bench-*`.
+- The `codex@openai-codex` plugin only if you enable the `codex` reviewer inside
+  Claude.
+- At least one non-Codex provider key in `.keys` / `companion.json`. Defaults are
+  `kimi` + `glm`.
 
-## Install (local, private)
+## Install
 
-This repo doubles as a local-directory marketplace (`rai-tools`). In
-`~/.claude/settings.json`:
-
-```json
-{
-  "extraKnownMarketplaces": {
-    "rai-tools": { "source": { "source": "directory", "path": "/absolute/path/to/bench" } }
-  },
-  "enabledPlugins": { "bench@rai-tools": true }
-}
-```
-
-Restart Claude Code; the `/bench:*` commands appear.
-
-Then register the review gates (one-time — copies the hooks into
-`~/.claude/hooks` and `~/.codex/hooks`, wires Claude into
-`~/.claude/settings.json`, and wires direct Codex into `~/.codex/hooks.json`):
+Fresh clone, install both Claude and Codex support:
 
 ```bash
-node /absolute/path/to/bench/scripts/deploy-global-hooks.mjs
+git clone https://github.com/RaiAnsar/peerBench.git && cd peerBench && node scripts/install.mjs
 ```
 
-For Claude, this registers the Stop gate (matcher-less), the ExitPlanMode plan
-gate, the `Write|Edit` plan-file gate, and the `Bash` pre-push gate. For direct
-Codex, this registers only the matcher-less `codex-stop-review.mjs` Stop gate,
-which runs the non-Codex reviewers and skips nested Codex reviewer processes.
-The Codex hook uses `statusMessage: "⛩ bench: reviewing turn…"` while it runs
-and emits Codex Stop JSON with `systemMessage` on ALLOW/failure notes so the result
-can surface in Codex UIs that show hook warnings/events.
-Re-run it any time to re-sync; it is idempotent and de-dupes existing entries.
-The deploy output includes an `origin` object comparing the local checkout with
-`origin/<branch>` before syncing. If your
-`~/.claude/statusline-command.sh` already calls peerBench's `statusline-segment.mjs`,
-the deploy step also patches that call to pass Claude's per-chat `session_id`.
-Without this step the commands work but the automatic gates do not fire. Codex
-may ask you to review/trust the new hook in `/hooks` the first time it sees
-`~/.codex/hooks.json`.
+Already cloned:
 
-The same deploy also installs Codex custom prompts into `~/.codex/prompts`.
-After restarting Codex or opening a new session, invoke them from Codex as
+```bash
+npm run setup
+```
+
+The installer is idempotent. It:
+
+- enables the local Claude plugin as `bench@peerbench` in `~/.claude/settings.json`
+  and migrates the old local `bench@rai-tools` id when it points at this checkout;
+- copies review hooks into `~/.claude/hooks` and `~/.codex/hooks`;
+- registers Claude gates for `ExitPlanMode`, plan/spec file writes, Stop, deep
+  Stop review delivery, and `git push`;
+- registers the direct Codex Stop hook, which removes `codex` from the reviewer
+  panel so Codex never asks itself to review its own work;
+- installs Codex manual prompts into `~/.codex/prompts`;
+- prints a local-vs-`origin/<branch>` comparison before syncing.
+
+Install only one side when needed:
+
+```bash
+node scripts/install.mjs --claude-only
+node scripts/install.mjs --codex-only
+```
+
+Set provider keys:
+
+```bash
+cp .keys.example .keys
+$EDITOR .keys
+node scripts/load-keys.mjs
+```
+
+Or load keys during install after `.keys` exists:
+
+```bash
+node scripts/install.mjs --load-keys
+```
+
+`load-keys` writes provider config to
+`~/.claude/plugins/data/bench-shared/companion.json` and never prints key values.
+
+Restart Claude Code so `/bench:*` commands appear. Open a fresh Codex session
+after installing or trusting hooks. Codex may ask you to trust the new hook in
+`/hooks` the first time it sees `~/.codex/hooks.json`.
+
+Claude commands are `/bench:hunt`, `/bench:investigate`, `/bench:debug`,
+`/bench:review`, `/bench:status`, `/bench:setup`, `/bench:on`, `/bench:off`,
+`/bench:reviewers`, and `/bench:scorecard`.
+
+Codex prompts are installed as
 `/prompts:bench-hunt`, `/prompts:bench-investigate`, `/prompts:bench-debug`,
 `/prompts:bench-review`, `/prompts:bench-status`, `/prompts:bench-setup`,
 `/prompts:bench-on`, `/prompts:bench-off`, `/prompts:bench-reviewers`, and
 `/prompts:bench-scorecard`. These prompts run the same `scripts/bench-runner.mjs`
 commands that Claude's `/bench:*` commands use.
+
+Verify setup:
+
+```bash
+node scripts/bench-runner.mjs setup
+npm test
+```
+
+### Credential hygiene
+
+- `.keys`, `.env`, `*.keys`, logs, and local result dumps are git-ignored.
+- `.keys.example` contains placeholders only.
+- Installer and key-loading output redacts key values.
+- Before making a fork or release public, run:
+
+```bash
+git ls-files | xargs rg -n --hidden -S "sk-[A-Za-z0-9_-]{20,}|github_pat_|ghp_|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|BEGIN .*PRIVATE KEY"
+git log --all --oneline -G "sk-[A-Za-z0-9_-]{20,}|github_pat_|ghp_|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|BEGIN .*PRIVATE KEY" -- .
+```
+
+Use a dedicated secret scanner such as `gitleaks` before publishing if you have
+ever committed real credentials and then removed them.
 
 ## Test
 

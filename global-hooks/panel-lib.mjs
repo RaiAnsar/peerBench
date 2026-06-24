@@ -1,4 +1,4 @@
-// Shared logic for the Codex+Kimi+MiMo panel gates. Deployed to
+// Shared logic for the peerBench panel gates. Deployed to
 // ~/.claude/hooks/panel-lib.mjs (canonical copy lives in the peerbench
 // repo — self-contained on purpose: no repo imports).
 import { execFileSync, spawn } from "node:child_process";
