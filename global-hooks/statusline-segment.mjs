@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { workspaceStateDir, wsKey } from "./config-store.mjs";
+import { normalizeSessionId, sessionKeyFromInput, workspaceStateDir, wsKey } from "./config-store.mjs";
 import { severityRank, SEVERITY_RANK } from "./deep-review.mjs";
 
 const C = { ALLOW: 48, BLOCK: 196, error: 208, advisory: 245 };   // 256-color codes (match gate-status.py palette); advisory = dim grey
@@ -48,16 +48,30 @@ function fileTs(name) { const m = TRACE_RE.exec(name); return m ? Number(m[1]) :
 // Return the newest trace in `tracesDir` that BELONGS to `expectedWsKey`. The ownership guard skips
 // any trace whose stamped `wsKey` is for a DIFFERENT workspace (a misplaced/leaked trace) so the
 // statusline can never surface another project's gate verdict. Legacy traces (no wsKey) are accepted.
-export function latestTrace(tracesDir, expectedWsKey = null) {
+// If `expectedSessionKey` is present, only traces stamped for that session are accepted; unstamped
+// legacy traces are skipped in that strict mode so one same-project chat cannot show another chat's
+// latest badge.
+export function latestTrace(tracesDir, expectedWsKey = null, expectedSessionKey = null) {
+  const sessionKey = normalizeSessionId(expectedSessionKey);
   let files;
   try { files = fs.readdirSync(tracesDir); } catch { return null; }
   const newestFirst = files.map((f) => [f, fileTs(f)]).filter(([, ts]) => ts >= 0).sort((a, b) => b[1] - a[1]);
+  // Two-tier when a session filter is active: (1) PREFER this session's own newest trace; (2) if it
+  // has none, fall back to the newest UNSTAMPED (legacy / pre-feature) trace — project-level, so the
+  // per-reviewer badge never just vanishes; (3) NEVER show a trace stamped for a DIFFERENT session.
+  // Strict-skipping legacy made the badge disappear in every project with pre-feature history
+  // (falling back to the old gate-status line) — this restores it without leaking another chat's badge.
+  let legacyFallback = null;
   for (const [name] of newestFirst) {
     let t; try { t = JSON.parse(fs.readFileSync(path.join(tracesDir, name), "utf8")); } catch { continue; }
-    if (expectedWsKey && t && t.wsKey && t.wsKey !== expectedWsKey) continue;   // misplaced → skip
-    return t;
+    if (expectedWsKey && t && t.wsKey && t.wsKey !== expectedWsKey) continue;   // misplaced workspace → skip
+    if (!sessionKey) return t;                                                  // no session filter → newest wins (legacy behavior)
+    const ts = normalizeSessionId(t?.sessionKey);
+    if (ts === sessionKey) return t;                                            // tier 1: this session's own (newest) — preferred
+    if (!ts && legacyFallback === null) legacyFallback = t;                     // tier 2: remember newest UNSTAMPED legacy
+    // a trace stamped for ANOTHER session → never shown
   }
-  return null;
+  return legacyFallback;   // no own-session trace → newest legacy (project-level), or null if none
 }
 
 // A trace's own chronological key — the numeric ms prefix of its id (`<ts>-<hex>`).
@@ -66,7 +80,7 @@ function traceTs(t) { const m = /^(\d+)-/.exec(String(t?.id || "")); return m ? 
 // Hooks key a trace by git-toplevel; we also check the raw dir as a fallback for the rare case
 // where git resolution fails and a hook wrote under the literal cwd. Take the chronologically
 // newest across the (de-duplicated) roots, compared NUMERICALLY (not lexically) by id timestamp.
-export function latestTraceForDir(dir, gitTopFn) {
+export function latestTraceForDir(dir, gitTopFn, sessionKey = null) {
   const roots = [];
   const top = gitTopFn ? gitTopFn(dir) : null;
   if (top) roots.push(top);
@@ -75,7 +89,7 @@ export function latestTraceForDir(dir, gitTopFn) {
   for (const ws of roots) {
     // Read each root's traces with that root's OWN key as the ownership filter — a trace surfaces
     // only if it genuinely belongs to the dir it sits in (never another project's leaked trace).
-    const t = latestTrace(path.join(workspaceStateDir(ws), "traces"), wsKey(ws));
+    const t = latestTrace(path.join(workspaceStateDir(ws), "traces"), wsKey(ws), sessionKey);
     if (t && (!best || traceTs(t) > traceTs(best))) best = t;
   }
   return best;
@@ -88,18 +102,36 @@ export function latestTraceForDir(dir, gitTopFn) {
 // the window — guessing from it surfaces one project's gate badge in every other window (the
 // cross-project mixup Rai hit). Reject the jq sentinels ("null"/"undefined"); return null when there
 // is no reliable per-window signal, so the caller renders NOTHING rather than the wrong project.
-export function resolveDir(argv2, env = process.env) {
+export function resolveDir(argv2, env = process.env, input = null) {
   const bad = (v) => !v || v === "null" || v === "undefined";
   if (!bad(argv2)) return argv2;
+  if (!bad(input?.workspace?.current_dir)) return input.workspace.current_dir;
+  if (!bad(input?.cwd)) return input.cwd;
   if (!bad(env?.CLAUDE_PROJECT_DIR)) return env.CLAUDE_PROJECT_DIR;
   return null;
 }
 
+export function resolveSessionKey(argv3, env = process.env, input = null) {
+  return normalizeSessionId(argv3) || sessionKeyFromInput(input || {}, env);
+}
+
+function readStatuslineInputSync() {
+  try {
+    if (process.stdin.isTTY) return null;
+    const raw = fs.readFileSync(0, "utf8").trim();
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const dir = resolveDir(process.argv[2], process.env);
+  const input = readStatuslineInputSync();
+  const dir = resolveDir(process.argv[2], process.env, input);
   if (!dir) process.exit(0);   // no reliable per-window project → render nothing (never guess via cwd)
+  const sessionKey = resolveSessionKey(process.argv[3], process.env, input);
   // stdio: ignore git's stderr ("fatal: not a git repository") so a non-repo dir stays silent.
   const gitTop = (d) => { try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: d, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return null; } };
-  const seg = renderSegment(latestTraceForDir(dir, gitTop));
+  const seg = renderSegment(latestTraceForDir(dir, gitTop, sessionKey));
   if (seg) process.stdout.write(seg);   // statusline appends this; prints nothing if no trace
 }

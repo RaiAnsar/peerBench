@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { combinePanel } from "./panel-lib.mjs";
-import { isBenchDisabled as defaultIsBenchDisabled, readReviewedHead, writeReviewedHead } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, readReviewedHead, sessionKeyFromInput, writeReviewedHead } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { deepKey } from "./deep-review.mjs";
@@ -22,7 +22,7 @@ const MAX_DIFF_BYTES = 200_000;
 // `<ref>..HEAD` would resolve to EMPTY by the time the runner reviews it. SHAs are immutable, so the
 // runner reviews the exact pushed commits regardless of timing. enqueue dedupes on the pinned range +
 // pushed HEAD. Never throws (the fast gate has already allowed). gitImpl is injectable for tests.
-export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now() } = {}) {
+export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now(), sessionKey = null } = {}) {
   try {
     const [headSha] = gitImpl(["rev-parse", "HEAD"], ws);
     let reviewRange = range;
@@ -33,7 +33,7 @@ export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now()
       if (baseOk && srcOk && baseSha && srcSha) reviewRange = `${baseSha}..${srcSha}`;
     }
     const contentKey = deepKey(`push:${reviewRange}`, headSha);
-    return enqueue(ws, { kind: "push", range: reviewRange, contentKey }, { now });
+    return enqueue(ws, { kind: "push", range: reviewRange, contentKey }, { now, sessionKey });
   } catch (e) {
     process.stderr.write(`⛩ pre-push: deep push-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
     return false;
@@ -390,6 +390,7 @@ export async function runMain({
     emitter.emit(decisionPayload(permissionDecision, reason, systemMessage));
 
   const input = inputOverride ?? readInput();
+  const sessionKey = sessionKeyFromInput(input, env);
 
   const command = String(input.tool_input?.command ?? "");
 
@@ -482,6 +483,7 @@ export async function runMain({
     writeTraceImpl(ws, {
       gate: "push",
       ws,
+      sessionKey,
       reviewers: results.map(({ raw, ...m }) => m),
       systemPrompt: system,
       userPrompt: user,
@@ -520,7 +522,7 @@ export async function runMain({
   // Only reached on a real ALLOW (block/fail-open/disabled/empty-range/deleteOnly all returned
   // earlier), so this is the correct boundary.
   try {
-    launchImpl(ws, range);
+    launchImpl(ws, range, { sessionKey });
   } catch (e) {
     process.stderr.write(`⛩ pre-push: deep push-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
   }

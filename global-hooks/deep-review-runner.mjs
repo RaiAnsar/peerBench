@@ -9,7 +9,7 @@
 // Crash-safe with NO delivery counter (see the spec). Fails OPEN everywhere.
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
-import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput } from "./config-store.mjs";
 import { shouldRewake } from "./deep-review.mjs";
 import { runSpecReview as defaultRunSpecReview, runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 import {
@@ -52,6 +52,7 @@ export async function runMain({
   const input = inputOverride ?? readInputSync();
   const cwd = (input && input.cwd) || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = wsOverride || workspaceRoot(cwd);
+  const sessionKey = sessionKeyFromInput(input, process.env);
 
   if (isBenchDisabledImpl(ws)) return exitImpl(0);
 
@@ -62,7 +63,7 @@ export async function runMain({
   const advisory = [];   // findings past WAKE_WINDOW → stdout note (non-waking), file kept
 
   // 2. Re-deliver pending .blocked jobs (retire ONLY on content-change; never by time/count).
-  for (const b of safe(() => listBlocked(ws), [])) {
+  for (const b of safe(() => listBlocked(ws, { sessionKey }), [])) {
     let cur = null;
     try { cur = currentContentKey(ws, b); } catch { cur = null; }
     // Retire on a DEFINITIVELY-gone target (deleted spec → GONE; the block is moot) OR a CONFIRMED
@@ -79,7 +80,7 @@ export async function runMain({
   // 3. Claim up to MAX_BATCH queued jobs (run concurrently in step 4). If MORE than MAX_BATCH are
   //    queued, the surplus is left as .json and drained via a continuation-wake in step 6 — so an
   //    unreviewed surplus job (which might hold a HIGH block) is never stranded while the agent idles.
-  const queued = safe(() => listJobs(ws), []);
+  const queued = safe(() => listJobs(ws, { sessionKey }), []);
   const surplus = queued.length > MAX_BATCH;
   const claimed = [];
   for (const job of queued.slice(0, MAX_BATCH)) {
@@ -92,8 +93,8 @@ export async function runMain({
   const outcomes = await Promise.all(claimed.map(async ({ job, claimedPath }) => {
     try {
       const res = job.kind === "push"
-        ? await runPushReviewImpl(job.range, ws)
-        : await runSpecReviewImpl(job.specPath, ws);
+        ? await runPushReviewImpl(job.range, ws, { sessionKey: job.sessionKey || sessionKey })
+        : await runSpecReviewImpl(job.specPath, ws, { sessionKey: job.sessionKey || sessionKey });
       return { job, claimedPath, res };
     } catch (e) {
       return { job, claimedPath, error: msg(e) };
@@ -120,7 +121,7 @@ export async function runMain({
       const findings = o.res.findings || o.res.summary || "(deep block)";
       markBlocked(ws, o.job._jobKey, {
         kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
-        contentKey: o.job.contentKey, findings, firstBlockedTs: now
+        contentKey: o.job.contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined, findings, firstBlockedTs: now
       }, { claimedPath: o.claimedPath });
       wake.push(findings);
     } else {

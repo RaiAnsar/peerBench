@@ -9,6 +9,7 @@ const PR_ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plan-revi
 process.env.BENCH_ROOT = PR_ROOT;
 
 import { buildPrompt, runMain, createEmitter } from "../global-hooks/plan-review.mjs";
+import { normalizeSessionId } from "../global-hooks/config-store.mjs";
 
 /** Fake reviewer that always returns the given verdict. */
 function prReviewer(name, verdict) {
@@ -108,7 +109,7 @@ test("severity-gate: plan-review persists per-reviewer severity in the trace (re
       resolveReviewersImpl: () => [prReviewer("Kimi", "ALLOW"), prSevReviewer("MiMo", "BLOCK", "medium")],
       writeTraceImpl: (_ws, trace) => { captured = trace; },
       isBenchDisabledImpl: () => false,
-      input: { cwd: ws, tool_input: { plan: "do a thing" } }
+      input: { cwd: ws, session_id: "chat-A", tool_input: { plan: "do a thing" } }
     });
   } finally {
     process.stdout.write = orig;
@@ -116,6 +117,7 @@ test("severity-gate: plan-review persists per-reviewer severity in the trace (re
   // A missing `parseSeverity` import throws while BUILDING the trace object (inside the best-effort
   // try/catch), so the trace is silently never written — captured stays null. This asserts it IS written.
   assert.ok(captured, "a trace must be written (a missing parseSeverity import would throw → no trace)");
+  assert.equal(captured.sessionKey, normalizeSessionId("chat-A"), "trace is stamped with the hook session");
   const mimo = (captured.reviewers || []).find((r) => r.name === "MiMo");
   assert.equal(mimo?.severity, "medium", "the BLOCK reviewer's severity is persisted so the statusline can render ~");
   assert.equal(mimo?.raw, undefined, "raw is stripped from the trace");

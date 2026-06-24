@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root-"));
-import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers, isBenchDisabled, displayName, PROVIDER_NAMES } from "../global-hooks/config-store.mjs";
+import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers, isBenchDisabled, displayName, PROVIDER_NAMES, normalizeSessionId, sessionKeyFromInput } from "../global-hooks/config-store.mjs";
 
 test("registry: display names + KNOWN_REVIEWERS + PROVIDER_NAMES all derive from the single DEFAULTS source", () => {
   // Adding/swapping a model is one DEFAULTS entry — these are derived, not hand-maintained lists.
@@ -69,6 +69,17 @@ test("workspaceStateDir maps a symlinked workspace to the SAME state dir as the 
   const real = path.join(base, "realname"); fs.mkdirSync(real);
   const link = path.join(base, "linkname"); fs.symlinkSync(real, link);   // differently-named symlink → real
   assert.equal(workspaceStateDir(link), workspaceStateDir(real), "symlink + real path must resolve to one state dir");
+});
+test("sessionKeyFromInput normalizes Claude session ids and is idempotent", () => {
+  const a = normalizeSessionId("claude-session-A");
+  assert.match(a, /^session-[0-9a-f]{16}$/);
+  assert.equal(normalizeSessionId(a), a, "already-normalized keys must not be hashed again");
+  assert.equal(sessionKeyFromInput({ session_id: "claude-session-A" }, {}), a);
+  assert.equal(sessionKeyFromInput({ sessionId: "claude-session-A" }, {}), a);
+  assert.equal(sessionKeyFromInput({}, { BENCH_SESSION_ID: "claude-session-A" }), a);
+  assert.equal(sessionKeyFromInput({}, { CLAUDE_SESSION_ID: "ambient", CODEX_COMPANION_SESSION_ID: "ambient" }), null,
+    "ambient parent-runtime session env vars must not create a peerBench chat key");
+  assert.equal(sessionKeyFromInput({ session_id: "null" }, {}), null);
 });
 test("reviewers override allows codex-only selection", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["codex"] });

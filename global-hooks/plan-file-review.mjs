@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { combinePanel } from "./panel-lib.mjs";
-import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { deepKey, parseSeverity } from "./deep-review.mjs";
@@ -27,9 +27,9 @@ function workspaceRoot(cwd) {
 // review-capped slice) so the key matches deep-queue.currentContentKey's recompute AND the bytes the
 // deep review actually evaluates — keying on the capped review slice would falsely retire a large
 // spec's .blocked, and capping the key while reviewing full would dedupe a stale review. Never throws.
-export function enqueueDeepReview(ws, filePath, content) {
+export function enqueueDeepReview(ws, filePath, content, { sessionKey = null } = {}) {
   try {
-    return enqueue(ws, { kind: "spec", specPath: filePath, contentKey: deepKey(filePath, content) });
+    return enqueue(ws, { kind: "spec", specPath: filePath, contentKey: deepKey(filePath, content) }, { sessionKey });
   } catch (e) {
     process.stderr.write(`⛩ plan gate: deep-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
     return false;
@@ -92,6 +92,7 @@ export async function runMain({
   const failOpen = (note) => emit({ systemMessage: `⛩ plan gate: review skipped — ${String(note).slice(0, 250)}` });
 
   const input = inputOverride ?? readInput();
+  const sessionKey = sessionKeyFromInput(input, process.env);
 
   const rawFilePath = String(input.tool_input?.file_path ?? "");
   if (!PLAN_PATH_RE.test(rawFilePath)) {
@@ -188,6 +189,7 @@ export async function runMain({
     writeTraceImpl(ws, {
       gate: "plan-file",
       ws,
+      sessionKey,
       // FIX 3: attach the parsed severity so the statusline can render a sub-threshold
       // plan-file BLOCK as `~` (advisory) rather than `✗` (mirrors spec-review-run's trace).
       reviewers: results.map(({ raw, ...m }) => ({ ...m, severity: parseSeverity(raw, m.verdict) })),
@@ -226,7 +228,7 @@ export async function runMain({
   }
   // Fast ALLOW (and NOT a dedup-hit: that path returned above): ENQUEUE the deep spec-review
   // for the asyncRewake Stop runner. Never blocks the save; never spawns a detached worker.
-  try { enqueueDeepReviewImpl(ws, filePath, fullContent); }   // FULL content → key matches the deep review + the retire-check
+  try { enqueueDeepReviewImpl(ws, filePath, fullContent, { sessionKey }); }   // FULL content → key matches the deep review + the retire-check
   catch (e) { process.stderr.write(`⛩ plan gate: deep-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`); }
   // Sub-threshold BLOCKs (medium/low) allow the save but surface as advisories, not a block.
   const advisoryNote = panel.advisories && panel.advisories.length

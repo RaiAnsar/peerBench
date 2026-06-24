@@ -13,7 +13,7 @@ const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt, resolveReviewBase, readReviewedHead, writeReviewedHead } from "../global-hooks/stop-review.mjs";
-import { setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
+import { normalizeSessionId, setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "stop-review.mjs");
@@ -151,6 +151,41 @@ test("caps its own consecutive blocks → allows without reviewing once the cap 
   assert.equal(called, false, "after MAX_STOP_LOOPS consecutive blocks the gate allows without reviewing (loop broken)");
 });
 
+test("same-project stop-loop cap is session-scoped", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-loop-"));
+  process.env.BENCH_ROOT = root;
+  const sessionA = normalizeSessionId("chat-A");
+  fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
+  fs.writeFileSync(path.join(workspaceStateDir(ws), `stop-loop.${sessionA}`), JSON.stringify({ count: 4, ts: Date.now() }));
+
+  let calledB = false;
+  let calledA = false;
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { calledB = true; return [fakeReviewer("Kimi", "ALLOW")]; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, session_id: "chat-B" }
+    });
+    await runMain({
+      resolveReviewersImpl: () => { calledA = true; return [fakeReviewer("Kimi", "ALLOW")]; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, session_id: "chat-A" }
+    });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calledB, true, "chat B must not inherit chat A's exhausted stop-loop counter");
+  assert.equal(calledA, false, "chat A still honors its own exhausted stop-loop counter");
+});
+
 // ---------------------------------------------------------------------------
 // Test: disabled workspace → no-op (exit 0)
 // ---------------------------------------------------------------------------
@@ -201,7 +236,7 @@ test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async ()
       writeTraceImpl,
       isBenchDisabledImpl: () => false,
       env: process.env,
-      input: { cwd: ws, last_assistant_message: "wrote some code" }
+      input: { cwd: ws, session_id: "chat-A", last_assistant_message: "wrote some code" }
     });
   } finally {
     restore();
@@ -215,6 +250,7 @@ test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async ()
 
   assert.ok(traceRecord !== null, "trace should be written");
   assert.equal(traceRecord.gate, "stop", "trace gate should be 'stop'");
+  assert.equal(traceRecord.sessionKey, normalizeSessionId("chat-A"), "trace is stamped with the hook session");
   assert.ok(traceRecord.ws, "trace should include ws");
   assert.ok(Array.isArray(traceRecord.reviewers), "trace.reviewers should be an array");
 });

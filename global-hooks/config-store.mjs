@@ -58,6 +58,32 @@ export function wsKey(ws) {
 export function workspaceStateDir(ws) {
   return path.join(sharedRoot(), "state", wsKey(ws));
 }
+
+export function normalizeSessionId(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw === "null" || raw === "undefined") return null;
+  if (/^session-[0-9a-f]{16}$/i.test(raw)) return raw.toLowerCase();
+  return `session-${createHash("sha256").update(raw).digest("hex").slice(0, 16)}`;
+}
+
+export function sessionKeyFromInput(input = {}, env = process.env) {
+  // Session identity comes ONLY from this invocation's input (the hook JSON's session_id, or the
+  // statusline stdin). Do NOT fall back to AMBIENT env session vars (CLAUDE_SESSION_ID /
+  // CODEX_COMPANION_SESSION_ID): those are inherited from whatever parent runtime launched the
+  // process, so they (a) collapse two distinct chats under one runtime onto the SAME key — defeating
+  // the very per-chat isolation this enables — and (b) make behavior non-deterministic (the suite
+  // dies when run inside a Codex/Claude session). `env` is kept only as an explicit opt-in override
+  // via BENCH_SESSION_ID (peerBench's own var, never ambient), useful for manual/test pinning.
+  return normalizeSessionId(
+    input?.session_id
+      ?? input?.sessionId
+      ?? input?.session?.id
+      ?? input?.workspace?.session_id
+      ?? input?.workspace?.sessionId
+      ?? env?.BENCH_SESSION_ID
+  );
+}
+
 function readFileConfig() { try { return JSON.parse(fs.readFileSync(path.join(sharedRoot(), "companion.json"), "utf8")); } catch { return {}; } }
 // Persist the active reviewer selection to the env-independent companion.json (atomic).
 export function setReviewers(list, { root = sharedRoot() } = {}) {

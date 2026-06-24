@@ -59,6 +59,50 @@ export function snapshot({ hooksDir, settingsPath, backupDir }) {
   return { files, settingsBackedUp, backupDir };
 }
 
+const STATUSLINE_SESSION_LINE =
+  `bench_session_id=$(printf '%s' "$input" | jq -r '.session_id // .sessionId // .workspace.session_id // .workspace.sessionId // empty')`;
+
+// Existing user statusline wrappers usually read stdin once (`input=$(cat)`) and then invoke
+// statusline-segment.mjs with only the project dir. Patch just that peerBench segment call so the
+// wrapper keeps its custom UI but forwards Claude's per-chat session_id as argv3.
+export function syncStatuslineSessionArg({
+  statuslinePath = path.join(os.homedir(), ".claude", "statusline-command.sh")
+} = {}) {
+  let text;
+  try { text = fs.readFileSync(statuslinePath, "utf8"); }
+  catch { return { statuslinePath, updated: false, reason: "missing" }; }
+
+  if (!text.includes("statusline-segment.mjs")) {
+    return { statuslinePath, updated: false, reason: "no peerbench statusline segment" };
+  }
+  if (/statusline-segment\.mjs[^\n]*bench_session_id/.test(text)) {
+    return { statuslinePath, updated: false, reason: "already session-aware" };
+  }
+
+  const lines = text.split("\n");
+  let inserted = text.includes("bench_session_id=");
+  let replaced = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes("statusline-segment.mjs") && !/^\s*#/.test(lines[i])) {
+      if (!inserted) {
+        lines.splice(i, 0, STATUSLINE_SESSION_LINE);
+        inserted = true;
+        i++;
+      }
+      const before = lines[i];
+      lines[i] = lines[i]
+        .replace(/"\$gate_dir"(?=\s*(?:2>|\)|$))/, `"$gate_dir" "$bench_session_id"`)
+        .replace(/\$gate_dir(?=\s*(?:2>|\)|$))/, `$gate_dir "$bench_session_id"`);
+      if (lines[i] !== before) replaced = true;
+      break;
+    }
+  }
+  if (!replaced) return { statuslinePath, updated: false, reason: "could not patch segment command" };
+
+  fs.writeFileSync(statuslinePath, lines.join("\n"));
+  return { statuslinePath, updated: true };
+}
+
 const LEGACY = ["codex-plan-review.mjs", "codex-plan-file-review.mjs"];
 // Register our hook canonically AND de-dupe: remove any existing entries referencing this hook
 // FILE (matched by basename, so it catches ANY path form — $HOME, absolute, different quoting),
@@ -150,5 +194,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const snap = snapshot({ hooksDir, settingsPath, backupDir });
   const dep = deploy({ src: path.join(here, "..", "global-hooks"), dest: hooksDir });
   const sync = syncSettings({ hooksDir, settingsPath });
-  console.log(JSON.stringify({ migrate, snapshot: snap, deploy: dep, sync }, null, 2));
+  const statusline = syncStatuslineSessionArg();
+  console.log(JSON.stringify({ migrate, snapshot: snap, deploy: dep, sync, statusline }, null, 2));
 }

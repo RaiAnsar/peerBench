@@ -4,7 +4,7 @@
 // when ALL reviewers error.
 import fs from "node:fs";
 import { combinePanel } from "./panel-lib.mjs";
-import { isBenchDisabled as defaultIsBenchDisabled } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput } from "./config-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { parseSeverity } from "./deep-review.mjs";
@@ -75,6 +75,7 @@ export async function runMain({
     emitter.emit(decisionPayload(permissionDecision, reason, systemMessage));
 
   const input = inputOverride ?? readInput();
+  const sessionKey = sessionKeyFromInput(input, process.env);
 
   const plan = String(input.tool_input?.plan ?? "").trim();
   if (!plan) {
@@ -95,6 +96,7 @@ export async function runMain({
     writeTraceImpl(ws, {
       gate: "plan",
       ws,
+      sessionKey,
       // FIX 3: attach the parsed severity so the statusline can render a sub-threshold
       // plan BLOCK as `~` (advisory) rather than `✗` (mirrors spec-review-run's trace).
       reviewers: results.map(({ raw, ...m }) => ({ ...m, severity: parseSeverity(raw, m.verdict) })),

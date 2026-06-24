@@ -7,7 +7,7 @@ process.env.BENCH_ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpd
 
 import { enqueue, listJobs, listBlocked, claim, requeue, recoverOrphans, markBlocked, deleteJob, currentContentKey, GONE } from "../global-hooks/deep-queue.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
-import { workspaceStateDir } from "../global-hooks/config-store.mjs";
+import { normalizeSessionId, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 function freshWs() { return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "dq-ws-"))); }
 const qdir = (ws) => path.join(workspaceStateDir(ws), "deep-queue");
@@ -49,6 +49,37 @@ test("enqueue writes a <contentKey>.json job and dedupes by contentKey", () => {
   assert.equal(jobs[0]._jobKey, "ck1");
   assert.equal(enqueue(ws, { kind: "spec", specPath: "/x/s.md", contentKey: "ck1" }), false, "same contentKey → deduped");
   assert.equal(listJobs(ws).length, 1);
+});
+
+test("session-stamped enqueue isolates same contentKey across same-workspace chats", () => {
+  const ws = freshWs();
+  const sessionA = normalizeSessionId("chat-A");
+  const sessionB = normalizeSessionId("chat-B");
+  assert.equal(enqueue(ws, { kind: "spec", specPath: "/x/s.md", contentKey: "same-content" }, { sessionKey: sessionA }), true);
+  assert.equal(enqueue(ws, { kind: "spec", specPath: "/x/s.md", contentKey: "same-content" }, { sessionKey: sessionB }), true,
+    "a second session's identical content is not deduped by the first session's job");
+  assert.equal(enqueue(ws, { kind: "spec", specPath: "/x/s.md", contentKey: "same-content" }, { sessionKey: sessionA }), false,
+    "the same session still dedupes its own content");
+
+  const aJobs = listJobs(ws, { sessionKey: sessionA });
+  const bJobs = listJobs(ws, { sessionKey: sessionB });
+  assert.equal(aJobs.length, 1);
+  assert.equal(bJobs.length, 1);
+  assert.equal(listJobs(ws).length, 2, "unfiltered list preserves legacy project-level visibility");
+  assert.equal(aJobs[0].sessionKey, sessionA);
+  assert.equal(bJobs[0].sessionKey, sessionB);
+  assert.match(aJobs[0]._jobKey, new RegExp(`^${sessionA}--same-content$`));
+  assert.match(bJobs[0]._jobKey, new RegExp(`^${sessionB}--same-content$`));
+});
+
+test("session filter includes legacy unstamped jobs but excludes foreign stamped jobs", () => {
+  const ws = freshWs();
+  const sessionA = normalizeSessionId("chat-A");
+  const sessionB = normalizeSessionId("chat-B");
+  enqueue(ws, { kind: "spec", specPath: "/legacy.md", contentKey: "legacy" });
+  enqueue(ws, { kind: "spec", specPath: "/a.md", contentKey: "owned" }, { sessionKey: sessionA });
+  enqueue(ws, { kind: "spec", specPath: "/b.md", contentKey: "foreign" }, { sessionKey: sessionB });
+  assert.deepEqual(listJobs(ws, { sessionKey: sessionA }).map((j) => j.contentKey).sort(), ["legacy", "owned"]);
 });
 
 test("enqueue dedupes against an existing .claimed or .blocked", () => {

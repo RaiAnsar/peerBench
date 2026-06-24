@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
-import { isBenchDisabled as defaultIsBenchDisabled, workspaceStateDir, readReviewedHead, writeReviewedHead } from "./config-store.mjs";
+import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput, workspaceStateDir, readReviewedHead, writeReviewedHead } from "./config-store.mjs";
 export { readReviewedHead, writeReviewedHead };   // re-exported so tests + siblings share one impl
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
@@ -138,6 +138,7 @@ export async function runMain({
   const input = inputOverride ?? readInput();
   const cwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);
+  const sessionKey = sessionKeyFromInput(input, env);
 
   if (isBenchDisabledImpl(ws)) {
     process.exit(0);   // disabled-first
@@ -149,7 +150,7 @@ export async function runMain({
   // Loop protection scoped to THIS gate. We deliberately do NOT key off `stop_hook_active`: that
   // flag is SHARED across all Stop hooks, so another asyncRewake gate (e.g. the codex gate) looping
   // would starve this one — it would skip on every turn. Instead, cap our OWN consecutive blocks.
-  const loopFile = path.join(workspaceStateDir(ws), "stop-loop");
+  const loopFile = path.join(workspaceStateDir(ws), sessionKey ? `stop-loop.${sessionKey}` : "stop-loop");
   let priorBlocks = 0;
   try {
     const j = JSON.parse(fs.readFileSync(loopFile, "utf8"));
@@ -203,6 +204,7 @@ export async function runMain({
     writeTraceImpl(ws, {
       gate: "stop",
       ws,
+      sessionKey,
       reviewers: results.map(({ raw, ...m }) => m),
       systemPrompt: system,
       userPrompt: user,

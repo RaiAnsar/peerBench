@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { renderSegment, latestTrace, latestTraceForDir, resolveDir } from "../global-hooks/statusline-segment.mjs";
-import { workspaceStateDir } from "../global-hooks/config-store.mjs";
+import { renderSegment, latestTrace, latestTraceForDir, resolveDir, resolveSessionKey } from "../global-hooks/statusline-segment.mjs";
+import { normalizeSessionId, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 test("all-allow → green label, names with ✓", () => {
   const s = renderSegment({ gate: "plan", reviewers: [{ name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "ALLOW" }] });
@@ -181,6 +181,23 @@ test("latestTrace: a legacy trace with NO wsKey is still accepted (back-compat)"
   fs.writeFileSync(path.join(d, "100-aaa.json"), JSON.stringify({ id: "100-aaa", gate: "plan", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
   assert.equal(latestTrace(d, "mine-cafef00d").id, "100-aaa", "unstamped legacy traces are not filtered out");
 });
+test("latestTrace: session filter prefers own session, falls back to legacy, never foreign", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "trsess-"));
+  const sessionA = normalizeSessionId("chat-A");
+  const sessionB = normalizeSessionId("chat-B");
+  fs.writeFileSync(path.join(d, "300-ccc.json"), JSON.stringify({ id: "300-ccc", gate: "stop", reviewers: [{ name: "K", verdict: "BLOCK" }] }));  // legacy: newest, UNSTAMPED
+  fs.writeFileSync(path.join(d, "200-bbb.json"), JSON.stringify({ id: "200-bbb", sessionKey: sessionB, gate: "plan", reviewers: [{ name: "K", verdict: "BLOCK" }] }));
+  fs.writeFileSync(path.join(d, "100-aaa.json"), JSON.stringify({ id: "100-aaa", sessionKey: sessionA, gate: "hunt", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
+  assert.equal(latestTrace(d, null, sessionA).id, "100-aaa", "tier 1: chat A prefers its OWN trace over the newer legacy/foreign ones");
+  assert.equal(latestTrace(d, null, sessionB).id, "200-bbb", "tier 1: chat B prefers its own trace");
+  assert.equal(latestTrace(d, null, normalizeSessionId("chat-C")).id, "300-ccc", "tier 2: a session with no own trace falls back to the newest LEGACY trace (NOT a foreign session's) — no badge regression");
+  assert.equal(latestTrace(d).id, "300-ccc", "without a session filter, legacy project-level behavior remains");
+
+  // foreign-only (no legacy present): an unknown session gets NOTHING — never another chat's stamped trace
+  const d2 = fs.mkdtempSync(path.join(os.tmpdir(), "trsess2-"));
+  fs.writeFileSync(path.join(d2, "100-aaa.json"), JSON.stringify({ id: "100-aaa", sessionKey: sessionA, gate: "hunt", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
+  assert.equal(latestTrace(d2, null, sessionB), null, "no own + no legacy → null, never a foreign session's stamped trace");
+});
 test("latestTraceForDir: a foreign-stamped trace sitting in this project's dir is NOT surfaced (mixup guard)", () => {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "sl-own-")));
   const prev = process.env.BENCH_ROOT; process.env.BENCH_ROOT = root;
@@ -194,4 +211,28 @@ test("latestTraceForDir: a foreign-stamped trace sitting in this project's dir i
   } finally {
     if (prev === undefined) delete process.env.BENCH_ROOT; else process.env.BENCH_ROOT = prev;
   }
+});
+test("latestTraceForDir: same workspace returns distinct traces per session", () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "sl-sess-")));
+  const prev = process.env.BENCH_ROOT; process.env.BENCH_ROOT = root;
+  try {
+    const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "wsSess-")));
+    const td = path.join(workspaceStateDir(ws), "traces");
+    fs.mkdirSync(td, { recursive: true });
+    const sessionA = normalizeSessionId("chat-A");
+    const sessionB = normalizeSessionId("chat-B");
+    fs.writeFileSync(path.join(td, "100-aaa.json"), JSON.stringify({ id: "100-aaa", sessionKey: sessionA, gate: "plan", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
+    fs.writeFileSync(path.join(td, "200-bbb.json"), JSON.stringify({ id: "200-bbb", sessionKey: sessionB, gate: "stop", reviewers: [{ name: "K", verdict: "BLOCK" }] }));
+    assert.equal(latestTraceForDir(ws, (d) => d, sessionA).id, "100-aaa", "chat A shows A's latest trace");
+    assert.equal(latestTraceForDir(ws, (d) => d, sessionB).id, "200-bbb", "chat B shows B's latest trace");
+  } finally {
+    if (prev === undefined) delete process.env.BENCH_ROOT; else process.env.BENCH_ROOT = prev;
+  }
+});
+
+test("resolveDir/resolveSessionKey can read Claude statusline JSON payloads", () => {
+  const input = { workspace: { current_dir: "/payload/ws" }, session_id: "payload-session" };
+  assert.equal(resolveDir("", {}, input), "/payload/ws");
+  assert.equal(resolveSessionKey("", {}, input), normalizeSessionId("payload-session"));
+  assert.equal(resolveSessionKey("argv-session", {}, input), normalizeSessionId("argv-session"), "explicit argv session wins");
 });

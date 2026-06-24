@@ -8,7 +8,7 @@ process.env.BENCH_ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpd
 import { runMain, WAKE_WINDOW_MS, MAX_BATCH, MAX_REVIEW_ATTEMPTS } from "../global-hooks/deep-review-runner.mjs";
 import { enqueue, listJobs, listBlocked, markBlocked } from "../global-hooks/deep-queue.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
-import { workspaceStateDir } from "../global-hooks/config-store.mjs";
+import { normalizeSessionId, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 function freshWs() { return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "drr-ws-"))); }
 
@@ -50,6 +50,52 @@ test("happy path: a CLEAN spec job → claim deleted, exit 0, no wake/advisory",
   assert.equal(listJobs(ws).length, 0, "clean job's claim deleted");
   assert.equal(listBlocked(ws).length, 0, "no .blocked");
   assert.equal(out.length, 0, "no output on a clean turn");
+});
+
+test("session isolation: runner claims only this chat's queued jobs in the same workspace", async () => {
+  const ws = freshWs();
+  const fileA = path.join(ws, "a.md");
+  const fileB = path.join(ws, "b.md");
+  fs.writeFileSync(fileA, "body A");
+  fs.writeFileSync(fileB, "body B");
+  const sessionA = normalizeSessionId("chat-A");
+  const sessionB = normalizeSessionId("chat-B");
+  enqueue(ws, { kind: "spec", specPath: fileA, contentKey: deepKey(fileA, "body A") }, { sessionKey: sessionA });
+  enqueue(ws, { kind: "spec", specPath: fileB, contentKey: deepKey(fileB, "body B") }, { sessionKey: sessionB });
+
+  const reviewed = [];
+  const { exit } = await runRunner(ws, {
+    input: { cwd: ws, session_id: "chat-B" },
+    runSpecReviewImpl: async (filePath) => {
+      reviewed.push(path.basename(filePath));
+      return { maxSeverity: "none", findingCount: 0, findings: "" };
+    }
+  });
+  assert.equal(exit, 0);
+  assert.deepEqual(reviewed, ["b.md"], "chat B must not claim chat A's queued job");
+  assert.equal(listJobs(ws, { sessionKey: sessionA }).length, 1, "chat A's job remains queued for chat A");
+  assert.equal(listJobs(ws, { sessionKey: sessionB }).length, 0, "chat B's own job was processed");
+});
+
+test("session isolation: runner re-delivers only this chat's blocked findings", async () => {
+  const ws = freshWs();
+  const fileA = path.join(ws, "a.md");
+  fs.writeFileSync(fileA, "body A");
+  const contentKey = deepKey(fileA, "body A");
+  const sessionA = normalizeSessionId("chat-A");
+  markBlocked(ws, `${sessionA}--${contentKey}`, {
+    kind: "spec", specPath: fileA, contentKey, sessionKey: sessionA,
+    findings: "- chat A finding", firstBlockedTs: Date.now()
+  });
+
+  const bRun = await runRunner(ws, { input: { cwd: ws, session_id: "chat-B" } });
+  assert.equal(bRun.exit, 0, "chat B must not be woken for chat A's durable block");
+  assert.doesNotMatch(bRun.err, /chat A finding/);
+  assert.equal(listBlocked(ws, { sessionKey: sessionA }).length, 1, "chat A block remains durable");
+
+  const aRun = await runRunner(ws, { input: { cwd: ws, session_id: "chat-A" } });
+  assert.equal(aRun.exit, 2, "chat A is still woken for its own block");
+  assert.match(aRun.err, /chat A finding/);
 });
 
 test("BLOCK: a HIGH spec job → .blocked persisted + exit 2 with findings", async () => {

@@ -38,8 +38,10 @@ surfaced only at the next stop could never wake an idle agent). The job lifecycl
 atomic-rename states (`.json` queued → `.claimed.<pid>` running → `.blocked` durable), a completed
 block is retired ONLY when its content changes (the agent addresses it) or the target is deleted —
 never lost on a crash, transient git error, or large file. Disabling the bench (`/bench:off`) skips
-the runner. (This replaced an earlier detached-worker + `deep-result` + next-stop-surfacing design
-that could not wake an idle agent — see `docs/superpowers/specs/2026-06-22-deep-review-wake-delivery-design.md`.)
+the runner. Deep jobs are stamped with Claude's hook `session_id`, so two Claude chats in the same
+git checkout do not claim or wake each other's queued findings. (This replaced an earlier detached
+worker + `deep-result` + next-stop-surfacing design that could not wake an idle agent — see
+`docs/superpowers/specs/2026-06-22-deep-review-wake-delivery-design.md`.)
 
 **2. Bug hunt (on demand).** `/bench:hunt [focus]` runs the panel **agentically** —
 each reviewer explores the repository read-only via tools (read_file, grep, glob,
@@ -119,8 +121,12 @@ when a task calls for finding or root-causing a bug. The rest are user-invoked.
 - `BENCH_ROOT` — override the shared dir (used for test isolation).
 - `BENCH_DEBUG=1` — verbose agentic diagnostics.
 
-State (panel on/off, gate history, traces) is **per-workspace**, keyed by git
-top-level. The provider config in `companion.json` is global/shared.
+State is keyed first by **workspace** (git top-level). Git facts that are truly
+workspace-wide, such as `/bench:off` and the stop gate's `reviewed-head` marker,
+stay project-scoped. Delivery/status artifacts that can interrupt a conversation
+(`deep-queue` jobs, durable deep blocks, stop-loop counters, and hook traces used
+by the statusline) are additionally stamped by Claude `session_id` when available.
+The provider config in `companion.json` is global/shared.
 
 ## Fallback (revert anytime)
 
@@ -132,10 +138,12 @@ top-level. The provider config in `companion.json` is global/shared.
 
 ## Statusline
 
-A compact segment renders the latest gate/hunt per workspace —
+A compact segment renders the latest gate/hunt for the current workspace and,
+when Claude provides a `session_id`, the current chat —
 `⛩ plan: Codex✓ Kimi✓ MiMo✓` (green all-allow, red on block, `!` on error/skip,
 `✓` for hunt findings). Verdicts older than ~45 min dim to `(idle)` so a stale
-result never looks like an active block.
+result never looks like an active block. If no session id is available, the
+segment falls back to workspace-level trace selection for compatibility.
 
 ## Requirements
 
@@ -168,8 +176,10 @@ node /absolute/path/to/bench/scripts/deploy-global-hooks.mjs
 
 This registers the Stop gate (matcher-less), the ExitPlanMode plan gate, the
 `Write|Edit` plan-file gate, and the `Bash` pre-push gate. Re-run it any time to
-re-sync; it is idempotent and de-dupes existing entries. Without this step the
-commands work but the automatic gates do not fire.
+re-sync; it is idempotent and de-dupes existing entries. If your
+`~/.claude/statusline-command.sh` already calls peerBench's `statusline-segment.mjs`,
+the deploy step also patches that call to pass Claude's per-chat `session_id`.
+Without this step the commands work but the automatic gates do not fire.
 
 ## Test
 

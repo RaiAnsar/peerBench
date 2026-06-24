@@ -343,6 +343,7 @@ test("severity-gate: a HIGH-severity BLOCK still blocks (rewake, exit 2)", async
 
 import { deepKey } from "../global-hooks/deep-review.mjs";
 import { listJobs } from "../global-hooks/deep-queue.mjs";
+import { normalizeSessionId } from "../global-hooks/config-store.mjs";
 
 function allowReviewers() {
   return () => [{ name: "Kimi", run: async () => ({ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }) }];
@@ -368,6 +369,28 @@ test("fast ALLOW ENQUEUES a kind:'spec' job keyed by (path,content) — no spawn
   assert.equal(jobs[0].kind, "spec");
   assert.equal(jobs[0].specPath, specFile);
   assert.equal(jobs[0].contentKey, deepKey(specFile, body), "job is keyed by (path, content)");
+});
+
+test("fast ALLOW stamps trace and deep job with the originating Claude session", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-session-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "s.md");
+  const body = "# Spec\n\nsession body.\n";
+  fs.writeFileSync(specFile, body);
+  const sessionKey = normalizeSessionId("chat-A");
+  let trace = null;
+
+  await runMain({
+    resolveReviewersImpl: allowReviewers(),
+    writeTraceImpl: (_ws, t) => { trace = t; },
+    isBenchDisabledImpl: () => false,
+    input: { cwd: ws, session_id: "chat-A", tool_input: { file_path: specFile } }
+  });
+
+  assert.equal(trace?.sessionKey, sessionKey, "fast plan-file trace is stamped with the hook session");
+  assert.equal(listJobs(ws, { sessionKey }).length, 1, "the originating session sees its deep job");
+  assert.equal(listJobs(ws, { sessionKey: normalizeSessionId("chat-B") }).length, 0, "another same-workspace session does not see the job");
 });
 
 test("enqueue dedupes — identical content re-save does not double-queue", async () => {

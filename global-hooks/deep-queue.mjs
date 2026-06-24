@@ -12,11 +12,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { workspaceStateDir } from "./config-store.mjs";
+import { normalizeSessionId, workspaceStateDir } from "./config-store.mjs";
 import { deepKey } from "./deep-review.mjs";
 
 const queueDir = (ws) => path.join(workspaceStateDir(ws), "deep-queue");
 const TMP = (f) => `${f}.tmp.${process.pid}`;
+const jobKeyFor = (contentKey, sessionKey = null) => sessionKey ? `${sessionKey}--${contentKey}` : contentKey;
+const belongsToSession = (job, sessionKey = null) => !sessionKey || !job.sessionKey || job.sessionKey === sessionKey;
 
 // Local git helper (deploy-parity: global-hooks only). Returns [out, ok].
 function gitDefault(args, cwd) {
@@ -36,33 +38,37 @@ function readJob(file, jobKeySuffix) {
 
 // Write <contentKey>.json IFF no state file for this jobKey already exists (.json/.claimed.*/.blocked).
 // Returns true if newly enqueued, false if deduped (already known). Atomic.
-export function enqueue(ws, { kind, specPath = null, range = null, contentKey }, { now = Date.now() } = {}) {
+export function enqueue(ws, { kind, specPath = null, range = null, contentKey, sessionKey: jobSessionKey = null }, { now = Date.now(), sessionKey = null } = {}) {
   if (!contentKey) throw new Error("enqueue: contentKey required");
+  const ownerSessionKey = normalizeSessionId(sessionKey ?? jobSessionKey);
+  const jobKey = jobKeyFor(contentKey, ownerSessionKey);
   const dir = queueDir(ws);
   fs.mkdirSync(dir, { recursive: true });
   let existing = [];
   try {
     existing = fs.readdirSync(dir).filter((f) =>
-      f === `${contentKey}.json` || f === `${contentKey}.blocked` || f.startsWith(`${contentKey}.claimed.`));
+      f === `${jobKey}.json` || f === `${jobKey}.blocked` || f.startsWith(`${jobKey}.claimed.`));
   } catch { /* dir just created */ }
   if (existing.length) return false;
-  const file = path.join(dir, `${contentKey}.json`);
+  const file = path.join(dir, `${jobKey}.json`);
   const tmp = TMP(file);
-  fs.writeFileSync(tmp, `${JSON.stringify({ kind, specPath, range, contentKey, ts: now }, null, 2)}\n`);
+  fs.writeFileSync(tmp, `${JSON.stringify({ kind, specPath, range, contentKey, sessionKey: ownerSessionKey || undefined, ts: now }, null, 2)}\n`);
   fs.renameSync(tmp, file);
   return true;
 }
 
-export function listJobs(ws) {
+export function listJobs(ws, { sessionKey = null } = {}) {
+  const expectedSessionKey = normalizeSessionId(sessionKey);
   const dir = queueDir(ws);
   let files = []; try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".json") && !f.includes(".tmp.")); } catch { return []; }
-  return files.map((f) => readJob(path.join(dir, f), /\.json$/)).filter(Boolean);
+  return files.map((f) => readJob(path.join(dir, f), /\.json$/)).filter((job) => job && belongsToSession(job, expectedSessionKey));
 }
 
-export function listBlocked(ws) {
+export function listBlocked(ws, { sessionKey = null } = {}) {
+  const expectedSessionKey = normalizeSessionId(sessionKey);
   const dir = queueDir(ws);
   let files = []; try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".blocked") && !f.includes(".tmp.")); } catch { return []; }
-  return files.map((f) => readJob(path.join(dir, f), /\.blocked$/)).filter(Boolean);
+  return files.map((f) => readJob(path.join(dir, f), /\.blocked$/)).filter((job) => job && belongsToSession(job, expectedSessionKey));
 }
 
 // Atomically claim <jobKey>.json → <jobKey>.claimed.<pid>. Returns the claimed path, or null if
@@ -91,9 +97,11 @@ export function requeue(ws, claimedPath) {
 export function requeueForRetry(ws, claimedPath, job, attempts, { now = Date.now() } = {}) {
   const dir = queueDir(ws);
   fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${job.contentKey}.json`);
+  const ownerSessionKey = normalizeSessionId(job.sessionKey);
+  const jobKey = job._jobKey || jobKeyFor(job.contentKey, ownerSessionKey);
+  const file = path.join(dir, `${jobKey}.json`);
   const tmp = TMP(file);
-  fs.writeFileSync(tmp, `${JSON.stringify({ kind: job.kind, specPath: job.specPath ?? null, range: job.range ?? null, contentKey: job.contentKey, ts: job.ts ?? now, attempts }, null, 2)}\n`);
+  fs.writeFileSync(tmp, `${JSON.stringify({ kind: job.kind, specPath: job.specPath ?? null, range: job.range ?? null, contentKey: job.contentKey, sessionKey: ownerSessionKey || undefined, ts: job.ts ?? now, attempts }, null, 2)}\n`);
   fs.renameSync(tmp, file);
   try { fs.rmSync(claimedPath, { force: true }); } catch { /* best-effort */ }
   return attempts;

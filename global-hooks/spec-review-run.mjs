@@ -33,7 +33,8 @@ function git(args, cwd) {
 export async function runSpecReview(filePath, ws, {
   panelImpl = specReviewPanel,
   writeTraceImpl = writeTrace,
-  now = Date.now()
+  now = Date.now(),
+  sessionKey = null
 } = {}) {
   let content = "";
   try { content = fs.readFileSync(filePath, "utf8"); } catch (e) {
@@ -53,6 +54,7 @@ export async function runSpecReview(filePath, ws, {
   try {
     traceId = writeTraceImpl(ws, {
       gate: "spec-review", ws,
+      sessionKey,
       reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null, severity: r.severity, findingCount: r.findingCount })),
       systemPrompt: SPEC_REVIEW_SYSTEM,
       userPrompt: buildSpecReviewUser(filePath, content),
@@ -69,7 +71,8 @@ export async function runPushReview(range, ws, {
   panelImpl = pushReviewPanel,
   writeTraceImpl = writeTrace,
   gitImpl = git,
-  now = Date.now()
+  now = Date.now(),
+  sessionKey = null
 } = {}) {
   if (!range) throw new Error("runPushReview: missing range");
 
@@ -108,6 +111,7 @@ export async function runPushReview(range, ws, {
   try {
     traceId = writeTraceImpl(ws, {
       gate: "push-review", ws,
+      sessionKey,
       reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null, severity: r.severity, findingCount: r.findingCount })),
       systemPrompt: PUSH_REVIEW_SYSTEM,
       userPrompt: buildPushReviewUser(range, content),

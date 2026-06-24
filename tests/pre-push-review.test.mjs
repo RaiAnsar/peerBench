@@ -15,7 +15,7 @@ const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root
 process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt, cdTargetBeforePush, commandCwd, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview } from "../global-hooks/pre-push-review.mjs";
-import { setBenchDisabled, readReviewedHead, writeReviewedHead } from "../global-hooks/config-store.mjs";
+import { normalizeSessionId, setBenchDisabled, readReviewedHead, writeReviewedHead } from "../global-hooks/config-store.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
 import { listJobs } from "../global-hooks/deep-queue.mjs";
 
@@ -290,7 +290,7 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
       writeTraceImpl: (_ws, trace) => { traceRecord = trace; },
       isBenchDisabledImpl: () => false,
       env: process.env,
-      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+      input: { cwd: ws, session_id: "chat-A", tool_input: { command: "git push origin main" } }
     });
   } finally {
     process.stdout.write = origWrite;
@@ -309,6 +309,7 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
 
   assert.ok(traceRecord !== null, "trace should be written");
   assert.equal(traceRecord.gate, "push", "trace gate must be 'push'");
+  assert.equal(traceRecord.sessionKey, normalizeSessionId("chat-A"), "trace is stamped with the hook session");
   assert.ok(traceRecord.ws, "trace.ws should be set");
   assert.ok(Array.isArray(traceRecord.reviewers), "trace.reviewers should be an array");
 });
@@ -958,10 +959,10 @@ function pushSpawnSpy() {
   return { impl, calls, unrefCount: () => unrefCount };
 }
 
-/** A launchImpl spy — records (ws, range) so we can assert WHETHER a launch was attempted. */
+/** A launchImpl spy — records (ws, range, opts) so we can assert WHETHER a launch was attempted. */
 function launchSpy() {
   const calls = [];
-  const impl = (ws, range) => { calls.push({ ws, range }); return true; };
+  const impl = (ws, range, opts = {}) => { calls.push({ ws, range, opts }); return true; };
   return { impl, calls };
 }
 
@@ -991,6 +992,29 @@ test("H: fast ALLOW ENQUEUES a kind:'push' job with a SHA-pinned range (no detac
   }
 });
 
+test("H: fast ALLOW passes the originating Claude session to the deep push-review enqueue", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hsess-")));
+  process.env.BENCH_ROOT = root;
+  const spy = launchSpy();
+
+  try {
+    await runMain({
+      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      launchImpl: spy.impl,
+      env: process.env,
+      input: { cwd: ws, session_id: "chat-A", tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(spy.calls.length, 1);
+  assert.equal(spy.calls[0].opts.sessionKey, normalizeSessionId("chat-A"));
+});
+
 test("H: launchPushReview enqueues a SHA-pinned range that survives the push advancing the remote ref (the race)", () => {
   const { ws } = freshPushRepo();   // one commit ahead of origin/main
   const wsReal = fs.realpathSync(ws);
@@ -1011,6 +1035,21 @@ test("H: launchPushReview enqueues a SHA-pinned range that survives the push adv
   const pinned = execFileSync("git", ["log", "--oneline", range], { cwd: ws, encoding: "utf8" }).trim();
   assert.equal(symbolic, "", "the SYMBOLIC range is empty after the push (the race that reviewed nothing)");
   assert.ok(pinned.length > 0, "the PINNED SHA range still contains the pushed commit (race fixed)");
+});
+
+test("H: launchPushReview stamps the queued push job by session", () => {
+  const { ws } = freshPushRepo();
+  const wsReal = fs.realpathSync(ws);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hsessjob-")));
+  process.env.BENCH_ROOT = root;
+  const sessionA = normalizeSessionId("chat-A");
+  try {
+    launchPushReview(ws, "origin/main..HEAD", { sessionKey: sessionA });
+    assert.equal(listJobs(wsReal, { sessionKey: sessionA }).length, 1, "originating session sees the queued push review");
+    assert.equal(listJobs(wsReal, { sessionKey: normalizeSessionId("chat-B") }).length, 0, "another same-workspace session does not see it");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
 });
 
 test("H: BLOCK → does NOT launch the deep push-review (push denied)", async () => {

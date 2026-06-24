@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
-import { deploy, snapshot, syncSettings, migrateDataDir } from "../scripts/deploy-global-hooks.mjs";
+import { deploy, snapshot, syncSettings, migrateDataDir, syncStatuslineSessionArg } from "../scripts/deploy-global-hooks.mjs";
 
 test("migrateDataDir: clean legacy → rename", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-"));
@@ -57,6 +57,46 @@ test("snapshot captures existing hooks + settings", () => {
   assert.equal(r.settingsBackedUp, true);
   assert.ok(fs.existsSync(path.join(backup, "b1", "settings.json")));
 });
+
+test("syncStatuslineSessionArg passes Claude session_id to peerBench statusline segment", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slcmd-"));
+  const statuslinePath = path.join(dir, "statusline-command.sh");
+  fs.writeFileSync(statuslinePath, [
+    "#!/bin/bash",
+    "input=$(cat)",
+    "dir=$(echo \"$input\" | jq -r '.workspace.current_dir // .cwd // empty')",
+    "gate_dir=\"$dir\"",
+    "# comment mentioning statusline-segment.mjs must not be patched",
+    "gc_gate=$(node ~/.claude/hooks/statusline-segment.mjs \"$gate_dir\" 2>/dev/null)",
+    "echo \"$gc_gate\"",
+    ""
+  ].join("\n"));
+
+  const first = syncStatuslineSessionArg({ statuslinePath });
+  assert.equal(first.updated, true);
+  const once = fs.readFileSync(statuslinePath, "utf8");
+  assert.match(once, /bench_session_id=.*session_id.*workspace\.session_id/, "wrapper extracts the per-invocation session id");
+  assert.match(once, /statusline-segment\.mjs "\$gate_dir" "\$bench_session_id"/, "segment receives session id as argv3");
+
+  const second = syncStatuslineSessionArg({ statuslinePath });
+  assert.equal(second.updated, false);
+  assert.equal(second.reason, "already session-aware");
+  const twice = fs.readFileSync(statuslinePath, "utf8");
+  assert.equal((twice.match(/bench_session_id=/g) || []).length, 1, "idempotent: extraction line is not duplicated");
+  assert.equal((twice.match(/\$bench_session_id/g) || []).length, 1, "idempotent: one argv use");
+});
+
+test("syncStatuslineSessionArg no-ops when there is no peerBench segment", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slcmd-none-"));
+  const statuslinePath = path.join(dir, "statusline-command.sh");
+  fs.writeFileSync(statuslinePath, "#!/bin/bash\necho ok\n");
+  const before = fs.readFileSync(statuslinePath, "utf8");
+  const result = syncStatuslineSessionArg({ statuslinePath });
+  assert.equal(result.updated, false);
+  assert.equal(result.reason, "no peerbench statusline segment");
+  assert.equal(fs.readFileSync(statuslinePath, "utf8"), before);
+});
+
 test("syncSettings removes only matching legacy commands, drops empty entries, registers absolute plan-* paths, preserves unrelated hooks", () => {
   const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-"));
   fs.writeFileSync(path.join(hooks, "codex-plan-review.mjs"), "// old\n");
