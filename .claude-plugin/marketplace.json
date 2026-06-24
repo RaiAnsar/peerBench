@@ -1,6 +1,9 @@
 {
-  "name": "peerbench",
+  "name": "aiwithrai",
   "owner": { "name": "Rai Ansar" },
+  "metadata": {
+    "description": "AI with Rai local marketplace for the peerbench Claude Code plugin."
+  },
   "plugins": [
     {
       "name": "bench",

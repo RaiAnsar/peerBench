@@ -197,8 +197,11 @@ npm run setup
 
 The installer is idempotent. It:
 
-- enables the local Claude plugin as `bench@peerbench` in `~/.claude/settings.json`
-  and migrates the old local `bench@rai-tools` id when it points at this checkout;
+- registers the local Claude marketplace as `aiwithrai`, installs/enables the
+  plugin as `bench@aiwithrai`, and migrates old local `bench@rai-tools` /
+  `bench@peerbench` ids when they point at this checkout;
+- scrubs local secret files such as `.keys` from Claude's installed plugin cache
+  after local marketplace installs;
 - copies review hooks into `~/.claude/hooks` and `~/.codex/hooks`;
 - registers Claude gates for `ExitPlanMode`, plan/spec file writes, Stop, deep
   Stop review delivery, and `git push`;
@@ -231,9 +234,15 @@ node scripts/install.mjs --load-keys
 `load-keys` writes provider config to
 `~/.claude/plugins/data/bench-shared/companion.json` and never prints key values.
 
-Restart Claude Code so `/bench:*` commands appear. Open a fresh Codex session
-after installing or trusting hooks. Codex may ask you to trust the new hook in
-`/hooks` the first time it sees `~/.codex/hooks.json`.
+Restart Claude Code so `/bench:*` commands appear. To verify Claude's plugin side:
+
+```bash
+claude plugin list | grep bench
+claude plugin details bench@aiwithrai
+```
+
+Open a fresh Codex session after installing or trusting hooks. Codex may ask you
+to trust the new hook in `/hooks` the first time it sees `~/.codex/hooks.json`.
 
 Claude commands are `/bench:hunt`, `/bench:investigate`, `/bench:debug`,
 `/bench:review`, `/bench:status`, `/bench:setup`, `/bench:on`, `/bench:off`,
