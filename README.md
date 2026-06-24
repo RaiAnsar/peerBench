@@ -60,8 +60,10 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
 
 ## Reviewers & cost model
 
-- **Codex** — OpenAI, via the `codex@openai-codex` plugin's shared runtime (an
-  agentic CLI that already reads files). The reliable reference.
+- **Codex** — OpenAI, via the
+  [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
+  `codex@openai-codex` Claude plugin's shared runtime (an agentic CLI that
+  already reads files). The reliable reference.
 - **Kimi** — Moonshot `kimi-k2.6` on the **coding-plan** endpoint
   (`api.kimi.com/coding/v1`) with **thinking disabled** (`thinking:{type:"disabled"}`,
   `temperature:0.6`). Fast, non-thinking, tool-calling — no Open Platform key needed.
@@ -176,8 +178,8 @@ segment falls back to workspace-level trace selection for compatibility.
 - Node 20+ (developed on 24).
 - Claude Code for `/bench:*` commands and Claude hooks.
 - Codex with hook support for direct Codex Stop reviews and `/prompts:bench-*`.
-- The `codex@openai-codex` plugin only if you enable the `codex` reviewer inside
-  Claude.
+- The [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
+  Claude plugin only if you enable the `codex` reviewer inside Claude.
 - At least one non-Codex provider key in `.keys` / `companion.json`. Defaults are
   `kimi` + `glm`.
 
@@ -205,6 +207,26 @@ gates just stay quiet instead of erroring on every prompt.
 The Claude Code desktop app has no `/plugin` command. Install it from the UI
 instead: Customize, the `+` by personal plugins, Create plugin and add
 marketplace, Add from repository, then enter `https://github.com/RaiAnsar/peerBench`.
+
+Optional, only if you want Claude Code to use Codex as one of peerBench's
+reviewers:
+
+```bash
+/plugin marketplace add openai/codex-plugin-cc
+```
+
+```bash
+/plugin install codex@openai-codex
+```
+
+```bash
+/reload-plugins
+/codex:setup
+```
+
+Without `openai/codex-plugin-cc`, Claude can still run peerBench with Kimi, GLM,
+Qwen, and MiMo, and Codex can still run peerBench directly. What will not work is
+selecting `codex` as a reviewer from inside Claude.
 
 ### Codex
 
