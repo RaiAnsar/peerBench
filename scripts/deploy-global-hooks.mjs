@@ -131,6 +131,13 @@ const LEGACY_COMMANDS = [
   "codex-multirepo-gate.mjs",
   "codex-stop-gate-autoenable.mjs"
 ];
+const PEERBENCH_SETTINGS_HOOKS = [
+  "plan-review.mjs",
+  "plan-file-review.mjs",
+  "pre-push-review.mjs",
+  "stop-review.mjs",
+  "deep-review-runner.mjs"
+];
 // Register our hook canonically AND de-dupe: remove any existing entries referencing this hook
 // FILE (matched by basename, so it catches ANY path form — $HOME, absolute, different quoting),
 // then add exactly one absolute-path entry. Idempotent + self-healing against duplicates.
@@ -154,23 +161,39 @@ function register(list, matcher, absCmd, extra = {}) {
     if (block) { block.hooks = block.hooks || []; block.hooks.push(cmd); } else list.push({ hooks: [cmd] });
   }
 }
+
+function removeHookCommands(settings, basenames) {
+  let removedEntries = 0;
+  settings.hooks = settings.hooks || {};
+  for (const ev of Object.keys(settings.hooks)) {
+    if (!Array.isArray(settings.hooks[ev])) continue;
+    for (const entry of settings.hooks[ev]) {
+      if (!Array.isArray(entry.hooks)) continue;
+      const before = entry.hooks.length;
+      entry.hooks = entry.hooks.filter((h) => !basenames.some((f) => String(h.command || "").includes(f)));
+      removedEntries += before - entry.hooks.length;
+    }
+    settings.hooks[ev] = settings.hooks[ev].filter((entry) => !Array.isArray(entry.hooks) || entry.hooks.length > 0);
+  }
+  return removedEntries;
+}
+
+export function removeClaudeSettingsPeerBenchHooks({ settingsPath }) {
+  let s = {};
+  try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch { s = {}; }
+  const removedEntries = removeHookCommands(s, [...PEERBENCH_SETTINGS_HOOKS, ...LEGACY_COMMANDS]);
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, `${JSON.stringify(s, null, 2)}\n`);
+  return { removedEntries, removedFiles: [], pluginManaged: true };
+}
+
 // Remove ONLY the matching legacy hook COMMANDS (not whole entries unless they become empty); register the new plan-*.mjs with ABSOLUTE paths.
 export function syncSettings({ hooksDir, settingsPath }) {
   const removedFiles = [];
   for (const f of LEGACY) { const p = path.join(hooksDir, f); if (fs.existsSync(p)) { fs.rmSync(p, { force: true }); removedFiles.push(f); } }
   let s = {}; try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch { s = {}; }
   s.hooks = s.hooks || {};
-  let removedEntries = 0;
-  for (const ev of Object.keys(s.hooks)) {
-    if (!Array.isArray(s.hooks[ev])) continue;
-    for (const entry of s.hooks[ev]) {
-      if (!Array.isArray(entry.hooks)) continue;
-      const before = entry.hooks.length;
-      entry.hooks = entry.hooks.filter((h) => !LEGACY_COMMANDS.some((f) => String(h.command || "").includes(f)));
-      removedEntries += before - entry.hooks.length;
-    }
-    s.hooks[ev] = s.hooks[ev].filter((entry) => !Array.isArray(entry.hooks) || entry.hooks.length > 0); // drop now-empty entries
-  }
+  const removedEntries = removeHookCommands(s, LEGACY_COMMANDS);
   s.hooks.PreToolUse = s.hooks.PreToolUse || [];
   s.hooks.PostToolUse = s.hooks.PostToolUse || [];
   s.hooks.Stop = s.hooks.Stop || [];

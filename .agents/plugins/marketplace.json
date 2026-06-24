@@ -1,0 +1,20 @@
+{
+  "name": "aiwithrai",
+  "interface": {
+    "displayName": "AI with Rai"
+  },
+  "plugins": [
+    {
+      "name": "bench",
+      "source": {
+        "source": "local",
+        "path": "./plugins/bench"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { runMain } from "./stop-review.mjs";
 
 function readInput() {
@@ -20,6 +21,15 @@ function readInput() {
 function truthy(value) {
   const raw = String(value ?? "").trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function isEntrypoint(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  try {
+    return fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(argv1);
+  } catch {
+    return fileURLToPath(metaUrl) === path.resolve(argv1);
+  }
 }
 
 export function shouldSkipCodexStop(env = process.env) {
@@ -72,7 +82,7 @@ export async function runCodexStop({
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntrypoint(import.meta.url)) {
   runCodexStop().catch((error) => {
     process.stderr.write(`⛩ bench codex stop: hook error (turn allowed) — ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(0);

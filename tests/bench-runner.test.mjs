@@ -140,6 +140,20 @@ test("D2b: setupStatus reports a correctly-registered gate as present", () => {
   assert.match(stopLine, /registered|present|ok|✓/i);
 });
 
+test("D2b: setupStatus reports plugin-managed hooks as registered", () => {
+  const settingsPath = writeSettings({ hooks: {} });
+  const pluginHooksPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "br-plugin-hooks-")), "hooks.json");
+  fs.writeFileSync(pluginHooksPath, JSON.stringify({
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/global-hooks/stop-review.mjs"' }] }]
+    }
+  }));
+  const out = setupStatus(settingsPath, { pluginHooksPath });
+  const stopLine = out.split("\n").find((l) => l.includes("stop-review.mjs"));
+  assert.ok(stopLine, "must have a stop-review line");
+  assert.match(stopLine, /registered \(plugin\)/i);
+});
+
 test("D2b: a stop hook trapped in a matcher-scoped block reports as misregistered", () => {
   const p = writeSettings({
     hooks: {
@@ -177,6 +191,19 @@ test("D2b: codexSetupStatus reports the direct-Codex stop wrapper", () => {
   const out = codexSetupStatus(p);
   assert.match(out, /codex-stop-review\.mjs/);
   assert.match(out, /registered/i);
+});
+
+test("D2b: codexSetupStatus reports plugin-managed direct-Codex stop wrapper", () => {
+  const settingsPath = writeSettings({ hooks: {} });
+  const pluginHooksPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "br-codex-plugin-hooks-")), "hooks.json");
+  fs.writeFileSync(pluginHooksPath, JSON.stringify({
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: 'node "${PLUGIN_ROOT}/global-hooks/codex-stop-review.mjs"' }] }]
+    }
+  }));
+  const out = codexSetupStatus(settingsPath, { pluginHooksPath });
+  assert.match(out, /codex-stop-review\.mjs/);
+  assert.match(out, /registered \(plugin\)/i);
 });
 
 test("D2b: codexSetupStatus flags matcher-scoped wrapper as misregistered", () => {

@@ -35,6 +35,63 @@ function workspaceRoot(cwd) {
   }
 }
 
+function readJson(pathname) {
+  try { return JSON.parse(fs.readFileSync(pathname, "utf8")); }
+  catch { return null; }
+}
+
+function isEntrypoint(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  try {
+    return fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(argv1);
+  } catch {
+    return fileURLToPath(metaUrl) === path.resolve(argv1);
+  }
+}
+
+function latestClaudeBenchPluginHooksPath({
+  home = os.homedir(),
+  pluginId = "bench@aiwithrai"
+} = {}) {
+  const installedPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
+  const installed = readJson(installedPath);
+  const entries = Array.isArray(installed?.plugins?.[pluginId]) ? installed.plugins[pluginId] : [];
+  const scoped = entries.filter((entry) => entry.scope === "user" || entry.scope === "local" || entry.scope === "project");
+  const latest = (scoped.length ? scoped : entries).at(-1);
+  return latest?.installPath ? path.join(latest.installPath, "hooks", "hooks.json") : null;
+}
+
+function latestCodexBenchPluginHooksPath({
+  home = os.homedir(),
+  marketplaceName = "aiwithrai",
+  pluginName = "bench"
+} = {}) {
+  const cacheDir = path.join(home, ".codex", "plugins", "cache", marketplaceName, pluginName);
+  let entries = [];
+  try {
+    entries = fs.readdirSync(cacheDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const pluginRoot = path.join(cacheDir, entry.name);
+        let mtimeMs = 0;
+        try { mtimeMs = fs.statSync(pluginRoot).mtimeMs; } catch {}
+        return { pluginRoot, mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const manifest = readJson(path.join(entry.pluginRoot, ".codex-plugin", "plugin.json"));
+    const hooks = manifest?.hooks;
+    const hooksPath = typeof hooks === "string" && hooks.startsWith("./")
+      ? path.join(entry.pluginRoot, hooks)
+      : path.join(entry.pluginRoot, "hooks", "hooks.json");
+    if (fs.existsSync(hooksPath)) return hooksPath;
+  }
+  return null;
+}
+
 const BOOL_FLAGS = new Set(["--json", "--write"]);
 const VALUE_FLAGS = new Set(["--effort", "--max-turns", "--base"]);
 
@@ -168,8 +225,8 @@ async function main() {
       `Codex plugin: ${codexFound ? "found" : "not found"}`,
       ...keyLines,
       `Bench disabled: ${disabled ? "yes" : "no"}`,
-      setupStatus(settingsPath),
-      codexSetupStatus(codexHooksPath),
+      setupStatus(settingsPath, { pluginHooksPath: latestClaudeBenchPluginHooksPath() }),
+      codexSetupStatus(codexHooksPath, { pluginHooksPath: latestCodexBenchPluginHooksPath() }),
       codexPromptStatus(codexPromptsDir),
       `Hint: /bench:reviewers to change reviewers | /bench:off to disable | /bench:on to re-enable`
     ];
@@ -394,26 +451,31 @@ const CODEX_PROMPTS = [
 
 // Inspect a settings.json and report each gate's registration honestly.
 // Unreadable/malformed/missing → "unable to check" + fail-open (no crash).
-export function setupStatus(settingsPath) {
-  let settings;
-  try {
-    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-  } catch {
-    return `Gate registration: unable to check (${settingsPath} unreadable or malformed).`;
+export function setupStatus(settingsPath, { pluginHooksPath = null } = {}) {
+  const settings = readJson(settingsPath);
+  const pluginSettings = pluginHooksPath ? readJson(pluginHooksPath) : null;
+  if (!settings && !pluginSettings) {
+    return `Gate registration: unable to check (${settingsPath} unreadable or malformed; no installed bench@aiwithrai hooks found).`;
   }
-  const hooks = (settings && settings.hooks) || {};
-  const lines = ["Gate registration (~/.claude/settings.json):"];
+  const hooks = settings?.hooks || {};
+  const pluginHooks = pluginSettings?.hooks || {};
+  const lines = ["Gate registration (Claude plugin/settings):"];
   for (const g of SETUP_GATES) {
-    const blocks = Array.isArray(hooks[g.event]) ? hooks[g.event] : [];
+    const settingsBlocks = Array.isArray(hooks[g.event]) ? hooks[g.event] : [];
+    const pluginBlocks = Array.isArray(pluginHooks[g.event]) ? pluginHooks[g.event] : [];
     const has = (block) =>
       Array.isArray(block.hooks) &&
       block.hooks.some((h) => String((h && h.command) || "").includes(g.file));
-    const correct = blocks.some((b) =>
+    const correctSettings = settingsBlocks.some((b) =>
       has(b) && (g.matcher === undefined ? !b.matcher : b.matcher === g.matcher));
-    const elsewhere = blocks.some((b) => has(b));
+    const correctPlugin = pluginBlocks.some((b) =>
+      has(b) && (g.matcher === undefined ? !b.matcher : b.matcher === g.matcher));
+    const elsewhere = [...settingsBlocks, ...pluginBlocks].some((b) => has(b));
     const label = g.matcher === undefined ? `${g.event}(matcher-less)` : `${g.event}/${g.matcher}`;
     let state;
-    if (correct) state = "registered";
+    if (correctPlugin && correctSettings) state = "registered (plugin + settings)";
+    else if (correctPlugin) state = "registered (plugin)";
+    else if (correctSettings) state = "registered (settings)";
     else if (elsewhere) state = "MISREGISTERED (wrong matcher block)";
     else state = "MISSING (not registered)";
     lines.push(`  ${label} → ${g.file}: ${state}`);
@@ -421,21 +483,27 @@ export function setupStatus(settingsPath) {
   return lines.join("\n");
 }
 
-export function codexSetupStatus(hooksPath) {
-  let settings;
-  try {
-    settings = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
-  } catch {
-    return `Codex gate registration: unable to check (${hooksPath} unreadable or malformed).`;
+export function codexSetupStatus(hooksPath, { pluginHooksPath = null } = {}) {
+  const settings = readJson(hooksPath);
+  const pluginSettings = pluginHooksPath ? readJson(pluginHooksPath) : null;
+  if (!settings && !pluginSettings) {
+    return `Codex gate registration: unable to check (${hooksPath} unreadable or malformed; no installed bench@aiwithrai Codex hooks found).`;
   }
-  const blocks = Array.isArray(settings?.hooks?.Stop) ? settings.hooks.Stop : [];
+  const settingsBlocks = Array.isArray(settings?.hooks?.Stop) ? settings.hooks.Stop : [];
+  const pluginBlocks = Array.isArray(pluginSettings?.hooks?.Stop) ? pluginSettings.hooks.Stop : [];
   const has = (block) =>
     Array.isArray(block.hooks) &&
     block.hooks.some((h) => String((h && h.command) || "").includes("codex-stop-review.mjs"));
-  const correct = blocks.some((b) => has(b) && !b.matcher);
-  const elsewhere = blocks.some((b) => has(b));
-  const state = correct ? "registered" : elsewhere ? "MISREGISTERED (wrong matcher block)" : "MISSING (not registered)";
-  return `Codex gate registration (~/.codex/hooks.json): Stop(matcher-less) → codex-stop-review.mjs: ${state}`;
+  const correctSettings = settingsBlocks.some((b) => has(b) && !b.matcher);
+  const correctPlugin = pluginBlocks.some((b) => has(b) && !b.matcher);
+  const elsewhere = [...settingsBlocks, ...pluginBlocks].some((b) => has(b));
+  let state;
+  if (correctPlugin && correctSettings) state = "registered (plugin + settings)";
+  else if (correctPlugin) state = "registered (plugin)";
+  else if (correctSettings) state = "registered (settings)";
+  else if (elsewhere) state = "MISREGISTERED (wrong matcher block)";
+  else state = "MISSING (not registered)";
+  return `Codex gate registration (plugin/~/.codex/hooks.json): Stop(matcher-less) → codex-stop-review.mjs: ${state}`;
 }
 
 export function codexPromptStatus(promptsDir) {
@@ -489,7 +557,7 @@ export function statusCommand(ws, rest = []) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntrypoint(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

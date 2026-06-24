@@ -1,4 +1,69 @@
 {
-  "description": "Bench plugin hooks (currently empty — all review gates live in global-hooks/ and are registered into ~/.claude/settings.json by scripts/deploy-global-hooks.mjs: plan-review.mjs, plan-file-review.mjs, pre-push-review.mjs, stop-review.mjs).",
-  "hooks": {}
+  "description": "peerBench automatic review gates for Claude Code.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/plan-review.mjs\"",
+            "statusMessage": "⛩ bench: reviewing plan…"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/pre-push-review.mjs\"",
+            "timeout": 1320,
+            "statusMessage": "⛩ bench: reviewing push…",
+            "if": "Bash(git *)"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/plan-file-review.mjs\"",
+            "statusMessage": "⛩ bench: reviewing plan/spec…"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/stop-review.mjs\"",
+            "timeout": 900,
+            "asyncRewake": true,
+            "statusMessage": "⛩ bench: reviewing turn…",
+            "rewakeMessage": "⛩ bench stop gate found issues in this turn's code changes. Fix them, then stop again to re-review:",
+            "rewakeSummary": "⛩ bench stop"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/deep-review-runner.mjs\"",
+            "timeout": 1320,
+            "asyncRewake": true,
+            "statusMessage": "⛩ bench: deep review…",
+            "rewakeMessage": "⛩ bench deep review found blocking issues. Address them, then continue:",
+            "rewakeSummary": "⛩ bench deep review"
+          }
+        ]
+      }
+    ]
+  }
 }

@@ -183,79 +183,51 @@ segment falls back to workspace-level trace selection for compatibility.
 
 ## Install
 
-The most setup peerBench will ask of you:
+The most effort peerBench will ever ask of you:
 
-peerBench's Claude and Codex gates run small Node.js hook scripts, so `node`
-must be on your `PATH`. For `nvm`, `asdf`, or Nix users, make sure `node` is on
-the **non-interactive** shell path too. If it is not, the manual `/bench:*` /
-`/prompts:bench-*` commands can still work, but the always-on gates stay quiet.
+The Claude Code and Codex plugins run tiny Node.js lifecycle hooks, so `node`
+needs to be on your PATH. For Nix, `nvm`, or `asdf` users: it must be on the
+non-interactive shell's PATH. If it is not, the skills still work; the always-on
+gates just stay quiet instead of erroring on every prompt.
 
 ### Claude Code
-
-Recommended install, including `/bench:*` commands and automatic gates:
-
-```bash
-git clone https://github.com/RaiAnsar/peerBench.git
-cd peerBench
-node scripts/install.mjs --claude-only
-```
-
-Marketplace-only install, if you just want the `/bench:*` commands:
 
 ```bash
 /plugin marketplace add RaiAnsar/peerBench
 ```
 
-Then send a second prompt:
-
 ```bash
 /plugin install bench@aiwithrai
 ```
 
-To add the automatic gates after a marketplace-only install:
+(You have to send two separate prompts for the install to work.)
 
-```bash
-git clone https://github.com/RaiAnsar/peerBench.git
-cd peerBench
-node scripts/install.mjs --claude-only
-```
-
-Restart Claude Code so `/bench:*` commands and hook changes are picked up.
-
-### Claude Code Desktop
-
-The Claude Code desktop app has no `/plugin` command. Install from the UI
-instead:
-
-1. Open **Customize**.
-2. Click the `+` by personal plugins.
-3. Choose **Create plugin and add marketplace**.
-4. Choose **Add from repository**.
-5. Enter `https://github.com/RaiAnsar/peerBench`.
-6. Install `bench@aiwithrai`.
-7. Run `node scripts/install.mjs --claude-only` from a clone if you also want
-   automatic gates.
-
-Restart the app after installing.
+The Claude Code desktop app has no `/plugin` command. Install it from the UI
+instead: Customize, the `+` by personal plugins, Create plugin and add
+marketplace, Add from repository, then enter `https://github.com/RaiAnsar/peerBench`.
 
 ### Codex
 
-peerBench's Codex support is installed by the script today. It writes the Stop
-hook and `/prompts:bench-*` prompt files:
-
 ```bash
-git clone https://github.com/RaiAnsar/peerBench.git
-cd peerBench
-node scripts/install.mjs --codex-only
+codex plugin marketplace add RaiAnsar/peerBench
+codex
 ```
 
-Open `/hooks`, review and trust the peerBench Stop hook, then start a new
-thread. The same install covers the Codex desktop app; restart the app after
-installing and it picks up the hook and `/prompts:bench-*` prompts.
+Open `/plugins`, select the AI with Rai marketplace, and install peerBench.
+Then open `/hooks`, review and trust its lifecycle hook, and start a new thread.
 
-### One Command For Both
+This same install also covers the Codex desktop app: restart the app after
+installing and it picks up the plugin.
 
-If you use both Claude and Codex on the same machine:
+CLI-only Codex install:
+
+```bash
+codex plugin add bench@aiwithrai
+```
+
+### Local Clone
+
+If you are developing peerBench locally or migrating an older install:
 
 ```bash
 git clone https://github.com/RaiAnsar/peerBench.git
@@ -269,7 +241,7 @@ Already cloned:
 npm run setup
 ```
 
-The installer is idempotent. It:
+The local installer is idempotent. It:
 
 - registers the local Claude marketplace as `aiwithrai`, installs/enables the
   plugin as `bench@aiwithrai`, and migrates old local `bench@rai-tools` /
@@ -284,7 +256,7 @@ The installer is idempotent. It:
 - installs Codex manual prompts into `~/.codex/prompts`;
 - prints a local-vs-`origin/<branch>` comparison before syncing.
 
-Use focused installs when needed:
+Focused local installs:
 
 ```bash
 node scripts/install.mjs --claude-only

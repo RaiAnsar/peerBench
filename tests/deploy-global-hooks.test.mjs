@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin } from "../scripts/deploy-global-hooks.mjs";
+import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin, removeClaudeSettingsPeerBenchHooks } from "../scripts/deploy-global-hooks.mjs";
 
 test("migrateDataDir: clean legacy → rename", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-"));
@@ -152,6 +152,34 @@ test("syncCodexPrompts renders peerBench custom prompts for Codex", () => {
   assert.match(rendered, /\/abs\/bench\/scripts\/bench-runner\.mjs/);
   assert.doesNotMatch(rendered, /\{\{BENCH_RUNNER\}\}/);
   assert.ok(fs.existsSync(path.join(dest, "bench-hunt.md.pre-peerbench.bak")));
+});
+
+test("removeClaudeSettingsPeerBenchHooks removes old settings hooks and preserves unrelated hooks", () => {
+  const settingsPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "claude-plugin-clean-")), "settings.json");
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    hooks: {
+      Stop: [
+        { hooks: [
+          { type: "command", command: 'node "/x/stop-review.mjs"' },
+          { type: "command", command: 'node "/x/unrelated-stop.mjs"' }
+        ] }
+      ],
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: 'node "/x/pre-push-review.mjs"' }] },
+        { matcher: "Other", hooks: [{ type: "command", command: 'node "/x/other.mjs"' }] }
+      ]
+    }
+  }, null, 2));
+
+  const result = removeClaudeSettingsPeerBenchHooks({ settingsPath });
+  const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  const commands = JSON.stringify(saved.hooks);
+  assert.equal(result.pluginManaged, true);
+  assert.equal(result.removedEntries, 2);
+  assert.doesNotMatch(commands, /stop-review\.mjs/);
+  assert.doesNotMatch(commands, /pre-push-review\.mjs/);
+  assert.match(commands, /unrelated-stop\.mjs/);
+  assert.match(commands, /other\.mjs/);
 });
 
 test("compareLocalWithOrigin reports same, dirty, and differing states", () => {

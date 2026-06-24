@@ -12,6 +12,7 @@ import {
   snapshotCodex,
   syncCodexHooks,
   syncCodexPrompts,
+  removeClaudeSettingsPeerBenchHooks,
   syncSettings,
   syncStatuslineSessionArg
 } from "./deploy-global-hooks.mjs";
@@ -339,7 +340,9 @@ export function installPeerBench({
       skipCli: !syncClaudePlugin
     });
     const dep = deploy({ src: globalHooksSrc, dest: hooksDir });
-    const sync = syncSettings({ hooksDir, settingsPath });
+    const sync = pluginRegistry.cli.skipped
+      ? syncSettings({ hooksDir, settingsPath })
+      : removeClaudeSettingsPeerBenchHooks({ settingsPath });
     const legacyCodexGate = disableLegacyCodexStopGateStates({
       pluginDataDir: path.join(home, ".claude", "plugins", "data", "codex-openai-codex")
     });
@@ -410,8 +413,12 @@ export function renderInstallSummary(result) {
         lines.push(`Claude plugin registry: installed ${c.pluginRegistry.pluginId}${c.pluginRegistry.scrubbed.length ? `; scrubbed ${c.pluginRegistry.scrubbed.length} sensitive cache file(s)` : ""}`);
       }
     }
-    lines.push(`Claude hooks: copied ${c.deploy.copied.length}, backed up ${c.deploy.backedUp.length}; gates synced`);
-    if (c.sync.removedEntries || c.sync.removedFiles?.length) {
+    if (c.sync.pluginManaged) {
+      lines.push(`Claude hooks: plugin-managed; copied ${c.deploy.copied.length}, removed ${c.sync.removedEntries} legacy settings hook(s)`);
+    } else {
+      lines.push(`Claude hooks: copied ${c.deploy.copied.length}, backed up ${c.deploy.backedUp.length}; gates synced`);
+    }
+    if (!c.sync.pluginManaged && (c.sync.removedEntries || c.sync.removedFiles?.length)) {
       lines.push(`Claude hooks: removed legacy entries ${c.sync.removedEntries}, files ${c.sync.removedFiles.join(", ") || "(none)"}`);
     }
     lines.push(`Claude statusline: ${c.statusline.updated ? "session-aware patch applied" : `no change (${c.statusline.reason || "already ok"})`}`);

@@ -1,0 +1,42 @@
+{
+  "name": "bench",
+  "version": "0.3.0",
+  "description": "peerBench multi-reviewer gates and read-only bug hunts for Codex.",
+  "author": {
+    "name": "Rai Ansar",
+    "url": "https://github.com/RaiAnsar"
+  },
+  "homepage": "https://github.com/RaiAnsar/peerBench",
+  "repository": "https://github.com/RaiAnsar/peerBench",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "hooks",
+    "multi-reviewer",
+    "codex",
+    "claude"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks.json",
+  "interface": {
+    "displayName": "peerBench",
+    "shortDescription": "Multi-model code review gates and bug hunts",
+    "longDescription": "peerBench runs a panel of AI reviewers over plans, code turns, pushes, specs, and manual bug hunts. In Codex it installs a Stop hook that reviews direct Codex work without asking Codex to review itself.",
+    "developerName": "Rai Ansar",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "websiteURL": "https://github.com/RaiAnsar/peerBench",
+    "privacyPolicyURL": "https://github.com/RaiAnsar/peerBench",
+    "termsOfServiceURL": "https://github.com/RaiAnsar/peerBench",
+    "defaultPrompt": [
+      "Run peerBench setup in this repo.",
+      "Use peerBench to review my current changes.",
+      "Use peerBench to hunt for bugs in this project."
+    ],
+    "brandColor": "#0F766E",
+    "screenshots": []
+  }
+}
