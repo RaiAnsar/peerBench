@@ -7,7 +7,7 @@ allowed-tools: Bash(node:*)
 Run (pass args as ONE quoted string exactly as shown):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" investigate "$ARGUMENTS"
+BENCH_SESSION_ID="${CLAUDE_SESSION_ID:-${BENCH_SESSION_ID:-}}" node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" investigate "$ARGUMENTS"
 ```
 
 Present the output verbatim. Then synthesize the root cause and adjudicate any disagreement between the reviewers.

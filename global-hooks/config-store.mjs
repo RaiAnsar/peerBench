@@ -85,6 +85,12 @@ export function sessionKeyFromInput(input = {}, env = process.env) {
 }
 
 function readFileConfig() { try { return JSON.parse(fs.readFileSync(path.join(sharedRoot(), "companion.json"), "utf8")); } catch { return {}; } }
+
+function truthy(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 // Persist the active reviewer selection to the env-independent companion.json (atomic).
 export function setReviewers(list, { root = sharedRoot() } = {}) {
   const reviewers = [...new Set((Array.isArray(list) ? list : []).filter((n) => KNOWN_REVIEWERS.includes(n)))];
@@ -140,11 +146,13 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
     const envThinking = d.thinkingEnv && d.thinkingEnv in env ? env[d.thinkingEnv] : undefined;
     const rawThinking = f.thinking !== undefined ? f.thinking : (envThinking !== undefined ? envThinking : (d.thinking || null));
     const thinking = rawThinking === "" ? null : rawThinking;
+    const model = env[`${name.toUpperCase()}_MODEL`] || f.model || d.model;
+    const temperature = typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0);
     providers[name] = {
       baseURL: env[`${name.toUpperCase()}_BASE_URL`] || f.baseURL || d.baseURL,
-      model: env[`${name.toUpperCase()}_MODEL`] || f.model || d.model,
+      model,
       apiKey: env[d.keyEnv] || f.apiKey || "",
-      temperature: typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0),
+      temperature,
       headers: { ...(d.headers || {}), ...(f.headers || {}) },
       timeoutMs: typeof f.timeoutMs === "number" ? f.timeoutMs : (d.timeoutMs ?? 90_000),
       thinking
@@ -154,6 +162,8 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
   const sel = Array.isArray(reviewersOverride) && reviewersOverride.length
     ? reviewersOverride
     : (Array.isArray(file.reviewers) && file.reviewers.length ? file.reviewers : DEFAULT_REVIEWERS);
-  const reviewers = [...new Set(sel.filter((n) => KNOWN_REVIEWERS.includes(n)))];
+  const suppressCodexReviewer = truthy(env.BENCH_SUPPRESS_CODEX_REVIEWER) || truthy(env.PEERBENCH_SUPPRESS_CODEX_REVIEWER);
+  const reviewers = [...new Set(sel.filter((n) => KNOWN_REVIEWERS.includes(n)))]
+    .filter((n) => !(suppressCodexReviewer && n === CODEX));
   return { reviewers: reviewers.length ? reviewers : DEFAULT_REVIEWERS, providers };
 }

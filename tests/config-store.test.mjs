@@ -85,6 +85,12 @@ test("reviewers override allows codex-only selection", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["codex"] });
   assert.deepEqual(cfg.reviewers, ["codex"]);
 });
+test("resolveConfig can suppress the Codex reviewer for direct Codex prompt sessions", () => {
+  const mixed = resolveConfig({ env: { BENCH_SUPPRESS_CODEX_REVIEWER: "1" }, reviewers: ["codex", "kimi", "glm"] });
+  assert.deepEqual(mixed.reviewers, ["kimi", "glm"]);
+  const codexOnly = resolveConfig({ env: { BENCH_SUPPRESS_CODEX_REVIEWER: "1" }, reviewers: ["codex"] });
+  assert.deepEqual(codexOnly.reviewers, ["kimi", "glm"]);
+});
 test("unknown reviewer names are filtered out", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["kimi", "bogus"] });
   assert.deepEqual(cfg.reviewers, ["kimi"]);

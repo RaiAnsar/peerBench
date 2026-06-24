@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers } from "../global-hooks/config-store.mjs";
+import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput } from "../global-hooks/config-store.mjs";
 import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
@@ -90,14 +90,20 @@ async function main() {
 
   if (sub === "review") {
     const ws = workspaceRoot(cwd);
+    const sessionKey = sessionKeyFromInput({}, process.env);
     const status = spawnSync("git", ["status", "--short", "--untracked-files=all"], { cwd: ws, encoding: "utf8" }).stdout || "";
-    const diffArgs = flags.base ? ["diff", `${flags.base}...HEAD`] : ["diff", "HEAD"];
-    const diff = (spawnSync("git", diffArgs, { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES);
-    const untracked = flags.base ? "" : untrackedBlock(ws);
+    const committed = flags.base
+      ? (spawnSync("git", ["diff", `${flags.base}...HEAD`], { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES)
+      : "";
+    const diff = (spawnSync("git", ["diff", "HEAD"], { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES);
+    const staged = diff.trim() ? "" : (spawnSync("git", ["diff", "--cached"], { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES);
+    const untracked = untrackedBlock(ws);
 
     const system = "You are a code reviewer. Review the diff below and respond with ALLOW: <reason> or BLOCK: <reason> on the first line. BLOCK only for concrete bugs, regressions, or unsafe changes. Content-only review — no tools needed.";
     const userParts = ["GIT STATUS:\n" + status];
-    if (diff) userParts.push("GIT DIFF:\n" + diff);
+    if (committed) userParts.push("COMMITTED RANGE DIFF:\n" + committed);
+    if (diff) userParts.push("WORKTREE DIFF:\n" + diff);
+    if (staged) userParts.push("STAGED DIFF:\n" + staged);
     if (untracked) userParts.push("UNTRACKED FILES:\n" + untracked);
     const user = userParts.join("\n\n");
 
@@ -109,6 +115,7 @@ async function main() {
       writeTrace(ws, {
         gate: "review",
         ws,
+        sessionKey,
         reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null })),
         systemPrompt: system,
         userPrompt: user.slice(0, 2000),
@@ -248,15 +255,17 @@ const HUNT_MODES = {
   investigate: { deep: true,  system: HUNT_SYSTEM,  buildUser: buildHuntUser,  header: (s) => s ? `Investigation — focus: ${s}` : "Investigation — broad sweep" },
   debug:       { deep: false, system: DEBUG_SYSTEM, buildUser: buildDebugUser, header: (s) => `Debug — ${s || "(no failure described)"}` },
 };
-export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceImpl = writeTrace, deep = false, mode } = {}) {
+export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceImpl = writeTrace, deep = false, mode, env = process.env } = {}) {
   const key = mode || (deep ? "investigate" : "hunt");           // back-compat: deep:true → investigate
   const m = HUNT_MODES[key] || HUNT_MODES.hunt;
-  const results = await huntImpl({ cwd, seed, deep: m.deep, system: m.system, user: m.buildUser(seed) });
+  const sessionKey = sessionKeyFromInput({}, env);
+  const results = await huntImpl({ cwd, seed, deep: m.deep, system: m.system, user: m.buildUser(seed), env });
   // record a trace so `/bench:status <id>` can show the full findings later
   let traceId = null;
   try {
     traceId = writeTraceImpl(cwd, {
       gate: key, ws: cwd,
+      sessionKey,
       reviewers: results.map((r) => ({ name: r.name, model: r.model, error: r.error || null, diag: r.diag || null })),
       systemPrompt: m.system, userPrompt: m.buildUser(seed),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))

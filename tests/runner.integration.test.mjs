@@ -69,12 +69,15 @@ test("review subcommand runs panel and prints combined result (no-key fail-open)
   assert.match(out, /Result:/i);
 });
 
-test("review with --base flag runs without error (fail-open when no keys)", () => {
+test("review with --base flag includes branch diff, worktree diff, and untracked files", async () => {
+  const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");
   const ws = freshWs();
   fs.writeFileSync(path.join(ws, "feature.txt"), "NEEDLE_BRANCH_DIFF\n");
   execFileSync("git", ["checkout", "-qb", "feat"], { cwd: ws });
   execFileSync("git", ["add", "feature.txt"], { cwd: ws });
   execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "feat"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "feature.txt"), "NEEDLE_BRANCH_DIFF\nUNCOMMITTED_BASE_REVIEW_NEEDLE\n");
+  fs.writeFileSync(path.join(ws, "untracked.txt"), "UNTRACKED_BASE_REVIEW_NEEDLE\n");
   const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runner-"));
   const out = execFileSync(process.execPath, [RUNNER, "review", "--json", "--base main"], {
     encoding: "utf8",
@@ -83,6 +86,18 @@ test("review with --base flag runs without error (fail-open when no keys)", () =
   });
   const payload = JSON.parse(out);
   assert.ok(["allow", "block", "fail-open"].includes(payload.decision));
+  const prev = process.env.BENCH_ROOT;
+  try {
+    process.env.BENCH_ROOT = dataRoot;
+    const [latest] = listTraces(ws, 1);
+    const trace = readTrace(ws, latest.id);
+    assert.match(trace.userPrompt, /COMMITTED RANGE DIFF:[\s\S]*NEEDLE_BRANCH_DIFF/);
+    assert.match(trace.userPrompt, /WORKTREE DIFF:[\s\S]*UNCOMMITTED_BASE_REVIEW_NEEDLE/);
+    assert.match(trace.userPrompt, /UNTRACKED FILES:[\s\S]*UNTRACKED_BASE_REVIEW_NEEDLE/);
+  } finally {
+    if (prev === undefined) delete process.env.BENCH_ROOT;
+    else process.env.BENCH_ROOT = prev;
+  }
 });
 
 test("status shows no traces message when workspace has no traces", () => {
@@ -103,6 +118,7 @@ test("huntCommand formats findings per reviewer and records a trace", async () =
   assert.match(out, /═══ MiMo ═══/); assert.match(out, /no findings — timeout/);
 });
 test("huntCommand deep=true uses 'investigate' header and records gate='investigate' in trace", async () => {
+  const { normalizeSessionId } = await import("../global-hooks/config-store.mjs");
   const { listTraces, readTrace } = await import("../global-hooks/trace-store.mjs");
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "hci-"));
   const huntImpl = async () => ([
@@ -110,12 +126,13 @@ test("huntCommand deep=true uses 'investigate' header and records gate='investig
     { name: "Kimi", findings: "deep kimi finding", model: "kimi-for-coding" },
     { name: "MiMo", findings: "deep mimo finding", model: "mimo" }
   ]);
-  const out = await huntCommand(ws, "why does uptime monitor never escalate", { huntImpl, deep: true });
+  const out = await huntCommand(ws, "why does uptime monitor never escalate", { huntImpl, deep: true, env: { BENCH_SESSION_ID: "manual-chat-A" } });
   assert.match(out, /Investigation — focus: why does uptime monitor never escalate/);
   const [latest] = listTraces(ws, 1);
   assert.equal(latest.gate, "investigate");
   const t = readTrace(ws, latest.id);
   assert.equal(t.gate, "investigate");
+  assert.equal(t.sessionKey, normalizeSessionId("manual-chat-A"));
 });
 test("huntCommand mode='debug' uses DEBUG_SYSTEM + debug user and records gate='debug'", async () => {
   const { DEBUG_SYSTEM } = await import("../global-hooks/hunt.mjs");

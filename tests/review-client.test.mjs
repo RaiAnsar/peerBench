@@ -41,6 +41,64 @@ test("sends provided temperature and merges extra headers", async () => {
   assert.equal(cap.headers["User-Agent"], "claude-cli/1.0.83 (external, cli)");
   assert.equal(cap.headers.Authorization, "Bearer k");
 });
+test("invalid-temperature HTTP 400 retries once with provider-declared temperature", async () => {
+  const bodies = [];
+  let calls = 0;
+  const res = await review({
+    baseURL: "https://x/v1",
+    apiKey: "k",
+    model: "kimi-k2.6",
+    system: "s",
+    user: "u",
+    temperature: 1,
+    timeoutMs: 5000,
+    fetchImpl: async (_url, opts) => {
+      calls++;
+      bodies.push(JSON.parse(opts.body));
+      if (calls === 1) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () => JSON.stringify({ error: { message: "invalid temperature: only 0.6 is allowed for this model" } })
+        };
+      }
+      return ok({ choices: [{ message: { content: "ALLOW: ok" } }] });
+    }
+  });
+  assert.equal(res.ok, true);
+  assert.equal(calls, 2);
+  assert.equal(bodies[0].temperature, 1);
+  assert.equal(bodies[1].temperature, 0.6);
+});
+test("data-inspection HTTP 400 retries once with redacted payment-security terms", async () => {
+  const bodies = [];
+  let calls = 0;
+  const res = await review({
+    baseURL: "https://x/v1",
+    apiKey: "k",
+    model: "qwen",
+    system: "Never expose PAN or CVV.",
+    user: "Review saving a card XXXX, then run card later.",
+    timeoutMs: 5000,
+    fetchImpl: async (_url, opts) => {
+      calls++;
+      bodies.push(JSON.parse(opts.body));
+      if (calls === 1) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () => JSON.stringify({ error: { code: "data_inspection_failed", message: "Input text data may contain inappropriate content." } })
+        };
+      }
+      return ok({ choices: [{ message: { content: "ALLOW: ok" } }] });
+    }
+  });
+  assert.equal(res.ok, true);
+  assert.equal(calls, 2);
+  assert.doesNotMatch(bodies[1].messages[0].content, /\bPAN\b|CVV/i);
+  assert.doesNotMatch(bodies[1].messages[1].content, /card XXXX|run card/i);
+  assert.match(bodies[1].messages[1].content, /masked saved payment method|run saved payment method/);
+});
 test("thinking:disabled includes thinking:{type:disabled} in body", async () => {
   const cap = {};
   await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, thinking: "disabled",

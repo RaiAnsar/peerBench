@@ -105,6 +105,78 @@ test("report mode returns final content as report (no verdict needed)", async ()
   assert.equal(res.ok, true); assert.match(res.report, /a\.js:5/);
 });
 
+test("report mode rejects raw tool-call markup and nudges for final findings", async () => {
+  const tools = { schemas: SCHEMAS, execute: async () => "x" };
+  const res = await agenticReview({ ...baseArgs, mode: "report", tools,
+    fetchImpl: fetchQueue([
+      sse([{ content: "<tool_call><function=read_file><parameter=path>src/a.ts</parameter></function></tool_call>" }]),
+      sse([{ content: "Findings:\n1. bug at fixed.ts:7" }])
+    ]) });
+  assert.equal(res.ok, true);
+  assert.match(res.report, /fixed\.ts:7/);
+});
+
+test("data-inspection HTTP 400 retries once with redacted payment-security terms", async () => {
+  const bodies = [];
+  let calls = 0;
+  const fetchImpl = async (_url, opts) => {
+    calls++;
+    bodies.push(JSON.parse(opts.body));
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 400,
+        body: null,
+        text: async () => JSON.stringify({ error: { code: "data_inspection_failed", message: "Input text data may contain inappropriate content." } })
+      };
+    }
+    return sse([{ content: "Findings:\n1. safe at payment.ts:3" }]);
+  };
+  const tools = { schemas: SCHEMAS, execute: async () => "x" };
+  const res = await agenticReview({
+    ...baseArgs,
+    mode: "report",
+    user: "Review saving a card XXXX; never log PAN/CVV; later run card on date.",
+    tools,
+    fetchImpl
+  });
+  assert.equal(res.ok, true);
+  assert.equal(calls, 2);
+  const retriedUser = bodies[1].messages.find((m) => m.role === "user").content;
+  assert.doesNotMatch(retriedUser, /\bPAN\b|CVV|card XXXX|run card/i);
+  assert.match(retriedUser, /payment-account-number|security-code|saved payment method/);
+  assert.equal(res.diag.rounds[0].retry, "redacted-data-inspection");
+});
+
+test("invalid-temperature HTTP 400 retries once with provider-declared temperature", async () => {
+  const bodies = [];
+  let calls = 0;
+  const fetchImpl = async (_url, opts) => {
+    calls++;
+    bodies.push(JSON.parse(opts.body));
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 400,
+        body: null,
+        text: async () => JSON.stringify({ error: { message: "invalid temperature: only 1 is allowed for this model" } })
+      };
+    }
+    if (calls === 2) {
+      return sse([{ tool_calls: [{ id: "1", index: 0, function: { name: "read_file", arguments: '{"path":"package.json"}' } }] }]);
+    }
+    return sse([{ content: "Findings:\n1. safe at temp.ts:1" }]);
+  };
+  const tools = { schemas: SCHEMAS, execute: async () => "x" };
+  const res = await agenticReview({ ...baseArgs, mode: "report", temperature: 0.6, tools, fetchImpl });
+  assert.equal(res.ok, true);
+  assert.equal(calls, 3);
+  assert.equal(bodies[0].temperature, 0.6);
+  assert.equal(bodies[1].temperature, 1);
+  assert.equal(bodies[2].temperature, 1);
+  assert.equal(res.diag.rounds[0].retry, "temperature-1");
+});
+
 test("retries a transient network error, then succeeds", async () => {
   let calls = 0;
   const fetchImpl = async () => {

@@ -12,7 +12,7 @@ Runs a panel review of the current working diff. Do NOT fix issues or apply patc
 Run — pass the arguments as ONE quoted string exactly as shown (the runner lifts `--base` from inside the quoted string; never unquote):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" review --json "$ARGUMENTS"
+BENCH_SESSION_ID="${CLAUDE_SESSION_ID:-${BENCH_SESSION_ID:-}}" node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" review --json "$ARGUMENTS"
 ```
 
 Present each reviewer's verdict and the combined result verbatim. Do not paraphrase.

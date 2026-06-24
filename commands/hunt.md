@@ -7,7 +7,7 @@ allowed-tools: Bash(node:*)
 Run (pass args as ONE quoted string exactly as shown):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" hunt "$ARGUMENTS"
+BENCH_SESSION_ID="${CLAUDE_SESSION_ID:-${BENCH_SESSION_ID:-}}" node "${CLAUDE_PLUGIN_ROOT}/scripts/bench-runner.mjs" hunt "$ARGUMENTS"
 ```
 
 Present the output verbatim. Then add a short synthesis: which findings multiple reviewers agree on (highest confidence) versus single-reviewer ones. These are UNVERIFIED read-only findings — verify each before fixing.

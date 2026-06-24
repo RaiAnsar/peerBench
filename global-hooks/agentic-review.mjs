@@ -1,4 +1,6 @@
 import { extractVerdict } from "./reviewers.mjs";
+import { allowedTemperatureFromError, isContentInspectionFailure, sanitizeForProviderInspection } from "./provider-compat.mjs";
+export { sanitizeForProviderInspection };
 
 // Parse an OpenAI-compatible SSE chat stream into one assembled message.
 // Returns { message: { content, tool_calls }, finish_reason, usage }.
@@ -61,6 +63,10 @@ const MAX_NET_RETRIES = 2;         // retry transient "fetch failed" (connection
 const RETRY_BACKOFF_MS = 750;
 const DEFAULT_ROUND_MS = 90_000;   // per-EXPLORATION-round cap: one runaway thinking round can't eat the whole budget
 
+function looksLikeRawToolCall(content) {
+  return /<tool_call\b|<function=|<parameter=|<\/function>/i.test(String(content || ""));
+}
+
 export async function agenticReview({
   baseURL, apiKey, model, system, user,
   temperature = 0, headers = {}, tools, thinking,
@@ -79,7 +85,7 @@ export async function agenticReview({
   const messages = [{ role: "system", content: system }, { role: "user", content: user }];
   const filesRead = [];
   const rounds = [];                              // per-round diagnostics
-  let nudges = 0, toolBytes = 0, lastReqBytes = 0, stepsRun = 0, concludeNudged = false, roundConclude = false;
+  let nudges = 0, toolBytes = 0, lastReqBytes = 0, stepsRun = 0, concludeNudged = false, roundConclude = false, inspectionRetryUsed = false, temperatureRetryUsed = false, currentTemperature = temperature;
   const dlog = (...a) => { if (debug) console.error(`[agentic ${model}]`, ...a); };
   const diag = () => ({ steps: stepsRun, filesRead: filesRead.slice(), toolBytes, lastReqBytes, rounds: rounds.slice() });
 
@@ -98,9 +104,10 @@ export async function agenticReview({
       // On conclude (force): OMIT the tools array entirely — a model can't call tools that aren't
       // offered, so it MUST produce content. (tool_choice:"none" alone is ignored by some models,
       // e.g. kimi-k2.6, which then reads until maxSteps and drops out with "no verdict".)
-      const body = JSON.stringify({ model, messages, temperature, stream: true,
+      const makeBody = (bodyMessages = messages, bodyTemperature = currentTemperature) => JSON.stringify({ model, messages: bodyMessages, temperature: bodyTemperature, stream: true,
         ...(force ? {} : { tools: tools.schemas, tool_choice: "auto" }),
         ...(thinking === "enabled" || thinking === "disabled" ? { thinking: { type: thinking } } : {}) });
+      let body = makeBody();
       lastReqBytes = body.length;
       dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);
       const t0 = Date.now();
@@ -109,7 +116,7 @@ export async function agenticReview({
       const roundController = new AbortController();
       const roundTimer = useWatchdog ? setTimeout(() => roundController.abort(), maxRoundMs) : null;
       const signal = useWatchdog ? AbortSignal.any([controller.signal, roundController.signal]) : controller.signal;
-      let resp, parsed, netErr = null;
+      let resp, parsed, netErr = null, inspectionRetriedThisRound = false, temperatureRetriedThisRound = false, activeTemperature = currentTemperature;
       try {
         for (let attempt = 0; attempt <= MAX_NET_RETRIES; attempt++) {
           try {
@@ -149,19 +156,87 @@ export async function agenticReview({
         return { ok: false, error: { kind, detail: `${String(netErr?.message || netErr).slice(0, 200)}${cause}` }, diag: diag() };
       }
       if (!resp.ok) {
-        const b = await resp.text().catch(() => "");
-        dlog(`step ${step}: HTTP ${resp.status} reqKB=${(lastReqBytes / 1024) | 0}`);
-        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}` });
-        return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${b.slice(0, 200)}` }, diag: diag() };
+        let b = await resp.text().catch(() => "");
+        const allowedTemperature = allowedTemperatureFromError(resp.status, b);
+        if (!temperatureRetryUsed && allowedTemperature != null && allowedTemperature !== activeTemperature) {
+          temperatureRetryUsed = true;
+          temperatureRetriedThisRound = true;
+          activeTemperature = allowedTemperature;
+          currentTemperature = allowedTemperature;
+          body = makeBody(messages, activeTemperature);
+          lastReqBytes = body.length;
+          try {
+            resp = await doFetch(`${baseURL}/chat/completions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              body, signal
+            });
+            if (resp.ok) parsed = await readSSE(resp);
+            else b = await resp.text().catch(() => "");
+          } catch (e) {
+            netErr = e;
+          }
+          if (netErr) {
+            const kind = netErr?.name === "AbortError" ? "timeout" : "network";
+            const cause = netErr?.cause ? ` cause=${netErr.cause.code || netErr.cause.message || String(netErr.cause).slice(0, 80)}` : "";
+            rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${netErr?.message}${cause}`, retry: `temperature-${allowedTemperature}` });
+            return { ok: false, error: { kind, detail: `${String(netErr?.message || netErr).slice(0, 200)}${cause}` }, diag: diag() };
+          }
+        }
+        if (!resp.ok && !inspectionRetryUsed && isContentInspectionFailure(resp.status, b)) {
+          inspectionRetryUsed = true;
+          inspectionRetriedThisRound = true;
+          const safeMessages = messages.map((m) =>
+            typeof m?.content === "string" ? { ...m, content: sanitizeForProviderInspection(m.content) } : m);
+          body = makeBody(safeMessages, activeTemperature);
+          lastReqBytes = body.length;
+          try {
+            resp = await doFetch(`${baseURL}/chat/completions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              body, signal
+            });
+            if (resp.ok) parsed = await readSSE(resp);
+          } catch (e) {
+            netErr = e;
+          }
+          if (netErr) {
+            const kind = netErr?.name === "AbortError" ? "timeout" : "network";
+            const cause = netErr?.cause ? ` cause=${netErr.cause.code || netErr.cause.message || String(netErr.cause).slice(0, 80)}` : "";
+            rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${netErr?.message}${cause}`, retry: "redacted-data-inspection" });
+            return { ok: false, error: { kind, detail: `${String(netErr?.message || netErr).slice(0, 200)}${cause}` }, diag: diag() };
+          }
+          if (!resp.ok) {
+            const b2 = await resp.text().catch(() => "");
+            dlog(`step ${step}: HTTP ${resp.status} after redacted retry reqKB=${(lastReqBytes / 1024) | 0}`);
+            rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}`, retry: "redacted-data-inspection" });
+            return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${b2.slice(0, 200)}` }, diag: diag() };
+          }
+        }
+        if (!resp.ok) {
+          dlog(`step ${step}: HTTP ${resp.status} reqKB=${(lastReqBytes / 1024) | 0}`);
+          rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}` });
+          return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${b.slice(0, 200)}` }, diag: diag() };
+        }
       }
       const msg = parsed.message;
 
       const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       const toolNames = toolCalls.map((t) => t.function?.name).join(",") || "-";
       dlog(`step ${step}: ${Date.now() - t0}ms finish=${parsed.finish_reason} tools=${toolNames} reqKB=${(lastReqBytes / 1024) | 0}`);
-      rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, finish: parsed.finish_reason, tools: toolNames });
+      const retry = [temperatureRetriedThisRound ? `temperature-${activeTemperature}` : null, inspectionRetriedThisRound ? "redacted-data-inspection" : null].filter(Boolean).join("+") || undefined;
+      rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, finish: parsed.finish_reason, tools: toolNames, ...(retry ? { retry } : {}) });
 
       if (toolCalls.length > 0) {
+        if (force) {
+          if (nudges < MAX_NUDGES) {
+            nudges++;
+            messages.push({ role: "user", content: "Do NOT call tools now. Tools are closed for this final round. Write the final findings as plain text with file:line evidence." });
+            roundConclude = true;
+            continue;
+          }
+          return { ok: false, error: { kind: "parse", detail: "tool calls returned during final report round" }, diag: diag() };
+        }
         messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: toolCalls });
         for (const tc of toolCalls) {
           const name = tc.function?.name;
@@ -184,6 +259,15 @@ export async function agenticReview({
       // No tool calls → check mode before verdict logic.
       const content = msg.content ?? "";
       if (mode === "report") {
+        if (!String(content).trim() || looksLikeRawToolCall(content)) {
+          if (nudges < MAX_NUDGES) {
+            nudges++;
+            messages.push({ role: "user", content: "Your previous response was not a final report. Do NOT emit tool-call XML or request more tools. Write the final findings now as plain text with file:line evidence." });
+            roundConclude = true;
+            continue;
+          }
+          return { ok: false, error: { kind: "parse", detail: looksLikeRawToolCall(content) ? "tool-call markup returned instead of final report" : "empty final report" }, raw: content, diag: diag() };
+        }
         return { ok: true, report: content, steps: stepsRun, filesRead, usage: parsed.usage ?? null, diag: diag() };
       }
       const v = extractVerdict(content);
