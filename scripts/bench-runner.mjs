@@ -144,6 +144,8 @@ async function main() {
     const codexFound = !!latestCodexRoot();
     const disabled = isBenchDisabled(ws);
     const settingsPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "settings.json");
+    const codexHooksPath = path.join(os.homedir(), ".codex", "hooks.json");
+    const codexPromptsDir = path.join(os.homedir(), ".codex", "prompts");
     // Report key status for the ACTIVE reviewers only, sourced the way the gates read them
     // (resolveConfig merges env + companion.json/.keys). Hardcoded KIMI/MIMO env checks were
     // misleading after the registry change — they named a disabled model and hid GLM/Qwen.
@@ -159,6 +161,8 @@ async function main() {
       ...keyLines,
       `Bench disabled: ${disabled ? "yes" : "no"}`,
       setupStatus(settingsPath),
+      codexSetupStatus(codexHooksPath),
+      codexPromptStatus(codexPromptsDir),
       `Hint: /bench:reviewers to change reviewers | /bench:off to disable | /bench:on to re-enable`
     ];
     process.stdout.write(lines.join("\n") + "\n");
@@ -356,6 +360,19 @@ const SETUP_GATES = [
   { event: "Stop", matcher: undefined, file: "deep-review-runner.mjs" }
 ];
 
+const CODEX_PROMPTS = [
+  "bench-debug.md",
+  "bench-hunt.md",
+  "bench-investigate.md",
+  "bench-off.md",
+  "bench-on.md",
+  "bench-review.md",
+  "bench-reviewers.md",
+  "bench-scorecard.md",
+  "bench-setup.md",
+  "bench-status.md"
+];
+
 // Inspect a settings.json and report each gate's registration honestly.
 // Unreadable/malformed/missing → "unable to check" + fail-open (no crash).
 export function setupStatus(settingsPath) {
@@ -383,6 +400,39 @@ export function setupStatus(settingsPath) {
     lines.push(`  ${label} → ${g.file}: ${state}`);
   }
   return lines.join("\n");
+}
+
+export function codexSetupStatus(hooksPath) {
+  let settings;
+  try {
+    settings = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
+  } catch {
+    return `Codex gate registration: unable to check (${hooksPath} unreadable or malformed).`;
+  }
+  const blocks = Array.isArray(settings?.hooks?.Stop) ? settings.hooks.Stop : [];
+  const has = (block) =>
+    Array.isArray(block.hooks) &&
+    block.hooks.some((h) => String((h && h.command) || "").includes("codex-stop-review.mjs"));
+  const correct = blocks.some((b) => has(b) && !b.matcher);
+  const elsewhere = blocks.some((b) => has(b));
+  const state = correct ? "registered" : elsewhere ? "MISREGISTERED (wrong matcher block)" : "MISSING (not registered)";
+  return `Codex gate registration (~/.codex/hooks.json): Stop(matcher-less) → codex-stop-review.mjs: ${state}`;
+}
+
+export function codexPromptStatus(promptsDir) {
+  const missing = [];
+  for (const f of CODEX_PROMPTS) {
+    try {
+      const text = fs.readFileSync(path.join(promptsDir, f), "utf8");
+      if (!text.includes("bench-runner.mjs") || text.includes("{{BENCH_RUNNER}}")) missing.push(f);
+    } catch {
+      missing.push(f);
+    }
+  }
+  if (!missing.length) {
+    return `Codex manual prompts (~/.codex/prompts): ${CODEX_PROMPTS.length} registered (/prompts:bench-hunt, /prompts:bench-investigate, /prompts:bench-on, ...)`;
+  }
+  return `Codex manual prompts (~/.codex/prompts): MISSING ${missing.join(", ")}`;
 }
 
 // `/bench:status` — no id lists recent traces; `/bench:status <id>` expands one.

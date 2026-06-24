@@ -1,4 +1,5 @@
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // ONE-TIME data-dir migration: pre-rename installs kept reviewer config + traces under
@@ -57,6 +58,23 @@ export function snapshot({ hooksDir, settingsPath, backupDir }) {
   let settingsBackedUp = false;
   if (fs.existsSync(settingsPath)) { fs.copyFileSync(settingsPath, path.join(backupDir, "settings.json")); settingsBackedUp = true; }
   return { files, settingsBackedUp, backupDir };
+}
+
+export function snapshotCodex({ hooksDir, hooksPath, backupDir }) {
+  fs.mkdirSync(backupDir, { recursive: true });
+  const files = [];
+  let live = [];
+  try { live = fs.readdirSync(hooksDir).filter((f) => f.endsWith(".mjs")); } catch { live = []; }
+  for (const f of live) {
+    const p = path.join(hooksDir, f);
+    try { fs.copyFileSync(p, path.join(backupDir, f)); files.push(f); } catch { /* skip unreadable */ }
+  }
+  let hooksJsonBackedUp = false;
+  if (fs.existsSync(hooksPath)) {
+    fs.copyFileSync(hooksPath, path.join(backupDir, "hooks.json"));
+    hooksJsonBackedUp = true;
+  }
+  return { files, hooksJsonBackedUp, backupDir };
 }
 
 const STATUSLINE_SESSION_LINE =
@@ -157,13 +175,14 @@ export function syncSettings({ hooksDir, settingsPath }) {
   });
   register(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"), {
     statusMessage: "⛩ bench: reviewing push…",
+    timeout: 1320,
     // Perf: only spawn on git commands instead of EVERY Bash. The `if` permission rule checks
     // subcommands and FAILS OPEN (runs the hook anyway) if it can't parse — so compound pushes
     // like `cd x && git push` are still covered; we just stop spawning Node for `ls`/`npm`/etc.
     if: "Bash(git *)"
   });
   register(s.hooks.Stop, undefined, path.join(hooksDir, "stop-review.mjs"), {
-    timeout: 300, asyncRewake: true,
+    timeout: 900, asyncRewake: true,
     statusMessage: "⛩ bench: reviewing turn…",
     rewakeMessage: "⛩ bench stop gate (Kimi+MiMo) found issues in this turn's code changes. Fix them, then stop again to re-review:",
     rewakeSummary: "⛩ bench stop"
@@ -185,15 +204,95 @@ export function syncSettings({ hooksDir, settingsPath }) {
   return { removedFiles, removedEntries };
 }
 
+export function syncCodexHooks({
+  hooksDir,
+  hooksPath = path.join(os.homedir(), ".codex", "hooks.json")
+}) {
+  let s = {}; try { s = JSON.parse(fs.readFileSync(hooksPath, "utf8")); } catch { s = {}; }
+  s.hooks = s.hooks || {};
+  s.hooks.Stop = Array.isArray(s.hooks.Stop) ? s.hooks.Stop : [];
+  register(s.hooks.Stop, undefined, path.join(hooksDir, "codex-stop-review.mjs"), {
+    timeout: 900,
+    statusMessage: "⛩ bench: reviewing turn…"
+  });
+  s.hooks.Stop = s.hooks.Stop.filter((b) => !Array.isArray(b.hooks) || b.hooks.length > 0);
+  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+  fs.writeFileSync(hooksPath, `${JSON.stringify(s, null, 2)}\n`);
+  return { hooksPath, stopHook: path.join(hooksDir, "codex-stop-review.mjs") };
+}
+
+export function syncCodexPrompts({
+  srcDir,
+  promptsDir = path.join(os.homedir(), ".codex", "prompts"),
+  benchRunnerPath
+}) {
+  if (!benchRunnerPath) throw new Error("syncCodexPrompts requires benchRunnerPath");
+  fs.mkdirSync(promptsDir, { recursive: true });
+  const copied = [], backedUp = [];
+  let files = [];
+  try { files = fs.readdirSync(srcDir).filter((f) => f.endsWith(".md")).sort(); } catch { files = []; }
+  for (const f of files) {
+    const from = path.join(srcDir, f);
+    const to = path.join(promptsDir, f);
+    const rendered = fs.readFileSync(from, "utf8").replaceAll("{{BENCH_RUNNER}}", benchRunnerPath);
+    if (fs.existsSync(to) && fs.readFileSync(to, "utf8") !== rendered) {
+      const bak = `${to}.pre-peerbench.bak`;
+      if (!fs.existsSync(bak)) { fs.copyFileSync(to, bak); backedUp.push(f); }
+    }
+    fs.writeFileSync(to, rendered);
+    copied.push(f);
+  }
+  return { promptsDir, copied, backedUp };
+}
+
+function gitOrNull(args, cwd) {
+  try { return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  catch { return null; }
+}
+
+export function compareLocalWithOrigin({ cwd, remote = "origin", branch } = {}) {
+  const repo = gitOrNull(["rev-parse", "--show-toplevel"], cwd);
+  if (!repo) return { ok: false, reason: "not a git repository" };
+  const localHead = gitOrNull(["rev-parse", "HEAD"], repo);
+  const currentBranch = branch || gitOrNull(["branch", "--show-current"], repo);
+  if (!localHead || !currentBranch) return { ok: false, repo, reason: "could not resolve local branch/head" };
+  const remoteLine = gitOrNull(["ls-remote", "--heads", remote, currentBranch], repo);
+  if (!remoteLine) return { ok: false, repo, branch: currentBranch, localHead, reason: `could not resolve ${remote}/${currentBranch}` };
+  const remoteHead = remoteLine.split(/\s+/)[0] || "";
+  const status = gitOrNull(["status", "--short"], repo) || "";
+  const dirty = status.split(/\r?\n/).filter(Boolean).length;
+  const same = localHead === remoteHead;
+  return {
+    ok: true,
+    repo,
+    remote,
+    branch: currentBranch,
+    localHead,
+    remoteHead,
+    dirty,
+    status: same ? (dirty ? "same-as-origin-with-local-changes" : "same-as-origin") : "differs-from-origin"
+  };
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const hooksDir = path.join(os.homedir(), ".claude", "hooks");
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+  const codexHooksDir = path.join(os.homedir(), ".codex", "hooks");
+  const codexHooksPath = path.join(os.homedir(), ".codex", "hooks.json");
   const backupDir = path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared", `backup-${Date.now()}`);
   const migrate = migrateDataDir();   // FIRST — before snapshot's backupDir can create bench-shared
+  const origin = compareLocalWithOrigin({ cwd: path.join(here, "..") });
   const snap = snapshot({ hooksDir, settingsPath, backupDir });
   const dep = deploy({ src: path.join(here, "..", "global-hooks"), dest: hooksDir });
   const sync = syncSettings({ hooksDir, settingsPath });
   const statusline = syncStatuslineSessionArg();
-  console.log(JSON.stringify({ migrate, snapshot: snap, deploy: dep, sync, statusline }, null, 2));
+  const codexSnapshot = snapshotCodex({ hooksDir: codexHooksDir, hooksPath: codexHooksPath, backupDir: path.join(backupDir, "codex") });
+  const codexDeploy = deploy({ src: path.join(here, "..", "global-hooks"), dest: codexHooksDir });
+  const codexSync = syncCodexHooks({ hooksDir: codexHooksDir, hooksPath: codexHooksPath });
+  const codexPrompts = syncCodexPrompts({
+    srcDir: path.join(here, "..", "codex-prompts"),
+    benchRunnerPath: path.join(here, "bench-runner.mjs")
+  });
+  console.log(JSON.stringify({ origin, migrate, snapshot: snap, deploy: dep, sync, statusline, codex: { snapshot: codexSnapshot, deploy: codexDeploy, sync: codexSync, prompts: codexPrompts } }, null, 2));
 }

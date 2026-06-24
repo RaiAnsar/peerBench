@@ -80,6 +80,38 @@ function fakeErrorReviewer(name) {
   };
 }
 
+function fakePushReview({
+  badge = "Kimi✓",
+  summary = "no blocking findings",
+  findingCount = 0,
+  maxSeverity = "none",
+  findings = "",
+  retry = false,
+  reason = "git error",
+  reviewers,
+  onCall
+} = {}) {
+  return async (range, ws, opts = {}) => {
+    if (onCall) onCall({ range, ws, opts });
+    if (retry) {
+      return { retry: true, reason, reviewers: [], findingCount: 0, maxSeverity: "none", findings: "", traceId: null, badge: "", summary: `push review deferred (${reason})`, hash: null };
+    }
+    const reviewRows = reviewers || [{ name: "Kimi", verdict: findingCount ? "BLOCK" : "ALLOW", severity: maxSeverity, findingCount }];
+    if (opts.writeTraceImpl) {
+      opts.writeTraceImpl(ws, {
+        gate: "push-review",
+        ws,
+        sessionKey: opts.sessionKey || null,
+        reviewers: reviewRows,
+        systemPrompt: "test push-review system",
+        userPrompt: `test push-review ${range}`,
+        rawResponses: { Kimi: findings || summary }
+      });
+    }
+    return { reviewers: reviewRows, findingCount, maxSeverity, findings, traceId: "trace-test", badge, summary, hash: "hash-test" };
+  };
+}
+
 /** Stub resolveReviewers factory → returns the given list. */
 function stubResolveReviewers(list) {
   return () => list;
@@ -289,6 +321,7 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
       ]),
       writeTraceImpl: (_ws, trace) => { traceRecord = trace; },
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ badge: "Kimi✓ MiMo✓" }),
       env: process.env,
       input: { cwd: ws, session_id: "chat-A", tool_input: { command: "git push origin main" } }
     });
@@ -308,7 +341,7 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
   assert.match(hookOut.permissionDecisionReason, /\[Kimi✓ MiMo✓\]/, "reason should lead with the badge");
 
   assert.ok(traceRecord !== null, "trace should be written");
-  assert.equal(traceRecord.gate, "push", "trace gate must be 'push'");
+  assert.equal(traceRecord.gate, "push-review", "trace gate must be 'push-review'");
   assert.equal(traceRecord.sessionKey, normalizeSessionId("chat-A"), "trace is stamped with the hook session");
   assert.ok(traceRecord.ws, "trace.ws should be set");
   assert.ok(Array.isArray(traceRecord.reviewers), "trace.reviewers should be an array");
@@ -338,6 +371,12 @@ test("git push + panel BLOCK → deny with findings in permissionDecisionReason"
       ]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({
+        badge: "Kimi✓ MiMo✗",
+        findingCount: 1,
+        maxSeverity: "high",
+        findings: "[MiMo]\nBLOCK: test\n\nDetails for MiMo."
+      }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push" } }
     });
@@ -352,7 +391,7 @@ test("git push + panel BLOCK → deny with findings in permissionDecisionReason"
   const hookOut = parsed[0]?.hookSpecificOutput;
   assert.ok(hookOut, "hookSpecificOutput must be present");
   assert.equal(hookOut.hookEventName, "PreToolUse", "hookEventName must be PreToolUse");
-  assert.equal(hookOut.permissionDecision, "deny", "panel BLOCK → permissionDecision=deny");
+  assert.equal(hookOut.permissionDecision, "deny", "full push review BLOCK → permissionDecision=deny");
   assert.ok(hookOut.permissionDecisionReason, "deny reason must be present");
   assert.match(hookOut.permissionDecisionReason, /MiMo|BLOCK|Details for MiMo/i, "findings should include BLOCK details");
 });
@@ -380,10 +419,10 @@ test("disabled workspace → allow no-op on git push (bench disabled)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test: no upstream / nothing to push → fail-open allow no-op
+// Test: no upstream / nothing to push
 // ---------------------------------------------------------------------------
 
-test("no upstream → fail-open allow (no reviewers called)", async () => {
+test("no upstream → deny so commits are not pushed unreviewed", async () => {
   // Repo with no remote configured → resolvePushRange fails gracefully.
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-noremote-"));
   execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
@@ -400,9 +439,9 @@ test("no upstream → fail-open allow (no reviewers called)", async () => {
 
   try {
     await runMain({
-      resolveReviewersImpl: () => { reviewersCalled = true; return []; },
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ onCall: () => { reviewersCalled = true; } }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push" } }
     });
@@ -411,15 +450,44 @@ test("no upstream → fail-open allow (no reviewers called)", async () => {
   }
 
   assert.equal(reviewersCalled, false, "reviewers must NOT be called when no upstream");
-  // Should allow — either exits silently or emits an allow decision.
-  if (emittedLines.length > 0) {
-    const parsed = parseLines(emittedLines);
-    if (parsed.length > 0 && parsed[0]?.hookSpecificOutput) {
-      assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "allow",
-        "no upstream should result in allow decision");
-    }
+  assert.ok(emittedLines.length > 0, "no upstream must emit a deny decision");
+  const parsed = parseLines(emittedLines);
+  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "deny",
+    "no upstream should block the push instead of allowing an unreviewed push");
+  assert.match(parsed[0].hookSpecificOutput.permissionDecisionReason, /no upstream|review a commit range|blocked/i);
+});
+
+test("git log failure for a resolved push range → deny so commits are not pushed unreviewed", async () => {
+  const { ws } = repoWithRemoteRefs("origin", ["release"], "feature");
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-logfail-")));
+  process.env.BENCH_ROOT = root;
+
+  let reviewCalled = false;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
+    return origWrite(chunk, ...rest);
+  };
+
+  try {
+    await runMain({
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ onCall: () => { reviewCalled = true; } }),
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin missing-source:release" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.BENCH_ROOT = TEMP_GCR;
   }
-  // (If no lines emitted, that's also fine — silent allow via early return.)
+
+  assert.equal(reviewCalled, false, "full review cannot run when git cannot list the range");
+  const parsed = parseLines(emittedLines);
+  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "deny",
+    "git log failure should block the push instead of allowing an unreviewed push");
+  assert.match(parsed[0].hookSpecificOutput.permissionDecisionReason, /git log .* failed|push blocked/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -460,10 +528,10 @@ test("nothing to push (already up-to-date) → allow no-op", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test: all reviewers errored → fail-open (allow, not deny)
+// Test: unavailable full review blocks the push
 // ---------------------------------------------------------------------------
 
-test("all reviewers errored → fail-open allow", async () => {
+test("full push review retry/unavailable → deny (push is not allowed unreviewed)", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-fo-")));
   process.env.BENCH_ROOT = root;
@@ -477,12 +545,9 @@ test("all reviewers errored → fail-open allow", async () => {
 
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([
-        fakeErrorReviewer("Kimi"),
-        fakeErrorReviewer("MiMo")
-      ]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ retry: true, reason: "reviewer timeout" }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
@@ -491,13 +556,13 @@ test("all reviewers errored → fail-open allow", async () => {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
 
-  assert.ok(emittedLines.length > 0, "should emit a fail-open allow decision");
+  assert.ok(emittedLines.length > 0, "should emit a deny decision");
   const parsed = parseLines(emittedLines);
   assert.ok(parsed.length > 0, "emitted line should be valid JSON");
   const hookOut = parsed[0]?.hookSpecificOutput;
   assert.ok(hookOut, "hookSpecificOutput must be present");
-  assert.equal(hookOut.permissionDecision, "allow",
-    "all-reviewers-errored should fail-open to allow (never deny)");
+  assert.equal(hookOut.permissionDecision, "deny",
+    "a full-review retry/unavailable signal must deny the push instead of allowing it unreviewed");
 });
 
 // ---------------------------------------------------------------------------
@@ -575,7 +640,7 @@ test("compound command with git push → detected as push", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-cpd-")));
   process.env.BENCH_ROOT = root;
 
-  let reviewersCalled = false;
+  let reviewCalled = false;
   const emittedLines = [];
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk, ...rest) => {
@@ -585,12 +650,9 @@ test("compound command with git push → detected as push", async () => {
 
   try {
     await runMain({
-      resolveReviewersImpl: () => {
-        reviewersCalled = true;
-        return [fakeReviewer("Kimi", "ALLOW")];
-      },
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ onCall: () => { reviewCalled = true; } }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "cd /repo && git push origin main" } }
     });
@@ -599,15 +661,12 @@ test("compound command with git push → detected as push", async () => {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
 
-  // The compound command contains "git push", so reviewers should be called
-  // (or we hit a fail-open for range reasons, but NOT skipped entirely).
-  // Either way, we should NOT have silently skipped.
+  // The compound command contains "git push", so the full push reviewer should be called.
+  // If the range cannot be resolved, the strict gate must deny instead of silently skipping.
   const parsed = parseLines(emittedLines);
-  // If reviewers were called, great. If the range failed and we allowed early,
-  // that's acceptable fail-open behavior.
-  if (!reviewersCalled) {
-    // Must have emitted an allow decision (fail-open, not a silent skip)
-    assert.ok(parsed.length > 0, "compound push command should produce some output if reviewers not called");
+  if (!reviewCalled) {
+    assert.equal(parsed[0]?.hookSpecificOutput?.permissionDecision, "deny",
+      "compound push with an unresolved range must block instead of silently skipping");
   }
 });
 
@@ -676,21 +735,14 @@ test("A1: runMain resolves the review cwd to the -C target dir", async () => {
   process.env.BENCH_ROOT = root;
 
   let seenCwd = null;
-  const capturingReviewer = {
-    name: "Kimi",
-    async run({ cwd }) {
-      seenCwd = cwd;
-      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
-    }
-  };
 
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = () => true;
   try {
     await runMain({
-      resolveReviewersImpl: () => [capturingReviewer],
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ onCall: ({ ws: reviewWs }) => { seenCwd = reviewWs; } }),
       env: process.env,
       input: { cwd: other, tool_input: { command: `git -C "${ws}" push origin main` } }
     });
@@ -796,13 +848,13 @@ test("A2: resolvePushRange — multiple refspecs (deploy push) are REVIEWED, not
   assert.ok(r.note && /2 refspecs/.test(r.note), "note explains the multi-refspec fallback");
 });
 
-test("A2: resolvePushRange — multiple refspecs with NO resolvable base → fail-open note (true last resort)", () => {
+test("A2: resolvePushRange — multiple refspecs with NO resolvable base → unresolved note", () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-norefs-"));
   execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
   execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base"], { cwd: ws });
   const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
   assert.equal(r.ok, false, "no @{u} and no remote-tracking ref anywhere → cannot review");
-  assert.ok(r.note && /⛩/.test(r.note), "carries a visible fail-open note");
+  assert.ok(r.note && /blocked/.test(r.note), "carries a visible strict-gate note");
 });
 
 // ===========================================================================
@@ -841,6 +893,7 @@ test("A4: a second decision within one invocation writes no second stdout line",
       resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "BLOCK")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ badge: "Kimi✗", findingCount: 1, maxSeverity: "high", findings: "[Kimi]\nBLOCK: test\n\nDetails for Kimi." }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
@@ -868,6 +921,7 @@ test("A4: two separate runMain invocations in one process each emit (no cross-in
         resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
         writeTraceImpl: () => {},
         isBenchDisabledImpl: () => false,
+        pushReviewImpl: fakePushReview({ badge: "Kimi✓" }),
         env: process.env,
         input: { cwd: ws, tool_input: { command: "git push origin main" } }
       });
@@ -928,6 +982,15 @@ test("D3: pre-push trace write failure emits a ⛩ note and still allows", async
       resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
       writeTraceImpl: () => { throw new Error("disk full"); },
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: async (range, wsArg, opts = {}) => {
+        const reviewers = [{ name: "Kimi", verdict: "ALLOW", severity: "none", findingCount: 0 }];
+        try {
+          opts.writeTraceImpl(wsArg, { gate: "push-review", ws: wsArg, sessionKey: opts.sessionKey || null, reviewers, systemPrompt: "", userPrompt: "", rawResponses: {} });
+        } catch (e) {
+          process.stderr.write(`⛩ push-review: trace write failed (${e instanceof Error ? e.message : String(e)}); result still returned.\n`);
+        }
+        return { reviewers, findingCount: 0, maxSeverity: "none", findings: "", traceId: null, badge: "Kimi✓", summary: "no blocking findings", hash: "h" };
+      },
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
@@ -943,9 +1006,8 @@ test("D3: pre-push trace write failure emits a ⛩ note and still allows", async
 });
 
 // ===========================================================================
-// H — auto deep-review on push: a fast ALLOW launches the deep, repo-aware
-// push-review worker detached + unref'd, debounced; NEVER on block/fail-open/
-// disabled/empty-range/deleteOnly/debounced.
+// H — pre-push now runs the deep, repo-aware push review INLINE before the
+// push is allowed. No post-ALLOW queued push job is created from runMain.
 // ===========================================================================
 
 /** A spawn spy that records calls and returns a child-like object with unref(). */
@@ -966,44 +1028,42 @@ function launchSpy() {
   return { impl, calls };
 }
 
-test("H: fast ALLOW ENQUEUES a kind:'push' job with a SHA-pinned range (no detached spawn)", async () => {
+test("H: ALLOW runs the full push review inline and does NOT enqueue a push job", async () => {
   const { ws } = freshPushRepo();
   const wsReal = fs.realpathSync(ws);
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hlaunch-")));
   process.env.BENCH_ROOT = root;
+  let call = null;
 
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW"), fakeReviewer("MiMo", "ALLOW")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ badge: "Kimi✓ MiMo✓", onCall: (c) => { call = c; } }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
 
+    assert.ok(call, "full push review must run inline before allowing the push");
+    assert.match(call.range, /\.\.(HEAD|main)$|[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}/, `range should cover pushed commits; got ${call.range}`);
     const jobs = listJobs(wsReal);
-    assert.equal(jobs.length, 1, "fast ALLOW must enqueue exactly one deep push job");
-    assert.equal(jobs[0].kind, "push");
-    // Race fix (H): the range must be PINNED to concrete SHAs at enqueue, not symbolic <ref>..HEAD.
-    assert.match(jobs[0].range, /^[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}$/, `range must be SHA-pinned; got ${jobs[0].range}`);
-    assert.ok(jobs[0].contentKey, "job carries a contentKey");
+    assert.equal(jobs.length, 0, "inline pre-push review must not enqueue a later push-review job");
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
 });
 
-test("H: fast ALLOW passes the originating Claude session to the deep push-review enqueue", async () => {
+test("H: inline full push review receives the originating Claude session", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hsess-")));
   process.env.BENCH_ROOT = root;
-  const spy = launchSpy();
+  let call = null;
 
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
-      launchImpl: spy.impl,
+      pushReviewImpl: fakePushReview({ onCall: (c) => { call = c; } }),
       env: process.env,
       input: { cwd: ws, session_id: "chat-A", tool_input: { command: "git push origin main" } }
     });
@@ -1011,8 +1071,8 @@ test("H: fast ALLOW passes the originating Claude session to the deep push-revie
     process.env.BENCH_ROOT = TEMP_GCR;
   }
 
-  assert.equal(spy.calls.length, 1);
-  assert.equal(spy.calls[0].opts.sessionKey, normalizeSessionId("chat-A"));
+  assert.ok(call);
+  assert.equal(call.opts.sessionKey, normalizeSessionId("chat-A"));
 });
 
 test("H: launchPushReview enqueues a SHA-pinned range that survives the push advancing the remote ref (the race)", () => {
@@ -1052,62 +1112,101 @@ test("H: launchPushReview stamps the queued push job by session", () => {
   }
 });
 
-test("H: BLOCK → does NOT launch the deep push-review (push denied)", async () => {
+test("H: high BLOCK from inline full push review denies the push", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hblock-")));
   process.env.BENCH_ROOT = root;
 
-  const spy = launchSpy();
+  const lines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return origWrite(chunk, ...rest); };
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "BLOCK")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
-      launchImpl: spy.impl,
+      pushReviewImpl: fakePushReview({ badge: "Kimi✗", findingCount: 1, maxSeverity: "high", findings: "[Kimi]\n- concrete push bug" }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
   } finally {
+    process.stdout.write = origWrite;
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-  assert.equal(spy.calls.length, 0, "a BLOCK must not launch a deep push-review");
+  const parsed = parseLines(lines)[0];
+  assert.equal(parsed.hookSpecificOutput.permissionDecision, "deny", "high full-review finding blocks the push");
+  assert.match(parsed.hookSpecificOutput.permissionDecisionReason, /concrete push bug/);
 });
 
-test("H: fail-open (all reviewers errored) → does NOT launch the deep push-review", async () => {
+test("H: unavailable inline full push review denies instead of allowing an unreviewed push", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hfo-")));
   process.env.BENCH_ROOT = root;
 
-  const spy = launchSpy();
+  const lines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return origWrite(chunk, ...rest); };
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeErrorReviewer("Kimi")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
-      launchImpl: spy.impl,
+      pushReviewImpl: fakePushReview({ retry: true, reason: "reviewer timeout" }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
   } finally {
+    process.stdout.write = origWrite;
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-  assert.equal(spy.calls.length, 0, "a fail-open (panel unavailable) must not launch a deep push-review");
+  const parsed = parseLines(lines)[0];
+  assert.equal(parsed.hookSpecificOutput.permissionDecision, "deny", "unavailable full review blocks the push");
+  assert.match(parsed.hookSpecificOutput.permissionDecisionReason, /reviewer timeout|unreviewed|blocked/i);
 });
 
-test("H: bench DISABLED → does NOT launch the deep push-review", async () => {
+test("H: all-error inline full push review denies instead of allowing an unreviewed push", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hallerr-")));
+  process.env.BENCH_ROOT = root;
+
+  const lines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return origWrite(chunk, ...rest); };
+  try {
+    await runMain({
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({
+        badge: "Kimi! GLM!",
+        summary: "Kimi review skipped: timeout | GLM review skipped: auth",
+        reviewers: [
+          { name: "Kimi", verdict: null, error: "timeout" },
+          { name: "GLM", verdict: null, error: "auth" }
+        ]
+      }),
+      env: process.env,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally {
+    process.stdout.write = origWrite;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  const parsed = parseLines(lines)[0];
+  assert.equal(parsed.hookSpecificOutput.permissionDecision, "deny", "all-error full review blocks the push");
+  assert.match(parsed.hookSpecificOutput.permissionDecisionReason, /no reviewer verdicts|unreviewed|blocked/i);
+});
+
+test("H: bench DISABLED → does NOT run the inline push review", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hdis-")));
   process.env.BENCH_ROOT = root;
 
-  const spy = launchSpy();
+  let called = false;
   const origExit = process.exit;
   process.exit = () => { throw new Error("__exit__"); };   // disabled path calls process.exit(0)
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => true,
-      launchImpl: spy.impl,
+      pushReviewImpl: fakePushReview({ onCall: () => { called = true; } }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
@@ -1117,69 +1216,68 @@ test("H: bench DISABLED → does NOT launch the deep push-review", async () => {
     process.exit = origExit;
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-  assert.equal(spy.calls.length, 0, "disabled bench must not launch a deep push-review");
+  assert.equal(called, false, "disabled bench must not run inline push review");
 });
 
-test("H: nothing to push (no commits ahead) → does NOT launch the deep push-review", async () => {
+test("H: nothing to push (no commits ahead) → does NOT run the inline push review", async () => {
   const { ws } = freshPushedRepo();   // nothing ahead of origin/main
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hempty-")));
   process.env.BENCH_ROOT = root;
 
-  const spy = launchSpy();
+  let called = false;
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
-      launchImpl: spy.impl,
+      pushReviewImpl: fakePushReview({ onCall: () => { called = true; } }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin main" } }
     });
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-  assert.equal(spy.calls.length, 0, "an empty push range (nothing to push) must not launch a deep push-review");
+  assert.equal(called, false, "an empty push range (nothing to push) must not run inline push review");
 });
 
-test("H: deleteOnly (:branch) → does NOT launch the deep push-review", async () => {
+test("H: deleteOnly (:branch) → does NOT run the inline push review", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hdel-")));
   process.env.BENCH_ROOT = root;
 
-  const spy = launchSpy();
+  let called = false;
   try {
     await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
-      launchImpl: spy.impl,
+      pushReviewImpl: fakePushReview({ onCall: () => { called = true; } }),
       env: process.env,
       input: { cwd: ws, tool_input: { command: "git push origin :stale-branch" } }
     });
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
-  assert.equal(spy.calls.length, 0, "a delete refspec pushes no commits → no deep push-review");
+  assert.equal(called, false, "a delete refspec pushes no commits → no inline push review");
 });
 
-test("H: dedup — same push (range+HEAD) → enqueue does NOT double-queue", async () => {
+test("H: repeated push attempts are each fully reviewed inline and never queued", async () => {
   const { ws } = freshPushRepo();
   const wsReal = fs.realpathSync(ws);
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hdebounce-")));
   process.env.BENCH_ROOT = root;
+  let calls = 0;
 
   const opts = {
-    resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
+    pushReviewImpl: fakePushReview({ onCall: () => { calls += 1; } }),
     env: process.env,
     input: { cwd: ws, tool_input: { command: "git push origin main" } }
   };
   try {
     await runMain(opts);
-    assert.equal(listJobs(wsReal).length, 1, "first ALLOW enqueues");
-    await runMain(opts);   // identical push (same HEAD, same range) → same contentKey → deduped
-    assert.equal(listJobs(wsReal).length, 1, "identical push must NOT double-queue");
+    await runMain(opts);
+    assert.equal(calls, 2, "each push attempt gets a fresh inline full review");
+    assert.equal(listJobs(wsReal).length, 0, "inline push review does not enqueue push jobs");
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }

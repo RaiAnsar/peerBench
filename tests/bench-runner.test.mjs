@@ -12,7 +12,7 @@ process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-runner-roo
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { reviewersCommand, setupStatus, statusCommand, huntCommand, gradeCommand } from "../scripts/bench-runner.mjs";
+import { reviewersCommand, setupStatus, codexSetupStatus, codexPromptStatus, statusCommand, huntCommand, gradeCommand } from "../scripts/bench-runner.mjs";
 import { resolveConfig, workspaceStateDir } from "../global-hooks/config-store.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 
@@ -166,6 +166,48 @@ test("D2b: missing settings file → 'unable to check' (no crash)", () => {
   let out;
   assert.doesNotThrow(() => { out = setupStatus(p); });
   assert.match(out, /unable to check/i);
+});
+
+test("D2b: codexSetupStatus reports the direct-Codex stop wrapper", () => {
+  const p = writeSettings({
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: 'node "/x/.codex/hooks/codex-stop-review.mjs"' }] }]
+    }
+  });
+  const out = codexSetupStatus(p);
+  assert.match(out, /codex-stop-review\.mjs/);
+  assert.match(out, /registered/i);
+});
+
+test("D2b: codexSetupStatus flags matcher-scoped wrapper as misregistered", () => {
+  const p = writeSettings({
+    hooks: {
+      Stop: [{ matcher: "SomeTool", hooks: [{ type: "command", command: 'node "/x/.codex/hooks/codex-stop-review.mjs"' }] }]
+    }
+  });
+  const out = codexSetupStatus(p);
+  assert.match(out, /misregistered|wrong/i);
+});
+
+test("D2b: codexPromptStatus reports installed prompt commands", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "br-codex-prompts-"));
+  for (const name of [
+    "bench-debug.md",
+    "bench-hunt.md",
+    "bench-investigate.md",
+    "bench-off.md",
+    "bench-on.md",
+    "bench-review.md",
+    "bench-reviewers.md",
+    "bench-scorecard.md",
+    "bench-setup.md",
+    "bench-status.md"
+  ]) {
+    fs.writeFileSync(path.join(dir, name), `node "/x/scripts/bench-runner.mjs" ${name}\n`);
+  }
+  assert.match(codexPromptStatus(dir), /10 registered/);
+  fs.writeFileSync(path.join(dir, "bench-hunt.md"), "{{BENCH_RUNNER}}\n");
+  assert.match(codexPromptStatus(dir), /MISSING.*bench-hunt\.md/);
 });
 
 // ── F: review output leads with the verdict badge ───────────────────────────

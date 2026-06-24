@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // global-hooks/stop-review.mjs
-// Stop hook: review the turn's code diff with the full panel (Kimi + MiMo + Codex),
+// Stop hook: review the turn's code diff with the configured non-Codex panel,
 // content-only (no tools). On BLOCK: write findings to stderr + exit 2 (asyncRewake).
 // On ALLOW: emit systemMessage + exit 0. Fails OPEN on any error.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { combinePanel, untrackedBlock } from "./panel-lib.mjs";
@@ -70,6 +71,30 @@ export function resolveReviewBase(ws, curHead, gitImpl = git) {
   return curHead;                                                // nothing better → working tree only
 }
 
+const REVIEWED_WORKTREE = (ws) => path.join(workspaceStateDir(ws), "reviewed-worktree");
+
+export function reviewFingerprint({ status = "", base = "", curHead = "", committed = "", diff = "", staged = "", untracked = "", reviewers = [] } = {}) {
+  return createHash("sha256")
+    .update(JSON.stringify({ status, base, curHead, committed, diff, staged, untracked, reviewers }))
+    .digest("hex");
+}
+
+export function readReviewedWorktree(ws) {
+  try { return fs.readFileSync(REVIEWED_WORKTREE(ws), "utf8").trim() || null; } catch { return null; }
+}
+
+export function writeReviewedWorktree(ws, fingerprint) {
+  if (!fingerprint) return;
+  try {
+    fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
+    fs.writeFileSync(REVIEWED_WORKTREE(ws), `${fingerprint}\n`);
+  } catch { /* best-effort marker */ }
+}
+
+export function clearReviewedWorktree(ws) {
+  try { fs.rmSync(REVIEWED_WORKTREE(ws), { force: true }); } catch { /* best-effort marker */ }
+}
+
 // Invocation-scoped emit-once guard. Claude Code reads only the FIRST line on stdout, so a second
 // stdout emit in the same invocation is silently dropped. MUST be created per runMain invocation: a
 // module-level flag would suppress later invocations in the same process and break the suite. The
@@ -87,9 +112,10 @@ export function createEmitter() {
   };
 }
 
-export function buildPrompt(status, diff, untracked, lastMsg, staged = "", committed = "") {
+export function buildPrompt(status, diff, untracked, lastMsg, staged = "", committed = "", { agentName = "Claude" } = {}) {
+  const turnLabel = agentName ? `${agentName} turn` : "agent turn";
   const system =
-    "You are reviewing the code changes from a Claude turn. Review based ONLY on the content " +
+    `You are reviewing the code changes from a ${turnLabel}. Review based ONLY on the content ` +
     "provided in this message. Do NOT use any tools or explore the filesystem. " +
     "Changes may be ALREADY COMMITTED this session (<committed_diff>) and/or UNCOMMITTED in the " +
     "working tree (<git_diff>/<staged_diff>) — review ALL of them. " +
@@ -130,7 +156,9 @@ export async function runMain({
   isBenchDisabledImpl = defaultIsBenchDisabled,
   env = process.env,
   input: inputOverride,
-  emitter = createEmitter()
+  emitter = createEmitter(),
+  agentName = "Claude",
+  blockHandler = null
 } = {}) {
   // FIX 5 — ALL stdout emits in this invocation (the surfaced deep note AND every runMain
   // emit below) route through one emit-once guard so only the FIRST line reaches the harness.
@@ -182,19 +210,31 @@ export async function runMain({
     // Nothing changed since the last review (status/report-only) — keep the baseline current so
     // the NEXT committing turn diffs from here, then skip.
     writeReviewedHead(ws, curHead);
+    clearReviewedWorktree(ws);
+    return;
+  }
+
+  // Never ask Codex to review a Codex turn. Claude can still use Codex through codex-plugin-cc;
+  // direct Codex work is reviewed by the non-Codex bench reviewers configured for this workspace.
+  const reviewers = resolveReviewersImpl({ env }).filter((r) => String(r.name).toLowerCase() !== "codex");
+  const reviewerNames = reviewers.map((r) => String(r.name).toLowerCase()).sort();
+
+  // Dirty working-tree changes can persist across many purely conversational turns. `reviewed-head`
+  // only handles committed history, so remember the exact uncommitted review payload that already
+  // passed and stay silent until that payload OR the reviewing panel changes. BLOCK/fail-open paths
+  // below deliberately do NOT write this marker, so unsafe or unreviewed snapshots keep getting checked.
+  const worktreeFingerprint = reviewFingerprint({ status, base, curHead, committed, diff, staged, untracked, reviewers: reviewerNames });
+  if (readReviewedWorktree(ws) === worktreeFingerprint) {
     return;
   }
 
   const lastMsg = String(input.last_assistant_message ?? "").slice(0, 4000);
-  const { system, user } = buildPrompt(status, diff, untracked, lastMsg, staged, committed);
+  const { system, user } = buildPrompt(status, diff, untracked, lastMsg, staged, committed, { agentName });
 
-  // (c) Codex reviews each turn via its OWN agentic gate (codex-plugin), where it scours files;
-  // this content-only gate adds just the cheap reviewers. To make this the sole per-turn gate
-  // (incl. Codex) later, drop this filter and disable Codex's own gate.
-  const reviewers = resolveReviewersImpl({ env }).filter((r) => String(r.name).toLowerCase() !== "codex");
   if (!reviewers.length) {
-    // e.g. reviewers configured as codex-only — nothing left for this content-only gate to run.
-    emit({ systemMessage: "⛩ bench stop: no non-Codex reviewers configured — turn allowed (Codex runs its own gate)." });
+    // e.g. reviewers configured as codex-only — nothing left after self-review suppression.
+    writeReviewedWorktree(ws, worktreeFingerprint);
+    emit({ systemMessage: "⛩ bench stop: no non-Codex reviewers configured — turn allowed (Codex reviewer excluded to avoid self-review)." });
     return;
   }
   const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
@@ -226,11 +266,15 @@ export async function runMain({
     try { fs.mkdirSync(workspaceStateDir(ws), { recursive: true }); fs.writeFileSync(loopFile, JSON.stringify({ count: priorBlocks + 1, ts: Date.now() })); } catch { /* noop */ }
     // asyncRewake: write findings to STDERR and exit 2 so the harness wakes
     // Claude with them instead of blocking the turn inline.
-    process.stderr.write(
+    const message =
       `Review panel blocked the turn [${panel.badge}]:\n\n${panel.findings}\n\n` +
       `${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}` +
-      `Address ALL findings before ending the session.`
-    );
+      `Address ALL findings before ending the session.`;
+    if (blockHandler) {
+      await blockHandler({ panel, message });
+      return;
+    }
+    process.stderr.write(message);
     process.exit(2);
   }
 
@@ -239,6 +283,7 @@ export async function runMain({
   // on block/fail-open above: a blocked or unreviewed range must be re-reviewed until it's clean.
   try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
   writeReviewedHead(ws, curHead);
+  writeReviewedWorktree(ws, worktreeFingerprint);
   emit({ systemMessage: `⛩ bench stop: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
 }
 

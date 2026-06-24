@@ -12,7 +12,7 @@ import path from "node:path";
 const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, resolveReviewBase, readReviewedHead, writeReviewedHead } from "../global-hooks/stop-review.mjs";
+import { runMain, buildPrompt, resolveReviewBase, readReviewedHead, writeReviewedHead, readReviewedWorktree } from "../global-hooks/stop-review.mjs";
 import { normalizeSessionId, setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
@@ -253,6 +253,158 @@ test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async ()
   assert.equal(traceRecord.sessionKey, normalizeSessionId("chat-A"), "trace is stamped with the hook session");
   assert.ok(traceRecord.ws, "trace should include ws");
   assert.ok(Array.isArray(traceRecord.reviewers), "trace.reviewers should be an array");
+});
+
+test("dirty ALLOW snapshot is reviewed once, then skipped until the worktree changes", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-once-"));
+  process.env.BENCH_ROOT = root;
+
+  let calls = 0;
+  let traces = 0;
+  const reviewer = {
+    name: "Kimi",
+    async run() {
+      calls += 1;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => { traces += 1; },
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, last_assistant_message: "wrote code" }
+  };
+
+  let marker = null;
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    await runMain(opts);
+    marker = readReviewedWorktree(ws);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 1, "the identical dirty snapshot must not be re-reviewed on the next Stop");
+  assert.equal(traces, 1, "the identical dirty snapshot must not write a second trace");
+  assert.equal(lines.length, 1, "only the first review should emit an ALLOW message");
+  assert.ok(marker, "ALLOW should persist a reviewed-worktree fingerprint");
+});
+
+test("dirty ALLOW snapshot is reviewed again after the worktree content changes", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-change-"));
+  process.env.BENCH_ROOT = root;
+
+  let calls = 0;
+  const reviewer = {
+    name: "Kimi",
+    async run() {
+      calls += 1;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, last_assistant_message: "wrote code" }
+  };
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    fs.appendFileSync(path.join(ws, "changed.js"), "export const y = 2;\n");
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 2, "a changed dirty snapshot must trigger a fresh review");
+});
+
+test("dirty ALLOW snapshot is reviewed again when the reviewer panel changes", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-reviewers-"));
+  process.env.BENCH_ROOT = root;
+
+  let kimiCalls = 0;
+  let glmCalls = 0;
+  const kimi = {
+    name: "Kimi",
+    async run() {
+      kimiCalls += 1;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+  const glm = {
+    name: "GLM",
+    async run() {
+      glmCalls += 1;
+      return { name: "GLM", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+  let reviewerList = [kimi];
+  const opts = {
+    resolveReviewersImpl: () => reviewerList,
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, last_assistant_message: "wrote code" }
+  };
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    reviewerList = [kimi, glm];
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(kimiCalls, 2, "the existing reviewer should run again when the panel changes");
+  assert.equal(glmCalls, 1, "the newly-added reviewer must review the already-dirty snapshot");
+});
+
+test("dirty BLOCK snapshot is not marked reviewed and repeats until fixed", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-block-"));
+  process.env.BENCH_ROOT = root;
+
+  let calls = 0;
+  const reviewer = {
+    name: "Kimi",
+    async run() {
+      calls += 1;
+      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: real bug", raw: "BLOCK: real bug" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, last_assistant_message: "wrote code" },
+    blockHandler: async () => {}
+  };
+
+  let marker = "unset";
+  try {
+    await runMain(opts);
+    await runMain(opts);
+    marker = readReviewedWorktree(ws);
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 2, "BLOCK must not suppress future reviews of the same unsafe snapshot");
+  assert.equal(marker, null, "BLOCK must not write a reviewed-worktree fingerprint");
 });
 
 // ---------------------------------------------------------------------------

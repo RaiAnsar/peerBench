@@ -158,7 +158,7 @@ test("runPushReview writes a gate:'push-review' trace and returns result + findi
   assert.equal(latest.gate, "push-review");
 });
 
-test("runPushReview FAILS OPEN (no block) when git log/diff report ok=false", async () => {
+test("runPushReview signals retry when git log/diff report ok=false", async () => {
   const ws = freshWs();
   const stub = gitStub({ logOk: false });
   let panelCalled = false;

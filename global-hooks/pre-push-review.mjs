@@ -1,27 +1,20 @@
 #!/usr/bin/env node
 // global-hooks/pre-push-review.mjs
-// PreToolUse(Bash) hook: when Claude runs `git push`, review the push diff
-// (ahead-of-remote commits) with the full panel content-only. On BLOCK: deny
-// the Bash tool with findings so Claude fixes first. Fails OPEN everywhere —
-// only a real panel BLOCK prevents the push.
+// PreToolUse(Bash) hook: when Claude runs `git push`, run the full repo-aware
+// push review against the ahead-of-remote commits before the push is allowed.
+// On a high/critical BLOCK: deny the Bash tool with findings so Claude fixes first.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled, readReviewedHead, sessionKeyFromInput, writeReviewedHead } from "./config-store.mjs";
-import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
-import { deepKey } from "./deep-review.mjs";
+import { deepKey, shouldRewake } from "./deep-review.mjs";
 import { enqueue } from "./deep-queue.mjs";
+import { runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 
-const MAX_DIFF_BYTES = 200_000;
-
-// H — after a fast ALLOW, ENQUEUE the deep, repo-aware push-review for the asyncRewake Stop runner.
-// No detached spawn. The range is PINNED to concrete SHAs NOW — we run (PreToolUse) BEFORE the actual
-// `git push`, which then advances the remote-tracking ref (@{u}/origin/<branch>) to HEAD; a SYMBOLIC
-// `<ref>..HEAD` would resolve to EMPTY by the time the runner reviews it. SHAs are immutable, so the
-// runner reviews the exact pushed commits regardless of timing. enqueue dedupes on the pinned range +
-// pushed HEAD. Never throws (the fast gate has already allowed). gitImpl is injectable for tests.
+// Legacy queue helper retained for direct callers/tests. runMain no longer uses it: pushes are
+// full-reviewed inline before the push is allowed. The helper still pins symbolic ranges to SHAs so
+// any queued push-review job survives the remote-tracking ref advancing after a push.
 export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now(), sessionKey = null } = {}) {
   try {
     const [headSha] = gitImpl(["rev-parse", "HEAD"], ws);
@@ -262,14 +255,21 @@ function decisionPayload(permissionDecision, reason, systemMessage) {
   return out;
 }
 
+function hasReviewerVerdict(review) {
+  return Array.isArray(review?.reviewers) && review.reviewers.some((r) => {
+    const verdict = String(r?.verdict || "").toUpperCase();
+    return verdict === "ALLOW" || verdict === "BLOCK";
+  });
+}
+
 function refExists(ref, cwd) {
   const [, ok] = gitTry(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
   return ok;
 }
 
 // Resolve push range (commits ahead of remote) from the PARSED push command. Returns
-// { range, ok, note, deleteOnly }. ok=false means no review (clean allow when deleteOnly/empty,
-// or fail-open with a visible ⛩ note when undeterminable / out of clean scope) (A2).
+// { range, ok, note, deleteOnly }. ok=false means no reviewable range. Delete-only pushes are
+// clean no-ops; other unresolved ranges are denied by runMain so commits are not pushed unreviewed.
 //
 //  - <src>:<dst>  → source = local <src> (HEAD if <src>=="HEAD"); base = <remote>/<dst> if it exists
 //                   (else the base-chain below). Explicit refspecs take precedence over @{u}.
@@ -296,7 +296,7 @@ export function resolvePushRange(cwd, parsed) {
     const why = wholeRefFlag ? `${wholeRefFlag} pushes multiple refs` : `${refspecs.length} refspecs`;
     const fb = fallbackRange(cwd, remote);
     if (fb.ok) return { ...fb, note: `⛩ pre-push: ${why} — reviewing current-branch commits (${fb.range}); exact push set not range-resolved.` };
-    return { range: "", ok: false, note: `⛩ pre-push: ${why} and no branch base resolved; push allowed without review.` };
+    return { range: "", ok: false, note: `⛩ pre-push: ${why} and no branch base resolved; push blocked until peerBench can review a commit range.` };
   }
 
   // Single explicit refspec.
@@ -315,7 +315,7 @@ export function resolvePushRange(cwd, parsed) {
       const fb = fallbackRange(cwd, remote);
       return fb.ok
         ? { ...fb, note: `⛩ pre-push: could not resolve a base for ${spec} — reviewing current-branch commits (${fb.range}).` }
-        : { range: "", ok: false, note: `⛩ pre-push: could not resolve a base for ${spec}; push allowed without review.` };
+        : { range: "", ok: false, note: `⛩ pre-push: could not resolve a base for ${spec}; push blocked until peerBench can review a commit range.` };
     }
     // bare <ref> → src = dst = <ref>
     const baseRef = `${remote}/${spec}`;
@@ -325,12 +325,12 @@ export function resolvePushRange(cwd, parsed) {
     const fb = fallbackRange(cwd, remote);
     return fb.ok
       ? { ...fb, note: `⛩ pre-push: no remote-tracking ref for ${spec} — reviewing current-branch commits (${fb.range}).` }
-      : { range: "", ok: false, note: `⛩ pre-push: no remote-tracking ref for ${spec}; push allowed without review.` };
+      : { range: "", ok: false, note: `⛩ pre-push: no remote-tracking ref for ${spec}; push blocked until peerBench can review a commit range.` };
   }
 
   // No explicit refspec → review the current branch's ahead-commits.
   const fb = fallbackRange(cwd, remote);
-  return fb.ok ? fb : { range: "", ok: false, note: "⛩ pre-push: no upstream to diff against; push allowed without review." };
+  return fb.ok ? fb : { range: "", ok: false, note: "⛩ pre-push: no upstream to diff against; push blocked until peerBench can review a commit range." };
 }
 
 // Current branch's ahead-commits: @{u}..HEAD, else <remote>/<branch|HEAD|main|master>..HEAD.
@@ -377,10 +377,9 @@ export function buildPrompt(commits, diff) {
 }
 
 export async function runMain({
-  resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
-  launchImpl = launchPushReview,
+  pushReviewImpl = defaultRunPushReview,
   env = process.env,
   input: inputOverride,
   emitter = createEmitter()
@@ -428,7 +427,8 @@ export async function runMain({
     process.exit(0);
   }
 
-  // 3. Compute push range from the PARSED command — fail OPEN if undeterminable.
+  // 3. Compute push range from the PARSED command. If a real push might transmit commits but
+  // peerBench cannot resolve a review range, fail closed instead of allowing an unreviewed push.
   const parsed = parsePushCommand(pushSeg.text);
   const { range, ok: rangeOk, note: rangeNote, deleteOnly } = resolvePushRange(ws, parsed);
   if (!rangeOk) {
@@ -436,7 +436,12 @@ export async function runMain({
       // delete refspec → pushes no commits → clean allow, no review, no noisy note.
       return;
     }
-    decision("allow", rangeNote || "pre-push: no upstream; allowed", rangeNote);
+    const note = rangeNote || "⛩ pre-push: no reviewable commit range; push blocked.";
+    decision(
+      "deny",
+      `${note} Retry after setting an upstream/remote tracking ref, or run /bench:off if you intentionally need to bypass peerBench.`,
+      note
+    );
     return;
   }
 
@@ -445,9 +450,9 @@ export async function runMain({
   const [commits, commitsOk] = gitTry(["log", "--oneline", range], ws);
   if (!commitsOk) {
     decision(
-      "allow",
-      `pre-push: could not list commits for ${range}; push allowed without review.`,
-      `⛩ pre-push: git log ${range} failed; push allowed without review.`
+      "deny",
+      `⛩ pre-push: git log ${range} failed; push blocked because peerBench could not inspect the commits. Retry, or run /bench:off if you intentionally need to bypass peerBench.`,
+      `⛩ pre-push: git log ${range} failed; push blocked.`
     );
     return;
   }
@@ -456,87 +461,70 @@ export async function runMain({
     return;
   }
 
-  // 5. Get diff, capped. gitTry → a git error is surfaced, not silently empty (A2).
-  const [diffRaw, diffOk] = gitTry(["diff", range], ws);
-  if (!diffOk) {
+  // 5. Run the full repo-aware push review inline. This is intentionally synchronous: the push
+  // must not leave the machine before peerBench has reviewed the exact commit range.
+  let review;
+  try {
+    review = await pushReviewImpl(range, ws, { sessionKey, writeTraceImpl });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
     decision(
-      "allow",
-      `pre-push: could not compute diff for ${range}; push allowed without review.`,
-      `⛩ pre-push: git diff ${range} failed; push allowed without review.`
+      "deny",
+      `⛩ bench pre-push: full push review errored (${msg}); push blocked. Retry, or run /bench:off if you intentionally need to bypass peerBench.`,
+      `⛩ bench pre-push: full review errored; push blocked.`
     );
     return;
   }
-  let diff = diffRaw;
-  if (diff.length > MAX_DIFF_BYTES) {
-    diff = diff.slice(0, MAX_DIFF_BYTES) + "\n\n[... diff truncated at 200 000 bytes ...]";
+
+  if (review?.retry) {
+    decision(
+      "deny",
+      `⛩ bench pre-push: full push review could not inspect ${range} (${review.reason || "retry requested"}); push blocked. Retry, or run /bench:off if you intentionally need to bypass peerBench.`,
+      `⛩ bench pre-push: full review unavailable; push blocked.`
+    );
+    return;
   }
 
-  // 6. Build content-only prompt and run the full panel.
-  const { system, user } = buildPrompt(commits, diff);
-
-  const reviewers = resolveReviewersImpl({ env });
-  const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
-  const panel = combinePanel(results);
-
-  // 7. Write trace — best-effort.
-  try {
-    writeTraceImpl(ws, {
-      gate: "push",
-      ws,
-      sessionKey,
-      reviewers: results.map(({ raw, ...m }) => m),
-      systemPrompt: system,
-      userPrompt: user,
-      rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || ""]))
-    });
-  } catch (e) {
-    // trace is best-effort — never block a push over it, but say so instead of swallowing (D3).
-    process.stderr.write(`⛩ pre-push: trace write failed (${e instanceof Error ? e.message : String(e)}); push review continues.\n`);
+  if (!hasReviewerVerdict(review)) {
+    decision(
+      "deny",
+      `⛩ bench pre-push: full push review produced no reviewer verdicts; push blocked so commits do not leave unreviewed. Retry, or run /bench:off if you intentionally need to bypass peerBench.`,
+      `⛩ bench pre-push: full review unavailable; push blocked.`
+    );
+    return;
   }
 
   const rangeNoteSuffix = rangeNote ? ` (${rangeNote})` : "";
 
-  // 8. Decision.
-  if (panel.decision === "fail-open") {
-    // All reviewers errored — fail OPEN with a visible note.
-    decision(
-      "allow",
-      `[${panel.badge}] Pre-push panel unavailable (${panel.summary}); push allowed without review.`,
-      `⛩ bench pre-push: panel skipped [${panel.badge}] — ${panel.summary.slice(0, 200)}`
-    );
-    return;
-  }
-
-  if (panel.decision === "block") {
+  // 6. Decision. The deep-review threshold is shared with spec/plan review: high/critical
+  // findings block, lower-severity findings are advisory.
+  if (shouldRewake(review)) {
     decision(
       "deny",
-      `[${panel.badge}] Review panel found issues that must be fixed before pushing:\n\n${panel.findings}\n\n` +
-      `${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}` +
+      `[${review.badge || "push-review"}] Full push review found issues that must be fixed before pushing:\n\n${review.findings || review.summary || "(no details)"}\n\n` +
       `Fix the issues above, then run git push again.`
     );
     return;
   }
 
-  // allow — H: the fast content review allowed, so ALSO ENQUEUE the deep, repo-aware push-review
-  // for the asyncRewake Stop runner (SHA-pinned range, no spawn). Never blocks or delays the push.
-  // Only reached on a real ALLOW (block/fail-open/disabled/empty-range/deleteOnly all returned
-  // earlier), so this is the correct boundary.
-  try {
-    launchImpl(ws, range, { sessionKey });
-  } catch (e) {
-    process.stderr.write(`⛩ pre-push: deep push-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
-  }
-  decision("allow", `⛩ bench pre-push: ALLOW [${panel.badge}] — ${panel.summary}${rangeNoteSuffix}`, `⛩ bench pre-push: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}`);
+  decision(
+    "allow",
+    `⛩ bench pre-push: ALLOW [${review.badge || "push-review"}] — ${review.summary || "full push review passed"}${rangeNoteSuffix}`,
+    `⛩ bench pre-push: ALLOW [${review.badge || "push-review"}] — ${(review.summary || "full push review passed").slice(0, 220)}`
+  );
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const emitter = createEmitter();
   runMain({ emitter }).catch((error) => {
-    // Top-level catch → fail OPEN, never wedge a push. Only emit if runMain hasn't already
-    // decided — a 2nd stdout line would be dropped by the harness (A4). Else log to stderr.
+    // Top-level catch → fail closed. Only emit if runMain hasn't already decided — a 2nd stdout
+    // line would be dropped by the harness (A4). Else log to stderr.
     const msg = error instanceof Error ? error.message : String(error);
     if (!emitter.hasEmitted()) {
-      emitter.emit(decisionPayload("allow", `Pre-push hook errored (${msg}); push allowed.`));
+      emitter.emit(decisionPayload(
+        "deny",
+        `⛩ pre-push: hook errored (${msg}); push blocked so commits do not leave unreviewed. Retry, or run /bench:off if you intentionally need to bypass peerBench.`
+      ));
     } else {
       process.stderr.write(`⛩ pre-push: error after decision already emitted — ${msg}\n`);
     }

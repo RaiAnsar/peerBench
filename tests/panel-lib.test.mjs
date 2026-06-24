@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { parseVerdict, combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
+import { parseVerdict, combinePanel, untrackedBlock, runCodexReview } from "../global-hooks/panel-lib.mjs";
 
 test("untrackedBlock embeds a real untracked file but NEVER follows a symlink out of the workspace", () => {
   const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-")));
@@ -23,6 +23,20 @@ test("parseVerdict extracts ALLOW/BLOCK/null", () => {
   assert.equal(parseVerdict("BLOCK: broken\n- a").verdict, "BLOCK");
   assert.equal(parseVerdict("something weird").verdict, null);
   assert.equal(parseVerdict("").verdict, null);
+});
+
+test("runCodexReview suppresses peerBench hooks in the nested Codex reviewer process", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-review-env-"));
+  const companion = path.join(dir, "companion.mjs");
+  fs.writeFileSync(companion, [
+    "#!/usr/bin/env node",
+    "const ok = process.env.BENCH_SUPPRESS_HOOKS === '1';",
+    "process.stdout.write(JSON.stringify({ rawOutput: ok ? 'ALLOW: suppressed' : 'BLOCK: unsuppressed' }));",
+    ""
+  ].join("\n"));
+  const result = await runCodexReview({ companionPath: companion, prompt: "review", cwd: dir, env: {} });
+  assert.equal(result.verdict, "ALLOW");
+  assert.match(result.firstLine, /suppressed/);
 });
 
 test("combinePanel: both allow", () => {

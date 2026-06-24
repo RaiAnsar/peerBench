@@ -1,6 +1,6 @@
 # peerbench
 
-A Claude Code plugin that reviews your work with a **panel of AI reviewers** —
+A Claude Code + Codex helper that reviews your work with a **panel of AI reviewers** —
 **Codex** (OpenAI), **Kimi** (Moonshot `kimi-k2.6`), **MiMo** (Xiaomi), and **GLM**
 (z.ai `glm-5.2`) — instead of a single reviewer. The panel runs automatically as
 **gates** (plans/specs, code turns, pushes) and on demand as a **bug hunt** that
@@ -21,20 +21,22 @@ gets the findings and fixes them); **ALLOW** shows a brief status line.
 
 | Gate | Fires on | Reviewers | Mode |
 | --- | --- | --- | --- |
-| Plan / spec | `ExitPlanMode`, and Writes to `**/plans/*.md` · `**/specs/*.md` | full panel (Codex + Kimi + MiMo) | content-only (reviews the plan text) |
-| Code turn (Stop) | end of a code-editing turn | Codex (via the Codex plugin) | content-only |
+| Plan | `ExitPlanMode` | active panel | content-only plan review |
+| Plan / spec file | Writes to `**/plans/*.md` · `**/specs/*.md` | active panel | fast content-only save gate, then repo-aware deep review on ALLOW |
+| Code turn (Stop) | end of a turn with committed, staged, unstaged, or untracked changes | active non-Codex reviewers | content-only diff review; direct Codex never asks Codex to review itself |
+| Push | `git push` | active panel | inline repo-aware full review of the about-to-be-pushed commit range |
 
-The panel is **AND-pass**: any reviewer's `BLOCK:` blocks; if a reviewer errors, the
-others decide; only if all error does the gate fail open (with a visible note).
+The panel is **AND-pass**: any reviewer's blocking `BLOCK:` blocks; if a reviewer
+errors, the others decide. Plan/Stop gates fail open with a visible note only when
+all reviewers error; pre-push fails closed so commits never leave unreviewed.
 
-**Auto deep-review on spec save + push (capabilities G & H).** When the fast plan/spec gate ALLOWs
-a `**/plans/*.md` · `**/specs/*.md` save (**G**), or the pre-push gate clears a `git push` (**H**),
-it **enqueues** a deep-review job to a crash-safe queue (`deep-queue/`); it never blocks the
-save/push. At the next turn end, the `asyncRewake` Stop runner (`deep-review-runner.mjs`) claims
-queued jobs, runs the deep panel **against the real repository** (repo-aware, read-only)
-concurrently, and on a **high-severity** block writes the findings to stderr + **exits 2 — which
-wakes Claude immediately, even if the session has gone idle** (the key property; a detached worker
-surfaced only at the next stop could never wake an idle agent). The job lifecycle is crash-safe:
+**Auto deep-review on spec save (capability G).** When the fast plan/spec file gate ALLOWs
+a `**/plans/*.md` · `**/specs/*.md` save, it **enqueues** a deep-review job to a crash-safe
+queue (`deep-queue/`) and does not block the save. At the next turn end, the `asyncRewake`
+Stop runner (`deep-review-runner.mjs`) claims queued jobs, runs the deep panel **against the
+real repository** (repo-aware, read-only) concurrently, and on a **high-severity** block writes
+the findings to stderr + **exits 2 — which wakes Claude immediately, even if the session has
+gone idle**. The job lifecycle is crash-safe:
 atomic-rename states (`.json` queued → `.claimed.<pid>` running → `.blocked` durable), a completed
 block is retired ONLY when its content changes (the agent addresses it) or the target is deleted —
 never lost on a crash, transient git error, or large file. Disabling the bench (`/bench:off`) skips
@@ -42,6 +44,13 @@ the runner. Deep jobs are stamped with Claude's hook `session_id`, so two Claude
 git checkout do not claim or wake each other's queued findings. (This replaced an earlier detached
 worker + `deep-result` + next-stop-surfacing design that could not wake an idle agent — see
 `docs/superpowers/specs/2026-06-22-deep-review-wake-delivery-design.md`.)
+
+**Inline full review before push (capability H).** The `Bash(git *)` pre-push hook reviews the
+exact ahead-of-remote commit range **before** the push is allowed. It runs the same repo-aware
+deep push review inline, blocks on high/critical findings, and also blocks if peerBench cannot
+resolve or inspect the commit range. Delete-only pushes and pushes with no commits ahead are
+allowed without running the reviewer. Use `/bench:off` only when you intentionally want to bypass
+the gate.
 
 **2. Bug hunt (on demand).** `/bench:hunt [focus]` runs the panel **agentically** —
 each reviewer explores the repository read-only via tools (read_file, grep, glob,
@@ -58,8 +67,9 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
   `temperature:0.6`). Fast, non-thinking, tool-calling — no Open Platform key needed.
 - **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`).
 
-Switch the active panel any time with `/bench:reviewers` (e.g. `codex kimi mimo`,
-or run `kimi mimo` only). Selectable reviewers: `kimi`, `mimo`, `codex`.
+Switch the active panel any time with `/bench:reviewers` (for example `kimi glm qwen`,
+or `codex kimi glm`). Selectable reviewers come from the registry (`kimi`, `mimo`,
+`glm`, `qwen`, `codex`).
 
 ### Read-only by construction
 
@@ -81,6 +91,10 @@ produce output:
 - **Conclude budget** — past ~150 KB of gathered context the model is told to stop
   reading and write its findings (prevents endless exploration).
 - **Network retry** + **wall-clock timeout** + per-tool try/catch.
+- **Budgets** — hunt/debug get a 12-minute wall clock; investigate and deep
+  spec/push review get 20 minutes. Deployed hooks have cushions above those
+  budgets: Stop hooks 15 minutes, Claude pre-push/deep-runner hooks 22 minutes,
+  and nested Codex reviewer tasks 25 minutes.
 - **Diagnostics** — set `BENCH_DEBUG=1` to stream per-round detail (request size,
   tool calls, latency, the underlying error cause) to stderr; the same diagnostics
   are saved into each hunt's trace for later inspection.
@@ -90,7 +104,7 @@ produce output:
 `kimi-k2.6` supports thinking on **or** off via the `thinking` parameter:
 
 - **Default (gates, `/bench:hunt`)** — thinking **off**: fast (~3s rounds), reliable.
-- **`/bench:investigate` (planned)** — thinking **on**: deeper reasoning for hard
+- **`/bench:investigate`** — thinking **on**: deeper reasoning for hard
   problems, with a generous budget. Same panel, opt-in depth.
 
 ## Commands
@@ -103,7 +117,7 @@ produce output:
   budget, for a hard specific problem. Slower than hunt.
 - `/bench:review [--base <ref>]` — on-demand panel review of your current changes.
 - `/bench:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo` or
-  `codex kimi mimo glm`). Selectable: `kimi`, `mimo`, `codex`, `glm`.
+  `codex kimi glm qwen`). Selectable: `kimi`, `mimo`, `glm`, `qwen`, `codex`.
 - `/bench:status [id]` — recent gate/hunt runs for this workspace; pass a trace id to expand it.
 - `/bench:setup` — check reviewer availability and per-workspace state.
 - `/bench:off` / `/bench:on` — disable / re-enable the gates for this workspace (`--global` for everywhere).
@@ -127,6 +141,13 @@ stay project-scoped. Delivery/status artifacts that can interrupt a conversation
 (`deep-queue` jobs, durable deep blocks, stop-loop counters, and hook traces used
 by the statusline) are additionally stamped by Claude `session_id` when available.
 The provider config in `companion.json` is global/shared.
+
+When peerBench is installed for direct Codex work, the Codex Stop hook uses the
+same stop-review logic but always removes the `codex` reviewer before the panel
+runs. That means Codex work is reviewed by Kimi/GLM/Qwen/etc., never by Codex
+itself. Codex processes launched as Claude reviewers/delegates are skipped with
+`BENCH_SUPPRESS_HOOKS` / `CODEX_COMPANION_SESSION_ID`, so `codex-plugin-cc`
+does not recursively trigger peerBench.
 
 ## Fallback (revert anytime)
 
@@ -167,19 +188,37 @@ This repo doubles as a local-directory marketplace (`rai-tools`). In
 
 Restart Claude Code; the `/bench:*` commands appear.
 
-Then register the four review gates (one-time — copies the hooks into
-`~/.claude/hooks` and wires them into `~/.claude/settings.json`):
+Then register the review gates (one-time — copies the hooks into
+`~/.claude/hooks` and `~/.codex/hooks`, wires Claude into
+`~/.claude/settings.json`, and wires direct Codex into `~/.codex/hooks.json`):
 
 ```bash
 node /absolute/path/to/bench/scripts/deploy-global-hooks.mjs
 ```
 
-This registers the Stop gate (matcher-less), the ExitPlanMode plan gate, the
-`Write|Edit` plan-file gate, and the `Bash` pre-push gate. Re-run it any time to
-re-sync; it is idempotent and de-dupes existing entries. If your
+For Claude, this registers the Stop gate (matcher-less), the ExitPlanMode plan
+gate, the `Write|Edit` plan-file gate, and the `Bash` pre-push gate. For direct
+Codex, this registers only the matcher-less `codex-stop-review.mjs` Stop gate,
+which runs the non-Codex reviewers and skips nested Codex reviewer processes.
+The Codex hook uses `statusMessage: "⛩ bench: reviewing turn…"` while it runs
+and emits Codex Stop JSON with `systemMessage` on ALLOW/failure notes so the result
+can surface in Codex UIs that show hook warnings/events.
+Re-run it any time to re-sync; it is idempotent and de-dupes existing entries.
+The deploy output includes an `origin` object comparing the local checkout with
+`origin/<branch>` before syncing. If your
 `~/.claude/statusline-command.sh` already calls peerBench's `statusline-segment.mjs`,
 the deploy step also patches that call to pass Claude's per-chat `session_id`.
-Without this step the commands work but the automatic gates do not fire.
+Without this step the commands work but the automatic gates do not fire. Codex
+may ask you to review/trust the new hook in `/hooks` the first time it sees
+`~/.codex/hooks.json`.
+
+The same deploy also installs Codex custom prompts into `~/.codex/prompts`.
+After restarting Codex or opening a new session, invoke them from Codex as
+`/prompts:bench-hunt`, `/prompts:bench-investigate`, `/prompts:bench-debug`,
+`/prompts:bench-review`, `/prompts:bench-status`, `/prompts:bench-setup`,
+`/prompts:bench-on`, `/prompts:bench-off`, `/prompts:bench-reviewers`, and
+`/prompts:bench-scorecard`. These prompts run the same `scripts/bench-runner.mjs`
+commands that Claude's `/bench:*` commands use.
 
 ## Test
 

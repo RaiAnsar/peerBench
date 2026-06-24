@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
-import { deploy, snapshot, syncSettings, migrateDataDir, syncStatuslineSessionArg } from "../scripts/deploy-global-hooks.mjs";
+import { execFileSync } from "node:child_process";
+import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin } from "../scripts/deploy-global-hooks.mjs";
 
 test("migrateDataDir: clean legacy → rename", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-"));
@@ -58,6 +59,18 @@ test("snapshot captures existing hooks + settings", () => {
   assert.ok(fs.existsSync(path.join(backup, "b1", "settings.json")));
 });
 
+test("snapshotCodex captures existing Codex hooks + hooks.json", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hk-"));
+  const backup = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bk-"));
+  fs.writeFileSync(path.join(hooks, "old.mjs"), "// old\n");
+  const hooksPath = path.join(hooks, "hooks.json");
+  fs.writeFileSync(hooksPath, '{"hooks":{}}');
+  const r = snapshotCodex({ hooksDir: hooks, hooksPath, backupDir: path.join(backup, "b1") });
+  assert.ok(r.files.includes("old.mjs"));
+  assert.equal(r.hooksJsonBackedUp, true);
+  assert.ok(fs.existsSync(path.join(backup, "b1", "hooks.json")));
+});
+
 test("syncStatuslineSessionArg passes Claude session_id to peerBench statusline segment", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slcmd-"));
   const statuslinePath = path.join(dir, "statusline-command.sh");
@@ -95,6 +108,82 @@ test("syncStatuslineSessionArg no-ops when there is no peerBench segment", () =>
   assert.equal(result.updated, false);
   assert.equal(result.reason, "no peerbench statusline segment");
   assert.equal(fs.readFileSync(statuslinePath, "utf8"), before);
+});
+
+test("syncCodexHooks registers only the Codex wrapper stop hook and is idempotent", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "codex-sync-hk-"));
+  fs.writeFileSync(path.join(hooks, "codex-stop-review.mjs"), "// wrapper\n");
+  const hooksPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "codex-sync-cfg-")), "hooks.json");
+  fs.writeFileSync(hooksPath, JSON.stringify({
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: 'node "/x/unrelated-stop.mjs"' }] }]
+    }
+  }, null, 2));
+
+  syncCodexHooks({ hooksDir: hooks, hooksPath });
+  syncCodexHooks({ hooksDir: hooks, hooksPath });
+  const s = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
+  const stop = s.hooks.Stop.flatMap((b) => b.hooks || []);
+  assert.equal(stop.filter((h) => h.command.includes("codex-stop-review.mjs")).length, 1, "Codex wrapper appears exactly once");
+  assert.equal(stop.filter((h) => h.command.includes("stop-review.mjs") && !h.command.includes("codex-stop-review.mjs")).length, 0, "Claude stop hook is not registered directly in Codex");
+  assert.ok(stop.some((h) => h.command.includes("unrelated-stop.mjs")), "unrelated Codex Stop hook preserved");
+  const peer = stop.find((h) => h.command.includes("codex-stop-review.mjs"));
+  assert.equal(peer.timeout, 900);
+  assert.ok(peer.statusMessage);
+  assert.ok(peer.command.includes(path.join(hooks, "codex-stop-review.mjs")), "uses deployed ~/.codex hook path");
+});
+
+test("syncCodexPrompts renders peerBench custom prompts for Codex", () => {
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "codex-prompts-src-"));
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), "codex-prompts-dest-"));
+  fs.writeFileSync(path.join(src, "bench-hunt.md"), [
+    "---",
+    "description: Run hunt",
+    "---",
+    "node \"{{BENCH_RUNNER}}\" hunt \"$ARGUMENTS\"",
+    ""
+  ].join("\n"));
+  fs.writeFileSync(path.join(dest, "bench-hunt.md"), "old\n");
+
+  const r = syncCodexPrompts({ srcDir: src, promptsDir: dest, benchRunnerPath: "/abs/bench/scripts/bench-runner.mjs" });
+  assert.deepEqual(r.copied, ["bench-hunt.md"]);
+  assert.deepEqual(r.backedUp, ["bench-hunt.md"]);
+  const rendered = fs.readFileSync(path.join(dest, "bench-hunt.md"), "utf8");
+  assert.match(rendered, /\/abs\/bench\/scripts\/bench-runner\.mjs/);
+  assert.doesNotMatch(rendered, /\{\{BENCH_RUNNER\}\}/);
+  assert.ok(fs.existsSync(path.join(dest, "bench-hunt.md.pre-peerbench.bak")));
+});
+
+test("compareLocalWithOrigin reports same, dirty, and differing states", () => {
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), "origin-"));
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "local-"));
+  const git = (cwd, args) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  git(remote, ["init", "-q", "--bare"]);
+  git(local, ["init", "-q", "-b", "main"]);
+  git(local, ["config", "user.email", "t@t.t"]);
+  git(local, ["config", "user.name", "t"]);
+  fs.writeFileSync(path.join(local, "a.txt"), "one\n");
+  git(local, ["add", "-A"]);
+  git(local, ["commit", "-qm", "one"]);
+  git(local, ["remote", "add", "origin", remote]);
+  git(local, ["push", "-q", "-u", "origin", "main"]);
+
+  const same = compareLocalWithOrigin({ cwd: local });
+  assert.equal(same.ok, true);
+  assert.equal(same.status, "same-as-origin");
+  assert.equal(same.dirty, 0);
+
+  fs.writeFileSync(path.join(local, "dirty.txt"), "dirty\n");
+  const dirty = compareLocalWithOrigin({ cwd: local });
+  assert.equal(dirty.status, "same-as-origin-with-local-changes");
+  assert.equal(dirty.dirty, 1);
+
+  git(local, ["add", "-A"]);
+  git(local, ["commit", "-qm", "local change"]);
+  const differs = compareLocalWithOrigin({ cwd: local });
+  assert.equal(differs.ok, true);
+  assert.equal(differs.status, "differs-from-origin");
+  assert.notEqual(differs.localHead, differs.remoteHead);
 });
 
 test("syncSettings removes only matching legacy commands, drops empty entries, registers absolute plan-* paths, preserves unrelated hooks", () => {
@@ -149,6 +238,7 @@ test("syncSettings registers all four gates: plan-review(ExitPlanMode), pre-push
   assert.ok(stopHook.rewakeMessage, "stop-review must have rewakeMessage");
   assert.ok(stopHook.rewakeSummary, "stop-review must have rewakeSummary");
   assert.ok(typeof stopHook.timeout === "number", "stop-review must have numeric timeout");
+  assert.equal(stopHook.timeout, 900, "stop-review should not regress to the old 300s cap");
 
   // Quick wins (hooks-doc optimizations): statusMessage on every gate (visible spinner) + an
   // `if` narrowing pre-push to git commands (fails open, so compound pushes stay covered).
@@ -158,6 +248,7 @@ test("syncSettings registers all four gates: plan-review(ExitPlanMode), pre-push
     assert.ok(byFile(f)?.statusMessage, `${f} must carry a statusMessage (visible spinner)`);
   }
   assert.equal(byFile("pre-push-review.mjs").if, "Bash(git *)", "pre-push must narrow to git commands via `if`");
+  assert.equal(byFile("pre-push-review.mjs").timeout, 1320, "pre-push full review needs room for the 20-minute investigate budget");
 });
 
 test("syncSettings is idempotent: running twice does not duplicate any gate", () => {

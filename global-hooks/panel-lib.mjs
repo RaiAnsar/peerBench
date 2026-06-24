@@ -73,11 +73,12 @@ export function spawnCollect(cmd, args, { cwd, env, timeoutMs }) {
   });
 }
 
-const TIMEOUT_MS = 13 * 60 * 1000;
+const TIMEOUT_MS = 25 * 60 * 1000;
 
 // Codex side: companion task --json -> { rawOutput }
 export async function runCodexReview({ companionPath, prompt, cwd, env }) {
-  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env, timeoutMs: TIMEOUT_MS });
+  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
+  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env: childEnv, timeoutMs: TIMEOUT_MS });
   if (r.status !== 0) return { name: "Codex", error: (r.stderr || r.stdout || "codex task failed").trim().slice(0, 300) };
   try {
     const raw = String(JSON.parse(r.stdout)?.rawOutput ?? "").trim();
@@ -91,7 +92,8 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 
 // Codex open-ended TASK → raw output (for hunt; no verdict parsing, so findings are kept).
 export async function runCodexTask({ companionPath, prompt, cwd, env }) {
-  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env, timeoutMs: TIMEOUT_MS });
+  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
+  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env: childEnv, timeoutMs: TIMEOUT_MS });
   if (r.status !== 0) return { name: "Codex", error: (r.stderr || r.stdout || "codex task failed").trim().slice(0, 300) };
   try {
     const raw = String(JSON.parse(r.stdout)?.rawOutput ?? "").trim();
