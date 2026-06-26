@@ -16,6 +16,7 @@ import {
 import { combinePanel } from "../global-hooks/panel-lib.mjs";
 import { specReviewCommand } from "../scripts/bench-runner.mjs";
 import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mjs";
+import { buildPushReviewUser } from "../global-hooks/hunt.mjs";
 import { listTraces, readTrace } from "../global-hooks/trace-store.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 
@@ -156,6 +157,34 @@ test("runPushReview writes a gate:'push-review' trace and returns result + findi
   assert.match(result.findings, /cross-file regression/);
   const [latest] = listTraces(ws, 1);
   assert.equal(latest.gate, "push-review");
+});
+
+test("runPushReview seeds and traces previous assistant context as claims, not proof", async () => {
+  const ws = freshWs();
+  const stub = gitStub({ commits: "c3 pushed", diff: "+quantity_on_order: null" });
+  let seeded = null;
+  const panelImpl = async ({ cwd, range: r, content, assistantContext }) => {
+    seeded = { cwd, range: r, content, assistantContext };
+    return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }];
+  };
+  const context = "I populated quantity_on_order for approvals and all paths are covered.";
+  await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl, assistantContext: context, now: Date.now() + 1 });
+
+  assert.match(seeded.assistantContext, /quantity_on_order/);
+  const [latest] = listTraces(ws, 1);
+  assert.equal(latest.gate, "push-review");
+  const trace = readTrace(ws, latest.id);
+  assert.match(trace.userPrompt, /<previous_assistant_message_context>/);
+  assert.match(trace.userPrompt, /quantity_on_order/);
+  assert.match(trace.userPrompt, /claims\/context only|not proof/i);
+});
+
+test("buildPushReviewUser keeps push evidence before assistant context", () => {
+  const user = buildPushReviewUser("base..head", "<commits>\nc1\n</commits>", {
+    assistantContext: "claimed all data paths were covered"
+  });
+  assert.ok(user.indexOf("<push") < user.indexOf("<previous_assistant_message_context>"));
+  assert.match(user, /claims\/context only|not proof/i);
 });
 
 test("runPushReview signals retry when git log/diff report ok=false", async () => {

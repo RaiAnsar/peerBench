@@ -97,26 +97,33 @@ export async function specReviewPanel({ cwd, filePath, content, env = process.en
 export const PUSH_REVIEW_SYSTEM =
   "You are reviewing the commits ABOUT TO BE PUSHED, provided as a commit list + diff, AGAINST the real repository, READ-ONLY, via the provided tools. " +
   "Scour the repo for cross-file bugs, regressions, or unsafe changes these commits introduce — read whatever files you need to confirm a claim. " +
+  "If a previous assistant message is provided, treat it as claims and scope clues only, not proof; compare those claims against the pushed commits and repository. " +
+  "Pay special attention to claimed coverage that may only be implemented on one of several code paths or data sources. " +
   "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>` — BLOCK only for a concrete bug, regression, security issue, or unsafe change " +
   "that must be fixed before these commits are pushed. " +
   "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
   "Then list each concrete finding on its own line starting with `- ` (file:line + the precise problem). " +
   "Ground every claim in code you actually read — no speculation.";
 
-export function buildPushReviewUser(range, content) {
-  return `<push range="${range}">\n${String(content ?? "")}\n</push>\n\n` +
-    "Review these about-to-be-pushed commits against the repository. Read whatever files you need to verify them.";
+export function buildPushReviewUser(range, content, { assistantContext = "" } = {}) {
+  const context = String(assistantContext ?? "").trim();
+  const contextBlock = context
+    ? `\n\n<previous_assistant_message_context>\n${context}\n</previous_assistant_message_context>`
+    : "";
+  return `<push range="${range}">\n${String(content ?? "")}\n</push>${contextBlock}\n\n` +
+    "Review these about-to-be-pushed commits against the repository. Read whatever files you need to verify them. " +
+    "The previous assistant message, when present, is claims/context only; do not treat it as proof.";
 }
 
 // Run the full configured panel deep on a set of pushed commits, returning per-reviewer
 // { name, verdict, severity, findingCount, findings }. Repo-aware (huntPanel's agentic tools)
 // but seeded with the commit list + diff and the push verdict-producing system prompt. The
 // shape mirrors specReviewPanel exactly so spec-review-run can reuse the same summarizer.
-export async function pushReviewPanel({ cwd, range, content, env = process.env, deep = true } = {}) {
+export async function pushReviewPanel({ cwd, range, content, env = process.env, deep = true, assistantContext = "" } = {}) {
   const results = await huntPanel({
     cwd, env, deep,
     system: PUSH_REVIEW_SYSTEM,
-    user: buildPushReviewUser(range, content)
+    user: buildPushReviewUser(range, content, { assistantContext })
   });
   return results.map((r) => {
     const parsed = parseSpecFindings(r.findings);

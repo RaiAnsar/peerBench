@@ -72,7 +72,8 @@ export async function runPushReview(range, ws, {
   writeTraceImpl = writeTrace,
   gitImpl = git,
   now = Date.now(),
-  sessionKey = null
+  sessionKey = null,
+  assistantContext = ""
 } = {}) {
   if (!range) throw new Error("runPushReview: missing range");
 
@@ -98,7 +99,7 @@ export async function runPushReview(range, ws, {
   const [headSha] = gitImpl(["rev-parse", "HEAD"], ws);
   const hash = deepKey(`push:${range}`, headSha);
 
-  const results = await panelImpl({ cwd: ws, range, content, env: process.env });
+  const results = await panelImpl({ cwd: ws, range, content, env: process.env, assistantContext });
 
   const structured = summarizeSpecReview(results);
   const findings = aggregateFindings(results);
@@ -114,7 +115,7 @@ export async function runPushReview(range, ws, {
       sessionKey,
       reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null, severity: r.severity, findingCount: r.findingCount })),
       systemPrompt: PUSH_REVIEW_SYSTEM,
-      userPrompt: buildPushReviewUser(range, content),
+      userPrompt: buildPushReviewUser(range, content, { assistantContext }),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
     }, { now });
   } catch (e) {

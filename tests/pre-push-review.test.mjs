@@ -14,7 +14,7 @@ import path from "node:path";
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, cdTargetBeforePush, commandCwd, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview } from "../global-hooks/pre-push-review.mjs";
+import { runMain, buildPrompt, cdTargetBeforePush, commandCwd, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview, assistantContextFromInput } from "../global-hooks/pre-push-review.mjs";
 import { normalizeSessionId, setBenchDisabled, readReviewedHead, writeReviewedHead } from "../global-hooks/config-store.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
 import { listJobs } from "../global-hooks/deep-queue.mjs";
@@ -1073,6 +1073,40 @@ test("H: inline full push review receives the originating Claude session", async
 
   assert.ok(call);
   assert.equal(call.opts.sessionKey, normalizeSessionId("chat-A"));
+});
+
+test("H: inline full push review receives previous assistant message context before allowing push", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hctx-")));
+  process.env.BENCH_ROOT = root;
+  let call = null;
+
+  try {
+    await runMain({
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      pushReviewImpl: fakePushReview({ onCall: (c) => { call = c; } }),
+      env: process.env,
+      input: {
+        cwd: ws,
+        last_assistant_message: "I populated quantity_on_order for approvals and all paths are covered.",
+        tool_input: { command: "git push origin main" }
+      }
+    });
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.ok(call);
+  assert.match(call.opts.assistantContext, /quantity_on_order/);
+  assert.match(call.opts.assistantContext, /all paths are covered/);
+});
+
+test("assistantContextFromInput trims and caps supported hook context fields", () => {
+  assert.equal(assistantContextFromInput({ last_assistant_message: "  done  " }), "done");
+  assert.equal(assistantContextFromInput({ transcript: { lastAssistantMessage: "nested" } }), "nested");
+  assert.equal(assistantContextFromInput({ last_assistant_message: "x".repeat(9000) }).length, 8000);
+  assert.equal(assistantContextFromInput({ last_assistant_message: { text: "ignored" } }), "");
 });
 
 test("H: launchPushReview enqueues a SHA-pinned range that survives the push advancing the remote ref (the race)", () => {

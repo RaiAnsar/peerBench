@@ -208,6 +208,20 @@ function readInput() {
   }
 }
 
+const MAX_ASSISTANT_CONTEXT_CHARS = 8000;
+
+export function assistantContextFromInput(input) {
+  const value =
+    input?.last_assistant_message
+    ?? input?.lastAssistantMessage
+    ?? input?.assistant?.last_message
+    ?? input?.assistant?.lastMessage
+    ?? input?.transcript?.last_assistant_message
+    ?? input?.transcript?.lastAssistantMessage
+    ?? "";
+  return typeof value === "string" ? value.trim().slice(0, MAX_ASSISTANT_CONTEXT_CHARS) : "";
+}
+
 function workspaceRoot(cwd) {
   try {
     return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
@@ -390,6 +404,7 @@ export async function runMain({
 
   const input = inputOverride ?? readInput();
   const sessionKey = sessionKeyFromInput(input, env);
+  const assistantContext = assistantContextFromInput(input);
 
   const command = String(input.tool_input?.command ?? "");
 
@@ -465,7 +480,7 @@ export async function runMain({
   // must not leave the machine before peerBench has reviewed the exact commit range.
   let review;
   try {
-    review = await pushReviewImpl(range, ws, { sessionKey, writeTraceImpl });
+    review = await pushReviewImpl(range, ws, { sessionKey, writeTraceImpl, assistantContext });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     decision(
