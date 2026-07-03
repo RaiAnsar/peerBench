@@ -102,7 +102,15 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
   clearTimeout(timer);
   let json;
   try { json = await resp.json(); } catch { return { ok: false, error: { kind: "parse", detail: "non-JSON response" } }; }
-  const text = json?.choices?.[0]?.message?.content;
-  if (typeof text !== "string") return { ok: false, error: { kind: "parse", detail: "no message content" } };
-  return { ok: true, text: text.trim(), usage: json.usage ?? null };
+  const raw = json?.choices?.[0]?.message?.content;
+  if (typeof raw !== "string") return { ok: false, error: { kind: "parse", detail: "no message content" } };
+  return { ok: true, text: stripThinking(raw), usage: json.usage ?? null };
+}
+
+// Some reasoning models (e.g. MiniMax M3) can't disable thinking and emit it inline as
+// <think>…</think> before the answer. Strip it so verdict parsing and displayed findings see only
+// the real output; keep the original if stripping would leave nothing (e.g. a truncated think block).
+function stripThinking(text) {
+  const stripped = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  return stripped || text.trim();
 }

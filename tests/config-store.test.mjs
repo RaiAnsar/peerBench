@@ -8,12 +8,13 @@ import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setRevie
 
 test("registry: display names + KNOWN_REVIEWERS + PROVIDER_NAMES all derive from the single DEFAULTS source", () => {
   // Adding/swapping a model is one DEFAULTS entry — these are derived, not hand-maintained lists.
-  assert.deepEqual(PROVIDER_NAMES, ["kimi", "mimo", "glm", "qwen"]);
-  assert.deepEqual(KNOWN_REVIEWERS, ["kimi", "mimo", "glm", "qwen", "codex"]);
+  assert.deepEqual(PROVIDER_NAMES, ["kimi", "mimo", "glm", "qwen", "minimax"]);
+  assert.deepEqual(KNOWN_REVIEWERS, ["kimi", "mimo", "glm", "qwen", "minimax", "codex"]);
   assert.equal(displayName("kimi"), "Kimi");
   assert.equal(displayName("mimo"), "MiMo");
   assert.equal(displayName("glm"), "GLM");
   assert.equal(displayName("qwen"), "Qwen");
+  assert.equal(displayName("minimax"), "MiniMax");
   assert.equal(displayName("codex"), "Codex");
   assert.equal(displayName("whatever"), "whatever", "unknown names pass through unchanged");
 });

@@ -32,7 +32,15 @@ const DEFAULTS = {
   // QWEN_BASE_URL / QWEN_MODEL in .keys if your key targets a different plan/workspace or model id.
   qwen: { displayName: "Qwen", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-max", keyEnv: "QWEN_API_KEY",
           temperature: 0.6, thinking: "disabled", thinkingEnv: "QWEN_THINKING",
-          headers: {}, timeoutMs: 300_000 }  // 5 min
+          headers: {}, timeoutMs: 300_000 },  // 5 min
+  // MiniMax (flat coding plan, sk-cp- key). OpenAI-compatible /chat/completions works as a drop-in.
+  // M3 is a reasoning model whose thinking can't be disabled and leaks inline as <think>…</think> in
+  // content — review-client strips it. Flat plan → thinking tokens are free (better reviews, no cost).
+  // Tested clean at 6 concurrent, so no per-key concurrency cap needed. temperature 1.0 per MiniMax's
+  // recommended sampling for M-series reasoning models.
+  minimax: { displayName: "MiniMax", baseURL: "https://api.minimax.io/v1", model: "MiniMax-M3", keyEnv: "MINIMAX_API_KEY",
+             temperature: 1.0, thinking: null, thinkingEnv: "MINIMAX_THINKING",
+             headers: {}, timeoutMs: 300_000 }  // 5 min
 };
 // Codex has no API-key config (it shells out to the codex plugin), so it is a valid reviewer but
 // lives outside DEFAULTS.

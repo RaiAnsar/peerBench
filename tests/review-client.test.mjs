@@ -99,6 +99,18 @@ test("data-inspection HTTP 400 retries once with redacted payment-security terms
   assert.doesNotMatch(bodies[1].messages[1].content, /card XXXX|run card/i);
   assert.match(bodies[1].messages[1].content, /masked saved payment method|run saved payment method/);
 });
+test("strips inline <think>…</think> so the verdict is what the caller sees", async () => {
+  const res = await review({ baseURL: "https://x/v1", apiKey: "k", model: "MiniMax-M3", system: "s", user: "u", timeoutMs: 5000,
+    fetchImpl: async () => ok({ choices: [{ message: { content: "<think>\nlots of reasoning\nabout the diff\n</think>\n\nBLOCK: real bug here" } }] }) });
+  assert.equal(res.ok, true);
+  assert.equal(res.text, "BLOCK: real bug here");
+});
+test("keeps original text when a think block would strip everything (truncated)", async () => {
+  const res = await review({ baseURL: "https://x/v1", apiKey: "k", model: "MiniMax-M3", system: "s", user: "u", timeoutMs: 5000,
+    fetchImpl: async () => ok({ choices: [{ message: { content: "<think>only reasoning, no answer</think>" } }] }) });
+  assert.equal(res.ok, true);
+  assert.match(res.text, /only reasoning/);
+});
 test("key pool: picks a start key and rotates to the next on a 429 (overflow)", async () => {
   const used = [];
   let calls = 0;
