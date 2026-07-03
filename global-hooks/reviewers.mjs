@@ -2,6 +2,7 @@
 import { parseVerdict, runCodexReview } from "./panel-lib.mjs";
 import { resolveConfig, displayName } from "./config-store.mjs";
 import { review as defaultReview } from "./review-client.mjs";
+import { withConcurrencyLimit } from "./concurrency-limit.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -56,7 +57,18 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
       name,
       async run({ system, user, cwd, env: runEnv }) {
         if (!p.apiKey) return { name: display, error: "no api key" };
-        const call = (u) => reviewImpl({ baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, system, user: u, temperature: p.temperature, headers: p.headers, timeoutMs: p.timeoutMs, thinking: p.thinking });
+        // Bound in-flight calls across ALL gate processes (z.ai per-key concurrency cap) so bursts
+        // queue instead of 429-ing — the way OpenCode is naturally serialized. No-op when concurrency=0.
+        // Each slot is pinned to one key (slot i → key i % keyCount) so no single key exceeds its cap;
+        // when the limiter is off / failed open (slotIdx null) we fall back to the whole pool.
+        const pool = p.apiKeys?.length ? p.apiKeys : [p.apiKey];
+        const call = (u) => withConcurrencyLimit(
+          { name, slots: p.concurrency, staleMs: p.timeoutMs, timeoutMs: p.timeoutMs },
+          (slotIdx) => {
+            const keys = slotIdx == null ? pool : [pool[slotIdx % pool.length]];
+            return reviewImpl({ baseURL: p.baseURL, apiKey: keys[0], apiKeys: keys, model: p.model, system, user: u, temperature: p.temperature, headers: p.headers, timeoutMs: p.timeoutMs, thinking: p.thinking });
+          }
+        );
         let r = await call(user);
         if (!r.ok) return { name: display, error: `${r.error.kind}: ${r.error.detail}` };
         let v = extractVerdict(r.text), raw = r.text, usage = r.usage;

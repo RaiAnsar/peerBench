@@ -31,7 +31,13 @@ function buildProvider(env, name) {
   const out = {};
   if (env[`${P}_BASE_URL`]) out.baseURL = env[`${P}_BASE_URL`];
   if (env[`${P}_MODEL`]) out.model = env[`${P}_MODEL`];
-  if (env[`${P}_API_KEY`]) out.apiKey = env[`${P}_API_KEY`];
+  if (env[`${P}_API_KEY`]) {
+    // <NAME>_API_KEY may be a comma-separated POOL (z.ai concurrency cap is per-key). Keep apiKey as
+    // the first for back-compat/display; add apiKeys when there's more than one.
+    const keys = env[`${P}_API_KEY`].split(",").map((s) => s.trim()).filter(Boolean);
+    out.apiKey = keys[0];
+    if (keys.length > 1) out.apiKeys = keys;
+  }
   const temp = env[`${P}_TEMPERATURE`];
   if (temp !== undefined && temp !== "" && Number.isFinite(Number(temp))) out.temperature = Number(temp);
   if (env[`${P}_THINKING`] !== undefined) out.thinking = env[`${P}_THINKING`];

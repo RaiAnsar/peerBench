@@ -20,10 +20,13 @@ const DEFAULTS = {
   mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
           headers: {}, timeoutMs: 180_000 },  // 3 min
-  // GLM (z.ai coding plan) — OpenAI-compatible /chat/completions.
+  // GLM (z.ai coding plan) — OpenAI-compatible /chat/completions. z.ai sheds 429/1305 above ~3
+  // concurrent PER KEY; measured clean at 2-3, but slot release/re-acquire briefly overlaps under
+  // continuous churn, so we cap at 2/key for margin (bursts queue instead of 429). Override per key
+  // with GLM_CONCURRENCY_PER_KEY or set the total directly with GLM_CONCURRENCY.
   glm: { displayName: "GLM", baseURL: "https://api.z.ai/api/coding/paas/v4", model: "glm-5.2", keyEnv: "GLM_API_KEY",
          temperature: 0.6, thinking: "disabled", thinkingEnv: "GLM_THINKING",
-         headers: {}, timeoutMs: 300_000 },  // 5 min
+         concurrencyPerKey: 2, headers: {}, timeoutMs: 300_000 },  // 5 min
   // Qwen (Alibaba MaaS token-plan, ap-southeast-1) — OpenAI-compatible /compatible-mode (NOT the
   // /apps/anthropic endpoint; our review-client speaks OpenAI /chat/completions). Override
   // QWEN_BASE_URL / QWEN_MODEL in .keys if your key targets a different plan/workspace or model id.
@@ -148,10 +151,21 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
     const thinking = rawThinking === "" ? null : rawThinking;
     const model = env[`${name.toUpperCase()}_MODEL`] || f.model || d.model;
     const temperature = typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0);
+    // Key POOL: env var (comma-separated) > companion apiKeys[] > companion single apiKey. apiKey
+    // stays the first key for back-compat; review-client rotates the pool on a 429 (per-key cap).
+    const envKey = env[d.keyEnv];
+    const apiKeys = (envKey ? envKey.split(",").map((s) => s.trim()).filter(Boolean) : null)
+      || (Array.isArray(f.apiKeys) && f.apiKeys.length ? f.apiKeys : null)
+      || (f.apiKey ? [f.apiKey] : []);
+    // Total in-flight cap = keys × per-key cap (env GLM_CONCURRENCY overrides). 0 → unlimited.
+    const perKey = Number(env[`${name.toUpperCase()}_CONCURRENCY_PER_KEY`]) || f.concurrencyPerKey || d.concurrencyPerKey || 0;
+    const concurrency = Number(env[`${name.toUpperCase()}_CONCURRENCY`]) || (perKey ? Math.max(1, apiKeys.length) * perKey : 0);
     providers[name] = {
       baseURL: env[`${name.toUpperCase()}_BASE_URL`] || f.baseURL || d.baseURL,
       model,
-      apiKey: env[d.keyEnv] || f.apiKey || "",
+      apiKey: apiKeys[0] || "",
+      apiKeys,
+      concurrency,
       temperature,
       headers: { ...(d.headers || {}), ...(f.headers || {}) },
       timeoutMs: typeof f.timeoutMs === "number" ? f.timeoutMs : (d.timeoutMs ?? 90_000),

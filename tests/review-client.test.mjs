@@ -99,6 +99,83 @@ test("data-inspection HTTP 400 retries once with redacted payment-security terms
   assert.doesNotMatch(bodies[1].messages[1].content, /card XXXX|run card/i);
   assert.match(bodies[1].messages[1].content, /masked saved payment method|run saved payment method/);
 });
+test("key pool: picks a start key and rotates to the next on a 429 (overflow)", async () => {
+  const used = [];
+  let calls = 0;
+  const res = await review({
+    baseURL: "https://x/v1", apiKeys: ["KEY_A", "KEY_B"], model: "glm-5.2", system: "s", user: "u", timeoutMs: 60000,
+    sleepImpl: async () => {},
+    keyPick: () => 0, // deterministic start at KEY_A
+    fetchImpl: async (_url, opts) => {
+      calls++;
+      used.push(opts.headers.Authorization);
+      if (calls === 1) return { ok: false, status: 429, headers: { get: () => null }, text: async () => "capped" };
+      return ok({ choices: [{ message: { content: "ALLOW: ok" } }] });
+    }
+  });
+  assert.equal(res.ok, true);
+  assert.deepEqual(used, ["Bearer KEY_A", "Bearer KEY_B"]); // first attempt KEY_A, retry overflows to KEY_B
+});
+test("key pool: empty pool → nokey error", async () => {
+  const res = await review({ baseURL: "https://x/v1", apiKeys: [], model: "m", system: "s", user: "u" });
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "nokey");
+});
+test("sends a default coding-client User-Agent when provider sets none", async () => {
+  const cap = {};
+  await review({ baseURL: "https://x/v1", apiKey: "k", model: "glm-5.2", system: "s", user: "u", timeoutMs: 5000,
+    fetchImpl: (url, opts) => { cap.headers = opts.headers; return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
+  assert.match(cap.headers["User-Agent"], /claude-cli/);
+});
+test("provider User-Agent overrides the default", async () => {
+  const cap = {};
+  await review({ baseURL: "https://x/v1", apiKey: "k", model: "kimi-k2.6", system: "s", user: "u", timeoutMs: 5000,
+    headers: { "User-Agent": "kimi-custom/9" },
+    fetchImpl: (url, opts) => { cap.headers = opts.headers; return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
+  assert.equal(cap.headers["User-Agent"], "kimi-custom/9");
+});
+test("HTTP 429 overload retries with jittered backoff then succeeds (no '!')", async () => {
+  let calls = 0;
+  const waits = [];
+  const res = await review({
+    baseURL: "https://x/v1", apiKey: "k", model: "glm-5.2", system: "s", user: "u", timeoutMs: 60000,
+    sleepImpl: async (ms) => { waits.push(ms); },
+    fetchImpl: async () => {
+      calls++;
+      if (calls === 1) return { ok: false, status: 429, headers: { get: () => null }, text: async () => JSON.stringify({ error: { code: "1305", message: "overloaded" } }) };
+      return ok({ choices: [{ message: { content: "ALLOW: ok" } }] });
+    }
+  });
+  assert.equal(res.ok, true);
+  assert.equal(calls, 2);
+  assert.equal(waits.length, 1);
+  assert.ok(waits[0] >= 1000 && waits[0] < 2000, `first backoff ~1s+jitter, got ${waits[0]}`);
+});
+test("HTTP 429 that never clears exhausts all retries and maps to http error", async () => {
+  let calls = 0;
+  const res = await review({
+    baseURL: "https://x/v1", apiKey: "k", model: "glm-5.2", system: "s", user: "u", timeoutMs: 60000,
+    sleepImpl: async () => {},
+    fetchImpl: async () => { calls++; return { ok: false, status: 429, headers: { get: () => null }, text: async () => "overloaded" }; }
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "http");
+  assert.equal(calls, 6); // 1 initial + 5 retries
+});
+test("Retry-After header is honored over default backoff", async () => {
+  let calls = 0;
+  const waits = [];
+  await review({
+    baseURL: "https://x/v1", apiKey: "k", model: "glm-5.2", system: "s", user: "u", timeoutMs: 5000,
+    sleepImpl: async (ms) => { waits.push(ms); },
+    fetchImpl: async () => {
+      calls++;
+      if (calls === 1) return { ok: false, status: 503, headers: { get: (h) => h.toLowerCase() === "retry-after" ? "2" : null }, text: async () => "busy" };
+      return ok({ choices: [{ message: { content: "ALLOW: ok" } }] });
+    }
+  });
+  assert.deepEqual(waits, [2000]);
+});
 test("thinking:disabled includes thinking:{type:disabled} in body", async () => {
   const cap = {};
   await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000, thinking: "disabled",
