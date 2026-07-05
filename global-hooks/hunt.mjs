@@ -3,7 +3,7 @@ import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { runCodexTask } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
-import { parseSeverity } from "./deep-review.mjs";
+import { parseSeverity, stripThink } from "./deep-review.mjs";
 import path from "node:path";
 
 export const HUNT_SYSTEM =
@@ -53,7 +53,7 @@ export function buildSpecReviewUser(filePath, content) {
 // Parse a single reviewer's spec-review output into { verdict, severity, findingCount }.
 // Falls back gracefully when the model omits the structured tail.
 export function parseSpecFindings(text) {
-  const s = String(text ?? "");
+  const s = stripThink(String(text ?? ""));   // reasoning must not drive verdict/severity/finding-count
   const v = extractVerdict(s);
   const verdict = v?.verdict ?? null;
   let severity = parseSeverity(s, verdict);   // shared severity extractor (deep-review.mjs)

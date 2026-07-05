@@ -35,25 +35,40 @@ export function severityRank(sev) {
   return SEVERITY_RANK[String(sev ?? "none").toLowerCase()] ?? 0;
 }
 
+// Strip a reviewer's private <think>…</think> reasoning. Its verdict/severity/findings must come
+// from the FINAL answer only — reasoning routinely echoes "Severity: high" while the actual verdict
+// is ALLOW/low, which used to inflate the computed severity and fire false blocks.
+export const stripThink = (s) => String(s ?? "").replace(/<think>[\s\S]*?<\/think>/gi, "");
+
+// Highest severity strictly BELOW the rewake floor (e.g. "medium" when the floor is "high"). A clean
+// ALLOW is capped here so it stays advisory and can never trip a block on its own.
+const SEVERITY_BELOW_FLOOR = Object.entries(SEVERITY_RANK)
+  .filter(([, r]) => r < severityRank(DEEP_REWAKE_SEVERITY))
+  .sort((a, b) => b[1] - a[1])[0]?.[0] || "none";
+
 // Extract the worst severity a reviewer declared from its raw text. Mirrors the
 // severity logic in hunt.parseSpecFindings so the fast plan/spec gates and the deep
 // pass read severity identically. A `SEVERITY: <x>` line wins; otherwise a BLOCK with
 // no SEVERITY line defaults to "high" (safe — a BLOCK is treated as a real blocker),
 // and a non-BLOCK with no line is "none". `verdict` is the already-parsed ALLOW/BLOCK.
 export function parseSeverity(raw, verdict) {
-  const s = String(raw ?? "");
+  const s = stripThink(raw);   // ignore <think> reasoning — only the final answer counts
   // Worst-wins: scan ALL line-start SEVERITY tokens and take the max-rank one, so a
   // genuine high/critical can never be silently downgraded by an earlier echoed/intermediate
   // `SEVERITY: none|low|medium` line (honors the "worst severity declared" contract).
   const matches = [...s.matchAll(/^\s*SEVERITY:\s*(none|low|medium|high|critical)\b/gim)];
+  let sev = "none";
   if (matches.length) {
-    let best = "none";
-    for (const m of matches) {
-      if (severityRank(m[1]) > severityRank(best)) best = m[1].toLowerCase();
-    }
-    return best;
+    for (const m of matches) if (severityRank(m[1]) > severityRank(sev)) sev = m[1].toLowerCase();
+  } else {
+    sev = verdict === "BLOCK" ? "high" : "none";
   }
-  return verdict === "BLOCK" ? "high" : "none";
+  // A clean ALLOW is a decision NOT to block — keep its severity advisory (below the rewake floor)
+  // so `ALLOW: fine … SEVERITY: critical` cannot fire a false block. Only BLOCK drives real blocks.
+  if (String(verdict).toUpperCase() === "ALLOW" && severityRank(sev) >= severityRank(DEEP_REWAKE_SEVERITY)) {
+    sev = SEVERITY_BELOW_FLOOR;
+  }
+  return sev;
 }
 
 // Aggregate per-reviewer spec-review results into the machine-readable contract

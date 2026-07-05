@@ -47,6 +47,23 @@ test("FIX 1: parseSeverity is worst-wins — SEVERITY: low BEFORE SEVERITY: crit
   assert.equal(parseSeverity("ALLOW: ok", "ALLOW"), "none");
 });
 
+test("parseSeverity ignores SEVERITY lines inside <think> reasoning", () => {
+  // Regression: MiniMax wrote SEVERITY: low as its answer but "Severity: high" in its reasoning,
+  // which used to win worst-wins and fire a false block.
+  const raw = "<think>\nThis is bad. Severity: high, multiple issues.\n</think>\n\nALLOW: fine\nSEVERITY: low";
+  assert.equal(parseSeverity(raw, "ALLOW"), "low", "think-internal severity must not count");
+  // BLOCK verdict + only a think-internal critical → falls back to the BLOCK default, not critical
+  assert.equal(parseSeverity("<think>SEVERITY: critical</think>\nBLOCK: bug\n- x", "BLOCK"), "high");
+});
+
+test("parseSeverity caps a clean ALLOW below the block floor (no severity-only false block)", () => {
+  assert.equal(parseSeverity("ALLOW: looks fine\nSEVERITY: critical", "ALLOW"), "medium",
+    "an explicit ALLOW cannot self-escalate to a blocking severity");
+  assert.equal(parseSeverity("ALLOW: fine\nSEVERITY: high", "ALLOW"), "medium");
+  assert.equal(parseSeverity("ALLOW: fine\nSEVERITY: medium", "ALLOW"), "medium", "sub-floor severity is preserved");
+  assert.equal(parseSeverity("BLOCK: real\nSEVERITY: critical", "BLOCK"), "critical", "BLOCK is never capped");
+});
+
 test("FIX 1: worst-wins severity propagates to combinePanel — low-then-critical BLOCK still blocks", () => {
   const raw = "BLOCK: data loss\nSEVERITY: low\n- echoed lower note\nSEVERITY: critical\n- drops every row";
   const r = combinePanel(
