@@ -19,6 +19,7 @@ import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
+import { listBlocked } from "../global-hooks/deep-queue.mjs";
 import { runSpecReview } from "../global-hooks/spec-review-run.mjs";
 import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
 import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
@@ -255,6 +256,28 @@ async function main() {
     return gradeCommand(rest);
   }
 
+  // `show [<traceId>]` — print the full per-reviewer findings for a trace (defaults to the most recent
+  // block). This is the retrieval safety net: every deep-review block message stamps its traceId, so
+  // findings are always one command away instead of a manual dig through the state dir.
+  if (sub === "show") {
+    const ws = workspaceRoot(cwd);
+    let id = rest[0];
+    if (!id) {
+      const b = listBlocked(ws).filter((x) => x.traceId).sort((a, c) => (Number(c.firstBlockedTs) || 0) - (Number(a.firstBlockedTs) || 0))[0];
+      id = b?.traceId;
+    }
+    if (!id) { process.stdout.write("usage: show <traceId>  (the id is printed in the block message)\n"); process.exitCode = 1; return; }
+    const t = readTrace(ws, id);
+    if (!t) { process.stdout.write(`Trace ${id} not found in this workspace.\n`); process.exitCode = 1; return; }
+    const head = (t.reviewers || []).map((r) => `${r.name}${r.verdict ? ":" + r.verdict : ""}${r.severity && r.severity !== "none" ? "/" + r.severity : ""}`).join(", ");
+    process.stdout.write(`⛩ ${t.gate || "review"} — trace ${id}${head ? ` (${head})` : ""}\n`);
+    const rr = t.rawResponses || {};
+    const names = Object.keys(rr);
+    if (!names.length) { process.stdout.write("(no per-reviewer findings recorded in this trace)\n"); return; }
+    for (const name of names) process.stdout.write(`\n═══ ${name} ═══\n${String(rr[name]).trim()}\n`);
+    return;
+  }
+
   if (sub === "hunt") {
     const seed = rest.join(" ").trim();
     const ws = workspaceRoot(cwd);
@@ -304,7 +327,7 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|setup|reviewers|scorecard|grade|hunt|investigate|debug|spec-review|off|on`);
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|show|setup|reviewers|scorecard|grade|hunt|investigate|debug|spec-review|off|on`);
 }
 
 const HUNT_MODES = {

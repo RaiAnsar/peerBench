@@ -32,6 +32,10 @@ function workspaceRoot(cwd) {
   catch { return cwd; }
 }
 
+// Retrieval footer stamped on every block so the full per-reviewer findings are always one command
+// away (`show <traceId>`) even if the inline text is truncated — no manual dig through the state dir.
+const traceHint = (id) => (id ? `\n↳ full findings: /bench:show ${id}` : "");
+
 // Synchronous stdin read (the runner reads the Stop hook JSON from fd 0).
 function readInputSync() {
   try { const raw = fs.readFileSync(0, "utf8").trim(); return raw ? JSON.parse(raw) : {}; }
@@ -72,7 +76,7 @@ export async function runMain({
     // delete a durable completed block on uncertainty (that would lose a HIGH finding on a transient
     // error); keep it and re-check next Stop.
     if (cur === GONE || (cur !== null && cur !== b.contentKey)) { deleteJob(b._path); continue; }   // gone or confirmed change → retired
-    const findings = b.findings || b.summary || "(deep block)";
+    const findings = (b.findings || b.summary || "(deep block)") + traceHint(b.traceId);
     if ((now - (Number(b.firstBlockedTs) || 0)) < WAKE_WINDOW_MS) wake.push(findings);
     else advisory.push(findings);   // KEEP the file — never deleted by elapsed time
   }
@@ -121,9 +125,10 @@ export async function runMain({
       const findings = o.res.findings || o.res.summary || "(deep block)";
       markBlocked(ws, o.job._jobKey, {
         kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
-        contentKey: o.job.contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined, findings, firstBlockedTs: now
+        contentKey: o.job.contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,
+        findings, traceId: o.res.traceId || null, firstBlockedTs: now
       }, { claimedPath: o.claimedPath });
-      wake.push(findings);
+      wake.push(findings + traceHint(o.res.traceId));
     } else {
       deleteJob(o.claimedPath);   // clean — nothing to lose
     }
