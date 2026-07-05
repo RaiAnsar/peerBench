@@ -95,6 +95,17 @@ test("aggregateFindings joins ONLY blocking reviewers' findings (not via combine
   assert.equal(aggregateFindings([{ name: "Kimi", verdict: "ALLOW", findings: "ok" }]), "", "no blockers → empty string");
 });
 
+test("aggregateFindings surfaces a severity-only block (ALLOW verdict + SEVERITY: critical)", () => {
+  // Regression: a reviewer that blocks via severity but writes `ALLOW: <none>` used to contribute
+  // nothing, so the wake delivered a bare count. It must now surface its findings.
+  const out = aggregateFindings([
+    { name: "MiniMax", verdict: "ALLOW", severity: "critical", findings: "- plan references files that do not exist" },
+    { name: "Codex", verdict: "ALLOW", severity: "low", findings: "- minor: mkdir missing" }
+  ]);
+  assert.match(out, /\[MiniMax\]\n- plan references/, "critical-severity reviewer included despite ALLOW verdict");
+  assert.doesNotMatch(out, /minor: mkdir/, "sub-threshold (low) severity stays excluded");
+});
+
 // ── deep spec/push review functions (return-only; NO deep-result file) ─────────
 
 test("runSpecReview writes a gate:'spec-review' trace and returns the structured result + findings", async () => {

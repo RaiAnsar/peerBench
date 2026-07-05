@@ -76,12 +76,16 @@ export function shouldRewake({ maxSeverity, findingCount } = {}) {
   return severityRank(maxSeverity) >= severityRank(DEEP_REWAKE_SEVERITY) && (Number(findingCount) || 0) > 0;
 }
 
-// Aggregate the per-reviewer `findings` of every BLOCKING reviewer into one string for delivery.
-// NOTE: deep-panel result objects (hunt.mjs) carry `findings` (NOT `raw`/`firstLine`), so this does
-// NOT route through combinePanel — it joins the blocking reviewers' `findings` directly.
-export function aggregateFindings(results) {
+// Aggregate the per-reviewer `findings` that CAUSED the block into one string for delivery.
+// Must mirror shouldRewake's criterion (severity ≥ DEEP_REWAKE_SEVERITY), NOT just verdict==BLOCK:
+// a reviewer that writes `ALLOW: <none>` + `SEVERITY: critical` blocks the turn but has a non-BLOCK
+// verdict, so keying on verdict alone returned "" and the wake delivered a bare count while the real
+// findings sat unread in the trace's rawResponses. Include a reviewer on a BLOCK verdict OR a declared
+// severity at/above the floor. NOTE: deep-panel results carry `findings` (not raw/firstLine).
+export function aggregateFindings(results, minSeverity = DEEP_REWAKE_SEVERITY) {
+  const floor = severityRank(minSeverity);
   return (Array.isArray(results) ? results : [])
-    .filter((r) => String(r.verdict).toUpperCase() === "BLOCK")
+    .filter((r) => String(r.verdict).toUpperCase() === "BLOCK" || severityRank(r.severity) >= floor)
     .map((r) => `[${r.name}]\n${String(r.findings || "").trim()}`)
     .join("\n\n")
     .trim();
