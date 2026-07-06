@@ -72,7 +72,7 @@ export function parseSpecFindings(text) {
 // agentic tools) but seeded with the spec text and a verdict-producing system prompt.
 export async function specReviewPanel({ cwd, filePath, content, env = process.env, deep = true } = {}) {
   const results = await huntPanel({
-    cwd, env, deep,
+    cwd, env, deep, budgetMs: DEEP_REVIEW_BUDGET_MS,
     system: SPEC_REVIEW_SYSTEM,
     user: buildSpecReviewUser(filePath, content)
   });
@@ -121,7 +121,7 @@ export function buildPushReviewUser(range, content, { assistantContext = "" } = 
 // shape mirrors specReviewPanel exactly so spec-review-run can reuse the same summarizer.
 export async function pushReviewPanel({ cwd, range, content, env = process.env, deep = true, assistantContext = "" } = {}) {
   const results = await huntPanel({
-    cwd, env, deep,
+    cwd, env, deep, budgetMs: DEEP_REVIEW_BUDGET_MS,
     system: PUSH_REVIEW_SYSTEM,
     user: buildPushReviewUser(range, content, { assistantContext })
   });
@@ -147,7 +147,13 @@ const INVESTIGATE_MAX_STEPS = 60;
 const INVESTIGATE_TIMEOUT_MS = 20 * 60 * 1000;
 const INVESTIGATE_ROUND_MS = 240_000;     // thinking rounds are slow ON PURPOSE here; relax the 90s watchdog
 
-export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, codexImpl, deep = false, system = HUNT_SYSTEM, user }) {
+// deep-review GATE budget (spec/push review on Stop). Distinct from hunt/investigate: a gate must land
+// PROMPTLY or Claude has already moved on and the block is skipped. This is a HARD wall-clock cap on
+// BOTH the codex and API reviewers — deep exploration still happens, just time-boxed. Env-tunable.
+// hunt/investigate never pass budgetMs, so their full 12/20/25-min budgets are untouched.
+const DEEP_REVIEW_BUDGET_MS = Number(process.env.BENCH_DEEP_REVIEW_BUDGET_MS) || 10 * 60 * 1000;
+
+export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, codexImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user }) {
   const cfg = resolveConfig({ env });
   const userMsg = user || buildHuntUser(seed);
   const debug = !!env.BENCH_DEBUG;
@@ -159,8 +165,9 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
         const root = latestCodexRoot();
         if (!root) return { name: "Codex", findings: "", error: "codex plugin not found" };
         const codexEnv = { ...env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA || CODEX_DATA };
-        // runCodexTask keeps the raw findings (a hunt has no ALLOW/BLOCK verdict to parse)
-        const r = await (codexImpl || runCodexTask)({ companionPath: path.join(root, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${userMsg}`, cwd, env: codexEnv });
+        // runCodexTask keeps the raw findings (a hunt has no ALLOW/BLOCK verdict to parse).
+        // budgetMs (gate path only) hard-caps codex's agentic wall-clock; omitted for hunt/investigate.
+        const r = await (codexImpl || runCodexTask)({ companionPath: path.join(root, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${userMsg}`, cwd, env: codexEnv, ...(budgetMs ? { timeoutMs: budgetMs } : {}) });
         if (debug) console.error(`[hunt codex] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
         return { name: "Codex", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
       }
@@ -171,7 +178,9 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
         system, user: userMsg, tools: createReviewTools(cwd), mode: "report",
         thinking: deep ? "enabled" : p.thinking,
         maxSteps: deep ? INVESTIGATE_MAX_STEPS : HUNT_MAX_STEPS,
-        timeoutMs: Math.max(p.timeoutMs || 0, deep ? INVESTIGATE_TIMEOUT_MS : HUNT_TIMEOUT_MS),
+        // budgetMs (gate path) is a HARD cap that overrides the long deep/hunt budgets so the review lands
+        // in time; without it, hunt/investigate keep their full budgets (Math.max floor of the provider default).
+        timeoutMs: budgetMs || Math.max(p.timeoutMs || 0, deep ? INVESTIGATE_TIMEOUT_MS : HUNT_TIMEOUT_MS),
         maxRoundMs: deep ? INVESTIGATE_ROUND_MS : undefined,
         fetchImpl: reviewImpl, debug
       });

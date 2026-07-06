@@ -91,9 +91,11 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 }
 
 // Codex open-ended TASK → raw output (for hunt; no verdict parsing, so findings are kept).
-export async function runCodexTask({ companionPath, prompt, cwd, env }) {
+// timeoutMs overrides the default agentic budget — the deep-review GATE passes a short (~10 min)
+// cap so a push/spec review lands promptly; hunt/investigate omit it and keep the full 25 min.
+export async function runCodexTask({ companionPath, prompt, cwd, env, timeoutMs = TIMEOUT_MS }) {
   const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
-  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env: childEnv, timeoutMs: TIMEOUT_MS });
+  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env: childEnv, timeoutMs });
   if (r.status !== 0) return { name: "Codex", error: (r.stderr || r.stdout || "codex task failed").trim().slice(0, 300) };
   try {
     const raw = String(JSON.parse(r.stdout)?.rawOutput ?? "").trim();

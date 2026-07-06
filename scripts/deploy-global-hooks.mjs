@@ -221,9 +221,11 @@ export function syncSettings({ hooksDir, settingsPath }) {
   });
   // The deep-review runner: a SECOND matcher-less Stop entry (register appends it alongside
   // stop-review, each entry keeping its own opts). asyncRewake + exit 2 delivers a HIGH deep-review
-  // block even to an idle agent; timeout 1320s > the 20-min deep budget. Runs concurrently with stop-review.
+  // block even to an idle agent. timeout 720s = the 10-min gate budget (DEEP_REVIEW_BUDGET_MS) + ~2 min
+  // overhead, so a hung reviewer can't blow past 12 min; the block lands while it's still relevant.
+  // Runs concurrently with stop-review.
   register(s.hooks.Stop, undefined, path.join(hooksDir, "deep-review-runner.mjs"), {
-    timeout: 1320, asyncRewake: true,
+    timeout: 720, asyncRewake: true,
     statusMessage: "⛩ bench: deep review…",
     rewakeMessage: "⛩ bench deep review found blocking issues. Address them, then continue:",
     rewakeSummary: "⛩ bench deep review"

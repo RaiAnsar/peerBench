@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { parseVerdict, combinePanel, untrackedBlock, runCodexReview } from "../global-hooks/panel-lib.mjs";
+import { parseVerdict, combinePanel, untrackedBlock, runCodexReview, runCodexTask } from "../global-hooks/panel-lib.mjs";
 
 test("untrackedBlock embeds a real untracked file but NEVER follows a symlink out of the workspace", () => {
   const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-")));
@@ -37,6 +37,20 @@ test("runCodexReview suppresses peerBench hooks in the nested Codex reviewer pro
   const result = await runCodexReview({ companionPath: companion, prompt: "review", cwd: dir, env: {} });
   assert.equal(result.verdict, "ALLOW");
   assert.match(result.firstLine, /suppressed/);
+});
+
+test("runCodexTask honors a short per-call timeoutMs (the deep-review GATE budget cap)", async () => {
+  // The gate passes budgetMs → runCodexTask timeoutMs so a hung codex can't blow past the budget.
+  // A companion that sleeps far longer than the cap must be killed → status 124 → error (not raw).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-timeout-"));
+  const companion = path.join(dir, "sleeper.mjs");
+  fs.writeFileSync(companion, "setTimeout(() => process.stdout.write('{}'), 60000);\n");
+  const started = Date.now();
+  const result = await runCodexTask({ companionPath: companion, prompt: "x", cwd: dir, env: {}, timeoutMs: 200 });
+  const elapsed = Date.now() - started;
+  assert.ok(result.error, "a reviewer that outruns the budget returns an error, not findings");
+  assert.equal(result.raw, undefined, "no raw findings when the budget is exceeded");
+  assert.ok(elapsed < 5000, `killed near the 200ms cap, not the 25-min default (took ${elapsed}ms)`);
 });
 
 test("combinePanel: both allow", () => {
