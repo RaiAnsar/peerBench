@@ -394,6 +394,11 @@ test("git push + panel BLOCK → deny with findings in permissionDecisionReason"
   assert.equal(hookOut.permissionDecision, "deny", "full push review BLOCK → permissionDecision=deny");
   assert.ok(hookOut.permissionDecisionReason, "deny reason must be present");
   assert.match(hookOut.permissionDecisionReason, /MiMo|BLOCK|Details for MiMo/i, "findings should include BLOCK details");
+  // Regression: a BLOCK must be USER-VISIBLE (systemMessage), not just fed to the model via the
+  // deny reason — a silent block is why a gate-blocked push churned invisibly for 30+ minutes.
+  assert.ok(parsed[0].systemMessage, "BLOCK must emit a user-visible systemMessage");
+  assert.match(parsed[0].systemMessage, /BLOCKED/, "systemMessage must announce the block");
+  assert.match(parsed[0].systemMessage, /Details for MiMo|MiMo/, "systemMessage must carry the findings, not just say 'blocked'");
 });
 
 // ---------------------------------------------------------------------------

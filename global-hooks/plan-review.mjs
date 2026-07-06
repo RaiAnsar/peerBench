@@ -115,9 +115,12 @@ export async function runMain({
   }
 
   if (panel.decision === "block") {
+    const detail = panel.findings || panel.summary || "(no details)";
     decision(
       "deny",
-      `[${panel.badge}] Review panel found issues that must be fixed before this plan can be presented:\n\n${panel.findings}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address these findings, then call ExitPlanMode again.`
+      `[${panel.badge}] Review panel found issues that must be fixed before this plan can be presented:\n\n${detail}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address these findings, then call ExitPlanMode again.`,
+      // USER-VISIBLE: the block was previously silent (model-only), so a blocked plan churned unseen.
+      `⛩ bench plan-review BLOCKED [${panel.badge}]\n${detail.slice(0, 1200)}`
     );
     return;
   }

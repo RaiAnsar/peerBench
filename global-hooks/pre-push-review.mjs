@@ -514,10 +514,15 @@ export async function runMain({
   // 6. Decision. The deep-review threshold is shared with spec/plan review: high/critical
   // findings block, lower-severity findings are advisory.
   if (shouldRewake(review)) {
+    const detail = review.findings || review.summary || "(no details)";
     decision(
       "deny",
-      `[${review.badge || "push-review"}] Full push review found issues that must be fixed before pushing:\n\n${review.findings || review.summary || "(no details)"}\n\n` +
-      `Fix the issues above, then run git push again.`
+      `[${review.badge || "push-review"}] Full push review found issues that must be fixed before pushing:\n\n${detail}\n\n` +
+      `Fix the issues above, then run git push again.`,
+      // USER-VISIBLE: the block was previously silent (only the model saw permissionDecisionReason),
+      // so a blocked push churned invisibly for the user. Surface the badge + trimmed findings + the
+      // retrieval command so a pre-push block is never "off the eyes".
+      `⛩ bench pre-push BLOCKED [${review.badge || "push-review"}]${rangeNoteSuffix}\n${detail.slice(0, 1200)}${review.traceId ? `\n\n↳ full findings: /bench:show ${review.traceId}` : ""}`
     );
     return;
   }
