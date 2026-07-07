@@ -21,6 +21,13 @@
             "timeout": 1320,
             "statusMessage": "⛩ bench: reviewing push…",
             "if": "Bash(git *)"
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/pre-merge-review.mjs\"",
+            "timeout": 150,
+            "statusMessage": "⛩ bench: reviewing merge…",
+            "if": "Bash(git merge*)"
           }
         ]
       }
@@ -56,7 +63,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/deep-review-runner.mjs\"",
-            "timeout": 1320,
+            "timeout": 720,
             "asyncRewake": true,
             "statusMessage": "⛩ bench: deep review…",
             "rewakeMessage": "⛩ bench deep review found blocking issues. Address them, then continue:",
