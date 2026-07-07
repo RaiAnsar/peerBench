@@ -349,9 +349,10 @@ export function installPeerBench({
     const sync = pluginRegistry.cli.skipped
       ? syncSettings({ hooksDir, settingsPath })
       : removeClaudeSettingsPeerBenchHooks({ settingsPath });
-    const legacyCodexGate = disableLegacyCodexStopGateStates({
-      pluginDataDir: path.join(home, ".claude", "plugins", "data", "codex-openai-codex")
-    });
+    // Default: KEEP the Codex stop gate (runs alongside peerBench). Single-gate mode disables it.
+    const legacyCodexGate = (env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true")
+      ? disableLegacyCodexStopGateStates({ pluginDataDir: path.join(home, ".claude", "plugins", "data", "codex-openai-codex") })
+      : { root: null, scanned: 0, changed: 0, files: [], kept: true };
     const statusline = syncStatuslineSessionArg({
       statuslinePath: path.join(home, ".claude", "statusline-command.sh")
     });

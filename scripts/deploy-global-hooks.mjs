@@ -409,7 +409,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const sync = claudePluginRoot
     ? removeClaudeSettingsPeerBenchHooks({ settingsPath })
     : syncSettings({ hooksDir, settingsPath });
-  const legacyCodexGate = disableLegacyCodexStopGateStates();
+  // Default: KEEP the Codex stop gate (it runs alongside peerBench). Only single-gate mode disables it.
+  const legacyCodexGate = (process.env.BENCH_SINGLE_GATE === "1" || process.env.BENCH_SINGLE_GATE === "true")
+    ? disableLegacyCodexStopGateStates()
+    : { root: null, scanned: 0, changed: 0, files: [], kept: true };
   const statusline = syncStatuslineSessionArg();
   const codexSnapshot = snapshotCodex({ hooksDir: codexHooksDir, hooksPath: codexHooksPath, backupDir: path.join(backupDir, "codex") });
   const codexDeploy = deploy({ src: path.join(repoRoot, "global-hooks"), dest: codexHooksDir });

@@ -17,7 +17,10 @@ function stateKeyForWorkspace(ws) {
   return `${slug}-${hash}`;
 }
 
-function disableStateFile(file) {
+// Set config.stopReviewGate to `enabled` in one Codex state file. Only rewrites when it actually
+// changes; preserves jobs and every other field. `enabled=false` = disable (bench single-gate mode),
+// `enabled=true` = enable (restore the Codex gate to run alongside peerBench).
+function setStopReviewGate(file, enabled) {
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -28,10 +31,10 @@ function disableStateFile(file) {
     return { file, changed: false, reason: "invalid-state" };
   }
   parsed.config = parsed.config && typeof parsed.config === "object" ? parsed.config : {};
-  if (parsed.config.stopReviewGate !== true) {
-    return { file, changed: false, reason: "already-disabled" };
+  if (parsed.config.stopReviewGate === enabled) {
+    return { file, changed: false, reason: enabled ? "already-enabled" : "already-disabled" };
   }
-  parsed.config.stopReviewGate = false;
+  parsed.config.stopReviewGate = enabled;
   try {
     fs.writeFileSync(file, `${JSON.stringify(parsed, null, 2)}\n`);
   } catch (e) {
@@ -40,13 +43,10 @@ function disableStateFile(file) {
   return { file, changed: true };
 }
 
-export function disableLegacyCodexStopGateForWorkspace(ws, opts = {}) {
-  if (!ws) return { changed: false, reason: "missing-workspace" };
-  const file = path.join(stateRoot(opts), stateKeyForWorkspace(ws), "state.json");
-  return disableStateFile(file);
-}
+const disableStateFile = (file) => setStopReviewGate(file, false);
+const enableStateFile = (file) => setStopReviewGate(file, true);
 
-export function disableLegacyCodexStopGateStates(opts = {}) {
+function eachStateFile(opts, fn) {
   const root = stateRoot(opts);
   let entries = [];
   try {
@@ -56,8 +56,30 @@ export function disableLegacyCodexStopGateStates(opts = {}) {
   }
   const files = [];
   for (const entry of entries) {
-    const result = disableStateFile(path.join(root, entry.name, "state.json"));
+    const result = fn(path.join(root, entry.name, "state.json"));
     if (result.changed) files.push(result.file);
   }
   return { root, scanned: entries.length, changed: files.length, files };
+}
+
+export function disableLegacyCodexStopGateForWorkspace(ws, opts = {}) {
+  if (!ws) return { changed: false, reason: "missing-workspace" };
+  const file = path.join(stateRoot(opts), stateKeyForWorkspace(ws), "state.json");
+  return disableStateFile(file);
+}
+
+export function disableLegacyCodexStopGateStates(opts = {}) {
+  return eachStateFile(opts, disableStateFile);
+}
+
+// Re-enable the Codex stop-review gate for a workspace / every configured workspace — used to RESTORE
+// the gate that single-gate mode turned off, so it runs ALONGSIDE the peerBench panel.
+export function enableLegacyCodexStopGateForWorkspace(ws, opts = {}) {
+  if (!ws) return { changed: false, reason: "missing-workspace" };
+  const file = path.join(stateRoot(opts), stateKeyForWorkspace(ws), "state.json");
+  return enableStateFile(file);
+}
+
+export function enableLegacyCodexStopGateStates(opts = {}) {
+  return eachStateFile(opts, enableStateFile);
 }

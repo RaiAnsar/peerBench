@@ -7,7 +7,8 @@ import { createHash } from "node:crypto";
 
 import {
   disableLegacyCodexStopGateForWorkspace,
-  disableLegacyCodexStopGateStates
+  disableLegacyCodexStopGateStates,
+  enableLegacyCodexStopGateStates
 } from "../global-hooks/legacy-codex-gate.mjs";
 
 function keyFor(ws) {
@@ -51,4 +52,21 @@ test("disableLegacyCodexStopGateStates disables every existing legacy state file
   assert.equal(result.changed, 1);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, "a", "state.json"), "utf8")).config.stopReviewGate, false);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, "b", "state.json"), "utf8")).config.stopReviewGate, false);
+});
+
+test("enableLegacyCodexStopGateStates re-enables every existing state file (restore), preserving jobs", () => {
+  const pluginDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-codex-en-"));
+  const root = path.join(pluginDataDir, "state");
+  fs.mkdirSync(path.join(root, "a"), { recursive: true });
+  fs.mkdirSync(path.join(root, "b"), { recursive: true });
+  fs.writeFileSync(path.join(root, "a", "state.json"), JSON.stringify({ version: 1, config: { stopReviewGate: false, other: "keep" }, jobs: [{ id: "j" }] }, null, 2));
+  fs.writeFileSync(path.join(root, "b", "state.json"), JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] }, null, 2));
+
+  const result = enableLegacyCodexStopGateStates({ pluginDataDir });
+  assert.equal(result.scanned, 2);
+  assert.equal(result.changed, 1);   // only `a` flipped false→true; `b` already enabled
+  const a = JSON.parse(fs.readFileSync(path.join(root, "a", "state.json"), "utf8"));
+  assert.equal(a.config.stopReviewGate, true);
+  assert.equal(a.config.other, "keep");
+  assert.deepEqual(a.jobs, [{ id: "j" }]);
 });

@@ -399,6 +399,7 @@ export const specReviewCommand = runSpecReview;
 
 export function gateToggleCommand(ws, args, {
   root,
+  env = process.env,
   disableLegacyCodexWorkspaceImpl = disableLegacyCodexStopGateForWorkspace,
   disableLegacyCodexGlobalImpl = disableLegacyCodexStopGateStates
 } = {}) {
@@ -414,11 +415,18 @@ export function gateToggleCommand(ws, args, {
   // Re-enable: derive the message from a fresh read so we never claim "enabled"
   // while the OTHER scope's marker is still disabling the gates.
   const stillDisabled = isBenchDisabled(ws, { root });
-  const legacy = scope === "global"
-    ? disableLegacyCodexGlobalImpl()
-    : disableLegacyCodexWorkspaceImpl(ws);
-  const legacyChanged = typeof legacy?.changed === "number" ? legacy.changed > 0 : Boolean(legacy?.changed);
-  const legacyNote = legacyChanged ? " Legacy Codex gate disabled." : "";
+  // By DEFAULT peerBench COEXISTS with the Codex stop gate — both review every turn (Codex is A-grade;
+  // silently killing it on bench:on was a real downgrade). Only explicit single-gate mode
+  // (BENCH_SINGLE_GATE=1) makes peerBench the sole reviewer by disabling the Codex gate.
+  const singleGate = env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true";
+  let legacyNote = " Codex gate kept — runs alongside peerBench.";
+  if (singleGate) {
+    const legacy = scope === "global"
+      ? disableLegacyCodexGlobalImpl()
+      : disableLegacyCodexWorkspaceImpl(ws);
+    const legacyChanged = typeof legacy?.changed === "number" ? legacy.changed > 0 : Boolean(legacy?.changed);
+    legacyNote = legacyChanged ? " Legacy Codex gate disabled." : "";
+  }
   if (!stillDisabled) return `bench: enabled (${scope}).${legacyNote}`;
   // The cleared scope didn't fully re-enable — name the remaining source honestly.
   if (scope === "workspace") {

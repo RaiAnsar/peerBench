@@ -110,12 +110,27 @@ test("gateToggleCommand on workspace: isBenchDisabled becomes false", () => {
   }
 });
 
-test("gateToggleCommand on workspace disables the legacy Codex plugin gate", () => {
+test("gateToggleCommand on: KEEPS the Codex gate by default (coexists with peerBench)", () => {
+  const root = freshRoot();
+  const ws = freshWs();
+  let called = false;
+  const out = gateToggleCommand(ws, ["on"], {
+    root,
+    env: {},   // no BENCH_SINGLE_GATE → keep both
+    disableLegacyCodexWorkspaceImpl: () => { called = true; return { changed: true }; }
+  });
+  assert.equal(called, false, "default must NOT disable the Codex gate");
+  assert.match(out, /enabled.*workspace/i);
+  assert.match(out, /Codex gate kept/i);
+});
+
+test("gateToggleCommand on with BENCH_SINGLE_GATE=1 disables the legacy Codex plugin gate", () => {
   const root = freshRoot();
   const ws = freshWs();
   let calledWith = null;
   const out = gateToggleCommand(ws, ["on"], {
     root,
+    env: { BENCH_SINGLE_GATE: "1" },
     disableLegacyCodexWorkspaceImpl: (workspace) => {
       calledWith = workspace;
       return { changed: true };
