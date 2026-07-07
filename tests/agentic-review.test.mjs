@@ -33,6 +33,31 @@ test("tool call then verdict → ALLOW, records filesRead", async () => {
   assert.deepEqual(res.filesRead, ["a.js"]); assert.equal(res.steps, 2);
 });
 
+// RC-1: the agentic path (hunt / investigate / deep gate) had NO 429 retry — a single transient
+// overload killed the whole run (trace evidence: GLM steps:1, "http 429"). It must now back off & retry.
+const r429 = () => ({ ok: false, status: 429, headers: { get: () => null }, text: async () => '{"error":{"code":"1305","message":"overloaded"}}' });
+
+test("RC-1: a transient 429 is retried, not fatal (agentic overload retry)", async () => {
+  const tools = { schemas: SCHEMAS, execute: async () => "x" };
+  let calls = 0;
+  const fetchImpl = async () => { calls++; return calls === 1 ? r429() : sse([{ content: "1. bug at a.js:3" }]); };
+  const res = await agenticReview({ ...baseArgs, mode: "report", tools, fetchImpl, sleepImpl: async () => {}, rng: () => 0.5 });
+  assert.equal(res.ok, true, "a transient 429 must be retried, not returned as a fatal http error");
+  assert.match(res.report, /a\.js:3/);
+  assert.ok(calls >= 2, `expected a retry after the 429 (got ${calls} fetch calls)`);
+});
+
+test("RC-1: gives up cleanly after exhausting 429 retries (1 + 5)", async () => {
+  const tools = { schemas: SCHEMAS, execute: async () => "x" };
+  let calls = 0;
+  const fetchImpl = async () => { calls++; return r429(); };
+  const res = await agenticReview({ ...baseArgs, mode: "report", tools, fetchImpl, sleepImpl: async () => {}, rng: () => 0.5 });
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "http");
+  assert.match(res.error.detail, /429/);
+  assert.equal(calls, 6, `expected 1 initial + 5 overload retries = 6 fetches (got ${calls})`);
+});
+
 test("readSSE captures a final event with NO trailing blank line (truncated stream)", async () => {
   // A stream whose last `data:` event isn't terminated by \n\n (and no [DONE]) — the old reader
   // dropped it, losing the verdict → spurious no-verdict/timeout (found by the bench's own hunt).

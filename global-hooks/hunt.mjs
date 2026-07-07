@@ -1,6 +1,7 @@
 import { resolveConfig, displayName } from "./config-store.mjs";
 import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
+import { withConcurrencyLimit } from "./concurrency-limit.mjs";
 import { runCodexTask } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
 import { parseSeverity, stripThink } from "./deep-review.mjs";
@@ -173,17 +174,27 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
       }
       const p = cfg.providers[name];
       if (!p?.apiKey) return { name: display, findings: "", error: "no api key" };
-      const res = await agenticReview({
-        baseURL: p.baseURL, apiKey: p.apiKey, model: p.model, temperature: p.temperature, headers: p.headers,
-        system, user: userMsg, tools: createReviewTools(cwd), mode: "report",
-        thinking: deep ? "enabled" : p.thinking,
-        maxSteps: deep ? INVESTIGATE_MAX_STEPS : HUNT_MAX_STEPS,
-        // budgetMs (gate path) is a HARD cap that overrides the long deep/hunt budgets so the review lands
-        // in time; without it, hunt/investigate keep their full budgets (Math.max floor of the provider default).
-        timeoutMs: budgetMs || Math.max(p.timeoutMs || 0, deep ? INVESTIGATE_TIMEOUT_MS : HUNT_TIMEOUT_MS),
-        maxRoundMs: deep ? INVESTIGATE_ROUND_MS : undefined,
-        fetchImpl: reviewImpl, debug
-      });
+      // budgetMs (gate path) is a HARD cap that overrides the long deep/hunt budgets so the review lands
+      // in time; without it, hunt/investigate keep their full budgets (Math.max floor of the provider default).
+      const apiTimeout = budgetMs || Math.max(p.timeoutMs || 0, deep ? INVESTIGATE_TIMEOUT_MS : HUNT_TIMEOUT_MS);
+      const pool = p.apiKeys?.length ? p.apiKeys : [p.apiKey];
+      // Bound in-flight AGENTIC calls across ALL processes (hunts + gates across projects) so bursts queue
+      // instead of 429-ing z.ai's per-key cap — the protection the simple stop-gate path already had, now on
+      // the agentic path too (this path used to bypass it). Slot pins one key. No heartbeat, so staleMs must
+      // exceed the full review; the slot-wait is capped at 90s so the gate stays prompt (429 retry is the net).
+      const res = await withConcurrencyLimit(
+        { name, slots: p.concurrency, staleMs: apiTimeout + 120_000, timeoutMs: Math.min(apiTimeout, 90_000) },
+        (slotIdx) => agenticReview({
+          baseURL: p.baseURL, apiKey: slotIdx == null ? pool[0] : pool[slotIdx % pool.length], model: p.model,
+          temperature: p.temperature, headers: p.headers,
+          system, user: userMsg, tools: createReviewTools(cwd), mode: "report",
+          thinking: deep ? "enabled" : p.thinking,
+          maxSteps: deep ? INVESTIGATE_MAX_STEPS : HUNT_MAX_STEPS,
+          timeoutMs: apiTimeout,
+          maxRoundMs: deep ? INVESTIGATE_ROUND_MS : undefined,
+          fetchImpl: reviewImpl, debug
+        })
+      );
       const d = res.diag || {};
       if (debug) console.error(`[hunt ${display}] ok=${res.ok} steps=${d.steps} files=${(d.filesRead || []).length} toolKB=${((d.toolBytes || 0) / 1024) | 0} lastReqKB=${((d.lastReqBytes || 0) / 1024) | 0} err=${res.ok ? "-" : res.error.kind}`);
       return res.ok

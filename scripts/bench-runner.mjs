@@ -20,7 +20,8 @@ import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
 import { listBlocked } from "../global-hooks/deep-queue.mjs";
-import { runSpecReview } from "../global-hooks/spec-review-run.mjs";
+import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mjs";
+import { shouldRewake } from "../global-hooks/deep-review.mjs";
 import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
 import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
 
@@ -149,6 +150,36 @@ async function main() {
   if (sub === "review") {
     const ws = workspaceRoot(cwd);
     const sessionKey = sessionKeyFromInput({}, process.env);
+
+    // `/bench:review <range>` (e.g. origin/main..staging) → DEEP, repo-aware review of a committed
+    // ref-range with the REAL diff embedded — the thing /bench:hunt structurally cannot do (hunt has no
+    // diff, so reviewers scrape reflog and bail). Reuses the push-review path: git log+diff → repo-aware
+    // panel (reviewers may read the repo to verify) → push-review trace. Plain `/bench:review` (no range)
+    // keeps the fast content-only worktree review below.
+    const rangeArg = rest.find((r) => !r.startsWith("--") && /\.\.\.?/.test(r));
+    if (rangeArg) {
+      try {
+        const result = await runPushReview(rangeArg, ws, { sessionKey });
+        if (result.retry) {
+          const msg = `git couldn't read range ${rangeArg} — check it (e.g. origin/main..HEAD, or fetch first).`;
+          process.stdout.write(flags.json ? JSON.stringify({ range: rangeArg, error: msg }) + "\n" : `⛩ review ${rangeArg}: ${msg}\n`);
+          process.exitCode = 1; return;
+        }
+        const blocking = shouldRewake({ maxSeverity: result.maxSeverity, findingCount: result.findingCount });
+        if (flags.json) {
+          process.stdout.write(JSON.stringify({ range: rangeArg, decision: blocking ? "block" : "allow", badge: result.badge, summary: result.summary, findings: result.findings, traceId: result.traceId, reviewers: result.reviewers }) + "\n");
+        } else {
+          const head = `⛩ review ${rangeArg} [${result.badge || "?"}] — ${result.summary}${result.traceId ? ` (trace ${result.traceId} · /bench:show ${result.traceId})` : ""}`;
+          process.stdout.write(`${head}${result.findings ? `\n\n${result.findings}` : ""}\n`);
+        }
+        process.exitCode = blocking ? 1 : 0;
+      } catch (e) {
+        process.stderr.write(`⛩ review ${rangeArg}: ${e instanceof Error ? e.message : String(e)}\n`);
+        process.exitCode = 1;
+      }
+      return;
+    }
+
     const status = spawnSync("git", ["status", "--short", "--untracked-files=all"], { cwd: ws, encoding: "utf8" }).stdout || "";
     const committed = flags.base
       ? (spawnSync("git", ["diff", `${flags.base}...HEAD`], { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES)
@@ -496,7 +527,7 @@ export function setupStatus(settingsPath, { pluginHooksPath = null } = {}) {
     const elsewhere = [...settingsBlocks, ...pluginBlocks].some((b) => has(b));
     const label = g.matcher === undefined ? `${g.event}(matcher-less)` : `${g.event}/${g.matcher}`;
     let state;
-    if (correctPlugin && correctSettings) state = "registered (plugin + settings)";
+    if (correctPlugin && correctSettings) state = "DUPLICATE (plugin + settings both active)";
     else if (correctPlugin) state = "registered (plugin)";
     else if (correctSettings) state = "registered (settings)";
     else if (elsewhere) state = "MISREGISTERED (wrong matcher block)";
@@ -521,7 +552,7 @@ export function codexSetupStatus(hooksPath, { pluginHooksPath = null } = {}) {
   const correctPlugin = pluginBlocks.some((b) => has(b) && !b.matcher);
   const elsewhere = [...settingsBlocks, ...pluginBlocks].some((b) => has(b));
   let state;
-  if (correctPlugin && correctSettings) state = "registered (plugin + settings)";
+  if (correctPlugin && correctSettings) state = "DUPLICATE (plugin + settings both active)";
   else if (correctPlugin) state = "registered (plugin)";
   else if (correctSettings) state = "registered (settings)";
   else if (elsewhere) state = "MISREGISTERED (wrong matcher block)";

@@ -63,6 +63,22 @@ const MAX_NET_RETRIES = 2;         // retry transient "fetch failed" (connection
 const RETRY_BACKOFF_MS = 750;
 const DEFAULT_ROUND_MS = 90_000;   // per-EXPLORATION-round cap: one runaway thinking round can't eat the whole budget
 
+// Overload retry: 429/503 are z.ai's per-key concurrency shedding. Unlike review() (the simple stop-gate
+// path), the AGENTIC path — hunt, investigate, AND the deep spec/push gate — had NO overload retry, so a
+// single 429 killed the whole run (seen in traces: GLM steps:1, "http 429"). Back off (jittered, honoring
+// Retry-After) and re-fetch the SAME key; the concurrency limiter pins one key per slot, so rotating here
+// would defeat the pinning — we ride out the transient overload instead.
+const RETRYABLE_STATUS = new Set([429, 503]);
+const MAX_OVERLOAD_RETRIES = 5;
+const OVERLOAD_BACKOFF_BASE_MS = 500;
+const OVERLOAD_BACKOFF_CAP_MS = 8_000;
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export function overloadBackoffMs(attempt, retryAfterSec, jitter = Math.random()) {
+  if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) return Math.min(retryAfterSec * 1000, 30_000);
+  const exp = Math.min(OVERLOAD_BACKOFF_CAP_MS, OVERLOAD_BACKOFF_BASE_MS * 2 ** attempt);
+  return Math.round(exp * (0.5 + jitter * 0.5));   // half-to-full jitter so concurrent gates don't re-collide in lockstep
+}
+
 function looksLikeRawToolCall(content) {
   return /<tool_call\b|<function=|<parameter=|<\/function>/i.test(String(content || ""));
 }
@@ -71,7 +87,8 @@ export async function agenticReview({
   baseURL, apiKey, model, system, user,
   temperature = 0, headers = {}, tools, thinking,
   mode = "verdict",
-  maxSteps = DEFAULT_MAX_STEPS, timeoutMs = DEFAULT_TIMEOUT_MS, maxRoundMs = DEFAULT_ROUND_MS, fetchImpl, debug = false
+  maxSteps = DEFAULT_MAX_STEPS, timeoutMs = DEFAULT_TIMEOUT_MS, maxRoundMs = DEFAULT_ROUND_MS, fetchImpl, debug = false,
+  sleepImpl = defaultSleep, rng = Math.random
 }) {
   const zeroDiag = { steps: 0, filesRead: [], toolBytes: 0, lastReqBytes: 0, rounds: [] };
   if (!apiKey) return { ok: false, error: { kind: "nokey", detail: "no api key" }, diag: zeroDiag };
@@ -118,21 +135,33 @@ export async function agenticReview({
       const signal = useWatchdog ? AbortSignal.any([controller.signal, roundController.signal]) : controller.signal;
       let resp, parsed, netErr = null, inspectionRetriedThisRound = false, temperatureRetriedThisRound = false, activeTemperature = currentTemperature;
       try {
-        for (let attempt = 0; attempt <= MAX_NET_RETRIES; attempt++) {
+        let netAttempt = 0, overloadRetries = 0;
+        for (;;) {
           try {
             resp = await doFetch(`${baseURL}/chat/completions`, {
               method: "POST",
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
               body, signal
             });
-            netErr = null; break;
+            netErr = null;
+            // Transient overload (429/503) → jittered backoff, re-fetch the SAME key. After
+            // MAX_OVERLOAD_RETRIES the 429 falls through to the http-error return below (retried, gave up cleanly).
+            if (RETRYABLE_STATUS.has(resp.status) && overloadRetries < MAX_OVERLOAD_RETRIES && !signal.aborted) {
+              const wait = overloadBackoffMs(overloadRetries++, Number(resp.headers?.get?.("retry-after")), rng());
+              dlog(`step ${step}: HTTP ${resp.status} overloaded; backoff ${wait}ms (retry ${overloadRetries}/${MAX_OVERLOAD_RETRIES})`);
+              await sleepImpl(wait);
+              continue;
+            }
+            break;
           } catch (e) {
             netErr = e;
             if (e?.name === "AbortError") break;                // timeout (round or total) — don't retry
-            if (attempt < MAX_NET_RETRIES) {
-              dlog(`step ${step}: net attempt ${attempt + 1} failed (${e?.cause?.code || e?.message}); retry in ${RETRY_BACKOFF_MS}ms`);
-              await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
+            if (netAttempt++ < MAX_NET_RETRIES) {
+              dlog(`step ${step}: net attempt ${netAttempt} failed (${e?.cause?.code || e?.message}); retry in ${RETRY_BACKOFF_MS}ms`);
+              await sleepImpl(RETRY_BACKOFF_MS);
+              continue;
             }
+            break;
           }
         }
         if (!netErr && resp.ok) parsed = await readSSE(resp);   // may throw on mid-stream abort
