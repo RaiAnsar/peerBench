@@ -178,7 +178,7 @@ test("CONTENT-CHANGE retirement: a .blocked whose content changed → deleted, N
   assert.doesNotMatch(err, /stale finding/, "not re-delivered");
 });
 
-test("SURPLUS DRAIN: > MAX_BATCH queued → MAX_BATCH run + CONTINUATION-WAKE (exit 2) so surplus can't strand while idle", async () => {
+test("SURPLUS DRAIN: > MAX_BATCH queued → all clean jobs drain in one invocation with no continuation-wake", async () => {
   const ws = freshWs();
   const N = MAX_BATCH + 1;
   for (let n = 1; n <= N; n++) {
@@ -187,24 +187,31 @@ test("SURPLUS DRAIN: > MAX_BATCH queued → MAX_BATCH run + CONTINUATION-WAKE (e
   }
   let runCount = 0;
   const { exit, err } = await runRunner(ws, { runSpecReviewImpl: async () => { runCount++; return { maxSeverity: "none", findingCount: 0, findings: "" }; } });
-  assert.equal(runCount, MAX_BATCH, "exactly MAX_BATCH jobs run concurrently this invocation");
-  assert.equal(exit, 2, "unclaimed surplus → continuation-wake (exit 2) forces a next Stop to drain it");
-  assert.match(err, /more queued/i, "the continuation note explains why");
-  assert.equal(listJobs(ws).length, N - MAX_BATCH, "surplus left as .json for the next (woken) Stop");
+  assert.equal(runCount, N, "surplus drains in later bounded batches during this invocation");
+  assert.equal(exit, 0, "all-clean surplus must not create a no-action rewake");
+  assert.doesNotMatch(err, /more queued/i, "no continuation note");
+  assert.equal(listJobs(ws).length, 0, "all jobs processed without needing a second Stop");
 });
 
-test("SURPLUS DRAIN: a second invocation drains the leftover → exit 0", async () => {
+test("SURPLUS DRAIN: a block in a later batch still wakes and leaves later surplus queued", async () => {
   const ws = freshWs();
-  const N = MAX_BATCH + 1;
+  const N = MAX_BATCH * 2 + 1;
   for (let n = 1; n <= N; n++) {
     const f = path.join(ws, `s${n}.md`); fs.writeFileSync(f, `body ${n}`);
     enqueue(ws, { kind: "spec", specPath: f, contentKey: deepKey(f, `body ${n}`) });
   }
-  const CLEAN_NONE = async () => ({ maxSeverity: "none", findingCount: 0, findings: "" });
-  await runRunner(ws, { runSpecReviewImpl: CLEAN_NONE });        // first: MAX_BATCH run, continuation-wake
-  const { exit } = await runRunner(ws, { runSpecReviewImpl: CLEAN_NONE });  // second: drains the leftover
-  assert.equal(exit, 0, "queue fully drained → no more continuation-wake");
-  assert.equal(listJobs(ws).length, 0, "all jobs processed across the two (woken) invocations");
+  let runCount = 0;
+  const { exit, err } = await runRunner(ws, {
+    runSpecReviewImpl: async () => {
+      runCount++;
+      if (runCount === MAX_BATCH + 1) return { maxSeverity: "high", findingCount: 1, findings: "- later block" };
+      return { maxSeverity: "none", findingCount: 0, findings: "" };
+    }
+  });
+  assert.equal(exit, 2, "a block found in a later batch still wakes");
+  assert.match(err, /later block/);
+  assert.equal(listBlocked(ws).length, 1, "blocking job persisted");
+  assert.equal(listJobs(ws).length, 1, "unprocessed jobs after the blocking batch remain queued");
 });
 
 test("N ≤ MAX_BATCH all-clean → exit 0, no continuation-wake", async () => {

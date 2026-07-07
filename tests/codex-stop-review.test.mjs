@@ -31,6 +31,14 @@ function captureEmitter() {
   };
 }
 
+// Scrub the vars that make shouldSkipCodexStop no-op, so the non-skipped-path tests are deterministic
+// regardless of the RUNNER's shell (a headless-Codex session sets CODEX_HOME/CODEX_COMPANION_SESSION_ID).
+function cleanEnv() {
+  const e = { ...process.env };
+  for (const k of ["CODEX_HOME", "CODEX_COMPANION_SESSION_ID", "BENCH_SUPPRESS_HOOKS", "PEERBENCH_SUPPRESS_HOOKS"]) delete e[k];
+  return e;
+}
+
 test("shouldSkipCodexStop skips nested/reviewer Codex, not direct Codex", () => {
   assert.equal(shouldSkipCodexStop({}), false);
   assert.equal(shouldSkipCodexStop({ BENCH_SUPPRESS_HOOKS: "1" }), true);
@@ -60,7 +68,7 @@ test("runCodexStop emits Codex block JSON and omits Codex reviewer from the pane
   const cap = captureEmitter();
   await runCodexStop({
     input: { cwd: ws, session_id: "codex-session", last_assistant_message: "changed code" },
-    env: process.env,
+    env: cleanEnv(),
     emitter: cap.emitter,
     resolveReviewersImpl: () => [
       { name: "Codex", async run() { throw new Error("must not be called"); } },
@@ -84,7 +92,7 @@ test("runCodexStop surfaces ALLOW reviews as Stop JSON systemMessage", async () 
   const cap = captureEmitter();
   await runCodexStop({
     input: { cwd: ws, session_id: "codex-session", last_assistant_message: "changed code" },
-    env: process.env,
+    env: cleanEnv(),
     emitter: cap.emitter,
     resolveReviewersImpl: () => [
       { name: "Codex", async run() { throw new Error("must not be called"); } },

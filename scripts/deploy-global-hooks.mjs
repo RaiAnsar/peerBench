@@ -135,9 +135,11 @@ const PEERBENCH_SETTINGS_HOOKS = [
   "plan-review.mjs",
   "plan-file-review.mjs",
   "pre-push-review.mjs",
+  "pre-merge-review.mjs",
   "stop-review.mjs",
   "deep-review-runner.mjs"
 ];
+const PEERBENCH_CODEX_HOOKS = ["codex-stop-review.mjs"];
 // Register our hook canonically AND de-dupe: remove any existing entries referencing this hook
 // FILE (matched by basename, so it catches ANY path form — $HOME, absolute, different quoting),
 // then add exactly one absolute-path entry. Idempotent + self-healing against duplicates.
@@ -187,6 +189,79 @@ export function removeClaudeSettingsPeerBenchHooks({ settingsPath }) {
   return { removedEntries, removedFiles: [], pluginManaged: true };
 }
 
+export function removeCodexSettingsPeerBenchHooks({ hooksPath }) {
+  let s = {};
+  try { s = JSON.parse(fs.readFileSync(hooksPath, "utf8")); } catch { s = {}; }
+  const removedEntries = removeHookCommands(s, PEERBENCH_CODEX_HOOKS);
+  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+  fs.writeFileSync(hooksPath, `${JSON.stringify(s, null, 2)}\n`);
+  return { removedEntries, pluginManaged: true };
+}
+
+function readJson(pathname) {
+  try { return JSON.parse(fs.readFileSync(pathname, "utf8")); }
+  catch { return null; }
+}
+
+export function latestClaudeBenchPluginRoot({
+  home = os.homedir(),
+  pluginId = "bench@aiwithrai"
+} = {}) {
+  const installedPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
+  const installed = readJson(installedPath);
+  const entries = Array.isArray(installed?.plugins?.[pluginId]) ? installed.plugins[pluginId] : [];
+  const scoped = entries.filter((entry) => entry.scope === "user" || entry.scope === "local" || entry.scope === "project");
+  const latest = (scoped.length ? scoped : entries).at(-1);
+  return typeof latest?.installPath === "string" && fs.existsSync(latest.installPath) ? latest.installPath : null;
+}
+
+export function latestCodexBenchPluginRoot({
+  home = os.homedir(),
+  marketplaceName = "aiwithrai",
+  pluginName = "bench"
+} = {}) {
+  const cacheDir = path.join(home, ".codex", "plugins", "cache", marketplaceName, pluginName);
+  let entries = [];
+  try {
+    entries = fs.readdirSync(cacheDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const pluginRoot = path.join(cacheDir, entry.name);
+        let mtimeMs = 0;
+        try { mtimeMs = fs.statSync(pluginRoot).mtimeMs; } catch {}
+        return { pluginRoot, mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (fs.existsSync(path.join(entry.pluginRoot, ".codex-plugin", "plugin.json"))) return entry.pluginRoot;
+  }
+  return null;
+}
+
+export function deployPluginRuntime({ repoRoot, pluginRoot }) {
+  const copied = [];
+  const copyDir = (rel) => {
+    const from = path.join(repoRoot, rel);
+    if (!fs.existsSync(from)) return;
+    fs.cpSync(from, path.join(pluginRoot, rel), { recursive: true, force: true });
+    copied.push(`${rel}/`);
+  };
+  const copyFile = (rel) => {
+    const from = path.join(repoRoot, rel);
+    if (!fs.existsSync(from)) return;
+    fs.mkdirSync(path.dirname(path.join(pluginRoot, rel)), { recursive: true });
+    fs.copyFileSync(from, path.join(pluginRoot, rel));
+    copied.push(rel);
+  };
+  fs.mkdirSync(pluginRoot, { recursive: true });
+  for (const rel of ["global-hooks", "scripts", "hooks", "commands", "skills", "codex-prompts"]) copyDir(rel);
+  for (const rel of ["hooks.json", "package.json", "README.md", "LICENSE", ".claude-plugin/plugin.json", ".codex-plugin/plugin.json"]) copyFile(rel);
+  return { pluginRoot, copied };
+}
+
 // Remove ONLY the matching legacy hook COMMANDS (not whole entries unless they become empty); register the new plan-*.mjs with ABSOLUTE paths.
 export function syncSettings({ hooksDir, settingsPath }) {
   const removedFiles = [];
@@ -212,6 +287,15 @@ export function syncSettings({ hooksDir, settingsPath }) {
     // subcommands and FAILS OPEN (runs the hook anyway) if it can't parse — so compound pushes
     // like `cd x && git push` are still covered; we just stop spawning Node for `ls`/`npm`/etc.
     if: "Bash(git *)"
+  });
+  // Pre-MERGE gate: a FAST, content-only, VISIBLE review of the incoming commits before a merge INTO a
+  // protected branch. statusMessage → visible in the spinner while it runs; timeout 150s > the hook's own
+  // 90s hard cap so it fails open cleanly rather than being SIGKILLed. Unlike the push gate this never
+  // does the deep (minutes-long) review inline — it enqueues that async — so a merge never looks hung.
+  register(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-merge-review.mjs"), {
+    statusMessage: "⛩ bench: reviewing merge…",
+    timeout: 150,
+    if: "Bash(git merge*)"
   });
   register(s.hooks.Stop, undefined, path.join(hooksDir, "stop-review.mjs"), {
     timeout: 900, asyncRewake: true,
@@ -310,24 +394,33 @@ export function compareLocalWithOrigin({ cwd, remote = "origin", branch } = {}) 
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const here = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = path.join(here, "..");
   const hooksDir = path.join(os.homedir(), ".claude", "hooks");
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
   const codexHooksDir = path.join(os.homedir(), ".codex", "hooks");
   const codexHooksPath = path.join(os.homedir(), ".codex", "hooks.json");
   const backupDir = path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared", `backup-${Date.now()}`);
   const migrate = migrateDataDir();   // FIRST — before snapshot's backupDir can create bench-shared
-  const origin = compareLocalWithOrigin({ cwd: path.join(here, "..") });
+  const origin = compareLocalWithOrigin({ cwd: repoRoot });
   const snap = snapshot({ hooksDir, settingsPath, backupDir });
-  const dep = deploy({ src: path.join(here, "..", "global-hooks"), dest: hooksDir });
-  const sync = syncSettings({ hooksDir, settingsPath });
+  const dep = deploy({ src: path.join(repoRoot, "global-hooks"), dest: hooksDir });
+  const claudePluginRoot = latestClaudeBenchPluginRoot();
+  const claudePluginDeploy = claudePluginRoot ? deployPluginRuntime({ repoRoot, pluginRoot: claudePluginRoot }) : null;
+  const sync = claudePluginRoot
+    ? removeClaudeSettingsPeerBenchHooks({ settingsPath })
+    : syncSettings({ hooksDir, settingsPath });
   const legacyCodexGate = disableLegacyCodexStopGateStates();
   const statusline = syncStatuslineSessionArg();
   const codexSnapshot = snapshotCodex({ hooksDir: codexHooksDir, hooksPath: codexHooksPath, backupDir: path.join(backupDir, "codex") });
-  const codexDeploy = deploy({ src: path.join(here, "..", "global-hooks"), dest: codexHooksDir });
-  const codexSync = syncCodexHooks({ hooksDir: codexHooksDir, hooksPath: codexHooksPath });
+  const codexDeploy = deploy({ src: path.join(repoRoot, "global-hooks"), dest: codexHooksDir });
+  const codexPluginRoot = latestCodexBenchPluginRoot();
+  const codexPluginDeploy = codexPluginRoot ? deployPluginRuntime({ repoRoot, pluginRoot: codexPluginRoot }) : null;
+  const codexSync = codexPluginRoot
+    ? removeCodexSettingsPeerBenchHooks({ hooksPath: codexHooksPath })
+    : syncCodexHooks({ hooksDir: codexHooksDir, hooksPath: codexHooksPath });
   const codexPrompts = syncCodexPrompts({
-    srcDir: path.join(here, "..", "codex-prompts"),
+    srcDir: path.join(repoRoot, "codex-prompts"),
     benchRunnerPath: path.join(here, "bench-runner.mjs")
   });
-  console.log(JSON.stringify({ origin, migrate, snapshot: snap, deploy: dep, sync, legacyCodexGate, statusline, codex: { snapshot: codexSnapshot, deploy: codexDeploy, sync: codexSync, prompts: codexPrompts } }, null, 2));
+  console.log(JSON.stringify({ origin, migrate, snapshot: snap, deploy: dep, pluginDeploy: claudePluginDeploy, sync, legacyCodexGate, statusline, codex: { snapshot: codexSnapshot, deploy: codexDeploy, pluginDeploy: codexPluginDeploy, sync: codexSync, prompts: codexPrompts } }, null, 2));
 }

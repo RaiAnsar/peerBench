@@ -12,7 +12,10 @@ import {
   snapshotCodex,
   syncCodexHooks,
   syncCodexPrompts,
+  deployPluginRuntime,
+  latestCodexBenchPluginRoot,
   removeClaudeSettingsPeerBenchHooks,
+  removeCodexSettingsPeerBenchHooks,
   syncSettings,
   syncStatuslineSessionArg
 } from "./deploy-global-hooks.mjs";
@@ -339,6 +342,9 @@ export function installPeerBench({
       env,
       skipCli: !syncClaudePlugin
     });
+    const pluginDeploy = pluginRegistry.installPath
+      ? deployPluginRuntime({ repoRoot, pluginRoot: pluginRegistry.installPath })
+      : null;
     const dep = deploy({ src: globalHooksSrc, dest: hooksDir });
     const sync = pluginRegistry.cli.skipped
       ? syncSettings({ hooksDir, settingsPath })
@@ -349,7 +355,7 @@ export function installPeerBench({
     const statusline = syncStatuslineSessionArg({
       statuslinePath: path.join(home, ".claude", "statusline-command.sh")
     });
-    result.claude = { plugin, pluginRegistry, migrate, snapshot: snap, deploy: dep, sync, legacyCodexGate, statusline };
+    result.claude = { plugin, pluginRegistry, pluginDeploy, migrate, snapshot: snap, deploy: dep, sync, legacyCodexGate, statusline };
   }
 
   if (codex) {
@@ -359,13 +365,17 @@ export function installPeerBench({
     const codexBackupDir = path.join(backupDir, "codex");
     const snap = snapshotCodex({ hooksDir, hooksPath, backupDir: codexBackupDir });
     const dep = deploy({ src: globalHooksSrc, dest: hooksDir });
-    const sync = syncCodexHooks({ hooksDir, hooksPath });
+    const pluginRoot = latestCodexBenchPluginRoot({ home });
+    const pluginDeploy = pluginRoot ? deployPluginRuntime({ repoRoot, pluginRoot }) : null;
+    const sync = pluginRoot
+      ? removeCodexSettingsPeerBenchHooks({ hooksPath })
+      : syncCodexHooks({ hooksDir, hooksPath });
     const prompts = syncCodexPrompts({
       srcDir: path.join(repoRoot, "codex-prompts"),
       promptsDir,
       benchRunnerPath: path.join(repoRoot, "scripts", "bench-runner.mjs")
     });
-    result.codex = { snapshot: snap, deploy: dep, sync, prompts };
+    result.codex = { snapshot: snap, deploy: dep, pluginDeploy, sync, prompts };
   }
 
   if (loadKeys) {
@@ -413,6 +423,9 @@ export function renderInstallSummary(result) {
         lines.push(`Claude plugin registry: installed ${c.pluginRegistry.pluginId}${c.pluginRegistry.scrubbed.length ? `; scrubbed ${c.pluginRegistry.scrubbed.length} sensitive cache file(s)` : ""}`);
       }
     }
+    if (c.pluginDeploy) {
+      lines.push(`Claude plugin cache: refreshed ${c.pluginDeploy.copied.length} path(s) in ${c.pluginDeploy.pluginRoot}`);
+    }
     if (c.sync.pluginManaged) {
       lines.push(`Claude hooks: plugin-managed; copied ${c.deploy.copied.length}, removed ${c.sync.removedEntries} legacy settings hook(s)`);
     } else {
@@ -425,7 +438,11 @@ export function renderInstallSummary(result) {
   }
   if (result.codex) {
     const c = result.codex;
-    lines.push(`Codex hooks: copied ${c.deploy.copied.length}, backed up ${c.deploy.backedUp.length}; Stop gate synced in ${c.sync.hooksPath}`);
+    if (c.pluginDeploy) {
+      lines.push(`Codex plugin cache: refreshed ${c.pluginDeploy.copied.length} path(s) in ${c.pluginDeploy.pluginRoot}; removed ${c.sync.removedEntries} settings hook(s)`);
+    } else {
+      lines.push(`Codex hooks: copied ${c.deploy.copied.length}, backed up ${c.deploy.backedUp.length}; Stop gate synced in ${c.sync.hooksPath}`);
+    }
     lines.push(`Codex prompts: copied ${c.prompts.copied.length}, backed up ${c.prompts.backedUp.length} in ${c.prompts.promptsDir}`);
   }
   if (result.keys.loaded) {

@@ -96,10 +96,11 @@ produce output:
 - **Conclude budget** — past ~150 KB of gathered context the model is told to stop
   reading and write its findings (prevents endless exploration).
 - **Network retry** + **wall-clock timeout** + per-tool try/catch.
-- **Budgets** — hunt/debug get a 12-minute wall clock; investigate and deep
-  spec/push review get 20 minutes. Deployed hooks have cushions above those
-  budgets: Stop hooks 15 minutes, Claude pre-push/deep-runner hooks 22 minutes,
-  and nested Codex reviewer tasks 25 minutes.
+- **Budgets** — hunt/debug get a 12-minute wall clock; investigate stays deep
+  at 20 minutes. Automatic deep gate reviews are capped at 10 minutes via
+  `BENCH_DEEP_REVIEW_BUDGET_MS`, with the Claude deep-runner hook capped at
+  12 minutes so a stale or hung reviewer cannot keep waking the session long
+  after the turn has moved on.
 - **Diagnostics** — set `BENCH_DEBUG=1` to stream per-round detail (request size,
   tool calls, latency, the underlying error cause) to stderr; the same diagnostics
   are saved into each hunt's trace for later inspection.

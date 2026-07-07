@@ -16,11 +16,10 @@ import {
   recoverOrphans, listBlocked, listJobs, claim, requeueForRetry, markBlocked, deleteJob, currentContentKey, GONE
 } from "./deep-queue.mjs";
 
-export const MAX_BATCH = 3;                     // claim+run at most this many CONCURRENTLY per invocation — a safety bound
-                                                // on concurrent agentic load. Full concurrency makes wall-clock ≈ one
-                                                // review regardless of N, so it stays under the timeout. Unclaimed surplus
-                                                // (> MAX_BATCH, rare) is drained via a continuation-wake (step 6), so a
-                                                // blocking finding in a surplus job is NEVER stranded while the agent idles.
+export const MAX_BATCH = 3;                     // claim+run at most this many CONCURRENTLY per batch — a safety bound
+                                                // on concurrent agentic load. Surplus is drained in later batches inside
+                                                // this same hook invocation, so Claude is not re-woken just to process
+                                                // queued clean reviews.
 export const WAKE_WINDOW_MS = 30 * 60 * 1000;   // re-WAKE a .blocked within this; after, downgrade to advisory (file kept)
 export const MAX_REVIEW_ATTEMPTS = 3;           // bound retries of a QUEUED job whose review keeps failing (git/transient).
                                                 // Safe to cap: a queued job has no completed finding, so dropping it after
@@ -81,71 +80,68 @@ export async function runMain({
     else advisory.push(findings);   // KEEP the file — never deleted by elapsed time
   }
 
-  // 3. Claim up to MAX_BATCH queued jobs (run concurrently in step 4). If MORE than MAX_BATCH are
-  //    queued, the surplus is left as .json and drained via a continuation-wake in step 6 — so an
-  //    unreviewed surplus job (which might hold a HIGH block) is never stranded while the agent idles.
-  const queued = safe(() => listJobs(ws, { sessionKey }), []);
-  const surplus = queued.length > MAX_BATCH;
-  const claimed = [];
-  for (const job of queued.slice(0, MAX_BATCH)) {
-    const claimedPath = claim(ws, job._jobKey);
-    if (claimedPath) claimed.push({ job, claimedPath });
-  }
-
-  // 4. Run the claimed batch CONCURRENTLY. Errors are NOT requeued here — step 5 handles every
-  //    retry (a throw OR a returned {retry:true}) uniformly so a single bounded path governs them.
-  const outcomes = await Promise.all(claimed.map(async ({ job, claimedPath }) => {
-    try {
-      const res = job.kind === "push"
-        ? await runPushReviewImpl(job.range, ws, { sessionKey: job.sessionKey || sessionKey })
-        : await runSpecReviewImpl(job.specPath, ws, { sessionKey: job.sessionKey || sessionKey });
-      return { job, claimedPath, res };
-    } catch (e) {
-      return { job, claimedPath, error: msg(e) };
-    }
-  }));
-
-  // 5. Persist results BEFORE delivering. A transient failure (throw OR {retry:true}) REQUEUES the
-  //    job (bounded) — never deletes it (that would lose a queued review). CLEAN → delete claim;
-  //    BLOCK → .blocked (durable) + wake.
-  for (const o of outcomes) {
-    const retryReason = o.error || (o.res && o.res.retry ? (o.res.reason || "retry") : null);
-    if (retryReason) {
-      const next = (Number(o.job.attempts) || 0) + 1;
-      if (next >= MAX_REVIEW_ATTEMPTS) {
-        deleteJob(o.claimedPath);
-        stderr(`⛩ deep-runner: ${o.job.kind} review failed ${next}x (${retryReason}); giving up on this queued job.\n`);
-      } else {
-        requeueForRetry(ws, o.claimedPath, o.job, next, { now });
-        stderr(`⛩ deep-runner: ${o.job.kind} review error (${retryReason}); requeued (attempt ${next}).\n`);
+  // 3-5. Drain queued jobs in bounded concurrent batches. Older builds exited 2 after a clean
+  //    MAX_BATCH batch just to force another Stop and process surplus, which created visible
+  //    no-action Claude turns. Keep MAX_BATCH as the concurrency cap, but drain surplus here.
+  const seenJobKeys = new Set();
+  for (;;) {
+    const queued = safe(() => listJobs(ws, { sessionKey }), []).filter((job) => !seenJobKeys.has(job._jobKey));
+    if (!queued.length) break;
+    const claimed = [];
+    for (const job of queued.slice(0, MAX_BATCH)) {
+      const claimedPath = claim(ws, job._jobKey);
+      if (claimedPath) {
+        seenJobKeys.add(job._jobKey);
+        claimed.push({ job, claimedPath });
       }
-      continue;
     }
-    if (shouldRewake({ maxSeverity: o.res.maxSeverity, findingCount: o.res.findingCount })) {
-      const findings = o.res.findings || o.res.summary || "(deep block)";
-      markBlocked(ws, o.job._jobKey, {
-        kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
-        contentKey: o.job.contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,
-        findings, traceId: o.res.traceId || null, firstBlockedTs: now
-      }, { claimedPath: o.claimedPath });
-      wake.push(findings + traceHint(o.res.traceId));
-    } else {
-      deleteJob(o.claimedPath);   // clean — nothing to lose
+    if (!claimed.length) break; // another runner claimed the visible work; stay quiet.
+
+    const outcomes = await Promise.all(claimed.map(async ({ job, claimedPath }) => {
+      try {
+        const res = job.kind === "push"
+          ? await runPushReviewImpl(job.range, ws, { sessionKey: job.sessionKey || sessionKey })
+          : await runSpecReviewImpl(job.specPath, ws, { sessionKey: job.sessionKey || sessionKey });
+        return { job, claimedPath, res };
+      } catch (e) {
+        return { job, claimedPath, error: msg(e) };
+      }
+    }));
+
+    // Persist results BEFORE delivering. A transient failure (throw OR {retry:true}) REQUEUES the
+    // job (bounded) — never deletes it (that would lose a queued review). CLEAN → delete claim;
+    // BLOCK → .blocked (durable) + wake.
+    for (const o of outcomes) {
+      const retryReason = o.error || (o.res && o.res.retry ? (o.res.reason || "retry") : null);
+      if (retryReason) {
+        const next = (Number(o.job.attempts) || 0) + 1;
+        if (next >= MAX_REVIEW_ATTEMPTS) {
+          deleteJob(o.claimedPath);
+          stderr(`⛩ deep-runner: ${o.job.kind} review failed ${next}x (${retryReason}); giving up on this queued job.\n`);
+        } else {
+          requeueForRetry(ws, o.claimedPath, o.job, next, { now });
+          stderr(`⛩ deep-runner: ${o.job.kind} review error (${retryReason}); requeued (attempt ${next}).\n`);
+        }
+        continue;
+      }
+      if (shouldRewake({ maxSeverity: o.res.maxSeverity, findingCount: o.res.findingCount })) {
+        const findings = o.res.findings || o.res.summary || "(deep block)";
+        markBlocked(ws, o.job._jobKey, {
+          kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
+          contentKey: o.job.contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,
+          findings, traceId: o.res.traceId || null, firstBlockedTs: now
+        }, { claimedPath: o.claimedPath });
+        wake.push(findings + traceHint(o.res.traceId));
+      } else {
+        deleteJob(o.claimedPath);   // clean — nothing to lose
+      }
     }
+    if (wake.length) break;
   }
 
-  // 6. Deliver. wake → stderr + exit 2 (wakes even idle, and a next Stop drains any surplus); else
-  //    a continuation-wake if unreviewed surplus remains (so it can't strand while idle); else
-  //    advisory → stdout note; else quiet.
+  // 6. Deliver. wake → stderr + exit 2 (wakes even idle); else advisory → stdout note; else quiet.
   if (wake.length) {
     stderr(`⛩ deep review found blocking issues — address them before continuing:\n\n${wake.join("\n\n")}\n`);
-    return exitImpl(2);
-  }
-  if (surplus) {
-    // No findings this batch, but more queued reviews remain unclaimed. exit 2 forces a next Stop
-    // to drain them (a clean/advisory exit 0 would let the agent idle with surplus unprocessed —
-    // a HIGH block in a surplus job would then sit unseen). Benign: no action required.
-    stderr(`⛩ deep review: ${queued.length - claimed.length} more queued review(s) — continuing to process (no action needed; a blocking finding will wake you).\n`);
     return exitImpl(2);
   }
   if (advisory.length) {

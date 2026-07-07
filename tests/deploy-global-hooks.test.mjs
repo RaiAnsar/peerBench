@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin, removeClaudeSettingsPeerBenchHooks } from "../scripts/deploy-global-hooks.mjs";
+import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin, removeClaudeSettingsPeerBenchHooks, removeCodexSettingsPeerBenchHooks, deployPluginRuntime, latestClaudeBenchPluginRoot, latestCodexBenchPluginRoot } from "../scripts/deploy-global-hooks.mjs";
 
 test("migrateDataDir: clean legacy → rename", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-"));
@@ -180,6 +180,72 @@ test("removeClaudeSettingsPeerBenchHooks removes old settings hooks and preserve
   assert.doesNotMatch(commands, /pre-push-review\.mjs/);
   assert.match(commands, /unrelated-stop\.mjs/);
   assert.match(commands, /other\.mjs/);
+});
+
+test("removeCodexSettingsPeerBenchHooks removes only the peerBench Codex wrapper", () => {
+  const hooksPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "codex-plugin-clean-")), "hooks.json");
+  fs.writeFileSync(hooksPath, JSON.stringify({
+    hooks: {
+      Stop: [
+        { hooks: [
+          { type: "command", command: 'node "/x/codex-stop-review.mjs"' },
+          { type: "command", command: 'node "/x/unrelated-stop.mjs"' }
+        ] }
+      ]
+    }
+  }, null, 2));
+
+  const result = removeCodexSettingsPeerBenchHooks({ hooksPath });
+  const saved = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
+  const commands = JSON.stringify(saved.hooks);
+  assert.equal(result.pluginManaged, true);
+  assert.equal(result.removedEntries, 1);
+  assert.doesNotMatch(commands, /codex-stop-review\.mjs/);
+  assert.match(commands, /unrelated-stop\.mjs/);
+});
+
+test("plugin root discovery finds installed Claude and newest Codex bench plugin cache", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-roots-"));
+  const claudeRoot = path.join(home, ".claude", "plugins", "cache", "aiwithrai", "bench", "0.3.0");
+  fs.mkdirSync(claudeRoot, { recursive: true });
+  fs.mkdirSync(path.dirname(path.join(home, ".claude", "plugins", "installed_plugins.json")), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "plugins", "installed_plugins.json"), JSON.stringify({
+    plugins: { "bench@aiwithrai": [{ scope: "user", installPath: claudeRoot }] }
+  }));
+
+  const oldCodexRoot = path.join(home, ".codex", "plugins", "cache", "aiwithrai", "bench", "0.2.0");
+  const newCodexRoot = path.join(home, ".codex", "plugins", "cache", "aiwithrai", "bench", "0.3.0");
+  fs.mkdirSync(path.join(oldCodexRoot, ".codex-plugin"), { recursive: true });
+  fs.mkdirSync(path.join(newCodexRoot, ".codex-plugin"), { recursive: true });
+  fs.writeFileSync(path.join(oldCodexRoot, ".codex-plugin", "plugin.json"), "{}");
+  fs.writeFileSync(path.join(newCodexRoot, ".codex-plugin", "plugin.json"), "{}");
+  const future = new Date(Date.now() + 10_000);
+  fs.utimesSync(newCodexRoot, future, future);
+
+  assert.equal(latestClaudeBenchPluginRoot({ home }), claudeRoot);
+  assert.equal(latestCodexBenchPluginRoot({ home }), newCodexRoot);
+});
+
+test("deployPluginRuntime refreshes hook/runtime files in an installed plugin cache", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-src-"));
+  const pluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-dest-"));
+  fs.mkdirSync(path.join(repo, "global-hooks"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "hooks"), { recursive: true });
+  fs.mkdirSync(path.join(repo, ".codex-plugin"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "global-hooks", "stop-review.mjs"), "new stop\n");
+  fs.writeFileSync(path.join(repo, "scripts", "bench-runner.mjs"), "new runner\n");
+  fs.writeFileSync(path.join(repo, "hooks", "hooks.json"), "{\"hooks\":{}}\n");
+  fs.writeFileSync(path.join(repo, ".codex-plugin", "plugin.json"), "{\"name\":\"bench\"}\n");
+  fs.mkdirSync(path.join(pluginRoot, "global-hooks"), { recursive: true });
+  fs.writeFileSync(path.join(pluginRoot, "global-hooks", "stop-review.mjs"), "old stop\n");
+
+  const result = deployPluginRuntime({ repoRoot: repo, pluginRoot });
+  assert.ok(result.copied.includes("global-hooks/"));
+  assert.ok(result.copied.includes("scripts/"));
+  assert.equal(fs.readFileSync(path.join(pluginRoot, "global-hooks", "stop-review.mjs"), "utf8"), "new stop\n");
+  assert.equal(fs.readFileSync(path.join(pluginRoot, "scripts", "bench-runner.mjs"), "utf8"), "new runner\n");
+  assert.equal(fs.readFileSync(path.join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"), "{\"name\":\"bench\"}\n");
 });
 
 test("compareLocalWithOrigin reports same, dirty, and differing states", () => {
