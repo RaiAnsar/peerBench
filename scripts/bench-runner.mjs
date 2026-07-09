@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput } from "../global-hooks/config-store.mjs";
+import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName } from "../global-hooks/config-store.mjs";
 import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
@@ -235,6 +235,16 @@ async function main() {
     return;
   }
 
+  // `health [--all]` — LIVE-ping every active reviewer (real 1-token API call per provider, real
+  // codex exec in the gate home) so "is the panel actually working" is one command, not vibes.
+  // --all checks every keyed provider (active or not) — e.g. verify a new key before activating it.
+  if (sub === "health") {
+    const out = await healthCommand({ all: rest.includes("--all") });
+    process.stdout.write(`${out.text}\n`);
+    process.exitCode = out.ok ? 0 : 1;
+    return;
+  }
+
   if (sub === "setup") {
     const ws = workspaceRoot(cwd);
     const cfg = resolveConfig({ env: process.env });
@@ -358,7 +368,72 @@ async function main() {
     return;
   }
 
-  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|show|setup|reviewers|scorecard|grade|hunt|investigate|debug|spec-review|off|on`);
+  throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|show|setup|health|reviewers|scorecard|grade|hunt|investigate|debug|spec-review|off|on`);
+}
+
+// LIVE health probe. API providers get a real 1-token chat completion (any 2xx = healthy — proves
+// key + endpoint + model id + our request shape in one shot); codex gets a real `codex exec` in the
+// GATE home (CODEX_HOME=~/.codex-headless) because `codex login status` lies (reports logged-in on a
+// revoked refresh token — seen live). Slow-ish on purpose: honest checks only.
+const HEALTH_API_TIMEOUT_MS = 30_000;
+const HEALTH_CODEX_TIMEOUT_MS = 180_000;
+export async function healthCommand({ all = false, env = process.env, fetchImpl, codexImpl, cfg: cfgOverride } = {}) {
+  const cfg = cfgOverride || resolveConfig({ env });
+  const doFetch = fetchImpl || globalThis.fetch;
+  const names = all
+    ? [...new Set([...cfg.reviewers, ...Object.keys(cfg.providers).filter((n) => cfg.providers[n]?.apiKey)])]
+    : cfg.reviewers;
+
+  const probeApi = async (name) => {
+    const p = cfg.providers[name];
+    if (!p?.apiKey) return { name, display: displayName(name), ok: false, note: "no api key (.keys + load-keys.mjs)" };
+    const t0 = Date.now();
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), HEALTH_API_TIMEOUT_MS);
+      const r = await doFetch(`${p.baseURL}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${p.apiKey}`, ...p.headers },
+        body: JSON.stringify({ model: p.model, messages: [{ role: "user", content: "Reply with exactly: OK" }], max_tokens: 16, stream: false }),
+        signal: ac.signal
+      }).finally(() => clearTimeout(timer));
+      const ms = Date.now() - t0;
+      if (r.ok) return { name, display: displayName(name), ok: true, note: `${p.model} · ${ms}ms` };
+      const body = (await r.text().catch(() => "")).slice(0, 120);
+      return { name, display: displayName(name), ok: false, note: `HTTP ${r.status} in ${ms}ms — ${body}` };
+    } catch (e) {
+      const kind = e?.name === "AbortError" ? `timeout >${HEALTH_API_TIMEOUT_MS / 1000}s` : String(e?.message || e).slice(0, 100);
+      return { name, display: displayName(name), ok: false, note: kind };
+    }
+  };
+
+  const probeCodex = async () => {
+    const run = codexImpl || (() => {
+      const home = path.join(os.homedir(), ".codex-headless");
+      return spawnSync("codex", ["exec", "--skip-git-repo-check", "-s", "read-only", "Reply with exactly: OK"], {
+        env: { ...env, CODEX_HOME: home }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
+      });
+    });
+    const t0 = Date.now();
+    const r = run();
+    const ms = Date.now() - t0;
+    const out = `${r.stdout || ""}\n${r.stderr || ""}`;
+    const model = (out.match(/^model:\s*(\S+)/m) || [])[1];
+    const effort = (out.match(/^reasoning effort:\s*(\S+)/m) || [])[1];
+    if (r.status === 0 && !/ERROR/.test(out)) return { name: "codex", display: "Codex", ok: true, note: `${model || "?"} @ ${effort || "?"} · ${(ms / 1000).toFixed(0)}s` };
+    const err = (out.match(/ERROR:.*$/m) || [out.trim().split("\n").at(-1) || "failed"])[0];
+    return { name: "codex", display: "Codex", ok: false, note: `${model ? `${model} @ ${effort} — ` : ""}${String(err).slice(0, 140)}` };
+  };
+
+  const results = await Promise.all(names.map((n) => (n === "codex" ? probeCodex() : probeApi(n))));
+  const active = new Set(cfg.reviewers);
+  const lines = results.map((r) => `  ${r.ok ? "✓" : "✗"} ${r.display.padEnd(8)} ${active.has(r.name) ? "active " : "keyed  "} ${r.note}`);
+  const ok = results.filter((r) => active.has(r.name)).every((r) => r.ok);
+  return {
+    ok,
+    results,
+    text: `⛩ bench health — live probes (${all ? "all keyed" : "active panel"}):\n${lines.join("\n")}\n${ok ? "All active reviewers healthy." : "ACTIVE reviewer failing — the panel will skip/fail-open on it."}`
+  };
 }
 
 const HUNT_MODES = {

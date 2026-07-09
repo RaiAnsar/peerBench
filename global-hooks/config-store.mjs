@@ -33,6 +33,12 @@ const DEFAULTS = {
   qwen: { displayName: "Qwen", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-max", keyEnv: "QWEN_API_KEY",
           temperature: 0.6, thinking: "disabled", thinkingEnv: "QWEN_THINKING",
           headers: {}, timeoutMs: 300_000 },  // 5 min
+  // Grok (xAI, metered API — $2/$6 per M tok; no flat plan). OpenAI-compatible /chat/completions at
+  // api.x.ai. Model id uses a DOT: "grok-4.5" ("grok-4-5" → model-not-found). Reasoning effort is
+  // server-side (defaults high); we send no thinking param. Re-added for Grok 4.5 (Jul 2026).
+  grok: { displayName: "Grok", baseURL: "https://api.x.ai/v1", model: "grok-4.5", keyEnv: "GROK_API_KEY",
+          temperature: 0, thinking: null, thinkingEnv: "GROK_THINKING",
+          headers: {}, timeoutMs: 300_000 },  // 5 min
   // MiniMax (flat coding plan, sk-cp- key). OpenAI-compatible /chat/completions works as a drop-in.
   // M3 is a reasoning model whose thinking can't be disabled and leaks inline as <think>…</think> in
   // content — review-client strips it. Flat plan → thinking tokens are free (better reviews, no cost).

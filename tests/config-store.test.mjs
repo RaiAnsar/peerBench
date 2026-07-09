@@ -8,12 +8,13 @@ import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setRevie
 
 test("registry: display names + KNOWN_REVIEWERS + PROVIDER_NAMES all derive from the single DEFAULTS source", () => {
   // Adding/swapping a model is one DEFAULTS entry — these are derived, not hand-maintained lists.
-  assert.deepEqual(PROVIDER_NAMES, ["kimi", "mimo", "glm", "qwen", "minimax"]);
-  assert.deepEqual(KNOWN_REVIEWERS, ["kimi", "mimo", "glm", "qwen", "minimax", "codex"]);
+  assert.deepEqual(PROVIDER_NAMES, ["kimi", "mimo", "glm", "qwen", "grok", "minimax"]);
+  assert.deepEqual(KNOWN_REVIEWERS, ["kimi", "mimo", "glm", "qwen", "grok", "minimax", "codex"]);
   assert.equal(displayName("kimi"), "Kimi");
   assert.equal(displayName("mimo"), "MiMo");
   assert.equal(displayName("glm"), "GLM");
   assert.equal(displayName("qwen"), "Qwen");
+  assert.equal(displayName("grok"), "Grok");
   assert.equal(displayName("minimax"), "MiniMax");
   assert.equal(displayName("codex"), "Codex");
   assert.equal(displayName("whatever"), "whatever", "unknown names pass through unchanged");
@@ -40,6 +41,14 @@ test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => 
 test("mimo is selectable (KNOWN, integration retained) but NOT in the default set", () => {
   assert.ok(KNOWN_REVIEWERS.includes("mimo"), "mimo must stay KNOWN/selectable (disabled, not removed)");
   assert.ok(!resolveConfig({ env: {} }).reviewers.includes("mimo"), "mimo must not be active by default");
+});
+test("grok is wired as a KNOWN/selectable provider with xAI defaults (dot model id)", () => {
+  assert.ok(KNOWN_REVIEWERS.includes("grok"), "grok must be KNOWN/selectable");
+  const a = resolveConfig({ env: { GROK_API_KEY: "gk" } });
+  assert.equal(a.providers.grok.apiKey, "gk");
+  assert.equal(a.providers.grok.model, "grok-4.5", "model id uses a DOT — grok-4-5 is model-not-found");
+  assert.equal(a.providers.grok.baseURL, "https://api.x.ai/v1");
+  assert.ok(!resolveConfig({ env: {} }).reviewers.includes("grok"), "grok must not be active by default");
 });
 test("qwen is wired as a KNOWN/selectable provider with its DashScope defaults", () => {
   assert.ok(KNOWN_REVIEWERS.includes("qwen"), "qwen must be KNOWN/selectable");

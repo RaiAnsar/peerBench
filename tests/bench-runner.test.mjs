@@ -362,3 +362,41 @@ test("gradeCommand surfaces a bad grade error but keeps the good ones", () => {
   assert.match(out, /Error grading 'Kimi:bogus'/);
   process.exitCode = prev;
 });
+
+// ── health: live-probe plumbing (stubbed transports — no network) ──────────────
+test("healthCommand probes active reviewers and fails on an active failure", async () => {
+  const { healthCommand } = await import("../scripts/bench-runner.mjs");
+  const cfg = {
+    reviewers: ["codex", "mimo"],
+    providers: { mimo: { apiKey: "k", baseURL: "https://x/v1", model: "mimo-v2.5-pro", headers: {} } }
+  };
+  const okFetch = async () => ({ ok: true, status: 200, text: async () => "" });
+  const okCodex = () => ({ status: 0, stdout: "model: gpt-5.6-sol\nreasoning effort: xhigh\nOK", stderr: "" });
+  const healthy = await healthCommand({ cfg, fetchImpl: okFetch, codexImpl: okCodex });
+  assert.equal(healthy.ok, true);
+  assert.match(healthy.text, /✓ Codex/);
+  assert.match(healthy.text, /gpt-5\.6-sol @ xhigh/);
+  assert.match(healthy.text, /✓ MiMo/);
+
+  const failFetch = async () => ({ ok: false, status: 429, text: async () => '{"error":"overloaded"}' });
+  const sick = await healthCommand({ cfg, fetchImpl: failFetch, codexImpl: okCodex });
+  assert.equal(sick.ok, false, "an active API reviewer failing must fail health");
+  assert.match(sick.text, /✗ MiMo.*HTTP 429/);
+});
+
+test("healthCommand --all probes keyed-but-inactive providers without failing overall health", async () => {
+  const { healthCommand } = await import("../scripts/bench-runner.mjs");
+  const cfg = {
+    reviewers: ["mimo"],
+    providers: {
+      mimo: { apiKey: "k", baseURL: "https://x/v1", model: "m", headers: {} },
+      grok: { apiKey: "gk", baseURL: "https://api.x.ai/v1", model: "grok-4.5", headers: {} }
+    }
+  };
+  const fetchImpl = async (url) => url.includes("x.ai")
+    ? { ok: false, status: 401, text: async () => "bad key" }
+    : { ok: true, status: 200, text: async () => "" };
+  const r = await healthCommand({ all: true, cfg, fetchImpl, codexImpl: () => ({ status: 0, stdout: "", stderr: "" }) });
+  assert.match(r.text, /✗ Grok.*keyed.*HTTP 401/, "inactive keyed provider is probed and reported");
+  assert.equal(r.ok, true, "an INACTIVE provider failing must not fail overall health");
+});
