@@ -377,7 +377,7 @@ async function main() {
 // revoked refresh token — seen live). Slow-ish on purpose: honest checks only.
 const HEALTH_API_TIMEOUT_MS = 30_000;
 const HEALTH_CODEX_TIMEOUT_MS = 180_000;
-export async function healthCommand({ all = false, env = process.env, fetchImpl, codexImpl, cfg: cfgOverride } = {}) {
+export async function healthCommand({ all = false, env = process.env, fetchImpl, codexImpl, grokImpl, cfg: cfgOverride } = {}) {
   const cfg = cfgOverride || resolveConfig({ env });
   const doFetch = fetchImpl || globalThis.fetch;
   const names = all
@@ -420,12 +420,29 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
     const out = `${r.stdout || ""}\n${r.stderr || ""}`;
     const model = (out.match(/^model:\s*(\S+)/m) || [])[1];
     const effort = (out.match(/^reasoning effort:\s*(\S+)/m) || [])[1];
-    if (r.status === 0 && !/ERROR/.test(out)) return { name: "codex", display: "Codex", ok: true, note: `${model || "?"} @ ${effort || "?"} · ${(ms / 1000).toFixed(0)}s` };
-    const err = (out.match(/ERROR:.*$/m) || [out.trim().split("\n").at(-1) || "failed"])[0];
+    // Success = it actually ANSWERED. Exit code + ERROR lines both lie: codex exec exits 0 on an API
+    // 400 (ERROR line, no answer), and prints non-fatal ERROR telemetry (models_manager refresh
+    // timeout) on runs that answer fine. The probe prompt demands "OK", so require it in stdout.
+    const answered = /(^|\n)OK\s*(\n|$)/.test(r.stdout || "");
+    if (r.status === 0 && answered) return { name: "codex", display: "Codex", ok: true, note: `${model || "?"} @ ${effort || "?"} · ${(ms / 1000).toFixed(0)}s` };
+    const errLines = out.match(/ERROR.*$/gm) || [];
+    const err = errLines.at(-1) || out.trim().split("\n").at(-1) || "failed";
     return { name: "codex", display: "Codex", ok: false, note: `${model ? `${model} @ ${effort} — ` : ""}${String(err).slice(0, 140)}` };
   };
 
-  const results = await Promise.all(names.map((n) => (n === "codex" ? probeCodex() : probeApi(n))));
+  const probeGrok = async () => {
+    const run = grokImpl || (() => spawnSync("grok", ["-p", "Reply with exactly: OK", "--no-memory", "--no-subagents", "--disable-web-search"], {
+      env, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
+    }));
+    const t0 = Date.now();
+    const r = run();
+    const ms = Date.now() - t0;
+    if (r.error?.code === "ENOENT") return { name: "grok", display: "Grok", ok: false, note: "grok CLI not found (curl -fsSL https://x.ai/cli/install.sh | bash)" };
+    if (r.status === 0 && /OK/.test(r.stdout || "")) return { name: "grok", display: "Grok", ok: true, note: `grok CLI (plan) · ${(ms / 1000).toFixed(1)}s` };
+    return { name: "grok", display: "Grok", ok: false, note: `${(r.stderr || r.stdout || "failed").trim().slice(0, 140)}` };
+  };
+
+  const results = await Promise.all(names.map((n) => (n === "codex" ? probeCodex() : n === "grok" ? probeGrok() : probeApi(n))));
   const active = new Set(cfg.reviewers);
   const lines = results.map((r) => `  ${r.ok ? "✓" : "✗"} ${r.display.padEnd(8)} ${active.has(r.name) ? "active " : "keyed  "} ${r.note}`);
   const ok = results.filter((r) => active.has(r.name)).every((r) => r.ok);

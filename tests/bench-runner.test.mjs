@@ -390,13 +390,24 @@ test("healthCommand --all probes keyed-but-inactive providers without failing ov
     reviewers: ["mimo"],
     providers: {
       mimo: { apiKey: "k", baseURL: "https://x/v1", model: "m", headers: {} },
-      grok: { apiKey: "gk", baseURL: "https://api.x.ai/v1", model: "grok-4.5", headers: {} }
+      qwen: { apiKey: "qk", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-max", headers: {} }
     }
   };
-  const fetchImpl = async (url) => url.includes("x.ai")
+  const fetchImpl = async (url) => url.includes("aliyuncs")
     ? { ok: false, status: 401, text: async () => "bad key" }
     : { ok: true, status: 200, text: async () => "" };
   const r = await healthCommand({ all: true, cfg, fetchImpl, codexImpl: () => ({ status: 0, stdout: "", stderr: "" }) });
-  assert.match(r.text, /✗ Grok.*keyed.*HTTP 401/, "inactive keyed provider is probed and reported");
+  assert.match(r.text, /✗ Qwen.*keyed.*HTTP 401/, "inactive keyed provider is probed and reported");
   assert.equal(r.ok, true, "an INACTIVE provider failing must not fail overall health");
+});
+
+test("healthCommand probes grok via the CLI (stub), reporting plan-billed health", async () => {
+  const { healthCommand } = await import("../scripts/bench-runner.mjs");
+  const cfg = { reviewers: ["grok"], providers: {} };
+  const r = await healthCommand({ cfg, grokImpl: () => ({ status: 0, stdout: "OK", stderr: "" }) });
+  assert.equal(r.ok, true);
+  assert.match(r.text, /✓ Grok.*grok CLI \(plan\)/);
+  const sick = await healthCommand({ cfg, grokImpl: () => ({ status: 1, stdout: "", stderr: "not logged in" }) });
+  assert.equal(sick.ok, false);
+  assert.match(sick.text, /✗ Grok.*not logged in/);
 });

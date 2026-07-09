@@ -33,12 +33,6 @@ const DEFAULTS = {
   qwen: { displayName: "Qwen", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-max", keyEnv: "QWEN_API_KEY",
           temperature: 0.6, thinking: "disabled", thinkingEnv: "QWEN_THINKING",
           headers: {}, timeoutMs: 300_000 },  // 5 min
-  // Grok (xAI, metered API — $2/$6 per M tok; no flat plan). OpenAI-compatible /chat/completions at
-  // api.x.ai. Model id uses a DOT: "grok-4.5" ("grok-4-5" → model-not-found). Reasoning effort is
-  // server-side (defaults high); we send no thinking param. Re-added for Grok 4.5 (Jul 2026).
-  grok: { displayName: "Grok", baseURL: "https://api.x.ai/v1", model: "grok-4.5", keyEnv: "GROK_API_KEY",
-          temperature: 0, thinking: null, thinkingEnv: "GROK_THINKING",
-          headers: {}, timeoutMs: 300_000 },  // 5 min
   // MiniMax (flat coding plan, sk-cp- key). OpenAI-compatible /chat/completions works as a drop-in.
   // M3 is a reasoning model whose thinking can't be disabled and leaks inline as <think>…</think> in
   // content — review-client strips it. Flat plan → thinking tokens are free (better reviews, no cost).
@@ -48,12 +42,15 @@ const DEFAULTS = {
              temperature: 1.0, thinking: null, thinkingEnv: "MINIMAX_THINKING",
              headers: {}, timeoutMs: 300_000 }  // 5 min
 };
-// Codex has no API-key config (it shells out to the codex plugin), so it is a valid reviewer but
-// lives outside DEFAULTS.
+// CLI-backed reviewers have no API-key config, so they live outside DEFAULTS:
+//  - codex shells out to the codex-plugin-cc companion (ChatGPT plan billing).
+//  - grok shells out to the local Grok Build CLI (`grok`, installed via x.ai/cli/install.sh) —
+//    Grok-plan billing, no metered API key. Runs read-only via --permission-mode plan.
 const CODEX = "codex";
+const GROK = "grok";
 export const PROVIDER_NAMES = Object.keys(DEFAULTS);                 // API-backed providers (for load-keys)
-export const KNOWN_REVIEWERS = [...PROVIDER_NAMES, CODEX];
-const DISPLAY = { ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => [k, v.displayName || k])), [CODEX]: "Codex" };
+export const KNOWN_REVIEWERS = [...PROVIDER_NAMES, CODEX, GROK];
+const DISPLAY = { ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => [k, v.displayName || k])), [CODEX]: "Codex", [GROK]: "Grok" };
 export function displayName(name) { return DISPLAY[name] || name; }
 const DEFAULT_REVIEWERS = ["kimi", "glm"];   // fallback only (mimo disabled); the active set lives in companion.json
 export function sharedRoot() {

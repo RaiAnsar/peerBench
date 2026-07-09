@@ -90,6 +90,32 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
   }
 }
 
+// Grok side: the local Grok Build CLI (x.ai harness), plan-billed — no API key. Headless single-turn
+// agent run: -p prints the response and exits; --permission-mode plan = read-only (no edits);
+// --no-memory/--no-subagents/--disable-web-search keep a review deterministic and repo-scoped.
+// BENCH_SUPPRESS_HOOKS: grok loads Claude Code settings (hooks included) — suppress ours inside it.
+const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40"];
+
+export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok" }) {
+  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
+  const r = await spawnCollect(bin, GROK_ARGS(prompt), { cwd, env: childEnv, timeoutMs });
+  if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
+  if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
+  const v = parseVerdict(String(r.stdout ?? "").trim());
+  if (!v.verdict) return { name: "Grok", error: "unexpected reviewer output" };
+  return { name: "Grok", ...v };
+}
+
+// Grok open-ended TASK → raw output (for hunt/deep gates; findings kept, no verdict parsing).
+export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok" }) {
+  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
+  const r = await spawnCollect(bin, GROK_ARGS(prompt), { cwd, env: childEnv, timeoutMs });
+  if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
+  if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
+  const raw = String(r.stdout ?? "").trim();
+  return raw ? { name: "Grok", raw } : { name: "Grok", error: "grok returned empty output" };
+}
+
 // Codex open-ended TASK → raw output (for hunt; no verdict parsing, so findings are kept).
 // timeoutMs overrides the default agentic budget — the deep-review GATE passes a short (~10 min)
 // cap so a push/spec review lands promptly; hunt/investigate omit it and keep the full 25 min.

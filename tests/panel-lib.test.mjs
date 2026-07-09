@@ -225,3 +225,36 @@ test("severity-gate UNCHANGED default: a medium BLOCK with NO blockMinSeverity s
   assert.equal(r.badge, "MiMo✗", "no severity-gating → ✗ for a BLOCK");
   assert.equal(r.advisories === undefined || r.advisories.length === 0, true, "no advisories without severity-gating");
 });
+
+test("runGrokTask/runGrokReview spawn the grok CLI headless read-only and honor timeoutMs", async () => {
+  const { runGrokTask, runGrokReview } = await import("../global-hooks/panel-lib.mjs");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-cli-"));
+  const fake = path.join(dir, "fake-grok.mjs");
+  // Fake grok: asserts headless read-only flags, prints a verdict. args[0] must be -p.
+  fs.writeFileSync(fake, [
+    "const a = process.argv.slice(2);",
+    "if (a[0] !== '-p' || !a.includes('--permission-mode') || a[a.indexOf('--permission-mode')+1] !== 'plan') { console.error('bad flags: '+a.join(' ')); process.exit(3); }",
+    "if (process.env.BENCH_SUPPRESS_HOOKS !== '1') { console.error('hooks not suppressed'); process.exit(4); }",
+    "console.log('ALLOW: grok healthy');",
+    ""
+  ].join("\n"));
+  const wrap = path.join(dir, "grok");
+  fs.writeFileSync(wrap, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`); fs.chmodSync(wrap, 0o755);
+  const rv = await runGrokReview({ prompt: "review this", cwd: dir, env: {}, bin: wrap });
+  assert.equal(rv.verdict, "ALLOW");
+  const rt = await runGrokTask({ prompt: "hunt this", cwd: dir, env: {}, bin: wrap });
+  assert.match(rt.raw, /ALLOW: grok healthy/);
+  // timeout: a sleeper wrapper must be killed near the cap
+  const sleeper = path.join(dir, "sleeper");
+  fs.writeFileSync(sleeper, `#!/bin/sh\nsleep 60\n`); fs.chmodSync(sleeper, 0o755);
+  const t0 = Date.now();
+  const rslow = await runGrokTask({ prompt: "x", cwd: dir, env: {}, timeoutMs: 200, bin: sleeper });
+  assert.ok(rslow.error, "timed-out grok returns an error");
+  assert.ok(Date.now() - t0 < 5000, "killed near the cap");
+});
+
+test("runGrokTask reports a missing grok CLI with the install hint", async () => {
+  const { runGrokTask } = await import("../global-hooks/panel-lib.mjs");
+  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "/nonexistent/grok-bin" });
+  assert.match(r.error, /grok CLI not found/);
+});

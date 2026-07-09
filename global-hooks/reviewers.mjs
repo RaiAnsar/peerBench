@@ -1,5 +1,5 @@
 // global-hooks/reviewers.mjs
-import { parseVerdict, runCodexReview } from "./panel-lib.mjs";
+import { parseVerdict, runCodexReview, runGrokReview } from "./panel-lib.mjs";
 import { resolveConfig, displayName } from "./config-store.mjs";
 import { review as defaultReview } from "./review-client.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
@@ -28,6 +28,14 @@ function codexAdapter() {
   } };
 }
 
+// Grok Build CLI (local x.ai harness, plan-billed — no API key). Same shape as codexAdapter:
+// spawn headless, read-only (plan mode), parse the ALLOW/BLOCK verdict from stdout.
+function grokAdapter() {
+  return { name: "grok", async run({ system, user, cwd, env = process.env }) {
+    return runGrokReview({ prompt: `${system}\n\n${user}`, cwd, env });
+  } };
+}
+
 // Scan EVERY line (skip filler / code-fence / blank) for the first ALLOW:/BLOCK: line.
 // Lines inside a ``` fence are ignored so model examples can't trigger a false verdict.
 export function extractVerdict(text) {
@@ -51,6 +59,7 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
   const cfg = resolveConfig({ env, reviewers });
   return cfg.reviewers.map((name) => {
     if (name === "codex") return codexAdapter();
+    if (name === "grok") return grokAdapter();
     const p = cfg.providers[name];
     const display = displayName(name);
     return {

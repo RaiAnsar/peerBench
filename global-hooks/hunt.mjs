@@ -2,7 +2,7 @@ import { resolveConfig, displayName } from "./config-store.mjs";
 import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
-import { runCodexTask } from "./panel-lib.mjs";
+import { runCodexTask, runGrokTask } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
 import { parseSeverity, stripThink } from "./deep-review.mjs";
 import path from "node:path";
@@ -154,7 +154,7 @@ const INVESTIGATE_ROUND_MS = 240_000;     // thinking rounds are slow ON PURPOSE
 // hunt/investigate never pass budgetMs, so their full 12/20/25-min budgets are untouched.
 const DEEP_REVIEW_BUDGET_MS = Number(process.env.BENCH_DEEP_REVIEW_BUDGET_MS) || 10 * 60 * 1000;
 
-export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, codexImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user }) {
+export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, codexImpl, grokImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user }) {
   const cfg = resolveConfig({ env });
   const userMsg = user || buildHuntUser(seed);
   const debug = !!env.BENCH_DEBUG;
@@ -171,6 +171,12 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
         const r = await (codexImpl || runCodexTask)({ companionPath: path.join(root, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${userMsg}`, cwd, env: codexEnv, ...(budgetMs ? { timeoutMs: budgetMs } : {}) });
         if (debug) console.error(`[hunt codex] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
         return { name: "Codex", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
+      }
+      if (name === "grok") {
+        // Grok Build CLI — its own agentic harness explores the repo read-only (plan mode), plan-billed.
+        const r = await (grokImpl || runGrokTask)({ prompt: `${system}\n\n${userMsg}`, cwd, env, ...(budgetMs ? { timeoutMs: budgetMs } : {}) });
+        if (debug) console.error(`[hunt grok] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
+        return { name: "Grok", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
       }
       const p = cfg.providers[name];
       if (!p?.apiKey) return { name: display, findings: "", error: "no api key" };
