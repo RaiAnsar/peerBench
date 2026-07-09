@@ -106,41 +106,42 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // mechanism codex uses) via grokSpawnSpec below. The grok flags stay as defense-in-depth only.
 export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--no-leader", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
 
-// Seatbelt profile (last-match-wins). This is an ALLOWLIST, not a blocklist: default-deny every
-// write, then re-allow ONLY grok's non-executable runtime data — the exact set an empirical headless
-// review touches (sessions/, docs/, logs/, active_sessions.json) plus the state/cache files it may
-// refresh mid-run (auth token, model cache, worktrees db, ui state). EVERYTHING else under ~/.grok
-// stays denied by falling through to the base deny: binaries (bin/, downloads/, vendor/), plugins &
-// skills (bundled/, installed-plugins/, plugins/, marketplace-cache/, skills/), shell hooks
-// (completions/, hooks/), and behavior/containment config (config.toml, sandbox.toml,
-// user-settings.json). A blocklist here was the wrong shape — it left downloads/ and vendor/ (real
-// binary-promotion surfaces) writable and would silently re-open on any NEW surface a future grok
-// version adds; the allowlist denies unknown surfaces by DEFAULT. Writes outside ~/.grok are limited
-// to a PER-RUN private tmpdir (not the shared /private/var/folders root) and /dev. Fail-closed:
-// sandbox-exec refuses to exec on a bad profile and our spawn surfaces that as a reviewer error —
-// never unsandboxed. (Every escalation here was caught by the Codex stop gate.)
-export const GROK_DATA_SUBPATHS = ["sessions", "logs", "projects", "docs", "upload_queue"];
-export const GROK_DATA_FILES = [
-  "active_sessions.json", "active_sessions.lock", "auth.json", "auth.json.lock",
-  "models_cache.json", "sandbox-events.jsonl", "worktrees.db", "slash-mru.json", "tip_cursor.json",
-];
-export const GROK_SEATBELT_PROFILE = (home, tmpDir) => {
-  const g = `${home}/.grok`;
-  const dataGrants = [
-    ...GROK_DATA_SUBPATHS.map((d) => `(subpath "${g}/${d}")`),
-    ...GROK_DATA_FILES.map((f) => `(literal "${g}/${f}")`),
-  ].join(" ");
-  return `(version 1)(allow default)(deny file-write*)` +
-    `(allow file-write* ${dataGrants}${tmpDir ? ` (subpath "${tmpDir}")` : ""} (subpath "/dev"))`;
-};
+// Seatbelt profile (last-match-wins). grok's ENTIRE writable state is redirected into the per-run
+// ephemeral tmpdir via GROK_HOME (see grokChildEnv), so this profile grants writes ONLY to that
+// tmpdir + /dev and denies everything else — ALL of ~/.grok is READ-ONLY. That closes every ~/.grok
+// surface at once, without enumerating any: binaries (bin/, downloads/, vendor/), plugins & skills
+// (bundled/, installed-plugins/, marketplace-cache/, skills/), shell hooks (completions/, hooks/),
+// behavior/containment config (config.toml, sandbox.toml, user-settings.json), AND the model-routing
+// models_cache.json. An enumerated allowlist was still too clever — it kept models_cache.json (a
+// persistent routing surface) writable; the redirect makes the whole question moot: nothing under
+// ~/.grok is writable and the tmpdir is deleted after the run, so NOTHING grok writes persists to the
+// next session. grok's own --sandbox read-only is a VERIFIED NO-OP (wrote into the workspace under
+// bypassPermissions) — never trust it; this OS wrapper + `--no-leader` are the hard guarantee.
+// Fail-closed: sandbox-exec refuses a bad profile and our spawn surfaces that as a reviewer error.
+// (Every escalation here was caught by the Codex stop gate.)
+export const GROK_SEATBELT_PROFILE = (tmpDir) =>
+  `(version 1)(allow default)(deny file-write*)(allow file-write*${tmpDir ? ` (subpath "${tmpDir}")` : ""} (subpath "/dev"))`;
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
 // darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
 // fail-open stderr check in the runners is the net.
-export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, home = os.homedir(), tmpDir } = {}) {
+export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir } = {}) {
   const args = GROK_ARGS(prompt);
-  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(home, tmpDir), bin, ...args] };
+  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir), bin, ...args] };
   return { cmd: bin, args };
+}
+
+// Child env for every grok spawn. GROK_HOME repoints grok's whole state dir at the ephemeral,
+// Seatbelt-writable tmpdir (so ~/.grok stays read-only and nothing persists); GROK_AUTH_PATH reads
+// the token from the REAL ~/.grok/auth.json (read-only) so the redirected home still authenticates
+// without exposing the token to writes; BENCH_SUPPRESS_HOOKS stops grok from firing Claude Code hooks.
+export function grokChildEnv(env, tmpDir, home) {
+  return {
+    ...env,
+    BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1",
+    GROK_AUTH_PATH: path.join(home || os.homedir(), ".grok", "auth.json"),
+    ...(tmpDir ? { TMPDIR: tmpDir, GROK_HOME: tmpDir } : {}),
+  };
 }
 
 // Per-run private TMPDIR (realpath'd — Seatbelt matches real paths, /var → /private/var). The child
@@ -166,8 +167,8 @@ export function grokText(stdout) {
 
 export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
   const tmpDir = makeGrokTmpDir();
-  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1", ...(tmpDir ? { TMPDIR: tmpDir } : {}) };
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
+  const childEnv = grokChildEnv(env, tmpDir, home);
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
@@ -180,8 +181,8 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
 // Grok open-ended TASK → raw output (for hunt/deep gates; findings kept, no verdict parsing).
 export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
   const tmpDir = makeGrokTmpDir();
-  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1", ...(tmpDir ? { TMPDIR: tmpDir } : {}) };
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
+  const childEnv = grokChildEnv(env, tmpDir, home);
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };

@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName } from "../global-hooks/config-store.mjs";
-import { combinePanel, untrackedBlock, grokSpawnSpec, grokText } from "../global-hooks/panel-lib.mjs";
+import { combinePanel, untrackedBlock, grokSpawnSpec, grokChildEnv, grokText } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
@@ -434,13 +434,14 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
     // Same safety contract as production reviews (GROK_ARGS: plan mode, verbatim, no memory/subagents/
     // web) + suppressed hooks — a probe outside it could write to the workspace while claiming "(plan)".
     const run = grokImpl || (() => {
-      // Same containment as real reviews: Seatbelt profile + a per-run private TMPDIR.
+      // Same containment as real reviews: Seatbelt profile + GROK_HOME redirected into a per-run
+      // private tmpdir (so ~/.grok stays read-only), auth read from the real read-only auth.json.
       let tmpDir = null;
       try { tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grok-bench-"))); } catch { /* no tmp grant */ }
       const spec = grokSpawnSpec("Reply with exactly: OK", { ...(tmpDir ? { tmpDir } : {}) });
       try {
         return spawnSync(spec.cmd, spec.args, {
-          env: { ...env, BENCH_SUPPRESS_HOOKS: env.BENCH_SUPPRESS_HOOKS || "1", ...(tmpDir ? { TMPDIR: tmpDir } : {}) }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
+          env: grokChildEnv(env, tmpDir), encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
         });
       } finally { if (tmpDir) try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
     });
