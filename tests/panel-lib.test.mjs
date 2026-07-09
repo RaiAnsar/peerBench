@@ -234,6 +234,7 @@ test("runGrokTask/runGrokReview spawn the grok CLI headless read-only and honor 
   fs.writeFileSync(fake, [
     "const a = process.argv.slice(2);",
     "if (a[0] !== '-p' || !a.includes('--permission-mode') || a[a.indexOf('--permission-mode')+1] !== 'plan') { console.error('bad flags: '+a.join(' ')); process.exit(3); }",
+    "if (!a.includes('--sandbox') || a[a.indexOf('--sandbox')+1] !== 'read-only') { console.error('missing read-only sandbox: '+a.join(' ')); process.exit(5); }",
     "if (process.env.BENCH_SUPPRESS_HOOKS !== '1') { console.error('hooks not suppressed'); process.exit(4); }",
     "console.log('ALLOW: grok healthy');",
     ""

@@ -99,7 +99,10 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // --output-format json: grok streams working NARRATION into plain stdout (even mid-sentence around
 // the verdict — broke first-line parsing, seen on Grok's first live review). JSON cleanly separates
 // the final answer (.text) from .thought/narration.
-export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
+// --sandbox read-only is the HARD read-only guarantee (OS-level, fail-closed: grok "refuses to start
+// rather than run unsandboxed" if the profile can't apply). plan mode alone only blocks edit TOOLS —
+// a bash-style tool could still mutate (caught by the Codex stop gate). plan stays as defense-in-depth.
+export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
 
 // Extract the final answer from grok stdout: JSON .text when parseable, else the raw stdout
 // (fallback keeps us working if the CLI's JSON shape changes).
