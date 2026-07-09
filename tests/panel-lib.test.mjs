@@ -274,20 +274,31 @@ test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-
   assert.equal(l.cmd, "grok", "non-darwin spawns bare (fail-open stderr check is the net)");
 });
 
-test("GROK_SEATBELT_PROFILE closes the code-exec + shared-tmp escape surfaces (caught by the Codex gate)", async () => {
-  const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
+test("GROK_SEATBELT_PROFILE is an ALLOWLIST — code-exec surfaces are denied by omission, not blocklisted (Codex gate)", async () => {
+  const { GROK_SEATBELT_PROFILE, GROK_DATA_SUBPATHS, GROK_DATA_FILES } = await import("../global-hooks/panel-lib.mjs");
   const p = GROK_SEATBELT_PROFILE("/Users/u", "/private/tmp/grok-bench-x");
+  // Default-deny with a SINGLE base deny; the fix flipped from allow-all-then-deny-back (a
+  // blocklist that silently re-opens on any new surface) to allow-only-the-data (default-deny).
+  assert.equal((p.match(/deny file-write/g) || []).length, 1, "exactly one base deny — no fragile deny-back list");
+  // The blanket ~/.grok grant is GONE (that grant is what left downloads/ & vendor/ writable).
+  assert.ok(!p.includes('(subpath "/Users/u/.grok")'), "must NOT grant all of ~/.grok");
+  // grok's non-executable runtime data IS granted (an empirical review writes exactly these).
+  for (const d of GROK_DATA_SUBPATHS) assert.ok(p.includes(`(subpath "/Users/u/.grok/${d}")`), `data dir ${d} must be writable`);
+  for (const f of GROK_DATA_FILES) assert.ok(p.includes(`(literal "/Users/u/.grok/${f}")`), `data file ${f} must be writable`);
+  assert.ok(p.includes('(subpath "/Users/u/.grok/sessions")'), "sessions writable (review transcript)");
+  // Every code-execution / config surface is ABSENT from the profile entirely → denied by fall-through.
+  // Includes downloads/ & vendor/ (binary promotion) and marketplace-cache/ & skills/ — the four the
+  // old blocklist MISSED. Their mere absence from an allowlist is the guarantee.
+  for (const surface of ["bin", "bundled", "installed-plugins", "plugins", "completions", "hooks",
+                         "downloads", "vendor", "skills", "marketplace-cache"]) {
+    assert.ok(!p.includes(`.grok/${surface}`), `~/.grok/${surface} must NOT appear (denied by omission)`);
+  }
+  for (const cfg of ["config.toml", "sandbox.toml", "user-settings.json"]) {
+    assert.ok(!p.includes(`.grok/${cfg}`), `~/.grok/${cfg} must NOT be writable (behavior/containment tamper)`);
+  }
   // A per-run private tmp is granted; the blanket shared TMPDIR root is NOT.
   assert.ok(p.includes('(subpath "/private/tmp/grok-bench-x")'), "per-run tmp is writable");
   assert.ok(!p.includes('"/private/var/folders"'), "must NOT grant the shared TMPDIR root (other processes' temp)");
-  // Every write-→-code-execution surface inside ~/.grok is denied back after the broad grant.
-  for (const sub of ["/bin", "/bundled", "/installed-plugins", "/plugins", "/completions", "/hooks"]) {
-    assert.ok(p.includes(`(subpath "/Users/u/.grok${sub}")`), `~/.grok${sub} must be re-denied (code planting)`);
-  }
-  assert.ok(p.includes('(literal "/Users/u/.grok/config.toml")'), "config.toml re-denied (containment tamper)");
-  assert.ok(p.includes('(literal "/Users/u/.grok/sandbox.toml")'), "sandbox.toml re-denied");
-  // last-match-wins: the deny lines come AFTER the ~/.grok allow.
-  assert.ok(p.lastIndexOf('deny file-write* (subpath "/Users/u/.grok/bin")') > p.indexOf('allow file-write* (subpath "/Users/u/.grok")'), "deny must follow the allow (last-match-wins)");
 });
 
 test("runGrokTask fail-closes when grok reports its sandbox could not be applied", async () => {

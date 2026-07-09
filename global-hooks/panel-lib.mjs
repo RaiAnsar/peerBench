@@ -106,19 +106,32 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // mechanism codex uses) via grokSpawnSpec below. The grok flags stay as defense-in-depth only.
 export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--no-leader", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
 
-// Seatbelt profile (last-match-wins). Writable: grok's state (~/.grok: sessions, auth refresh,
-// caches), a PER-RUN private tmpdir, and /dev. Then DENIED back inside ~/.grok: every surface whose
-// write means code execution or behavior change on the user's NEXT grok run — bin/ (binary
-// poisoning), bundled/ + installed-plugins/ + plugins/ (plugin planting), completions/ (shell
-// injection), hooks/, config.toml + sandbox.toml (containment tampering). The per-run tmpdir
-// replaces the old blanket /private/var/folders grant, which exposed EVERY process's temp/cache
-// files (both escapes caught by the Codex stop gate). Fail-closed: sandbox-exec refuses to exec on
-// a bad profile and our spawn surfaces that as a reviewer error — never unsandboxed.
+// Seatbelt profile (last-match-wins). This is an ALLOWLIST, not a blocklist: default-deny every
+// write, then re-allow ONLY grok's non-executable runtime data — the exact set an empirical headless
+// review touches (sessions/, docs/, logs/, active_sessions.json) plus the state/cache files it may
+// refresh mid-run (auth token, model cache, worktrees db, ui state). EVERYTHING else under ~/.grok
+// stays denied by falling through to the base deny: binaries (bin/, downloads/, vendor/), plugins &
+// skills (bundled/, installed-plugins/, plugins/, marketplace-cache/, skills/), shell hooks
+// (completions/, hooks/), and behavior/containment config (config.toml, sandbox.toml,
+// user-settings.json). A blocklist here was the wrong shape — it left downloads/ and vendor/ (real
+// binary-promotion surfaces) writable and would silently re-open on any NEW surface a future grok
+// version adds; the allowlist denies unknown surfaces by DEFAULT. Writes outside ~/.grok are limited
+// to a PER-RUN private tmpdir (not the shared /private/var/folders root) and /dev. Fail-closed:
+// sandbox-exec refuses to exec on a bad profile and our spawn surfaces that as a reviewer error —
+// never unsandboxed. (Every escalation here was caught by the Codex stop gate.)
+export const GROK_DATA_SUBPATHS = ["sessions", "logs", "projects", "docs", "upload_queue"];
+export const GROK_DATA_FILES = [
+  "active_sessions.json", "active_sessions.lock", "auth.json", "auth.json.lock",
+  "models_cache.json", "sandbox-events.jsonl", "worktrees.db", "slash-mru.json", "tip_cursor.json",
+];
 export const GROK_SEATBELT_PROFILE = (home, tmpDir) => {
   const g = `${home}/.grok`;
+  const dataGrants = [
+    ...GROK_DATA_SUBPATHS.map((d) => `(subpath "${g}/${d}")`),
+    ...GROK_DATA_FILES.map((f) => `(literal "${g}/${f}")`),
+  ].join(" ");
   return `(version 1)(allow default)(deny file-write*)` +
-    `(allow file-write* (subpath "${g}")${tmpDir ? ` (subpath "${tmpDir}")` : ""} (subpath "/dev"))` +
-    `(deny file-write* (subpath "${g}/bin") (subpath "${g}/bundled") (subpath "${g}/installed-plugins") (subpath "${g}/plugins") (subpath "${g}/completions") (subpath "${g}/hooks") (literal "${g}/config.toml") (literal "${g}/sandbox.toml"))`;
+    `(allow file-write* ${dataGrants}${tmpDir ? ` (subpath "${tmpDir}")` : ""} (subpath "/dev"))`;
 };
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
