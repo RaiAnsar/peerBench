@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName } from "../global-hooks/config-store.mjs";
-import { combinePanel, untrackedBlock, GROK_ARGS, grokText } from "../global-hooks/panel-lib.mjs";
+import { combinePanel, untrackedBlock, grokSpawnSpec, grokText } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
@@ -433,9 +433,12 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
   const probeGrok = async () => {
     // Same safety contract as production reviews (GROK_ARGS: plan mode, verbatim, no memory/subagents/
     // web) + suppressed hooks — a probe outside it could write to the workspace while claiming "(plan)".
-    const run = grokImpl || (() => spawnSync("grok", GROK_ARGS("Reply with exactly: OK"), {
-      env: { ...env, BENCH_SUPPRESS_HOOKS: env.BENCH_SUPPRESS_HOOKS || "1" }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
-    }));
+    const run = grokImpl || (() => {
+      const spec = grokSpawnSpec("Reply with exactly: OK");
+      return spawnSync(spec.cmd, spec.args, {
+        env: { ...env, BENCH_SUPPRESS_HOOKS: env.BENCH_SUPPRESS_HOOKS || "1" }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
+      });
+    });
     const t0 = Date.now();
     const r = run();
     const ms = Date.now() - t0;

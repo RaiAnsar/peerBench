@@ -256,6 +256,31 @@ test("runGrokTask/runGrokReview spawn the grok CLI headless read-only and honor 
 
 test("runGrokTask reports a missing grok CLI with the install hint", async () => {
   const { runGrokTask } = await import("../global-hooks/panel-lib.mjs");
-  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "/nonexistent/grok-bin" });
+  // platform:"linux" → unwrapped spawn so the ENOENT surfaces as our 127 path (pure, darwin-independent)
+  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "/nonexistent/grok-bin", platform: "linux" });
   assert.match(r.error, /grok CLI not found/);
+});
+
+test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-only profile", async () => {
+  const { grokSpawnSpec, GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
+  const d = grokSpawnSpec("review", { bin: "grok", platform: "darwin", home: "/Users/u" });
+  assert.equal(d.cmd, "/usr/bin/sandbox-exec", "darwin must be OS-sandboxed — grok's own sandbox is a verified no-op");
+  assert.equal(d.args[0], "-p");
+  assert.equal(d.args[1], GROK_SEATBELT_PROFILE("/Users/u"));
+  assert.match(d.args[1], /\(deny file-write\*\)/, "profile denies writes");
+  assert.ok(!d.args[1].includes('"/Users/u"') || d.args[1].includes('"/Users/u/.grok"'), "home itself is NOT write-allowed, only ~/.grok");
+  assert.equal(d.args[2], "grok");
+  assert.ok(d.args.includes("--no-leader"), "must not attach to a (possibly unsandboxed) shared leader");
+  const l = grokSpawnSpec("review", { bin: "grok", platform: "linux" });
+  assert.equal(l.cmd, "grok", "non-darwin spawns bare (fail-open stderr check is the net)");
+});
+
+test("runGrokTask fail-closes when grok reports its sandbox could not be applied", async () => {
+  const { runGrokTask } = await import("../global-hooks/panel-lib.mjs");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-sbxwarn-"));
+  const fake = path.join(dir, "grok");
+  fs.writeFileSync(fake, `#!/bin/sh\necho "warning: sandbox could not be applied: whatever" >&2\necho '{"text":"ALLOW: fine"}'\n`);
+  fs.chmodSync(fake, 0o755);
+  const r = await runGrokTask({ prompt: "x", cwd: dir, env: {}, bin: fake, platform: "linux" });
+  assert.match(r.error, /sandbox could not be applied/, "an unsandboxed run must be REFUSED, not accepted");
 });

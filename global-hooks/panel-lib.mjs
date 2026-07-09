@@ -3,6 +3,7 @@
 // repo — self-contained on purpose: no repo imports).
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { parseSeverity, severityRank, SEVERITY_RANK } from "./deep-review.mjs";
 
@@ -99,10 +100,31 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // --output-format json: grok streams working NARRATION into plain stdout (even mid-sentence around
 // the verdict — broke first-line parsing, seen on Grok's first live review). JSON cleanly separates
 // the final answer (.text) from .thought/narration.
-// --sandbox read-only is the HARD read-only guarantee (OS-level, fail-closed: grok "refuses to start
-// rather than run unsandboxed" if the profile can't apply). plan mode alone only blocks edit TOOLS —
-// a bash-style tool could still mutate (caught by the Codex stop gate). plan stays as defense-in-depth.
-export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
+// Grok's OWN --sandbox read-only is a silent NO-OP on this build (verified live: with permissions
+// bypassed it wrote breach.txt into the workspace cwd, no warning, exit 0 — caught by the Codex stop
+// gate). So the HARD read-only guarantee is OURS: wrap grok in macOS Seatbelt (sandbox-exec, the same
+// mechanism codex uses) via grokSpawnSpec below. The grok flags stay as defense-in-depth only.
+export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--no-leader", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
+
+// Seatbelt profile: everything allowed EXCEPT file writes, which are limited to grok's own state
+// (~/.grok — sessions/logs), TMPDIR (/private/var/folders) and /dev. The workspace, home, and the
+// rest of the filesystem are OS-enforced read-only. Fail-closed: if sandbox-exec can't apply the
+// profile it refuses to exec, and our spawn surfaces that as a reviewer error — never unsandboxed.
+export const GROK_SEATBELT_PROFILE = (home) =>
+  `(version 1)(allow default)(deny file-write*)(allow file-write* (subpath "${home}/.grok") (subpath "/private/var/folders") (subpath "/dev"))`;
+
+// The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
+// darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
+// fail-open stderr check in the runners is the net.
+export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, home = os.homedir() } = {}) {
+  const args = GROK_ARGS(prompt);
+  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(home), bin, ...args] };
+  return { cmd: bin, args };
+}
+
+// grok prints "warning: sandbox could not be applied: …" and can CONTINUE unsandboxed (fail-open).
+// Treat that as fatal on the paths where Seatbelt isn't wrapping.
+const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(String(stderr ?? ""));
 
 // Extract the final answer from grok stdout: JSON .text when parseable, else the raw stdout
 // (fallback keeps us working if the CLI's JSON shape changes).
@@ -112,22 +134,26 @@ export function grokText(stdout) {
   return raw;
 }
 
-export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok" }) {
+export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
   const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
-  const r = await spawnCollect(bin, GROK_ARGS(prompt), { cwd, env: childEnv, timeoutMs });
+  const spec = grokSpawnSpec(prompt, { bin, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
+  const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs });
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
+  if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
   const v = parseVerdict(grokText(r.stdout));
   if (!v.verdict) return { name: "Grok", error: "unexpected reviewer output" };
   return { name: "Grok", ...v };
 }
 
 // Grok open-ended TASK → raw output (for hunt/deep gates; findings kept, no verdict parsing).
-export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok" }) {
+export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
   const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
-  const r = await spawnCollect(bin, GROK_ARGS(prompt), { cwd, env: childEnv, timeoutMs });
+  const spec = grokSpawnSpec(prompt, { bin, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
+  const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs });
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
+  if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
   const raw = grokText(r.stdout);
   return raw ? { name: "Grok", raw } : { name: "Grok", error: "grok returned empty output" };
 }
