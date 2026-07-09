@@ -94,14 +94,27 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // agent run: -p prints the response and exits; --permission-mode plan = read-only (no edits);
 // --no-memory/--no-subagents/--disable-web-search keep a review deterministic and repo-scoped.
 // BENCH_SUPPRESS_HOOKS: grok loads Claude Code settings (hooks included) — suppress ours inside it.
-const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40"];
+// Exported: the health probe must spawn grok with the SAME safety contract (plan mode, verbatim,
+// suppressed hooks) — a probe outside it could mutate the workspace while reporting "(plan)".
+// --output-format json: grok streams working NARRATION into plain stdout (even mid-sentence around
+// the verdict — broke first-line parsing, seen on Grok's first live review). JSON cleanly separates
+// the final answer (.text) from .thought/narration.
+export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
+
+// Extract the final answer from grok stdout: JSON .text when parseable, else the raw stdout
+// (fallback keeps us working if the CLI's JSON shape changes).
+export function grokText(stdout) {
+  const raw = String(stdout ?? "").trim();
+  try { const j = JSON.parse(raw); if (typeof j?.text === "string") return j.text.trim(); } catch { /* not json */ }
+  return raw;
+}
 
 export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok" }) {
   const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
   const r = await spawnCollect(bin, GROK_ARGS(prompt), { cwd, env: childEnv, timeoutMs });
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
-  const v = parseVerdict(String(r.stdout ?? "").trim());
+  const v = parseVerdict(grokText(r.stdout));
   if (!v.verdict) return { name: "Grok", error: "unexpected reviewer output" };
   return { name: "Grok", ...v };
 }
@@ -112,7 +125,7 @@ export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bi
   const r = await spawnCollect(bin, GROK_ARGS(prompt), { cwd, env: childEnv, timeoutMs });
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
-  const raw = String(r.stdout ?? "").trim();
+  const raw = grokText(r.stdout);
   return raw ? { name: "Grok", raw } : { name: "Grok", error: "grok returned empty output" };
 }
 

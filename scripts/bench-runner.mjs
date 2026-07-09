@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName } from "../global-hooks/config-store.mjs";
-import { combinePanel, untrackedBlock } from "../global-hooks/panel-lib.mjs";
+import { combinePanel, untrackedBlock, GROK_ARGS, grokText } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
@@ -23,7 +23,7 @@ import { listBlocked } from "../global-hooks/deep-queue.mjs";
 import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mjs";
 import { shouldRewake } from "../global-hooks/deep-review.mjs";
 import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
-import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
+import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates, enableLegacyCodexStopGateForWorkspace, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -431,14 +431,16 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
   };
 
   const probeGrok = async () => {
-    const run = grokImpl || (() => spawnSync("grok", ["-p", "Reply with exactly: OK", "--no-memory", "--no-subagents", "--disable-web-search"], {
-      env, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
+    // Same safety contract as production reviews (GROK_ARGS: plan mode, verbatim, no memory/subagents/
+    // web) + suppressed hooks — a probe outside it could write to the workspace while claiming "(plan)".
+    const run = grokImpl || (() => spawnSync("grok", GROK_ARGS("Reply with exactly: OK"), {
+      env: { ...env, BENCH_SUPPRESS_HOOKS: env.BENCH_SUPPRESS_HOOKS || "1" }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
     }));
     const t0 = Date.now();
     const r = run();
     const ms = Date.now() - t0;
     if (r.error?.code === "ENOENT") return { name: "grok", display: "Grok", ok: false, note: "grok CLI not found (curl -fsSL https://x.ai/cli/install.sh | bash)" };
-    if (r.status === 0 && /OK/.test(r.stdout || "")) return { name: "grok", display: "Grok", ok: true, note: `grok CLI (plan) · ${(ms / 1000).toFixed(1)}s` };
+    if (r.status === 0 && /OK/.test(grokText(r.stdout))) return { name: "grok", display: "Grok", ok: true, note: `grok CLI (plan) · ${(ms / 1000).toFixed(1)}s` };
     return { name: "grok", display: "Grok", ok: false, note: `${(r.stderr || r.stdout || "failed").trim().slice(0, 140)}` };
   };
 
@@ -493,7 +495,9 @@ export function gateToggleCommand(ws, args, {
   root,
   env = process.env,
   disableLegacyCodexWorkspaceImpl = disableLegacyCodexStopGateForWorkspace,
-  disableLegacyCodexGlobalImpl = disableLegacyCodexStopGateStates
+  disableLegacyCodexGlobalImpl = disableLegacyCodexStopGateStates,
+  enableLegacyCodexWorkspaceImpl = enableLegacyCodexStopGateForWorkspace,
+  enableLegacyCodexGlobalImpl = enableLegacyCodexStopGateStates
 } = {}) {
   const sub = args[0]; // "off" or "on"
   const hasGlobal = args.slice(1).includes("--global");
@@ -511,13 +515,23 @@ export function gateToggleCommand(ws, args, {
   // silently killing it on bench:on was a real downgrade). Only explicit single-gate mode
   // (BENCH_SINGLE_GATE=1) makes peerBench the sole reviewer by disabling the Codex gate.
   const singleGate = env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true";
-  let legacyNote = " Codex gate kept — runs alongside peerBench.";
+  let legacyNote;
   if (singleGate) {
     const legacy = scope === "global"
       ? disableLegacyCodexGlobalImpl()
       : disableLegacyCodexWorkspaceImpl(ws);
     const legacyChanged = typeof legacy?.changed === "number" ? legacy.changed > 0 : Boolean(legacy?.changed);
     legacyNote = legacyChanged ? " Legacy Codex gate disabled." : "";
+  } else {
+    // Keep-both must actively RESTORE a gate that single-gate mode (or the pre-fix disable) turned
+    // off — merely skipping the disable left such workspaces silently Codex-less (caught by Grok).
+    const restored = scope === "global"
+      ? enableLegacyCodexGlobalImpl()
+      : enableLegacyCodexWorkspaceImpl(ws);
+    const n = typeof restored?.changed === "number" ? restored.changed : (restored?.changed ? 1 : 0);
+    legacyNote = n > 0
+      ? ` Codex gate RESTORED (${n} workspace${n === 1 ? "" : "s"}) — runs alongside peerBench.`
+      : " Codex gate kept — runs alongside peerBench.";
   }
   if (!stillDisabled) return `bench: enabled (${scope}).${legacyNote}`;
   // The cleared scope didn't fully re-enable — name the remaining source honestly.

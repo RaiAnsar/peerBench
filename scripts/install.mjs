@@ -19,7 +19,7 @@ import {
   syncSettings,
   syncStatuslineSessionArg
 } from "./deploy-global-hooks.mjs";
-import { disableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
+import { disableLegacyCodexStopGateStates, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -349,10 +349,11 @@ export function installPeerBench({
     const sync = pluginRegistry.cli.skipped
       ? syncSettings({ hooksDir, settingsPath })
       : removeClaudeSettingsPeerBenchHooks({ settingsPath });
-    // Default: KEEP the Codex stop gate (runs alongside peerBench). Single-gate mode disables it.
+    // Default: KEEP the Codex stop gate — and actively RESTORE any state a prior disable turned off.
+    const codexPluginData = path.join(home, ".claude", "plugins", "data", "codex-openai-codex");
     const legacyCodexGate = (env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true")
-      ? disableLegacyCodexStopGateStates({ pluginDataDir: path.join(home, ".claude", "plugins", "data", "codex-openai-codex") })
-      : { root: null, scanned: 0, changed: 0, files: [], kept: true };
+      ? disableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData })
+      : { ...enableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData }), kept: true };
     const statusline = syncStatuslineSessionArg({
       statuslinePath: path.join(home, ".claude", "statusline-command.sh")
     });

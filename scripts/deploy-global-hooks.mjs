@@ -1,7 +1,7 @@
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { disableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
+import { disableLegacyCodexStopGateStates, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
 
 // ONE-TIME data-dir migration: pre-rename installs kept reviewer config + traces under
 // 'grok-companion-shared'; move it to 'bench-shared' once. No-op on fresh installs or after
@@ -409,10 +409,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const sync = claudePluginRoot
     ? removeClaudeSettingsPeerBenchHooks({ settingsPath })
     : syncSettings({ hooksDir, settingsPath });
-  // Default: KEEP the Codex stop gate (it runs alongside peerBench). Only single-gate mode disables it.
+  // Default: KEEP the Codex stop gate — and actively RESTORE any state a prior disable turned off
+  // (skip-only left those workspaces silently Codex-less — caught by Grok). Single-gate mode disables.
   const legacyCodexGate = (process.env.BENCH_SINGLE_GATE === "1" || process.env.BENCH_SINGLE_GATE === "true")
     ? disableLegacyCodexStopGateStates()
-    : { root: null, scanned: 0, changed: 0, files: [], kept: true };
+    : { ...enableLegacyCodexStopGateStates(), kept: true };
   const statusline = syncStatuslineSessionArg();
   const codexSnapshot = snapshotCodex({ hooksDir: codexHooksDir, hooksPath: codexHooksPath, backupDir: path.join(backupDir, "codex") });
   const codexDeploy = deploy({ src: path.join(repoRoot, "global-hooks"), dest: codexHooksDir });

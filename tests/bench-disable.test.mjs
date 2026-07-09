@@ -117,11 +117,28 @@ test("gateToggleCommand on: KEEPS the Codex gate by default (coexists with peerB
   const out = gateToggleCommand(ws, ["on"], {
     root,
     env: {},   // no BENCH_SINGLE_GATE → keep both
-    disableLegacyCodexWorkspaceImpl: () => { called = true; return { changed: true }; }
+    disableLegacyCodexWorkspaceImpl: () => { called = true; return { changed: true }; },
+    enableLegacyCodexWorkspaceImpl: () => ({ changed: false, reason: "already-enabled" })
   });
   assert.equal(called, false, "default must NOT disable the Codex gate");
   assert.match(out, /enabled.*workspace/i);
   assert.match(out, /Codex gate kept/i);
+});
+
+test("gateToggleCommand on: RESTORES a previously-disabled Codex gate (not just skip-disable)", () => {
+  // Caught by Grok's first review: keep-both merely skipped the disable, so a workspace already at
+  // stopReviewGate:false stayed silently Codex-less. bench:on must actively re-enable it.
+  const root = freshRoot();
+  const ws = freshWs();
+  let enabledWs = null;
+  const out = gateToggleCommand(ws, ["on"], {
+    root,
+    env: {},
+    disableLegacyCodexWorkspaceImpl: () => { throw new Error("must not disable in keep-both"); },
+    enableLegacyCodexWorkspaceImpl: (workspace) => { enabledWs = workspace; return { changed: true }; }
+  });
+  assert.equal(enabledWs, ws, "keep-both must call the enable/restore path");
+  assert.match(out, /Codex gate RESTORED/i);
 });
 
 test("gateToggleCommand on with BENCH_SINGLE_GATE=1 disables the legacy Codex plugin gate", () => {

@@ -9,7 +9,7 @@
 // updates one global scorecard.
 import fs from "node:fs";
 import path from "node:path";
-import { sharedRoot, PROVIDER_NAMES, displayName } from "./config-store.mjs";
+import { sharedRoot, KNOWN_REVIEWERS, displayName } from "./config-store.mjs";
 
 const TRACE_RE = /^\d+-[0-9a-f]+\.json$/i;
 const GRADES = ["tp", "fp", "miss"];
@@ -20,7 +20,9 @@ const upper = (s) => norm(s).toUpperCase();
 // traces that stored a different case ("glm" vs "GLM") don't split into two scorecard rows.
 const CANON = (() => {
   const map = {};
-  for (const id of [...PROVIDER_NAMES, "codex"]) { const d = displayName(id); map[id.toLowerCase()] = d; map[d.toLowerCase()] = d; }
+  // KNOWN_REVIEWERS (not PROVIDER_NAMES+codex) so CLI-backed reviewers (codex, grok) canonicalize
+  // too — otherwise "grok"/"Grok" grades would split into two scorecard rows (caught by Grok's FIRST review).
+  for (const id of KNOWN_REVIEWERS) { const d = displayName(id); map[id.toLowerCase()] = d; map[d.toLowerCase()] = d; }
   return map;
 })();
 const canon = (name) => CANON[norm(name).toLowerCase()] || norm(name);
