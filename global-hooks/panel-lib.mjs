@@ -106,21 +106,38 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // mechanism codex uses) via grokSpawnSpec below. The grok flags stay as defense-in-depth only.
 export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--no-leader", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
 
-// Seatbelt profile: everything allowed EXCEPT file writes, which are limited to grok's own state
-// (~/.grok — sessions/logs), TMPDIR (/private/var/folders) and /dev. The workspace, home, and the
-// rest of the filesystem are OS-enforced read-only. Fail-closed: if sandbox-exec can't apply the
-// profile it refuses to exec, and our spawn surfaces that as a reviewer error — never unsandboxed.
-export const GROK_SEATBELT_PROFILE = (home) =>
-  `(version 1)(allow default)(deny file-write*)(allow file-write* (subpath "${home}/.grok") (subpath "/private/var/folders") (subpath "/dev"))`;
+// Seatbelt profile (last-match-wins). Writable: grok's state (~/.grok: sessions, auth refresh,
+// caches), a PER-RUN private tmpdir, and /dev. Then DENIED back inside ~/.grok: every surface whose
+// write means code execution or behavior change on the user's NEXT grok run — bin/ (binary
+// poisoning), bundled/ + installed-plugins/ + plugins/ (plugin planting), completions/ (shell
+// injection), hooks/, config.toml + sandbox.toml (containment tampering). The per-run tmpdir
+// replaces the old blanket /private/var/folders grant, which exposed EVERY process's temp/cache
+// files (both escapes caught by the Codex stop gate). Fail-closed: sandbox-exec refuses to exec on
+// a bad profile and our spawn surfaces that as a reviewer error — never unsandboxed.
+export const GROK_SEATBELT_PROFILE = (home, tmpDir) => {
+  const g = `${home}/.grok`;
+  return `(version 1)(allow default)(deny file-write*)` +
+    `(allow file-write* (subpath "${g}")${tmpDir ? ` (subpath "${tmpDir}")` : ""} (subpath "/dev"))` +
+    `(deny file-write* (subpath "${g}/bin") (subpath "${g}/bundled") (subpath "${g}/installed-plugins") (subpath "${g}/plugins") (subpath "${g}/completions") (subpath "${g}/hooks") (literal "${g}/config.toml") (literal "${g}/sandbox.toml"))`;
+};
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
 // darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
 // fail-open stderr check in the runners is the net.
-export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, home = os.homedir() } = {}) {
+export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, home = os.homedir(), tmpDir } = {}) {
   const args = GROK_ARGS(prompt);
-  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(home), bin, ...args] };
+  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(home, tmpDir), bin, ...args] };
   return { cmd: bin, args };
 }
+
+// Per-run private TMPDIR (realpath'd — Seatbelt matches real paths, /var → /private/var). The child
+// gets TMPDIR pointed here so its temp writes land in a dir no other process shares; best-effort
+// cleanup afterwards. Returns null on failure (profile then simply grants no tmp surface).
+function makeGrokTmpDir() {
+  try { return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grok-bench-"))); }
+  catch { return null; }
+}
+const cleanupTmpDir = (d) => { if (d) try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } };
 
 // grok prints "warning: sandbox could not be applied: …" and can CONTINUE unsandboxed (fail-open).
 // Treat that as fatal on the paths where Seatbelt isn't wrapping.
@@ -135,9 +152,10 @@ export function grokText(stdout) {
 }
 
 export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
-  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
-  const spec = grokSpawnSpec(prompt, { bin, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
-  const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs });
+  const tmpDir = makeGrokTmpDir();
+  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1", ...(tmpDir ? { TMPDIR: tmpDir } : {}) };
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
+  const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
@@ -148,9 +166,10 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
 
 // Grok open-ended TASK → raw output (for hunt/deep gates; findings kept, no verdict parsing).
 export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
-  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
-  const spec = grokSpawnSpec(prompt, { bin, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
-  const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs });
+  const tmpDir = makeGrokTmpDir();
+  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1", ...(tmpDir ? { TMPDIR: tmpDir } : {}) };
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(home ? { home } : {}) });
+  const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };

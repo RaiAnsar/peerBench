@@ -263,16 +263,31 @@ test("runGrokTask reports a missing grok CLI with the install hint", async () =>
 
 test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-only profile", async () => {
   const { grokSpawnSpec, GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
-  const d = grokSpawnSpec("review", { bin: "grok", platform: "darwin", home: "/Users/u" });
+  const d = grokSpawnSpec("review", { bin: "grok", platform: "darwin", home: "/Users/u", tmpDir: "/private/tmp/grok-bench-x" });
   assert.equal(d.cmd, "/usr/bin/sandbox-exec", "darwin must be OS-sandboxed — grok's own sandbox is a verified no-op");
   assert.equal(d.args[0], "-p");
-  assert.equal(d.args[1], GROK_SEATBELT_PROFILE("/Users/u"));
+  assert.equal(d.args[1], GROK_SEATBELT_PROFILE("/Users/u", "/private/tmp/grok-bench-x"));
   assert.match(d.args[1], /\(deny file-write\*\)/, "profile denies writes");
-  assert.ok(!d.args[1].includes('"/Users/u"') || d.args[1].includes('"/Users/u/.grok"'), "home itself is NOT write-allowed, only ~/.grok");
   assert.equal(d.args[2], "grok");
   assert.ok(d.args.includes("--no-leader"), "must not attach to a (possibly unsandboxed) shared leader");
   const l = grokSpawnSpec("review", { bin: "grok", platform: "linux" });
   assert.equal(l.cmd, "grok", "non-darwin spawns bare (fail-open stderr check is the net)");
+});
+
+test("GROK_SEATBELT_PROFILE closes the code-exec + shared-tmp escape surfaces (caught by the Codex gate)", async () => {
+  const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
+  const p = GROK_SEATBELT_PROFILE("/Users/u", "/private/tmp/grok-bench-x");
+  // A per-run private tmp is granted; the blanket shared TMPDIR root is NOT.
+  assert.ok(p.includes('(subpath "/private/tmp/grok-bench-x")'), "per-run tmp is writable");
+  assert.ok(!p.includes('"/private/var/folders"'), "must NOT grant the shared TMPDIR root (other processes' temp)");
+  // Every write-→-code-execution surface inside ~/.grok is denied back after the broad grant.
+  for (const sub of ["/bin", "/bundled", "/installed-plugins", "/plugins", "/completions", "/hooks"]) {
+    assert.ok(p.includes(`(subpath "/Users/u/.grok${sub}")`), `~/.grok${sub} must be re-denied (code planting)`);
+  }
+  assert.ok(p.includes('(literal "/Users/u/.grok/config.toml")'), "config.toml re-denied (containment tamper)");
+  assert.ok(p.includes('(literal "/Users/u/.grok/sandbox.toml")'), "sandbox.toml re-denied");
+  // last-match-wins: the deny lines come AFTER the ~/.grok allow.
+  assert.ok(p.lastIndexOf('deny file-write* (subpath "/Users/u/.grok/bin")') > p.indexOf('allow file-write* (subpath "/Users/u/.grok")'), "deny must follow the allow (last-match-wins)");
 });
 
 test("runGrokTask fail-closes when grok reports its sandbox could not be applied", async () => {

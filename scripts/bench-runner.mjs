@@ -434,10 +434,15 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
     // Same safety contract as production reviews (GROK_ARGS: plan mode, verbatim, no memory/subagents/
     // web) + suppressed hooks — a probe outside it could write to the workspace while claiming "(plan)".
     const run = grokImpl || (() => {
-      const spec = grokSpawnSpec("Reply with exactly: OK");
-      return spawnSync(spec.cmd, spec.args, {
-        env: { ...env, BENCH_SUPPRESS_HOOKS: env.BENCH_SUPPRESS_HOOKS || "1" }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
-      });
+      // Same containment as real reviews: Seatbelt profile + a per-run private TMPDIR.
+      let tmpDir = null;
+      try { tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grok-bench-"))); } catch { /* no tmp grant */ }
+      const spec = grokSpawnSpec("Reply with exactly: OK", { ...(tmpDir ? { tmpDir } : {}) });
+      try {
+        return spawnSync(spec.cmd, spec.args, {
+          env: { ...env, BENCH_SUPPRESS_HOOKS: env.BENCH_SUPPRESS_HOOKS || "1", ...(tmpDir ? { TMPDIR: tmpDir } : {}) }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
+        });
+      } finally { if (tmpDir) try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
     });
     const t0 = Date.now();
     const r = run();
