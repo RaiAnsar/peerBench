@@ -132,14 +132,21 @@ export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platfor
 }
 
 // Child env for every grok spawn. GROK_HOME repoints grok's whole state dir at the ephemeral,
-// Seatbelt-writable tmpdir (so ~/.grok stays read-only and nothing persists); GROK_AUTH_PATH reads
-// the token from the REAL ~/.grok/auth.json (read-only) so the redirected home still authenticates
-// without exposing the token to writes; BENCH_SUPPRESS_HOOKS stops grok from firing Claude Code hooks.
+// Seatbelt-writable tmpdir (so ~/.grok stays read-only and nothing persists); BENCH_SUPPRESS_HOOKS
+// stops grok from firing Claude Code hooks.
+//
+// Auth: because we override GROK_HOME, grok's default `$GROK_HOME/auth.json` lookup would miss the
+// user's token, so we point GROK_AUTH_PATH at the auth.json in grok's ORIGINAL home (their custom
+// GROK_HOME if set, else ~/.grok) — read-only, so the token is never exposed to writes. But if the
+// caller already provides their OWN auth (GROK_AUTH inline token, or a custom GROK_AUTH_PATH), we
+// must NOT clobber it — respect it and pass it through untouched.
 export function grokChildEnv(env, tmpDir, home) {
+  const hasCallerAuth = env?.GROK_AUTH || env?.GROK_AUTH_PATH;
+  const originalGrokHome = env?.GROK_HOME || path.join(home || os.homedir(), ".grok");
   return {
     ...env,
     BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1",
-    GROK_AUTH_PATH: path.join(home || os.homedir(), ".grok", "auth.json"),
+    ...(hasCallerAuth ? {} : { GROK_AUTH_PATH: path.join(originalGrokHome, "auth.json") }),
     ...(tmpDir ? { TMPDIR: tmpDir, GROK_HOME: tmpDir } : {}),
   };
 }
@@ -167,6 +174,9 @@ export function grokText(stdout) {
 
 export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
   const tmpDir = makeGrokTmpDir();
+  // Fail CLOSED: without the private tmpdir there is no ephemeral GROK_HOME to absorb grok's writes
+  // and (off darwin) no Seatbelt either — grok would write ~/.grok unsandboxed. Refuse instead.
+  if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
   const childEnv = grokChildEnv(env, tmpDir, home);
   const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
@@ -181,6 +191,8 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
 // Grok open-ended TASK → raw output (for hunt/deep gates; findings kept, no verdict parsing).
 export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
   const tmpDir = makeGrokTmpDir();
+  // Fail CLOSED (see runGrokReview): no private tmpdir → no containment → refuse.
+  if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
   const childEnv = grokChildEnv(env, tmpDir, home);
   const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));

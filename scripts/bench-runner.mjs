@@ -438,12 +438,14 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
       // private tmpdir (so ~/.grok stays read-only), auth read from the real read-only auth.json.
       let tmpDir = null;
       try { tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grok-bench-"))); } catch { /* no tmp grant */ }
-      const spec = grokSpawnSpec("Reply with exactly: OK", { ...(tmpDir ? { tmpDir } : {}) });
+      // Fail CLOSED: no private tmpdir → no containment; report unhealthy instead of probing unsandboxed.
+      if (!tmpDir) return { status: 1, stderr: "grok sandbox tmpdir could not be created" };
+      const spec = grokSpawnSpec("Reply with exactly: OK", { tmpDir });
       try {
         return spawnSync(spec.cmd, spec.args, {
           env: grokChildEnv(env, tmpDir), encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
         });
-      } finally { if (tmpDir) try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+      } finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
     });
     const t0 = Date.now();
     const r = run();

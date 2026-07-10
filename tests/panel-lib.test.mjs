@@ -301,10 +301,41 @@ test("grokChildEnv redirects grok's whole state into the ephemeral tmpdir with r
   assert.equal(e.GROK_AUTH_PATH, "/Users/u/.grok/auth.json", "auth read from the real (read-only) auth.json so the redirected home still authenticates");
   assert.equal(e.BENCH_SUPPRESS_HOOKS, "1", "grok must not fire Claude Code hooks");
   assert.equal(e.PATH, "/usr/bin", "passes through the caller env");
-  // Without a tmpdir (mkdtemp failed) we must NOT set GROK_HOME to ~/.grok — leave it unset so the
-  // Seatbelt (which then grants no write surface) fails the run closed rather than writing to ~/.grok.
+  // Without a tmpdir (mkdtemp failed) we must NOT set GROK_HOME to ~/.grok — leave it unset. The
+  // runners then refuse (fail-closed); grokChildEnv itself never points GROK_HOME at ~/.grok.
   const e2 = grokChildEnv({}, null, "/Users/u");
-  assert.ok(!("GROK_HOME" in e2), "no tmpdir → GROK_HOME unset (fail-closed, never falls back to ~/.grok writes)");
+  assert.ok(!("GROK_HOME" in e2), "no tmpdir → GROK_HOME unset (never falls back to ~/.grok writes)");
+});
+
+test("grokChildEnv respects caller-provided auth (never clobbers a custom GROK_AUTH_PATH / GROK_AUTH)", async () => {
+  const { grokChildEnv } = await import("../global-hooks/panel-lib.mjs");
+  // Custom explicit auth path → left untouched, our default NOT injected.
+  const e1 = grokChildEnv({ GROK_AUTH_PATH: "/custom/auth.json" }, "/tmp/t", "/Users/u");
+  assert.equal(e1.GROK_AUTH_PATH, "/custom/auth.json", "must not overwrite a caller GROK_AUTH_PATH");
+  // Inline token → we must not set GROK_AUTH_PATH at all (it would shadow the token).
+  const e2 = grokChildEnv({ GROK_AUTH: "tok-123" }, "/tmp/t", "/Users/u");
+  assert.equal(e2.GROK_AUTH, "tok-123", "inline token passes through");
+  assert.ok(!("GROK_AUTH_PATH" in e2), "must not inject GROK_AUTH_PATH when a GROK_AUTH token is provided");
+  // Custom GROK_HOME (no explicit auth) → default auth path comes from THAT home, not ~/.grok.
+  const e3 = grokChildEnv({ GROK_HOME: "/custom/grokhome" }, "/tmp/t", "/Users/u");
+  assert.equal(e3.GROK_AUTH_PATH, "/custom/grokhome/auth.json", "auth default derives from the caller's original GROK_HOME");
+  assert.equal(e3.GROK_HOME, "/tmp/t", "GROK_HOME is still redirected to the ephemeral tmpdir for containment");
+});
+
+test("runGrokReview fails CLOSED when the private tmpdir can't be created (no unsandboxed spawn, any platform)", async () => {
+  const { runGrokReview, runGrokTask } = await import("../global-hooks/panel-lib.mjs");
+  const prev = process.env.TMPDIR;
+  process.env.TMPDIR = "/nonexistent-bench-tmpdir-abc123/nope";  // makeGrokTmpDir → mkdtemp throws → null
+  try {
+    // platform:"linux" = NO Seatbelt; the refusal is the ONLY thing preventing an unsandboxed grok write.
+    const r = await runGrokReview({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
+    assert.equal(r.name, "Grok");
+    assert.match(r.error, /tmpdir could not be created|refusing unsandboxed/i);
+    const t = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
+    assert.match(t.error, /tmpdir could not be created|refusing unsandboxed/i);
+  } finally {
+    if (prev === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = prev;
+  }
 });
 
 test("runGrokTask fail-closes when grok reports its sandbox could not be applied", async () => {
