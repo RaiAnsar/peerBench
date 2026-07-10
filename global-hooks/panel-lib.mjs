@@ -139,15 +139,22 @@ export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platfor
 }
 
 // Which auth the gate's grok uses. Precedence:
-//   1. Caller-managed (GROK_AUTH inline token or GROK_AUTH_PATH) → null; we inject nothing.
-//   2. The gate's DEDICATED auth home ~/.grok-headless/auth.json when it exists → writable, so
+//   1. GROK_AUTH inline token → null; nothing to inject, no file to persist.
+//   2. Caller's own GROK_AUTH_PATH → we don't inject (it's already in the env) but we DO mark it
+//      writable so the Seatbelt grants that file + its .lock: the caller designated it as grok's
+//      credential file, and grok's rotating OAuth tokens must persist back to it — respecting the
+//      path while denying the write would 401 custom-auth users the same way the read-only default
+//      did (caught by the Codex gate).
+//   3. The gate's DEDICATED auth home ~/.grok-headless/auth.json when it exists → writable, so
 //      token refresh persists and its rotation chain stays INDEPENDENT of the user's interactive
 //      ~/.grok login (mirror of CODEX_HOME=~/.codex-headless; sharing ~/.grok/auth.json burns the
 //      user's refresh chain because rotated tokens can't be persisted read-only).
 //      One-time setup: GROK_HOME=~/.grok-headless grok -p OK  (complete the browser sign-in).
-//   3. Fallback: the original home's auth.json, READ-ONLY (works until token expiry; degraded).
+//   4. Fallback: the original home's auth.json, READ-ONLY (works until token expiry; degraded —
+//      401s there carry the one-time setup hint).
 export function grokAuthPath(env, home, { fsImpl = fs } = {}) {
-  if (env?.GROK_AUTH || env?.GROK_AUTH_PATH) return null;
+  if (env?.GROK_AUTH) return null;
+  if (env?.GROK_AUTH_PATH) return { path: env.GROK_AUTH_PATH, writable: true, callerManaged: true };
   const h = home || os.homedir();
   const headless = path.join(h, ".grok-headless", "auth.json");
   try { if (fsImpl.existsSync(headless)) return { path: headless, writable: true }; } catch { /* fall through */ }
@@ -164,7 +171,7 @@ export function grokChildEnv(env, tmpDir, home, opts) {
   return {
     ...env,
     BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1",
-    ...(auth ? { GROK_AUTH_PATH: auth.path } : {}),
+    ...(auth && !auth.callerManaged ? { GROK_AUTH_PATH: auth.path } : {}),
     ...(tmpDir ? { TMPDIR: tmpDir, GROK_HOME: tmpDir } : {}),
   };
 }
@@ -187,7 +194,9 @@ const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(S
 // without ~/.grok-headless, grok cannot persist its rotating OAuth tokens through the sandbox.
 export function grokFailureMessage(r, auth) {
   const msg = (r.stderr || r.stdout || "grok failed").trim().slice(0, 300);
-  if (/401|unauthorized|expired credentials|no auth context/i.test(msg) && !auth?.writable) {
+  // Hint ONLY on the read-only fallback — a 401 with caller-managed auth (inline token or custom
+  // writable path) or with the gate home means bad credentials, not a missing gate home.
+  if (/401|unauthorized|expired credentials|no auth context/i.test(msg) && auth && !auth.writable) {
     return `${msg}\n→ grok gate auth not set up. One-time fix: run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` and complete the browser sign-in, then retry.`;
   }
   return msg;

@@ -312,18 +312,32 @@ test("grokChildEnv redirects grok's whole state into the ephemeral tmpdir with r
   assert.ok(!("GROK_HOME" in e2), "no tmpdir → GROK_HOME unset (never falls back to ~/.grok writes)");
 });
 
-test("grokAuthPath precedence: caller auth > gate auth home (writable) > original home read-only", async () => {
+test("grokAuthPath precedence: inline token > caller path (writable!) > gate auth home > original home read-only", async () => {
   const { grokAuthPath } = await import("../global-hooks/panel-lib.mjs");
   const noFs = { fsImpl: { existsSync: () => false } };
   const yesFs = { fsImpl: { existsSync: () => true } };
-  assert.equal(grokAuthPath({ GROK_AUTH: "tok" }, "/Users/u", yesFs), null, "inline token → caller-managed");
-  assert.equal(grokAuthPath({ GROK_AUTH_PATH: "/c/a.json" }, "/Users/u", yesFs), null, "custom path → caller-managed");
+  assert.equal(grokAuthPath({ GROK_AUTH: "tok" }, "/Users/u", yesFs), null, "inline token → nothing to inject or grant");
+  // A caller's custom auth file must be WRITABLE — grok's rotating tokens persist back to it;
+  // respecting the path while denying the write 401s custom-auth users (caught by the Codex gate).
+  const caller = grokAuthPath({ GROK_AUTH_PATH: "/c/a.json" }, "/Users/u", yesFs);
+  assert.deepEqual(caller, { path: "/c/a.json", writable: true, callerManaged: true }, "custom path → writable, caller-managed");
   const gate = grokAuthPath({}, "/Users/u", yesFs);
   assert.deepEqual(gate, { path: "/Users/u/.grok-headless/auth.json", writable: true }, "gate home → writable");
   const fb = grokAuthPath({}, "/Users/u", noFs);
   assert.deepEqual(fb, { path: "/Users/u/.grok/auth.json", writable: false }, "fallback → read-only");
   const fbCustomHome = grokAuthPath({ GROK_HOME: "/custom/gh" }, "/Users/u", noFs);
   assert.deepEqual(fbCustomHome, { path: "/custom/gh/auth.json", writable: false }, "fallback honors the caller's original GROK_HOME");
+});
+
+test("grokFailureMessage: setup hint ONLY on the read-only fallback 401", async () => {
+  const { grokFailureMessage } = await import("../global-hooks/panel-lib.mjs");
+  const r401 = { stderr: "Error: Unauthorized (401) … no auth context" };
+  const hint = /grok gate auth not set up/;
+  assert.match(grokFailureMessage(r401, { path: "/Users/u/.grok/auth.json", writable: false }), hint, "read-only fallback → hint");
+  assert.doesNotMatch(grokFailureMessage(r401, { path: "/Users/u/.grok-headless/auth.json", writable: true }), hint, "gate home 401 = bad creds, not missing setup");
+  assert.doesNotMatch(grokFailureMessage(r401, { path: "/c/a.json", writable: true, callerManaged: true }), hint, "caller path 401 = their creds, not our setup");
+  assert.doesNotMatch(grokFailureMessage(r401, null), hint, "inline token 401 = bad token, no hint");
+  assert.doesNotMatch(grokFailureMessage({ stderr: "some other crash" }, { writable: false }), hint, "non-auth failures never hint");
 });
 
 test("GROK_SEATBELT_PROFILE authWrite grants exactly the gate auth file + its lock — nothing else", async () => {
