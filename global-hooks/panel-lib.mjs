@@ -212,9 +212,15 @@ const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(S
 // without ~/.grok-headless, grok cannot persist its rotating OAuth tokens through the sandbox.
 export function grokFailureMessage(r, auth) {
   const msg = (r.stderr || r.stdout || "grok failed").trim().slice(0, 300);
-  // Hint ONLY on the read-only fallback — a 401 with caller-managed auth (inline token or custom
-  // writable path) or with the gate home means bad credentials, not a missing gate home.
-  if (/401|unauthorized|expired credentials|no auth context/i.test(msg) && auth && !auth.writable) {
+  const isAuthErr = /401|unauthorized|expired credentials|no auth context/i.test(msg);
+  // A 401 only warrants a recovery hint when auth was read-only (token couldn't rotate/persist).
+  if (isAuthErr && auth && !auth.writable) {
+    // A caller's OWN GROK_AUTH_PATH takes precedence over the gate home, so the ~/.grok-headless
+    // setup would NOT be used — telling them to run it is misdirection. Their read-only reason is an
+    // unsafe path (can't be granted sandbox write), so the effective fix is to correct/unset it.
+    if (auth.callerManaged) {
+      return `${msg}\n→ GROK_AUTH_PATH can't be granted sandbox write access (needs an absolute path with no quotes/backslashes/control chars), so grok can't persist a refreshed token. Fix or unset GROK_AUTH_PATH, then retry.`;
+    }
     return `${msg}\n→ grok gate auth not set up. One-time fix: run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` and complete the browser sign-in, then retry.`;
   }
   return msg;

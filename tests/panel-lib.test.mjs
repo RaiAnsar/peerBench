@@ -329,15 +329,21 @@ test("grokAuthPath precedence: inline token > caller path (writable!) > gate aut
   assert.deepEqual(fbCustomHome, { path: "/custom/gh/auth.json", writable: false }, "fallback honors the caller's original GROK_HOME");
 });
 
-test("grokFailureMessage: setup hint ONLY on the read-only fallback 401", async () => {
+test("grokFailureMessage: gate-home setup hint ONLY on the read-only FALLBACK (never caller-managed)", async () => {
   const { grokFailureMessage } = await import("../global-hooks/panel-lib.mjs");
   const r401 = { stderr: "Error: Unauthorized (401) … no auth context" };
-  const hint = /grok gate auth not set up/;
-  assert.match(grokFailureMessage(r401, { path: "/Users/u/.grok/auth.json", writable: false }), hint, "read-only fallback → hint");
-  assert.doesNotMatch(grokFailureMessage(r401, { path: "/Users/u/.grok-headless/auth.json", writable: true }), hint, "gate home 401 = bad creds, not missing setup");
-  assert.doesNotMatch(grokFailureMessage(r401, { path: "/c/a.json", writable: true, callerManaged: true }), hint, "caller path 401 = their creds, not our setup");
-  assert.doesNotMatch(grokFailureMessage(r401, null), hint, "inline token 401 = bad token, no hint");
-  assert.doesNotMatch(grokFailureMessage({ stderr: "some other crash" }, { writable: false }), hint, "non-auth failures never hint");
+  const gateHint = /grok gate auth not set up/;
+  const callerHint = /GROK_AUTH_PATH can't be granted sandbox write/;
+  assert.match(grokFailureMessage(r401, { path: "/Users/u/.grok/auth.json", writable: false }), gateHint, "read-only fallback → gate-home hint");
+  assert.doesNotMatch(grokFailureMessage(r401, { path: "/Users/u/.grok-headless/auth.json", writable: true }), gateHint, "gate home 401 = bad creds, not missing setup");
+  // Unsafe caller path is read-only, but the gate-home hint is WRONG for it (their env var wins) —
+  // it must get the caller-specific instruction instead.
+  const callerRo = grokFailureMessage(r401, { path: "/c/a.json", writable: false, callerManaged: true });
+  assert.doesNotMatch(callerRo, gateHint, "caller-managed read-only must NOT get the (ineffective) gate-home hint");
+  assert.match(callerRo, callerHint, "caller-managed read-only gets the fix-your-GROK_AUTH_PATH instruction");
+  assert.doesNotMatch(grokFailureMessage(r401, { path: "/c/a.json", writable: true, callerManaged: true }), gateHint, "caller path (writable) 401 = their creds, no hint");
+  assert.doesNotMatch(grokFailureMessage(r401, null), gateHint, "inline token 401 = bad token, no hint");
+  assert.doesNotMatch(grokFailureMessage({ stderr: "some other crash" }, { writable: false }), gateHint, "non-auth failures never hint");
 });
 
 test("GROK_SEATBELT_PROFILE authWrite grants exactly the gate auth file + its lock — nothing else", async () => {
