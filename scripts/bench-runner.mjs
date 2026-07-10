@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName } from "../global-hooks/config-store.mjs";
-import { combinePanel, untrackedBlock, grokSpawnSpec, grokChildEnv, grokText } from "../global-hooks/panel-lib.mjs";
+import { combinePanel, untrackedBlock, grokSpawnSpec, grokChildEnv, grokAuthPath, grokText } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
@@ -440,7 +440,8 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
       try { tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grok-bench-"))); } catch { /* no tmp grant */ }
       // Fail CLOSED: no private tmpdir → no containment; report unhealthy instead of probing unsandboxed.
       if (!tmpDir) return { status: 1, stderr: "grok sandbox tmpdir could not be created" };
-      const spec = grokSpawnSpec("Reply with exactly: OK", { tmpDir });
+      const auth = grokAuthPath(env);
+      const spec = grokSpawnSpec("Reply with exactly: OK", { tmpDir, ...(auth?.writable ? { authWrite: auth.path } : {}) });
       try {
         return spawnSync(spec.cmd, spec.args, {
           env: grokChildEnv(env, tmpDir), encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS

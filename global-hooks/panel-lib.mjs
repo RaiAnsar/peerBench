@@ -119,34 +119,52 @@ export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "
 // bypassPermissions) — never trust it; this OS wrapper + `--no-leader` are the hard guarantee.
 // Fail-closed: sandbox-exec refuses a bad profile and our spawn surfaces that as a reviewer error.
 // (Every escalation here was caught by the Codex stop gate.)
-export const GROK_SEATBELT_PROFILE = (tmpDir) =>
-  `(version 1)(allow default)(deny file-write*)(allow file-write*${tmpDir ? ` (subpath "${tmpDir}")` : ""} (subpath "/dev"))`;
+// authWrite (optional) = the gate's OWN auth file (~/.grok-headless/auth.json): grok's plan auth is
+// OAuth with ROTATING tokens it must persist back to auth.json (+ a .lock it writes to establish the
+// auth context) — with auth fully read-only, the first post-expiry gate run gets "401 no auth context"
+// and every review after shows Grok! (exactly what happened). So the ONE persistent writable surface
+// is the gate's dedicated credential file — never the user's ~/.grok/auth.json, never code. Risk is
+// bounded: corrupting it DoSes the reviewer (visible fail-open badge), planting a token re-routes
+// billing — neither is code exec; same trust level as the codex gate's writable ~/.codex-headless.
+export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite) =>
+  `(version 1)(allow default)(deny file-write*)(allow file-write*${tmpDir ? ` (subpath "${tmpDir}")` : ""}${authWrite ? ` (literal "${authWrite}") (literal "${authWrite}.lock")` : ""} (subpath "/dev"))`;
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
 // darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
 // fail-open stderr check in the runners is the net.
-export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir } = {}) {
+export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir, authWrite } = {}) {
   const args = GROK_ARGS(prompt);
-  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir), bin, ...args] };
+  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir, authWrite), bin, ...args] };
   return { cmd: bin, args };
 }
 
+// Which auth the gate's grok uses. Precedence:
+//   1. Caller-managed (GROK_AUTH inline token or GROK_AUTH_PATH) → null; we inject nothing.
+//   2. The gate's DEDICATED auth home ~/.grok-headless/auth.json when it exists → writable, so
+//      token refresh persists and its rotation chain stays INDEPENDENT of the user's interactive
+//      ~/.grok login (mirror of CODEX_HOME=~/.codex-headless; sharing ~/.grok/auth.json burns the
+//      user's refresh chain because rotated tokens can't be persisted read-only).
+//      One-time setup: GROK_HOME=~/.grok-headless grok -p OK  (complete the browser sign-in).
+//   3. Fallback: the original home's auth.json, READ-ONLY (works until token expiry; degraded).
+export function grokAuthPath(env, home, { fsImpl = fs } = {}) {
+  if (env?.GROK_AUTH || env?.GROK_AUTH_PATH) return null;
+  const h = home || os.homedir();
+  const headless = path.join(h, ".grok-headless", "auth.json");
+  try { if (fsImpl.existsSync(headless)) return { path: headless, writable: true }; } catch { /* fall through */ }
+  const originalGrokHome = env?.GROK_HOME || path.join(h, ".grok");
+  return { path: path.join(originalGrokHome, "auth.json"), writable: false };
+}
+
 // Child env for every grok spawn. GROK_HOME repoints grok's whole state dir at the ephemeral,
-// Seatbelt-writable tmpdir (so ~/.grok stays read-only and nothing persists); BENCH_SUPPRESS_HOOKS
-// stops grok from firing Claude Code hooks.
-//
-// Auth: because we override GROK_HOME, grok's default `$GROK_HOME/auth.json` lookup would miss the
-// user's token, so we point GROK_AUTH_PATH at the auth.json in grok's ORIGINAL home (their custom
-// GROK_HOME if set, else ~/.grok) — read-only, so the token is never exposed to writes. But if the
-// caller already provides their OWN auth (GROK_AUTH inline token, or a custom GROK_AUTH_PATH), we
-// must NOT clobber it — respect it and pass it through untouched.
-export function grokChildEnv(env, tmpDir, home) {
-  const hasCallerAuth = env?.GROK_AUTH || env?.GROK_AUTH_PATH;
-  const originalGrokHome = env?.GROK_HOME || path.join(home || os.homedir(), ".grok");
+// Seatbelt-writable tmpdir (so ~/.grok stays read-only and nothing persists); GROK_AUTH_PATH comes
+// from grokAuthPath (gate auth home > read-only fallback; caller-provided auth never clobbered);
+// BENCH_SUPPRESS_HOOKS stops grok from firing Claude Code hooks.
+export function grokChildEnv(env, tmpDir, home, opts) {
+  const auth = grokAuthPath(env, home, opts);
   return {
     ...env,
     BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1",
-    ...(hasCallerAuth ? {} : { GROK_AUTH_PATH: path.join(originalGrokHome, "auth.json") }),
+    ...(auth ? { GROK_AUTH_PATH: auth.path } : {}),
     ...(tmpDir ? { TMPDIR: tmpDir, GROK_HOME: tmpDir } : {}),
   };
 }
@@ -164,6 +182,17 @@ const cleanupTmpDir = (d) => { if (d) try { fs.rmSync(d, { recursive: true, forc
 // Treat that as fatal on the paths where Seatbelt isn't wrapping.
 const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(String(stderr ?? ""));
 
+// Failure text for a non-zero grok exit. When the failure is auth (401) AND we were on the read-only
+// fallback (no writable gate auth home), tell the user the one-time fix instead of a bare 401 —
+// without ~/.grok-headless, grok cannot persist its rotating OAuth tokens through the sandbox.
+export function grokFailureMessage(r, auth) {
+  const msg = (r.stderr || r.stdout || "grok failed").trim().slice(0, 300);
+  if (/401|unauthorized|expired credentials|no auth context/i.test(msg) && !auth?.writable) {
+    return `${msg}\n→ grok gate auth not set up. One-time fix: run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` and complete the browser sign-in, then retry.`;
+  }
+  return msg;
+}
+
 // Extract the final answer from grok stdout: JSON .text when parseable, else the raw stdout
 // (fallback keeps us working if the CLI's JSON shape changes).
 export function grokText(stdout) {
@@ -177,11 +206,12 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
   // Fail CLOSED: without the private tmpdir there is no ephemeral GROK_HOME to absorb grok's writes
   // and (off darwin) no Seatbelt either — grok would write ~/.grok unsandboxed. Refuse instead.
   if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
+  const auth = grokAuthPath(env, home);
   const childEnv = grokChildEnv(env, tmpDir, home);
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}) });
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
-  if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
+  if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
   const v = parseVerdict(grokText(r.stdout));
   if (!v.verdict) return { name: "Grok", error: "unexpected reviewer output" };
@@ -193,11 +223,12 @@ export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bi
   const tmpDir = makeGrokTmpDir();
   // Fail CLOSED (see runGrokReview): no private tmpdir → no containment → refuse.
   if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
+  const auth = grokAuthPath(env, home);
   const childEnv = grokChildEnv(env, tmpDir, home);
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}) });
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
-  if (r.status !== 0) return { name: "Grok", error: (r.stderr || r.stdout || "grok failed").trim().slice(0, 300) };
+  if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
   const raw = grokText(r.stdout);
   return raw ? { name: "Grok", raw } : { name: "Grok", error: "grok returned empty output" };

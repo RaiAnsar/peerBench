@@ -295,16 +295,44 @@ test("GROK_SEATBELT_PROFILE grants writes ONLY to the ephemeral tmpdir + /dev �
 
 test("grokChildEnv redirects grok's whole state into the ephemeral tmpdir with read-only auth", async () => {
   const { grokChildEnv } = await import("../global-hooks/panel-lib.mjs");
-  const e = grokChildEnv({ PATH: "/usr/bin" }, "/private/tmp/grok-bench-x", "/Users/u");
+  const noHeadless = { fsImpl: { existsSync: () => false } };
+  const e = grokChildEnv({ PATH: "/usr/bin" }, "/private/tmp/grok-bench-x", "/Users/u", noHeadless);
   assert.equal(e.GROK_HOME, "/private/tmp/grok-bench-x", "GROK_HOME redirects all writes into the ephemeral tmpdir");
   assert.equal(e.TMPDIR, "/private/tmp/grok-bench-x", "TMPDIR shares the same ephemeral dir");
-  assert.equal(e.GROK_AUTH_PATH, "/Users/u/.grok/auth.json", "auth read from the real (read-only) auth.json so the redirected home still authenticates");
+  assert.equal(e.GROK_AUTH_PATH, "/Users/u/.grok/auth.json", "no gate auth home → falls back to the real (read-only) auth.json");
   assert.equal(e.BENCH_SUPPRESS_HOOKS, "1", "grok must not fire Claude Code hooks");
   assert.equal(e.PATH, "/usr/bin", "passes through the caller env");
+  // Gate auth home present → auth points THERE (writable, refresh persists, chain independent of ~/.grok).
+  const hasHeadless = { fsImpl: { existsSync: (p) => p === "/Users/u/.grok-headless/auth.json" } };
+  const e3 = grokChildEnv({}, "/private/tmp/grok-bench-x", "/Users/u", hasHeadless);
+  assert.equal(e3.GROK_AUTH_PATH, "/Users/u/.grok-headless/auth.json", "gate auth home wins when it exists");
   // Without a tmpdir (mkdtemp failed) we must NOT set GROK_HOME to ~/.grok — leave it unset. The
   // runners then refuse (fail-closed); grokChildEnv itself never points GROK_HOME at ~/.grok.
-  const e2 = grokChildEnv({}, null, "/Users/u");
+  const e2 = grokChildEnv({}, null, "/Users/u", noHeadless);
   assert.ok(!("GROK_HOME" in e2), "no tmpdir → GROK_HOME unset (never falls back to ~/.grok writes)");
+});
+
+test("grokAuthPath precedence: caller auth > gate auth home (writable) > original home read-only", async () => {
+  const { grokAuthPath } = await import("../global-hooks/panel-lib.mjs");
+  const noFs = { fsImpl: { existsSync: () => false } };
+  const yesFs = { fsImpl: { existsSync: () => true } };
+  assert.equal(grokAuthPath({ GROK_AUTH: "tok" }, "/Users/u", yesFs), null, "inline token → caller-managed");
+  assert.equal(grokAuthPath({ GROK_AUTH_PATH: "/c/a.json" }, "/Users/u", yesFs), null, "custom path → caller-managed");
+  const gate = grokAuthPath({}, "/Users/u", yesFs);
+  assert.deepEqual(gate, { path: "/Users/u/.grok-headless/auth.json", writable: true }, "gate home → writable");
+  const fb = grokAuthPath({}, "/Users/u", noFs);
+  assert.deepEqual(fb, { path: "/Users/u/.grok/auth.json", writable: false }, "fallback → read-only");
+  const fbCustomHome = grokAuthPath({ GROK_HOME: "/custom/gh" }, "/Users/u", noFs);
+  assert.deepEqual(fbCustomHome, { path: "/custom/gh/auth.json", writable: false }, "fallback honors the caller's original GROK_HOME");
+});
+
+test("GROK_SEATBELT_PROFILE authWrite grants exactly the gate auth file + its lock — nothing else", async () => {
+  const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
+  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.grok-headless/auth.json");
+  assert.ok(p.includes('(literal "/Users/u/.grok-headless/auth.json")'), "gate auth.json writable (OAuth token rotation must persist)");
+  assert.ok(p.includes('(literal "/Users/u/.grok-headless/auth.json.lock")'), "its lock writable (grok locks to establish auth context)");
+  assert.ok(!p.includes('(subpath "/Users/u/.grok-headless")'), "must be the two literals, never the whole dir");
+  assert.ok(!p.includes('"/Users/u/.grok/'), "the user's interactive ~/.grok stays fully read-only");
 });
 
 test("grokChildEnv respects caller-provided auth (never clobbers a custom GROK_AUTH_PATH / GROK_AUTH)", async () => {
