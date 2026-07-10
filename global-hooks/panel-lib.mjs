@@ -119,15 +119,31 @@ export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "
 // bypassPermissions) — never trust it; this OS wrapper + `--no-leader` are the hard guarantee.
 // Fail-closed: sandbox-exec refuses a bad profile and our spawn surfaces that as a reviewer error.
 // (Every escalation here was caught by the Codex stop gate.)
-// authWrite (optional) = the gate's OWN auth file (~/.grok-headless/auth.json): grok's plan auth is
-// OAuth with ROTATING tokens it must persist back to auth.json (+ a .lock it writes to establish the
-// auth context) — with auth fully read-only, the first post-expiry gate run gets "401 no auth context"
-// and every review after shows Grok! (exactly what happened). So the ONE persistent writable surface
-// is the gate's dedicated credential file — never the user's ~/.grok/auth.json, never code. Risk is
-// bounded: corrupting it DoSes the reviewer (visible fail-open badge), planting a token re-routes
-// billing — neither is code exec; same trust level as the codex gate's writable ~/.codex-headless.
-export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite) =>
-  `(version 1)(allow default)(deny file-write*)(allow file-write*${tmpDir ? ` (subpath "${tmpDir}")` : ""}${authWrite ? ` (literal "${authWrite}") (literal "${authWrite}.lock")` : ""} (subpath "/dev"))`;
+// A path is safe to embed in the profile ONLY if it's an absolute path free of characters that could
+// break out of the SBPL double-quoted string literal and inject arbitrary sandbox rules. SBPL string
+// literals are `"…"`; a `"` closes the string, `\` starts an escape, and control chars are illegal —
+// any of those in a caller-influenced path (e.g. GROK_AUTH_PATH) would let it inject its own
+// (allow file-write* …) grant. We REFUSE such paths rather than try to escape them (there is no safe
+// escape). Non-absolute is rejected too (only fully-resolved paths belong in a sandbox policy).
+export function sbplPathSafe(p) {
+  // eslint-disable-next-line no-control-regex
+  return typeof p === "string" && p.length > 0 && path.isAbsolute(p) && !/["\\\x00-\x1f]/.test(p);
+}
+
+// authWrite (optional) = a credential file grok must persist ROTATING OAuth tokens back to (the gate's
+// own ~/.grok-headless/auth.json, or a caller's designated GROK_AUTH_PATH). With auth fully read-only
+// the first post-expiry gate run gets "401 no auth context" and every review after shows Grok!. So the
+// ONE persistent writable surface is that single auth file + its .lock — never the user's
+// ~/.grok/auth.json, never code. EVERY interpolated path is validated by sbplPathSafe first: an unsafe
+// tmpDir drops its grant (run then fails closed — no writable GROK_HOME); an unsafe authWrite drops
+// its grant (grok reads that auth read-only — degraded, not injected). Risk of the auth grant is
+// bounded: corrupting it DoSes the reviewer (visible fail-open badge) or re-routes billing — neither
+// is code exec; same trust level as the codex gate's writable ~/.codex-headless.
+export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite) => {
+  const tmpGrant = sbplPathSafe(tmpDir) ? ` (subpath "${tmpDir}")` : "";
+  const authGrant = sbplPathSafe(authWrite) ? ` (literal "${authWrite}") (literal "${authWrite}.lock")` : "";
+  return `(version 1)(allow default)(deny file-write*)(allow file-write*${tmpGrant}${authGrant} (subpath "/dev"))`;
+};
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
 // darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
@@ -154,10 +170,12 @@ export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platfor
 //      401s there carry the one-time setup hint).
 export function grokAuthPath(env, home, { fsImpl = fs } = {}) {
   if (env?.GROK_AUTH) return null;
-  if (env?.GROK_AUTH_PATH) return { path: env.GROK_AUTH_PATH, writable: true, callerManaged: true };
+  // A caller path is honored, but it only earns a WRITE grant if it's safe to embed in the sandbox
+  // policy; an unsafe path (SBPL-breaking chars) degrades to read-only rather than injecting a grant.
+  if (env?.GROK_AUTH_PATH) return { path: env.GROK_AUTH_PATH, writable: sbplPathSafe(env.GROK_AUTH_PATH), callerManaged: true };
   const h = home || os.homedir();
   const headless = path.join(h, ".grok-headless", "auth.json");
-  try { if (fsImpl.existsSync(headless)) return { path: headless, writable: true }; } catch { /* fall through */ }
+  try { if (fsImpl.existsSync(headless)) return { path: headless, writable: sbplPathSafe(headless) }; } catch { /* fall through */ }
   const originalGrokHome = env?.GROK_HOME || path.join(h, ".grok");
   return { path: path.join(originalGrokHome, "auth.json"), writable: false };
 }

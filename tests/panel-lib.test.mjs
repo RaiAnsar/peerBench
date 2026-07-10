@@ -349,6 +349,39 @@ test("GROK_SEATBELT_PROFILE authWrite grants exactly the gate auth file + its lo
   assert.ok(!p.includes('"/Users/u/.grok/'), "the user's interactive ~/.grok stays fully read-only");
 });
 
+test("sbplPathSafe rejects anything that could break out of an SBPL string literal", async () => {
+  const { sbplPathSafe } = await import("../global-hooks/panel-lib.mjs");
+  assert.equal(sbplPathSafe("/Users/u/.grok-headless/auth.json"), true, "normal absolute path is safe");
+  assert.equal(sbplPathSafe('/tmp/x") (allow file-write* (subpath "/'), false, "double-quote breakout rejected");
+  assert.equal(sbplPathSafe("/tmp/x\\y"), false, "backslash rejected");
+  assert.equal(sbplPathSafe("/tmp/x\ny"), false, "newline rejected");
+  assert.equal(sbplPathSafe("/tmp/x\x00y"), false, "NUL rejected");
+  assert.equal(sbplPathSafe("relative/path"), false, "non-absolute rejected");
+  assert.equal(sbplPathSafe(""), false, "empty rejected");
+  assert.equal(sbplPathSafe(undefined), false, "undefined rejected");
+});
+
+test("GROK_SEATBELT_PROFILE: a malicious authWrite cannot INJECT sandbox rules (SBPL injection)", async () => {
+  const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
+  // Attacker-shaped path that tries to close the literal and add an allow-write-everywhere rule.
+  const evil = '/tmp/x") (allow file-write* (subpath "/")) ;';
+  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", evil);
+  assert.ok(!p.includes('subpath "/")'), "the injected root grant must NOT appear");
+  assert.ok(!p.includes(evil), "the raw payload must not be interpolated at all");
+  // Exactly the safe grants remain: the tmpdir and /dev, nothing from the payload.
+  assert.equal((p.match(/\(literal /g) || []).length, 0, "no literal grants when authWrite is unsafe");
+  assert.ok(p.includes('(subpath "/private/tmp/grok-bench-x")') && p.includes('(subpath "/dev")'), "only the safe grants survive");
+  // A safe tmpDir but unsafe authWrite → tmp grant kept, auth grant dropped (fail-safe, not fail-open).
+  assert.equal((p.match(/deny file-write/g) || []).length, 1, "still exactly one base deny");
+});
+
+test("grokAuthPath: an unsafe caller GROK_AUTH_PATH degrades to read-only (no write grant injected)", async () => {
+  const { grokAuthPath } = await import("../global-hooks/panel-lib.mjs");
+  const evil = grokAuthPath({ GROK_AUTH_PATH: '/x") (allow file-write* (subpath "/' }, "/Users/u", { fsImpl: { existsSync: () => false } });
+  assert.equal(evil.writable, false, "unsafe caller path must NOT be marked writable");
+  assert.equal(evil.callerManaged, true, "still honored (grok reads it) — just read-only");
+});
+
 test("grokChildEnv respects caller-provided auth (never clobbers a custom GROK_AUTH_PATH / GROK_AUTH)", async () => {
   const { grokChildEnv } = await import("../global-hooks/panel-lib.mjs");
   // Custom explicit auth path → left untouched, our default NOT injected.
