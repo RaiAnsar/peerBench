@@ -222,32 +222,44 @@ const cleanupTmpDir = (d) => { if (d) try { fs.rmSync(d, { recursive: true, forc
 const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(String(stderr ?? ""));
 
 // Failure text for a non-zero grok exit. On an auth error (401 / invalid_grant) it appends the
-// EFFECTIVE recovery for whichever auth source we used — a bare 401 recurs every session otherwise.
-export function grokFailureMessage(r, auth) {
+// EFFECTIVE recovery — which depends on the auth SOURCE and the PLATFORM.
+//
+// PLATFORM matters: the Seatbelt sandbox (and thus every write-grant / atomic-rotation limitation) is
+// applied ONLY on darwin — grokSpawnSpec runs grok BARE elsewhere. So off darwin grok writes auth
+// freely and token rotation works; a 401 there is simply an expired/dead token, and the darwin-only
+// "the sandbox can't create the temp file / unset GROK_AUTH_PATH" guidance would be WRONG (caught by
+// the Codex gate). Default the platform from process.platform for direct/legacy callers.
+export function grokFailureMessage(r, auth, platform = process.platform) {
   const msg = (r.stderr || r.stdout || "grok failed").trim().slice(0, 300);
   const isAuthErr = /401|unauthorized|expired credentials|no auth context|invalid_grant/i.test(msg);
   if (!isAuthErr || !auth) return msg;
 
-  // Caller-managed GROK_AUTH_PATH can NEVER persist a rotating token under the sandbox, so its 401s
-  // recur every session — and it needs explicit guidance (this was knowingly degraded for isolation;
-  // caught by the Codex gate). Two sub-cases, same effective fix:
-  //   • SAFE path (writable) → granted only its exact file, not its dir, so grok can't create the
-  //     temp sibling its atomic token-rotation needs → refresh denied.
-  //   • UNSAFE path (not writable) → no write grant at all.
-  // The gate home rotates atomically, but it's only consulted if GROK_AUTH_PATH is UNSET (caller path
-  // takes precedence — a prior gate catch), so the recovery MUST say to unset it.
+  const gateReauth = '`GROK_HOME=~/.grok-headless grok -p "Reply OK"`';
+
+  if (platform !== "darwin") {
+    // No OS sandbox → rotation works; the token itself is dead. Re-auth wherever grok reads it from.
+    const isGateHome = !auth.callerManaged && String(auth.path || "").includes("/.grok-headless/");
+    return `${msg}\n→ grok auth token expired/invalid; re-auth grok (sign in again), then retry.${isGateHome ? ` For the gate home: run ${gateReauth}.` : ""}`;
+  }
+
+  // darwin (Seatbelt-wrapped): a caller-managed GROK_AUTH_PATH can NEVER persist a rotating token, so
+  // its 401s recur every session and need explicit guidance (knowingly degraded for isolation; a prior
+  // gate catch). SAFE path (writable) → granted only its exact file, not its dir → grok can't create
+  // the atomic temp sibling → refresh denied. UNSAFE path (not writable) → no write grant. Same fix:
+  // the gate home rotates atomically, but is only consulted if GROK_AUTH_PATH is UNSET (caller path
+  // takes precedence), so the recovery MUST say to unset it.
   if (auth.callerManaged) {
     const why = auth.writable
       ? "a custom GROK_AUTH_PATH is granted only its exact file (not its directory) for sandbox isolation, so grok can't create the temp file its atomic token-rotation needs"
       : "GROK_AUTH_PATH can't be granted sandbox write access (needs an absolute path with no quotes/backslashes/control chars)";
-    return `${msg}\n→ ${why}, so a refreshed token can't persist → this recurs every session. For durable rotation, UNSET GROK_AUTH_PATH and run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` (the gate home rotates atomically).`;
+    return `${msg}\n→ ${why}, so a refreshed token can't persist → this recurs every session. For durable rotation, UNSET GROK_AUTH_PATH and run ${gateReauth} (the gate home rotates atomically).`;
   }
   // Read-only fallback (no gate home, no caller auth): set the gate home up.
   if (!auth.writable) {
-    return `${msg}\n→ grok gate auth not set up. One-time fix: run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` and complete the browser sign-in, then retry.`;
+    return `${msg}\n→ grok gate auth not set up. One-time fix: run ${gateReauth} and complete the browser sign-in, then retry.`;
   }
   // Gate home IS writable but still 401 → its stored token is genuinely dead; re-auth the gate home.
-  return `${msg}\n→ grok gate token expired. Re-auth: run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` and complete the browser sign-in.`;
+  return `${msg}\n→ grok gate token expired. Re-auth: run ${gateReauth} and complete the browser sign-in.`;
 }
 
 // Extract the final answer from grok stdout: JSON .text when parseable, else the raw stdout
@@ -268,7 +280,7 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
   const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
-  if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth) };
+  if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth, platform) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
   const v = parseVerdict(grokText(r.stdout));
   if (!v.verdict) return { name: "Grok", error: "unexpected reviewer output" };
@@ -285,7 +297,7 @@ export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bi
   const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
-  if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth) };
+  if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth, platform) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
   const raw = grokText(r.stdout);
   return raw ? { name: "Grok", raw } : { name: "Grok", error: "grok returned empty output" };

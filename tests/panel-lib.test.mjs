@@ -329,37 +329,53 @@ test("grokAuthPath precedence: inline token > caller path (writable!) > gate aut
   assert.deepEqual(fbCustomHome, { path: "/custom/gh/auth.json", writable: false }, "fallback honors the caller's original GROK_HOME");
 });
 
-test("grokFailureMessage: every auth-source 401 gets its EFFECTIVE recovery (no bare, recurring 401)", async () => {
+test("grokFailureMessage (darwin/sandboxed): every auth-source 401 gets its EFFECTIVE recovery", async () => {
   const { grokFailureMessage } = await import("../global-hooks/panel-lib.mjs");
   const r401 = { stderr: "Error: Unauthorized (401) … no auth context" };
   const rGrant = { stderr: "Internal error: invalid_grant (auth_kind=bearer)" };
   const setupHint = /grok gate auth not set up/;
   const rotateHint = /UNSET GROK_AUTH_PATH and run/;
+  const dar = (r, auth) => grokFailureMessage(r, auth, "darwin");   // pin platform → deterministic
 
   // Read-only fallback (no gate home) → set the gate home up.
-  assert.match(grokFailureMessage(r401, { path: "/Users/u/.grok/auth.json", writable: false }), setupHint, "read-only fallback → gate-home setup hint");
+  assert.match(dar(r401, { path: "/Users/u/.grok/auth.json", writable: false }), setupHint, "read-only fallback → gate-home setup hint");
 
-  // Caller-managed, SAFE path (writable, literals) → atomic refresh is denied → MUST get rotation
-  // guidance (the exact gap the Codex gate flagged: knowingly broken, previously no guidance).
-  const callerWritable = grokFailureMessage(rGrant, { path: "/c/a.json", writable: true, callerManaged: true });
+  // Caller-managed, SAFE path (writable, literals) → atomic refresh is denied under Seatbelt → MUST get
+  // rotation guidance (the exact gap the Codex gate flagged: knowingly broken, previously no guidance).
+  const callerWritable = dar(rGrant, { path: "/c/a.json", writable: true, callerManaged: true });
   assert.match(callerWritable, rotateHint, "writable caller 401 → rotation recovery (unset + gate home)");
   assert.match(callerWritable, /atomic token-rotation|can't create the temp file/i, "explains WHY rotation fails for a caller path");
-  assert.doesNotMatch(callerWritable, setupHint, "not the bare gate-home setup hint (that's ineffective while GROK_AUTH_PATH is set)");
+  assert.doesNotMatch(callerWritable, setupHint, "not the bare gate-home setup hint (ineffective while GROK_AUTH_PATH is set)");
 
-  // Caller-managed, UNSAFE path (not writable) → also gets the unset+gate-home recovery, and explains
-  // the path is unsafe.
-  const callerUnsafe = grokFailureMessage(r401, { path: "/c/a.json", writable: false, callerManaged: true });
+  // Caller-managed, UNSAFE path → also steered to unset+gate-home, and explains the path is unsafe.
+  const callerUnsafe = dar(r401, { path: "/c/a.json", writable: false, callerManaged: true });
   assert.match(callerUnsafe, rotateHint, "unsafe caller 401 → still steered to the gate home (unset first)");
   assert.match(callerUnsafe, /can't be granted sandbox write access/i, "explains the path is unsafe");
 
   // Gate home writable but still 401 → its token is dead → re-auth the gate home (not "not set up").
-  const gate401 = grokFailureMessage(r401, { path: "/Users/u/.grok-headless/auth.json", writable: true });
+  const gate401 = dar(r401, { path: "/Users/u/.grok-headless/auth.json", writable: true });
   assert.match(gate401, /gate.*token expired|Re-auth/i, "gate-home 401 → re-auth, not setup");
   assert.doesNotMatch(gate401, setupHint, "gate-home 401 is not a 'not set up' case");
 
   // Inline token / non-auth → no recovery appended.
-  assert.doesNotMatch(grokFailureMessage(r401, null), /→/, "inline token 401 = bad token, no recovery line");
-  assert.doesNotMatch(grokFailureMessage({ stderr: "some other crash" }, { writable: false }), /→/, "non-auth failures never append recovery");
+  assert.doesNotMatch(dar(r401, null), /→/, "inline token 401 = bad token, no recovery line");
+  assert.doesNotMatch(dar({ stderr: "some other crash" }, { writable: false }), /→/, "non-auth failures never append recovery");
+});
+
+test("grokFailureMessage (off darwin / unsandboxed): 401 is just an expired token — NO sandbox guidance", async () => {
+  const { grokFailureMessage } = await import("../global-hooks/panel-lib.mjs");
+  const rGrant = { stderr: "Internal error: invalid_grant (auth_kind=bearer)" };
+  const lin = (auth) => grokFailureMessage(rGrant, auth, "linux");
+  // Off darwin grokSpawnSpec runs grok BARE — no write restriction, rotation works. The darwin-only
+  // "sandbox can't create the temp file / unset GROK_AUTH_PATH" guidance would be WRONG here (Codex gate).
+  const caller = lin({ path: "/c/a.json", writable: true, callerManaged: true });
+  assert.match(caller, /expired|re-auth/i, "off darwin → generic re-auth");
+  assert.doesNotMatch(caller, /UNSET GROK_AUTH_PATH/, "MUST NOT tell an unsandboxed caller to unset GROK_AUTH_PATH");
+  assert.doesNotMatch(caller, /sandbox|atomic token-rotation|temp file/i, "MUST NOT claim the sandbox blocks rotation (there is none)");
+  // Gate home off darwin → generic re-auth, may point at the gate-home command.
+  const gate = lin({ path: "/Users/u/.grok-headless/auth.json", writable: true });
+  assert.match(gate, /re-auth/i, "off-darwin gate-home 401 → re-auth");
+  assert.doesNotMatch(gate, /sandbox|atomic/i, "no sandbox claims off darwin");
 });
 
 test("GROK_SEATBELT_PROFILE gate-managed auth grants the auth PARENT DIR (atomic OAuth write needs it)", async () => {
