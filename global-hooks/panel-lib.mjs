@@ -132,16 +132,24 @@ export function sbplPathSafe(p) {
 
 // authWrite (optional) = a credential file grok must persist ROTATING OAuth tokens back to (the gate's
 // own ~/.grok-headless/auth.json, or a caller's designated GROK_AUTH_PATH). With auth fully read-only
-// the first post-expiry gate run gets "401 no auth context" and every review after shows Grok!. So the
-// ONE persistent writable surface is that single auth file + its .lock — never the user's
-// ~/.grok/auth.json, never code. EVERY interpolated path is validated by sbplPathSafe first: an unsafe
-// tmpDir drops its grant (run then fails closed — no writable GROK_HOME); an unsafe authWrite drops
-// its grant (grok reads that auth read-only — degraded, not injected). Risk of the auth grant is
-// bounded: corrupting it DoSes the reviewer (visible fail-open badge) or re-routes billing — neither
-// is code exec; same trust level as the codex gate's writable ~/.codex-headless.
+// the first post-expiry gate run gets "401 no auth context" and every review after shows Grok!.
+//
+// Grant is the PARENT DIR as a subpath — NOT just the two file literals. Grok persists auth via
+// atomic write (create sibling temp + rename over auth.json). Seatbelt `literal` allows open/write
+// on an existing file but DENIES creating `auth.json.tmp` / `auth.json.new` in the same directory,
+// which surfaces as `auth update disk write failed: Operation not permitted`. Refresh then
+// succeeds in-memory (and often rotates the RT server-side) while disk keeps the old RT → next
+// run gets invalid_grant → device-code re-auth loop. Live-verified: literals-only = atomic FAIL;
+// subpath(parent) = atomic OK. Parent is still bounded: gate home is ~/.grok-headless (never
+// interactive ~/.grok — authWrite is only set when grokAuthPath marks writable). Unsafe paths are
+// still refused by sbplPathSafe (no SBPL injection). Risk of the auth grant is bounded: corrupting
+// it DoSes the reviewer (visible fail-open badge) or re-routes billing — neither is code exec;
+// same trust level as the codex gate's writable ~/.codex-headless.
 export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite) => {
   const tmpGrant = sbplPathSafe(tmpDir) ? ` (subpath "${tmpDir}")` : "";
-  const authGrant = sbplPathSafe(authWrite) ? ` (literal "${authWrite}") (literal "${authWrite}.lock")` : "";
+  // Parent-dir grant covers auth.json, auth.json.lock, and the atomic-write siblings grok creates.
+  const authDir = typeof authWrite === "string" && authWrite.length ? path.dirname(authWrite) : "";
+  const authGrant = sbplPathSafe(authWrite) && sbplPathSafe(authDir) ? ` (subpath "${authDir}")` : "";
   return `(version 1)(allow default)(deny file-write*)(allow file-write*${tmpGrant}${authGrant} (subpath "/dev"))`;
 };
 

@@ -346,13 +346,22 @@ test("grokFailureMessage: gate-home setup hint ONLY on the read-only FALLBACK (n
   assert.doesNotMatch(grokFailureMessage({ stderr: "some other crash" }, { writable: false }), gateHint, "non-auth failures never hint");
 });
 
-test("GROK_SEATBELT_PROFILE authWrite grants exactly the gate auth file + its lock — nothing else", async () => {
+test("GROK_SEATBELT_PROFILE authWrite grants the auth PARENT DIR (atomic OAuth write needs it)", async () => {
   const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
   const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.grok-headless/auth.json");
-  assert.ok(p.includes('(literal "/Users/u/.grok-headless/auth.json")'), "gate auth.json writable (OAuth token rotation must persist)");
-  assert.ok(p.includes('(literal "/Users/u/.grok-headless/auth.json.lock")'), "its lock writable (grok locks to establish auth context)");
-  assert.ok(!p.includes('(subpath "/Users/u/.grok-headless")'), "must be the two literals, never the whole dir");
-  assert.ok(!p.includes('"/Users/u/.grok/'), "the user's interactive ~/.grok stays fully read-only");
+  // Grok persists tokens via sibling temp + rename. Literal-only grants allow open/write on the
+  // existing file but deny creating auth.json.tmp → "disk write failed: Operation not permitted"
+  // → RT rotates in-memory, disk keeps the dead RT → re-auth loop on every post-expiry gate.
+  assert.ok(!p.includes("(literal "), "literals alone are insufficient; grant is the parent subpath");
+  // Parse the actual subpath grants and check membership EXACTLY, rather than substring-matching the
+  // profile text: a bare `p.includes('/Users/u/.grok')` would false-positive on `.grok-headless`, and a
+  // negative substring assertion is easy to misread even when correct (a reviewer flagged this exact
+  // line as inverted — it is not: the closing quote makes `(subpath ".../.grok")` distinct from
+  // `(subpath ".../.grok-headless")`, verified false — but the structural check removes the ambiguity).
+  const grants = [...p.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]);
+  assert.ok(grants.includes("/Users/u/.grok-headless"), "gate auth home parent is writable so atomic temp+rename can land");
+  assert.ok(!grants.includes("/Users/u/.grok"), "user's interactive ~/.grok is NEVER a write grant — only the gate home");
+  assert.deepEqual(grants.filter((g) => g.includes("/.grok")), ["/Users/u/.grok-headless"], "the only .grok* write surface is the gate home");
 });
 
 test("sbplPathSafe rejects anything that could break out of an SBPL string literal", async () => {
