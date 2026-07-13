@@ -1417,6 +1417,30 @@ test("FAST (default): a clean panel allows AND enqueues the deep async review", 
   assert.equal(enq.kind, "push", "enqueued job is a push review");
 });
 
+test("FAST: a quick panel does NOT keep the hook alive for the full budget (budget timer is cleared)", async () => {
+  // Regression (Codex gate): Promise.race resolves when reviewers win, but an un-cleared budget
+  // setTimeout stays a REF'd handle → the hook process lingers the whole budget → ~90s freeze on every
+  // fast ALLOW. With a 10-MINUTE budget, a leaked timer is unmistakable in the active-resource count.
+  const timerCount = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-fast-timer-")));
+  process.env.BENCH_ROOT = root;
+  const before = timerCount();
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;   // swallow the emitted decision
+  try {
+    await callRunMain({
+      resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW")],
+      enqueueImpl: () => true,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: { ...process.env, BENCH_PUSH_GATE_BUDGET_MS: "600000" },   // 10 min — a leaked timer is obvious
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  assert.equal(timerCount(), before, "the budget timer MUST be cleared once the panel returns (else the hook lingers the whole budget)");
+});
+
 test("FAST: reviewers exceeding the budget → FAIL OPEN (push allowed, deep review queued, session not frozen)", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-fast-to-")));

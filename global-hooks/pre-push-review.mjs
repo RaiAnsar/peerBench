@@ -16,7 +16,6 @@ import { runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 
 const DEFAULT_PUSH_GATE_BUDGET_MS = 90_000;   // hard cap on the INLINE gate → it can never freeze the session (env-tunable per invocation)
 const MAX_PUSH_DIFF_BYTES = 200_000;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Enqueue the DEEP async push review. Pins symbolic ranges to SHAs so a queued job survives the
 // remote-tracking ref advancing after the push lands. runMain calls this so the thorough panel pass
@@ -540,12 +539,21 @@ export async function runMain({
   const { system, user } = buildPrompt(commits, diff);
 
   let results = null;
+  let budgetTimer = null;
   try {
     const reviewers = resolveReviewersImpl({ env });
     const reviewPromise = Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
-    results = await Promise.race([reviewPromise, sleep(budgetMs).then(() => "TIMEOUT")]);
+    const timeout = new Promise((resolve) => { budgetTimer = setTimeout(() => resolve("TIMEOUT"), budgetMs); });
+    results = await Promise.race([reviewPromise, timeout]);
   } catch {
     results = null;
+  } finally {
+    // CRITICAL: clear the budget timer the instant the panel returns. A pending setTimeout is a REF'd
+    // handle that keeps the hook PROCESS alive until it fires — so on a fast ALLOW the hook would linger
+    // the full budget and Claude Code (which waits for the hook to EXIT) freezes ~90s on EVERY push,
+    // defeating the whole fast-mode point (caught by the Codex gate). On the timeout branch the timer has
+    // already fired; the LOSING reviewer promise still holds sockets open, so that path exit(0)s below.
+    if (budgetTimer) clearTimeout(budgetTimer);
   }
 
   if (results === "TIMEOUT" || !Array.isArray(results) || !hasReviewerVerdict({ reviewers: results })) {
@@ -555,7 +563,7 @@ export async function runMain({
       `⛩ bench pre-push: ${why}; push allowed — a deep review is queued (delivered at the next stop). Run /bench:review ${range} for a full pass now.${rangeNoteSuffix}`,
       `⛩ bench pre-push: ${why} (${range}); push allowed — deep review queued.`
     );
-    return exit(0);   // don't linger on a dangling reviewer promise
+    return exit(0);   // reviewers lost the race but their sockets are still open — force-exit
   }
 
   const panel = combinePanel(results, { blockMinSeverity: "high" });

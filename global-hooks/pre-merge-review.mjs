@@ -36,8 +36,6 @@ const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--names
 // not "msg". Only DEFINITE value-flags (optional-arg flags like -S are left alone to avoid eating a ref).
 const MERGE_VALUE_FLAGS = new Set(["-m", "--message", "-F", "--file", "-s", "--strategy", "-X", "--strategy-option", "--into-name"]);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 // Detect `git merge <ref...>` in a shell segment (allow leading env assignments + git global opts).
 // Excludes --abort/--continue/--quit (not a NEW merge) and --help. Returns { refs } or null.
 export function parseMergeSegment(text) {
@@ -148,12 +146,19 @@ export async function runMain({
   const budgetMs = Number(env.BENCH_MERGE_GATE_BUDGET_MS) || DEFAULT_MERGE_GATE_BUDGET_MS;
   const { system, user } = buildPrompt(commits, diff);
   let results = null;
+  let budgetTimer = null;
   try {
     const reviewers = resolveReviewersImpl({ env });
     const reviewPromise = Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
-    results = await Promise.race([reviewPromise, sleep(budgetMs).then(() => "TIMEOUT")]);
+    const timeout = new Promise((resolve) => { budgetTimer = setTimeout(() => resolve("TIMEOUT"), budgetMs); });
+    results = await Promise.race([reviewPromise, timeout]);
   } catch {
     results = null;
+  } finally {
+    // Clear the budget timer the instant the panel returns — a pending setTimeout keeps the hook process
+    // alive for the whole budget, freezing a fast merge for ~90s (same class of bug the Codex gate caught
+    // on the push gate). The timeout branch already fired the timer and exit(0)s below on the dangling promise.
+    if (budgetTimer) clearTimeout(budgetTimer);
   }
 
   if (results === "TIMEOUT" || results === null || !Array.isArray(results)) {
