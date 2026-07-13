@@ -441,7 +441,7 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
       // Fail CLOSED: no private tmpdir → no containment; report unhealthy instead of probing unsandboxed.
       if (!tmpDir) return { status: 1, stderr: "grok sandbox tmpdir could not be created" };
       const auth = grokAuthPath(env);
-      const spec = grokSpawnSpec("Reply with exactly: OK", { tmpDir, ...(auth?.writable ? { authWrite: auth.path } : {}) });
+      const spec = grokSpawnSpec("Reply with exactly: OK", { tmpDir, ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
       try {
         return spawnSync(spec.cmd, spec.args, {
           env: grokChildEnv(env, tmpDir), encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS

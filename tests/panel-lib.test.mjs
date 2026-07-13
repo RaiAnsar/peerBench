@@ -346,9 +346,10 @@ test("grokFailureMessage: gate-home setup hint ONLY on the read-only FALLBACK (n
   assert.doesNotMatch(grokFailureMessage({ stderr: "some other crash" }, { writable: false }), gateHint, "non-auth failures never hint");
 });
 
-test("GROK_SEATBELT_PROFILE authWrite grants the auth PARENT DIR (atomic OAuth write needs it)", async () => {
+test("GROK_SEATBELT_PROFILE gate-managed auth grants the auth PARENT DIR (atomic OAuth write needs it)", async () => {
   const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
-  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.grok-headless/auth.json");
+  // gateManaged=true → the bench-controlled ~/.grok-headless: parent-dir grant is safe + needed.
+  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.grok-headless/auth.json", true);
   // Grok persists tokens via sibling temp + rename. Literal-only grants allow open/write on the
   // existing file but deny creating auth.json.tmp → "disk write failed: Operation not permitted"
   // → RT rotates in-memory, disk keeps the dead RT → re-auth loop on every post-expiry gate.
@@ -362,6 +363,32 @@ test("GROK_SEATBELT_PROFILE authWrite grants the auth PARENT DIR (atomic OAuth w
   assert.ok(grants.includes("/Users/u/.grok-headless"), "gate auth home parent is writable so atomic temp+rename can land");
   assert.ok(!grants.includes("/Users/u/.grok"), "user's interactive ~/.grok is NEVER a write grant — only the gate home");
   assert.deepEqual(grants.filter((g) => g.includes("/.grok")), ["/Users/u/.grok-headless"], "the only .grok* write surface is the gate home");
+});
+
+test("GROK_SEATBELT_PROFILE caller-managed auth grants ONLY the file literals — never the parent dir (write isolation)", async () => {
+  const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
+  // A caller's GROK_AUTH_PATH has an ARBITRARY parent — granting it as a subpath would disable the
+  // sandbox's write isolation (Codex gate). gateManaged=false → exact file + .lock literals, no dir.
+  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.config/foo/auth.json", false);
+  assert.ok(p.includes('(literal "/Users/u/.config/foo/auth.json")'), "the caller's exact auth file is writable");
+  assert.ok(p.includes('(literal "/Users/u/.config/foo/auth.json.lock")'), "its lock is writable");
+  const subpaths = [...p.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]);
+  assert.ok(!subpaths.includes("/Users/u/.config/foo"), "the caller's parent dir must NOT be granted as a subpath");
+  // The dangerous cases: a broad parent must never become a write grant.
+  for (const broad of ["/Users/u/auth.json" /* $HOME */, "/auth.json" /* filesystem root */, "/Users/u/.grok/auth.json" /* interactive grok */]) {
+    const prof = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", broad, false);
+    const sp = [...prof.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]);
+    assert.deepEqual(sp, ["/private/tmp/grok-bench-x", "/dev"], `caller auth ${broad} grants no dir subpath — only tmp + /dev`);
+    assert.ok(prof.includes(`(literal "${broad}")`), "the exact caller file is still writable (bounded)");
+  }
+});
+
+test("grokSpawnSpec routes gate auth to a parent-dir grant and caller auth to literals (authGateManaged)", async () => {
+  const { grokSpawnSpec } = await import("../global-hooks/panel-lib.mjs");
+  const gate = grokSpawnSpec("x", { platform: "darwin", tmpDir: "/tmp/t", authWrite: "/Users/u/.grok-headless/auth.json", authGateManaged: true });
+  assert.ok(gate.args[1].includes('(subpath "/Users/u/.grok-headless")'), "gate-managed → parent-dir grant");
+  const caller = grokSpawnSpec("x", { platform: "darwin", tmpDir: "/tmp/t", authWrite: "/home/x/auth.json", authGateManaged: false });
+  assert.ok(caller.args[1].includes('(literal "/home/x/auth.json")') && !caller.args[1].includes('(subpath "/home/x")'), "caller → literals, no parent dir");
 });
 
 test("sbplPathSafe rejects anything that could break out of an SBPL string literal", async () => {

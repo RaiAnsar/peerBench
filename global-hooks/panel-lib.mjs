@@ -130,35 +130,41 @@ export function sbplPathSafe(p) {
   return typeof p === "string" && p.length > 0 && path.isAbsolute(p) && !/["\\\x00-\x1f]/.test(p);
 }
 
-// authWrite (optional) = a credential file grok must persist ROTATING OAuth tokens back to (the gate's
-// own ~/.grok-headless/auth.json, or a caller's designated GROK_AUTH_PATH). With auth fully read-only
-// the first post-expiry gate run gets "401 no auth context" and every review after shows Grok!.
+// authWrite (optional) = a credential file grok must persist ROTATING OAuth tokens back to. With auth
+// fully read-only the first post-expiry gate run gets "401 no auth context" and every review shows Grok!.
 //
-// Grant is the PARENT DIR as a subpath — NOT just the two file literals. Grok persists auth via
-// atomic write (create sibling temp + rename over auth.json). Seatbelt `literal` allows open/write
-// on an existing file but DENIES creating `auth.json.tmp` / `auth.json.new` in the same directory,
-// which surfaces as `auth update disk write failed: Operation not permitted`. Refresh then
-// succeeds in-memory (and often rotates the RT server-side) while disk keeps the old RT → next
-// run gets invalid_grant → device-code re-auth loop. Live-verified: literals-only = atomic FAIL;
-// subpath(parent) = atomic OK. Parent is still bounded: gate home is ~/.grok-headless (never
-// interactive ~/.grok — authWrite is only set when grokAuthPath marks writable). Unsafe paths are
-// still refused by sbplPathSafe (no SBPL injection). Risk of the auth grant is bounded: corrupting
-// it DoSes the reviewer (visible fail-open badge) or re-routes billing — neither is code exec;
-// same trust level as the codex gate's writable ~/.codex-headless.
-export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite) => {
+// The GRANT SHAPE depends on WHO owns the auth file (gateManaged):
+//  • Gate's OWN dedicated ~/.grok-headless (gateManaged=true) → grant the PARENT DIR as a subpath.
+//    Grok persists auth via atomic write (create sibling temp + rename over auth.json); Seatbelt
+//    `literal` allows open/write on the existing file but DENIES creating auth.json.tmp, surfacing as
+//    "auth update disk write failed: Operation not permitted" → RT rotates in-memory while disk keeps
+//    the dead RT → invalid_grant re-auth loop. Live-verified: literals = atomic FAIL, subpath = OK.
+//    Safe because bench CREATES and CONTROLS ~/.grok-headless (never interactive ~/.grok; not on the
+//    review exec/config path — GROK_HOME is the ephemeral tmpdir during runs).
+//  • A caller's designated GROK_AUTH_PATH (gateManaged=false) → grant ONLY the exact file + its .lock.
+//    Its parent dir is ARBITRARY (a caller could set GROK_AUTH_PATH=$HOME/auth.json or /auth.json),
+//    and granting that dir would DISABLE write isolation for the whole review (caught by the Codex
+//    gate). So caller auth gets bounded literals; atomic temp+rename may then be denied → the caller's
+//    token rotation is degraded (use the gate home for atomic rotation) but the sandbox stays intact.
+// Every interpolated path is still refused by sbplPathSafe (no SBPL injection).
+export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite, gateManaged = false) => {
   const tmpGrant = sbplPathSafe(tmpDir) ? ` (subpath "${tmpDir}")` : "";
-  // Parent-dir grant covers auth.json, auth.json.lock, and the atomic-write siblings grok creates.
-  const authDir = typeof authWrite === "string" && authWrite.length ? path.dirname(authWrite) : "";
-  const authGrant = sbplPathSafe(authWrite) && sbplPathSafe(authDir) ? ` (subpath "${authDir}")` : "";
+  let authGrant = "";
+  if (sbplPathSafe(authWrite)) {
+    const authDir = path.dirname(authWrite);
+    authGrant = gateManaged && sbplPathSafe(authDir)
+      ? ` (subpath "${authDir}")`                                          // bench-controlled dir → atomic write OK
+      : ` (literal "${authWrite}") (literal "${authWrite}.lock")`;         // caller path → bounded, isolation intact
+  }
   return `(version 1)(allow default)(deny file-write*)(allow file-write*${tmpGrant}${authGrant} (subpath "/dev"))`;
 };
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
 // darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
 // fail-open stderr check in the runners is the net.
-export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir, authWrite } = {}) {
+export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir, authWrite, authGateManaged = false } = {}) {
   const args = GROK_ARGS(prompt);
-  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir, authWrite), bin, ...args] };
+  if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir, authWrite, authGateManaged), bin, ...args] };
   return { cmd: bin, args };
 }
 
@@ -249,7 +255,7 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
   if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
   const auth = grokAuthPath(env, home);
   const childEnv = grokChildEnv(env, tmpDir, home);
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path } : {}) });
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth) };
@@ -266,7 +272,7 @@ export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bi
   if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
   const auth = grokAuthPath(env, home);
   const childEnv = grokChildEnv(env, tmpDir, home);
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path } : {}) });
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth) };
