@@ -8,14 +8,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { isBenchDisabled as defaultIsBenchDisabled, readReviewedHead, sessionKeyFromInput, writeReviewedHead } from "./config-store.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
+import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
+import { combinePanel } from "./panel-lib.mjs";
 import { deepKey, shouldRewake } from "./deep-review.mjs";
-import { enqueue } from "./deep-queue.mjs";
+import { enqueue as defaultEnqueue } from "./deep-queue.mjs";
 import { runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 
-// Legacy queue helper retained for direct callers/tests. runMain no longer uses it: pushes are
-// full-reviewed inline before the push is allowed. The helper still pins symbolic ranges to SHAs so
-// any queued push-review job survives the remote-tracking ref advancing after a push.
-export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now(), sessionKey = null } = {}) {
+const DEFAULT_PUSH_GATE_BUDGET_MS = 90_000;   // hard cap on the INLINE gate → it can never freeze the session (env-tunable per invocation)
+const MAX_PUSH_DIFF_BYTES = 200_000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Enqueue the DEEP async push review. Pins symbolic ranges to SHAs so a queued job survives the
+// remote-tracking ref advancing after the push lands. runMain calls this so the thorough panel pass
+// runs in the BACKGROUND (delivered by the deep-review-runner rewake) instead of freezing the push.
+export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now(), sessionKey = null, enqueueImpl = defaultEnqueue } = {}) {
   try {
     const [headSha] = gitImpl(["rev-parse", "HEAD"], ws);
     let reviewRange = range;
@@ -26,7 +32,7 @@ export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now()
       if (baseOk && srcOk && baseSha && srcSha) reviewRange = `${baseSha}..${srcSha}`;
     }
     const contentKey = deepKey(`push:${reviewRange}`, headSha);
-    return enqueue(ws, { kind: "push", range: reviewRange, contentKey }, { now, sessionKey });
+    return enqueueImpl(ws, { kind: "push", range: reviewRange, contentKey }, { now, sessionKey });
   } catch (e) {
     process.stderr.write(`⛩ pre-push: deep push-review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast review stands.\n`);
     return false;
@@ -391,12 +397,15 @@ export function buildPrompt(commits, diff) {
 }
 
 export async function runMain({
+  resolveReviewersImpl = defaultResolveReviewers,
+  pushReviewImpl = defaultRunPushReview,
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
-  pushReviewImpl = defaultRunPushReview,
+  enqueueImpl = defaultEnqueue,
   env = process.env,
   input: inputOverride,
-  emitter = createEmitter()
+  emitter = createEmitter(),
+  exit = (code) => process.exit(code)
 } = {}) {
   // All decisions route through this invocation's emit-once guard (A4).
   const decision = (permissionDecision, reason, systemMessage) =>
@@ -404,7 +413,7 @@ export async function runMain({
 
   const input = inputOverride ?? readInput();
   const sessionKey = sessionKeyFromInput(input, env);
-  const assistantContext = assistantContextFromInput(input);
+  const assistantContext = assistantContextFromInput(input);   // used by the blocking-mode deep review
 
   const command = String(input.tool_input?.command ?? "");
 
@@ -439,7 +448,7 @@ export async function runMain({
 
   // 2. Bench disabled check.
   if (isBenchDisabledImpl(ws)) {
-    process.exit(0);
+    return exit(0);
   }
 
   // 3. Compute push range from the PARSED command. If a real push might transmit commits but
@@ -476,61 +485,109 @@ export async function runMain({
     return;
   }
 
-  // 5. Run the full repo-aware push review inline. This is intentionally synchronous: the push
-  // must not leave the machine before peerBench has reviewed the exact commit range.
-  let review;
-  try {
-    review = await pushReviewImpl(range, ws, { sessionKey, writeTraceImpl, assistantContext });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    decision(
-      "deny",
-      `⛩ bench pre-push: full push review errored (${msg}); push blocked. Retry, or run /bench:off if you intentionally need to bypass peerBench.`,
-      `⛩ bench pre-push: full review errored; push blocked.`
-    );
-    return;
-  }
-
-  if (review?.retry) {
-    decision(
-      "deny",
-      `⛩ bench pre-push: full push review could not inspect ${range} (${review.reason || "retry requested"}); push blocked. Retry, or run /bench:off if you intentionally need to bypass peerBench.`,
-      `⛩ bench pre-push: full review unavailable; push blocked.`
-    );
-    return;
-  }
-
-  if (!hasReviewerVerdict(review)) {
-    decision(
-      "deny",
-      `⛩ bench pre-push: full push review produced no reviewer verdicts; push blocked so commits do not leave unreviewed. Retry, or run /bench:off if you intentionally need to bypass peerBench.`,
-      `⛩ bench pre-push: full review unavailable; push blocked.`
-    );
-    return;
-  }
-
   const rangeNoteSuffix = rangeNote ? ` (${rangeNote})` : "";
+  const mode = String(env.BENCH_PUSH_GATE_MODE || "fast").toLowerCase();
 
-  // 6. Decision. The deep-review threshold is shared with spec/plan review: high/critical
-  // findings block, lower-severity findings are advisory.
-  if (shouldRewake(review)) {
-    const detail = review.findings || review.summary || "(no details)";
+  // REVERT SWITCH — BENCH_PUSH_GATE_MODE=blocking restores the ORIGINAL gate: a full repo-aware review
+  // runs INLINE and the push is BLOCKED until it finishes (fail-closed on error/timeout/no-verdict).
+  // Stronger guarantee, but it freezes the session for the WHOLE review (no Ctrl+B / no input) — the
+  // reason "fast" is the default. Flip back any time with BENCH_PUSH_GATE_MODE=blocking.
+  if (mode === "blocking") {
+    let review;
+    try {
+      review = await pushReviewImpl(range, ws, { sessionKey, writeTraceImpl, assistantContext });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      decision("deny", `⛩ bench pre-push: full push review errored (${msg}); push blocked. Retry, or run /bench:off if you intentionally need to bypass peerBench.`, `⛩ bench pre-push: full review errored; push blocked.`);
+      return;
+    }
+    if (review?.retry) {
+      decision("deny", `⛩ bench pre-push: full push review could not inspect ${range} (${review.reason || "retry requested"}); push blocked. Retry, or run /bench:off if you intentionally need to bypass peerBench.`, `⛩ bench pre-push: full review unavailable; push blocked.`);
+      return;
+    }
+    if (!hasReviewerVerdict(review)) {
+      decision("deny", `⛩ bench pre-push: full push review produced no reviewer verdicts; push blocked so commits do not leave unreviewed. Retry, or run /bench:off if you intentionally need to bypass peerBench.`, `⛩ bench pre-push: full review unavailable; push blocked.`);
+      return;
+    }
+    if (shouldRewake(review)) {
+      const detail = review.findings || review.summary || "(no details)";
+      decision("deny", `[${review.badge || "push-review"}] Full push review found issues that must be fixed before pushing:\n\n${detail}\n\nFix the issues above, then run git push again.`, `⛩ bench pre-push BLOCKED [${review.badge || "push-review"}]${rangeNoteSuffix}\n${detail.slice(0, 1200)}${review.traceId ? `\n\n↳ full findings: /bench:show ${review.traceId}` : ""}`);
+      return;
+    }
+    decision("allow", `⛩ bench pre-push: ALLOW [${review.badge || "push-review"}] — ${review.summary || "full push review passed"}${rangeNoteSuffix}`, `⛩ bench pre-push: ALLOW [${review.badge || "push-review"}] — ${(review.summary || "full push review passed").slice(0, 220)}`);
+    return;
+  }
+
+  // ── FAST mode (default) ──────────────────────────────────────────────────────────────────────
+  // 5. Enqueue the DEEP async panel review FIRST (best-effort). The thorough repo-aware Codex/Grok/MiMo
+  // pass now runs in the BACKGROUND — delivered by the deep-review-runner via the visible rewake at the
+  // next stop (non-blocking, backgroundable). This is what lets the inline gate below stay FAST: the slow
+  // exhaustive review no longer runs INSIDE this PreToolUse hook, so it can't freeze the session.
+  // (History: pushes were full-reviewed inline here — a 15–20 min block with no way to Ctrl+B or send
+  // input while Codex/Grok/MiMo churned. The fast-inline-cap + async-panel split fixes exactly that.)
+  try {
+    launchPushReview(ws, range, { sessionKey, enqueueImpl });
+  } catch (e) {
+    process.stderr.write(`⛩ pre-push: deep review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast gate stands.\n`);
+  }
+
+  // 6. Fast content-only inline review, HARD-capped. On timeout/error/no-verdict → FAIL OPEN (allow):
+  // the deep review is already queued, so a slow review can never wedge the push or freeze the session.
+  // A fast, confident high/critical finding still BLOCKS — obvious problems stop before the push leaves.
+  const budgetMs = Number(env.BENCH_PUSH_GATE_BUDGET_MS) || DEFAULT_PUSH_GATE_BUDGET_MS;
+  let diff = gitTry(["diff", range], ws)[0] || "";
+  if (diff.length > MAX_PUSH_DIFF_BYTES) diff = diff.slice(0, MAX_PUSH_DIFF_BYTES) + "\n\n[... diff truncated at 200 000 bytes ...]";
+  const { system, user } = buildPrompt(commits, diff);
+
+  let results = null;
+  try {
+    const reviewers = resolveReviewersImpl({ env });
+    const reviewPromise = Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env })));
+    results = await Promise.race([reviewPromise, sleep(budgetMs).then(() => "TIMEOUT")]);
+  } catch {
+    results = null;
+  }
+
+  if (results === "TIMEOUT" || !Array.isArray(results) || !hasReviewerVerdict({ reviewers: results })) {
+    const why = results === "TIMEOUT" ? `fast review didn't finish in ${(budgetMs / 1000) | 0}s` : "fast review unavailable";
+    decision(
+      "allow",
+      `⛩ bench pre-push: ${why}; push allowed — a deep review is queued (delivered at the next stop). Run /bench:review ${range} for a full pass now.${rangeNoteSuffix}`,
+      `⛩ bench pre-push: ${why} (${range}); push allowed — deep review queued.`
+    );
+    return exit(0);   // don't linger on a dangling reviewer promise
+  }
+
+  const panel = combinePanel(results, { blockMinSeverity: "high" });
+  try {
+    writeTraceImpl(ws, {
+      gate: "push-review", ws, sessionKey,
+      reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null })),
+      systemPrompt: system, userPrompt: user.slice(0, 2000),
+      rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || r.error || ""]))
+    });
+  } catch (e) {
+    process.stderr.write(`⛩ pre-push: trace write failed (${e instanceof Error ? e.message : String(e)}); review continues.\n`);
+  }
+
+  // 7. Decision. High/critical findings block (fast); lower severity is advisory (shared threshold
+  // with plan/spec). The thorough deep pass is already queued regardless.
+  if (panel.decision === "block") {
+    const detail = panel.findings || panel.summary || "(no details)";
     decision(
       "deny",
-      `[${review.badge || "push-review"}] Full push review found issues that must be fixed before pushing:\n\n${detail}\n\n` +
-      `Fix the issues above, then run git push again.`,
-      // USER-VISIBLE: the block was previously silent (only the model saw permissionDecisionReason),
-      // so a blocked push churned invisibly for the user. Surface the badge + trimmed findings + the
-      // retrieval command so a pre-push block is never "off the eyes".
-      `⛩ bench pre-push BLOCKED [${review.badge || "push-review"}]${rangeNoteSuffix}\n${detail.slice(0, 1200)}${review.traceId ? `\n\n↳ full findings: /bench:show ${review.traceId}` : ""}`
+      `[${panel.badge}] Fast pre-push review found issues that must be fixed before pushing:\n\n${detail}\n\n` +
+      `Fix the issues above, then run git push again. (A deep review is also queued.)`,
+      // USER-VISIBLE: a pre-push block is never "off the eyes" — surface the badge + trimmed findings.
+      `⛩ bench pre-push BLOCKED [${panel.badge}]${rangeNoteSuffix}\n${detail.slice(0, 1200)}`
     );
     return;
   }
 
   decision(
     "allow",
-    `⛩ bench pre-push: ALLOW [${review.badge || "push-review"}] — ${review.summary || "full push review passed"}${rangeNoteSuffix}`,
-    `⛩ bench pre-push: ALLOW [${review.badge || "push-review"}] — ${(review.summary || "full push review passed").slice(0, 220)}`
+    `⛩ bench pre-push: ALLOW [${panel.badge}] — ${panel.summary || "fast push review passed"} (a deep review is queued for the thorough pass)${rangeNoteSuffix}`,
+    `⛩ bench pre-push: ALLOW [${panel.badge}] — ${(panel.summary || "push review passed").slice(0, 200)}`
   );
 }
 

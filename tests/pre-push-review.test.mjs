@@ -117,6 +117,27 @@ function stubResolveReviewers(list) {
   return () => list;
 }
 
+// Safe wrapper for runMain: default to a single ALLOW reviewer (so a test that reaches the review never
+// makes a REAL API/CLI call) and a no-op exit (so the fail-open `return exit(0)` path never kills the
+// test process). Deep-review enqueue defaults to a no-op so tests don't write queue jobs unless asserted.
+//
+// Mode routing: a test that injects `pushReviewImpl` is exercising the BLOCKING (inline deep-review)
+// revert path — BENCH_PUSH_GATE_MODE=blocking — so default it there. Fast-mode tests inject
+// `resolveReviewersImpl` (or nothing) and get the default fast mode. Either can be overridden via opts.env.
+function callRunMain(opts = {}) {
+  const baseEnv = opts.env || process.env;
+  const env = opts.pushReviewImpl
+    ? { ...baseEnv, BENCH_PUSH_GATE_MODE: baseEnv.BENCH_PUSH_GATE_MODE || "blocking" }
+    : baseEnv;
+  return runMain({
+    resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW")],
+    enqueueImpl: () => true,
+    exit: () => {},
+    ...opts,
+    env
+  });
+}
+
 /** Capture JSON lines emitted to stdout by emit(). */
 function captureEmit(fn) {
   const lines = [];
@@ -155,7 +176,7 @@ test("non-git-push command → allow no-op (git status)", async () => {
   };
 
   try {
-    await runMain({
+    await callRunMain({
       resolveReviewersImpl: () => { reviewersCalled = true; return [fakeReviewer("Kimi", "ALLOW")]; },
       writeTraceImpl: () => { traceWritten = true; },
       isBenchDisabledImpl: () => false,
@@ -182,7 +203,7 @@ test("bootstrap: a non-push git command records the reviewed-head baseline when 
   const { ws } = freshPushRepo();
   assert.equal(readReviewedHead(ws), null, "precondition: no marker yet");
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ws, encoding: "utf8" }).trim();
-  await runMain({
+  await callRunMain({
     resolveReviewersImpl: () => [],
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
@@ -195,7 +216,7 @@ test("bootstrap: a non-push git command records the reviewed-head baseline when 
 test("bootstrap: does NOT overwrite an existing marker (preserves a cross-session unreviewed range)", async () => {
   const { ws } = freshPushRepo();
   writeReviewedHead(ws, "PREEXISTING");
-  await runMain({
+  await callRunMain({
     resolveReviewersImpl: () => [],
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
@@ -207,7 +228,7 @@ test("bootstrap: does NOT overwrite an existing marker (preserves a cross-sessio
 
 test("bootstrap: skipped when bench is disabled (no marker written)", async () => {
   const { ws } = freshPushRepo();
-  await runMain({
+  await callRunMain({
     resolveReviewersImpl: () => [],
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => true,
@@ -251,7 +272,7 @@ test("bootstrap: marks the repo the command TOUCHES via -C, not input.cwd (Codex
   const { ws: repoA } = freshPushRepo();
   const { ws: repoB } = freshPushRepo();
   const headB = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoB, encoding: "utf8" }).trim();
-  await runMain({
+  await callRunMain({
     resolveReviewersImpl: () => [],
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
@@ -266,7 +287,7 @@ test("bootstrap: an ENV-PREFIXED `git -C <repoB>` still marks repoB, not input.c
   const { ws: repoA } = freshPushRepo();
   const { ws: repoB } = freshPushRepo();
   const headB = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoB, encoding: "utf8" }).trim();
-  await runMain({
+  await callRunMain({
     resolveReviewersImpl: () => [],
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
@@ -285,7 +306,7 @@ test("git push --help → allow no-op (ignored)", async () => {
   const { ws } = freshPushRepo();
   let reviewersCalled = false;
 
-  await runMain({
+  await callRunMain({
     resolveReviewersImpl: () => { reviewersCalled = true; return []; },
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
@@ -314,7 +335,7 @@ test("git push + panel ALLOW → allow (decision=allow in output) + trace gate=p
   };
 
   try {
-    await runMain({
+    await callRunMain({
       resolveReviewersImpl: stubResolveReviewers([
         fakeReviewer("Kimi", "ALLOW"),
         fakeReviewer("MiMo", "ALLOW")
@@ -364,7 +385,7 @@ test("git push + panel BLOCK → deny with findings in permissionDecisionReason"
   };
 
   try {
-    await runMain({
+    await callRunMain({
       resolveReviewersImpl: stubResolveReviewers([
         fakeReviewer("Kimi", "ALLOW"),
         fakeReviewer("MiMo", "BLOCK")
@@ -443,7 +464,7 @@ test("no upstream → deny so commits are not pushed unreviewed", async () => {
   };
 
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: () => { reviewersCalled = true; } }),
@@ -476,7 +497,7 @@ test("git log failure for a resolved push range → deny so commits are not push
   };
 
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: () => { reviewCalled = true; } }),
@@ -511,7 +532,7 @@ test("nothing to push (already up-to-date) → allow no-op", async () => {
   };
 
   try {
-    await runMain({
+    await callRunMain({
       resolveReviewersImpl: () => { reviewersCalled = true; return []; },
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
@@ -549,7 +570,7 @@ test("full push review retry/unavailable → deny (push is not allowed unreviewe
   };
 
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ retry: true, reason: "reviewer timeout" }),
@@ -654,7 +675,7 @@ test("compound command with git push → detected as push", async () => {
   };
 
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: () => { reviewCalled = true; } }),
@@ -744,7 +765,7 @@ test("A1: runMain resolves the review cwd to the -C target dir", async () => {
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = () => true;
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: ({ ws: reviewWs }) => { seenCwd = reviewWs; } }),
@@ -894,7 +915,7 @@ test("A4: a second decision within one invocation writes no second stdout line",
     return origWrite(chunk, ...rest);
   };
   try {
-    await runMain({
+    await callRunMain({
       resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "BLOCK")]),
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
@@ -922,7 +943,7 @@ test("A4: two separate runMain invocations in one process each emit (no cross-in
   };
   try {
     for (let i = 0; i < 2; i++) {
-      await runMain({
+      await callRunMain({
         resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
         writeTraceImpl: () => {},
         isBenchDisabledImpl: () => false,
@@ -983,7 +1004,7 @@ test("D3: pre-push trace write failure emits a ⛩ note and still allows", async
   process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
   process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) stdoutLines.push(chunk.trim()); return origOut(chunk, ...rest); };
   try {
-    await runMain({
+    await callRunMain({
       resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
       writeTraceImpl: () => { throw new Error("disk full"); },
       isBenchDisabledImpl: () => false,
@@ -1041,7 +1062,7 @@ test("H: ALLOW runs the full push review inline and does NOT enqueue a push job"
   let call = null;
 
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ badge: "Kimi✓ MiMo✓", onCall: (c) => { call = c; } }),
@@ -1065,7 +1086,7 @@ test("H: inline full push review receives the originating Claude session", async
   let call = null;
 
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: (c) => { call = c; } }),
@@ -1087,7 +1108,7 @@ test("H: inline full push review receives previous assistant message context bef
   let call = null;
 
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: (c) => { call = c; } }),
@@ -1160,7 +1181,7 @@ test("H: high BLOCK from inline full push review denies the push", async () => {
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return origWrite(chunk, ...rest); };
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ badge: "Kimi✗", findingCount: 1, maxSeverity: "high", findings: "[Kimi]\n- concrete push bug" }),
@@ -1185,7 +1206,7 @@ test("H: unavailable inline full push review denies instead of allowing an unrev
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return origWrite(chunk, ...rest); };
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ retry: true, reason: "reviewer timeout" }),
@@ -1210,7 +1231,7 @@ test("H: all-error inline full push review denies instead of allowing an unrevie
   const origWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) lines.push(chunk.trim()); return origWrite(chunk, ...rest); };
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({
@@ -1242,7 +1263,7 @@ test("H: bench DISABLED → does NOT run the inline push review", async () => {
   const origExit = process.exit;
   process.exit = () => { throw new Error("__exit__"); };   // disabled path calls process.exit(0)
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => true,
       pushReviewImpl: fakePushReview({ onCall: () => { called = true; } }),
@@ -1265,7 +1286,7 @@ test("H: nothing to push (no commits ahead) → does NOT run the inline push rev
 
   let called = false;
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: () => { called = true; } }),
@@ -1285,7 +1306,7 @@ test("H: deleteOnly (:branch) → does NOT run the inline push review", async ()
 
   let called = false;
   try {
-    await runMain({
+    await callRunMain({
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       pushReviewImpl: fakePushReview({ onCall: () => { called = true; } }),
@@ -1313,8 +1334,8 @@ test("H: repeated push attempts are each fully reviewed inline and never queued"
     input: { cwd: ws, tool_input: { command: "git push origin main" } }
   };
   try {
-    await runMain(opts);
-    await runMain(opts);
+    await callRunMain(opts);
+    await callRunMain(opts);
     assert.equal(calls, 2, "each push attempt gets a fresh inline full review");
     assert.equal(listJobs(wsReal).length, 0, "inline push review does not enqueue push jobs");
   } finally {
@@ -1364,4 +1385,126 @@ test("H: launchPushReview dedupes on the (push:range, headSha) content key — s
   } finally {
     process.env.BENCH_ROOT = TEMP_GCR;
   }
+});
+
+// ---------------------------------------------------------------------------
+// FAST mode (default): capped inline gate + async deep enqueue + fail-open.
+// The blocking (inline deep-review) revert path is covered by the "H:" tests above,
+// which the callRunMain wrapper routes to BENCH_PUSH_GATE_MODE=blocking.
+// ---------------------------------------------------------------------------
+
+test("FAST (default): a clean panel allows AND enqueues the deep async review", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-fast-al-")));
+  process.env.BENCH_ROOT = root;
+  let enq = null;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim()); return origWrite(chunk, ...rest); };
+  try {
+    await callRunMain({
+      resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW"), fakeReviewer("MiMo", "ALLOW")],
+      enqueueImpl: (_ws, job) => { enq = job; return true; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  const parsed = parseLines(emittedLines);
+  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "allow", "fast clean panel → allow");
+  assert.match(parsed[0].hookSpecificOutput.permissionDecisionReason, /deep review is queued/i, "reason notes the async pass");
+  assert.ok(enq, "fast mode MUST enqueue the deep async review (the thorough backstop)");
+  assert.equal(enq.kind, "push", "enqueued job is a push review");
+});
+
+test("FAST: reviewers exceeding the budget → FAIL OPEN (push allowed, deep review queued, session not frozen)", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-fast-to-")));
+  process.env.BENCH_ROOT = root;
+  let enqCalled = false;
+  const neverResolves = { name: "Kimi", run: () => new Promise(() => {}) };  // simulates a slow panel
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim()); return origWrite(chunk, ...rest); };
+  try {
+    await callRunMain({
+      resolveReviewersImpl: () => [neverResolves],
+      enqueueImpl: () => { enqCalled = true; return true; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: { ...process.env, BENCH_PUSH_GATE_BUDGET_MS: "40" },   // 40 ms cap → the review times out fast
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  const parsed = parseLines(emittedLines);
+  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "allow", "over-budget review must FAIL OPEN (never freeze/wedge the push)");
+  assert.match(parsed[0].hookSpecificOutput.permissionDecisionReason, /didn't finish|deep review is queued/i);
+  assert.ok(enqCalled, "the deep review is queued as the backstop even when the fast gate times out");
+});
+
+test("FAST: all reviewers erroring → FAIL OPEN (no verdict ≠ block; deep review is the backstop)", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-fast-err-")));
+  process.env.BENCH_ROOT = root;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim()); return origWrite(chunk, ...rest); };
+  try {
+    await callRunMain({
+      resolveReviewersImpl: () => [fakeErrorReviewer("Kimi"), fakeErrorReviewer("MiMo")],
+      enqueueImpl: () => true,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  const parsed = parseLines(emittedLines);
+  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "allow", "all-error fast panel fails OPEN in fast mode (blocking mode denies)");
+});
+
+test("FAST: a high BLOCK from the fast panel still denies the push", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-fast-blk-")));
+  process.env.BENCH_ROOT = root;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim()); return origWrite(chunk, ...rest); };
+  try {
+    await callRunMain({
+      resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW"), fakeReviewer("MiMo", "BLOCK")],
+      enqueueImpl: () => true,
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  const parsed = parseLines(emittedLines);
+  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "deny", "an obvious high finding still blocks fast");
+  assert.match(parsed[0].systemMessage, /BLOCKED/, "the block is user-visible");
+});
+
+test("REVERT SWITCH: BENCH_PUSH_GATE_MODE=blocking runs the inline deep review and does NOT enqueue", async () => {
+  const { ws } = freshPushRepo();
+  const wsReal = fs.realpathSync(ws);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-revert-")));
+  process.env.BENCH_ROOT = root;
+  let inlineRan = false, enqCalled = false;
+  const emittedLines = [];
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim()); return origWrite(chunk, ...rest); };
+  try {
+    await callRunMain({
+      pushReviewImpl: fakePushReview({ badge: "Kimi✓", onCall: () => { inlineRan = true; } }),
+      enqueueImpl: () => { enqCalled = true; return true; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: { ...process.env, BENCH_PUSH_GATE_MODE: "blocking" },
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  const parsed = parseLines(emittedLines);
+  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "allow", "clean inline review allows");
+  assert.ok(inlineRan, "blocking mode runs the inline deep review");
+  assert.equal(enqCalled, false, "blocking mode does NOT enqueue a later async job (faithful revert)");
+  assert.equal(listJobs(wsReal).length, 0, "no queued job in blocking mode");
 });
