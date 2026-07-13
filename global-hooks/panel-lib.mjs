@@ -221,23 +221,33 @@ const cleanupTmpDir = (d) => { if (d) try { fs.rmSync(d, { recursive: true, forc
 // Treat that as fatal on the paths where Seatbelt isn't wrapping.
 const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(String(stderr ?? ""));
 
-// Failure text for a non-zero grok exit. When the failure is auth (401) AND we were on the read-only
-// fallback (no writable gate auth home), tell the user the one-time fix instead of a bare 401 —
-// without ~/.grok-headless, grok cannot persist its rotating OAuth tokens through the sandbox.
+// Failure text for a non-zero grok exit. On an auth error (401 / invalid_grant) it appends the
+// EFFECTIVE recovery for whichever auth source we used — a bare 401 recurs every session otherwise.
 export function grokFailureMessage(r, auth) {
   const msg = (r.stderr || r.stdout || "grok failed").trim().slice(0, 300);
-  const isAuthErr = /401|unauthorized|expired credentials|no auth context/i.test(msg);
-  // A 401 only warrants a recovery hint when auth was read-only (token couldn't rotate/persist).
-  if (isAuthErr && auth && !auth.writable) {
-    // A caller's OWN GROK_AUTH_PATH takes precedence over the gate home, so the ~/.grok-headless
-    // setup would NOT be used — telling them to run it is misdirection. Their read-only reason is an
-    // unsafe path (can't be granted sandbox write), so the effective fix is to correct/unset it.
-    if (auth.callerManaged) {
-      return `${msg}\n→ GROK_AUTH_PATH can't be granted sandbox write access (needs an absolute path with no quotes/backslashes/control chars), so grok can't persist a refreshed token. Fix or unset GROK_AUTH_PATH, then retry.`;
-    }
+  const isAuthErr = /401|unauthorized|expired credentials|no auth context|invalid_grant/i.test(msg);
+  if (!isAuthErr || !auth) return msg;
+
+  // Caller-managed GROK_AUTH_PATH can NEVER persist a rotating token under the sandbox, so its 401s
+  // recur every session — and it needs explicit guidance (this was knowingly degraded for isolation;
+  // caught by the Codex gate). Two sub-cases, same effective fix:
+  //   • SAFE path (writable) → granted only its exact file, not its dir, so grok can't create the
+  //     temp sibling its atomic token-rotation needs → refresh denied.
+  //   • UNSAFE path (not writable) → no write grant at all.
+  // The gate home rotates atomically, but it's only consulted if GROK_AUTH_PATH is UNSET (caller path
+  // takes precedence — a prior gate catch), so the recovery MUST say to unset it.
+  if (auth.callerManaged) {
+    const why = auth.writable
+      ? "a custom GROK_AUTH_PATH is granted only its exact file (not its directory) for sandbox isolation, so grok can't create the temp file its atomic token-rotation needs"
+      : "GROK_AUTH_PATH can't be granted sandbox write access (needs an absolute path with no quotes/backslashes/control chars)";
+    return `${msg}\n→ ${why}, so a refreshed token can't persist → this recurs every session. For durable rotation, UNSET GROK_AUTH_PATH and run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` (the gate home rotates atomically).`;
+  }
+  // Read-only fallback (no gate home, no caller auth): set the gate home up.
+  if (!auth.writable) {
     return `${msg}\n→ grok gate auth not set up. One-time fix: run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` and complete the browser sign-in, then retry.`;
   }
-  return msg;
+  // Gate home IS writable but still 401 → its stored token is genuinely dead; re-auth the gate home.
+  return `${msg}\n→ grok gate token expired. Re-auth: run \`GROK_HOME=~/.grok-headless grok -p "Reply OK"\` and complete the browser sign-in.`;
 }
 
 // Extract the final answer from grok stdout: JSON .text when parseable, else the raw stdout
