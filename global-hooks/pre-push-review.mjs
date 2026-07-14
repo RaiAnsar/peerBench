@@ -485,13 +485,13 @@ export async function runMain({
   }
 
   const rangeNoteSuffix = rangeNote ? ` (${rangeNote})` : "";
-  const mode = String(env.BENCH_PUSH_GATE_MODE || "fast").toLowerCase();
+  // DEFAULT = blocking (Rai's call 2026-07-14): a full repo-aware review runs INLINE and the push is
+  // BLOCKED until it finishes (fail-closed). It freezes the session for the whole review (no Ctrl+B /
+  // no input), but the thorough findings are worth it — the fast 90s content-only pass produced
+  // findings not worth the shallowness. Opt into the fast + async-panel mode with BENCH_PUSH_GATE_MODE=fast.
+  const mode = String(env.BENCH_PUSH_GATE_MODE || "blocking").toLowerCase();
 
-  // REVERT SWITCH — BENCH_PUSH_GATE_MODE=blocking restores the ORIGINAL gate: a full repo-aware review
-  // runs INLINE and the push is BLOCKED until it finishes (fail-closed on error/timeout/no-verdict).
-  // Stronger guarantee, but it freezes the session for the WHOLE review (no Ctrl+B / no input) — the
-  // reason "fast" is the default. Flip back any time with BENCH_PUSH_GATE_MODE=blocking.
-  if (mode === "blocking") {
+  if (mode !== "fast") {
     let review;
     try {
       review = await pushReviewImpl(range, ws, { sessionKey, writeTraceImpl, assistantContext });
@@ -517,7 +517,7 @@ export async function runMain({
     return;
   }
 
-  // ── FAST mode (default) ──────────────────────────────────────────────────────────────────────
+  // ── FAST mode (opt-in: BENCH_PUSH_GATE_MODE=fast) ────────────────────────────────────────────
   // 5. Enqueue the DEEP async panel review FIRST (best-effort). The thorough repo-aware Codex/Grok/MiMo
   // pass now runs in the BACKGROUND — delivered by the deep-review-runner via the visible rewake at the
   // next stop (non-blocking, backgroundable). This is what lets the inline gate below stay FAST: the slow

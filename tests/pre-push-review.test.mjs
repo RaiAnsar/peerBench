@@ -121,14 +121,13 @@ function stubResolveReviewers(list) {
 // makes a REAL API/CLI call) and a no-op exit (so the fail-open `return exit(0)` path never kills the
 // test process). Deep-review enqueue defaults to a no-op so tests don't write queue jobs unless asserted.
 //
-// Mode routing: a test that injects `pushReviewImpl` is exercising the BLOCKING (inline deep-review)
-// revert path — BENCH_PUSH_GATE_MODE=blocking — so default it there. Fast-mode tests inject
-// `resolveReviewersImpl` (or nothing) and get the default fast mode. Either can be overridden via opts.env.
+// Mode routing is DETERMINISTIC and DECOUPLED from the production default (which is `blocking`): a test
+// injecting `pushReviewImpl` exercises BLOCKING (inline deep review); anything else runs FAST with the
+// wrapper's fake reviewer (never a real API/CLI call). An explicit opts.env.BENCH_PUSH_GATE_MODE wins.
+// (Tests that want to verify the actual DEFAULT call runMain directly, bypassing this wrapper.)
 function callRunMain(opts = {}) {
-  const baseEnv = opts.env || process.env;
-  const env = opts.pushReviewImpl
-    ? { ...baseEnv, BENCH_PUSH_GATE_MODE: baseEnv.BENCH_PUSH_GATE_MODE || "blocking" }
-    : baseEnv;
+  const wantMode = opts.env?.BENCH_PUSH_GATE_MODE || (opts.pushReviewImpl ? "blocking" : "fast");
+  const env = { ...(opts.env || process.env), BENCH_PUSH_GATE_MODE: wantMode };
   return runMain({
     resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW")],
     enqueueImpl: () => true,
@@ -1393,7 +1392,7 @@ test("H: launchPushReview dedupes on the (push:range, headSha) content key — s
 // which the callRunMain wrapper routes to BENCH_PUSH_GATE_MODE=blocking.
 // ---------------------------------------------------------------------------
 
-test("FAST (default): a clean panel allows AND enqueues the deep async review", async () => {
+test("FAST (opt-in): a clean panel allows AND enqueues the deep async review", async () => {
   const { ws } = freshPushRepo();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-fast-al-")));
   process.env.BENCH_ROOT = root;
@@ -1531,4 +1530,54 @@ test("REVERT SWITCH: BENCH_PUSH_GATE_MODE=blocking runs the inline deep review a
   assert.ok(inlineRan, "blocking mode runs the inline deep review");
   assert.equal(enqCalled, false, "blocking mode does NOT enqueue a later async job (faithful revert)");
   assert.equal(listJobs(wsReal).length, 0, "no queued job in blocking mode");
+});
+
+test("DEFAULT (no BENCH_PUSH_GATE_MODE) is BLOCKING — thorough inline review, not fast (Rai's call 2026-07-14)", async () => {
+  // Bypass callRunMain (which pins a mode) and call runMain DIRECTLY with the mode UNSET, to assert the
+  // true production default. A regression here would silently return peerBench to shallow 90s findings.
+  const { ws } = freshPushRepo();
+  const wsReal = fs.realpathSync(ws);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-default-")));
+  process.env.BENCH_ROOT = root;
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.BENCH_PUSH_GATE_MODE;   // no mode set → must default to blocking
+  let inlineRan = false;
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    await runMain({
+      pushReviewImpl: fakePushReview({ badge: "Kimi✓", onCall: () => { inlineRan = true; } }),
+      // If the default were fast, these fast-path deps would run — make that an unmistakable failure:
+      resolveReviewersImpl: () => { throw new Error("default must be BLOCKING — the fast panel must not run"); },
+      enqueueImpl: () => { throw new Error("default must be BLOCKING — must not enqueue an async job"); },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      exit: () => {},
+      env: cleanEnv,
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  assert.ok(inlineRan, "default (mode unset) runs the full inline blocking review");
+  assert.equal(listJobs(wsReal).length, 0, "default blocking mode enqueues nothing");
+});
+
+test("an unrecognized BENCH_PUSH_GATE_MODE falls through to BLOCKING (fail toward thoroughness)", async () => {
+  const { ws } = freshPushRepo();
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-typo-")));
+  process.env.BENCH_ROOT = root;
+  let inlineRan = false;
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    await runMain({
+      pushReviewImpl: fakePushReview({ badge: "Kimi✓", onCall: () => { inlineRan = true; } }),
+      resolveReviewersImpl: () => { throw new Error("a typo'd mode must NOT silently become fast"); },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      exit: () => {},
+      env: { ...process.env, BENCH_PUSH_GATE_MODE: "blockign" /* typo */ },
+      input: { cwd: ws, tool_input: { command: "git push origin main" } }
+    });
+  } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
+  assert.ok(inlineRan, "only exact 'fast' opts out; anything else → blocking");
 });
