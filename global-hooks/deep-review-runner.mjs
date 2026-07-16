@@ -78,12 +78,27 @@ export async function runMain({
   for (const b of safe(() => listBlocked(ws, { sessionKey }), [])) {
     let cur = null;
     try { cur = currentContentKey(ws, b); } catch { cur = null; }
-    // Retire on a DEFINITIVELY-gone target (deleted spec → GONE; the block is moot) OR a CONFIRMED
-    // content change (a valid current key that DIFFERS). `cur === null` means we could NOT determine
-    // the current key (transient `git rev-parse` failure, or a present-but-unreadable spec) — do NOT
-    // delete a durable completed block on uncertainty (that would lose a HIGH finding on a transient
-    // error); keep it and re-check next Stop.
-    if (cur === GONE || (cur !== null && cur !== b.contentKey)) { deleteJob(b._path); continue; }   // gone or confirmed change → retired
+    if (!b.contentKey) {
+      // UNSTAMPED merge block: it was persisted while the block-time recompute failed (transient git
+      // blip), so there is no key to compare against — an unstamped block is NEVER retired. Self-heal
+      // at the first successful recompute so normal addressed-retirement resumes from here.
+      if (cur !== null && cur !== GONE) {
+        try {
+          markBlocked(ws, b._jobKey, {
+            kind: b.kind, specPath: b.specPath, range: b.range, contentKey: cur,
+            sessionKey: b.sessionKey, findings: b.findings, traceId: b.traceId ?? null,
+            firstBlockedTs: b.firstBlockedTs
+          });
+        } catch { /* best-effort — deliver regardless; heal again next Stop */ }
+      }
+    } else if (cur === GONE || (cur !== null && cur !== b.contentKey)) {
+      // Retire on a DEFINITIVELY-gone target (deleted spec → GONE; the block is moot) OR a CONFIRMED
+      // content change (a valid current key that DIFFERS). `cur === null` means we could NOT determine
+      // the current key (transient `git rev-parse` failure, or a present-but-unreadable spec) — do NOT
+      // delete a durable completed block on uncertainty (that would lose a HIGH finding on a transient
+      // error); keep it and re-check next Stop.
+      deleteJob(b._path); continue;   // gone or confirmed change → retired
+    }
     const findings = (b.findings || b.summary || "(deep block)") + traceHint(b.traceId);
     if ((now - (Number(b.firstBlockedTs) || 0)) < WAKE_WINDOW_MS) wake.push(findings);
     else advisory.push(findings);   // KEEP the file — never deleted by elapsed time
@@ -154,8 +169,15 @@ export async function runMain({
         // merge itself moved HEAD between enqueue and review, so the enqueue-time key would read as
         // "changed" at the very next Stop and instantly retire the block. Stamped here, it retires
         // exactly when the agent lands the fix commit (HEAD moves again) — push-block semantics.
+        // If the recompute FAILS here (transient git blip), persist contentKey:null — NOT the stale
+        // enqueue key, which a later healthy recompute would read as "changed" and retire (losing
+        // the finding). An unstamped block is never retired; step 2 self-heals it at the first
+        // successful recompute.
         let contentKey = o.job.contentKey;
-        if (o.job.kind === "merge") { try { contentKey = currentContentKey(ws, o.job) || contentKey; } catch { /* keep enqueue key */ } }
+        if (o.job.kind === "merge") {
+          try { contentKey = currentContentKey(ws, o.job); } catch { contentKey = null; }
+          if (contentKey === GONE) contentKey = null;
+        }
         markBlocked(ws, o.job._jobKey, {
           kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
           contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,

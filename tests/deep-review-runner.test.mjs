@@ -342,3 +342,36 @@ test("DRAIN DEADLINE: surplus that can't fit the runner budget is deferred + exi
   assert.match(err, /deferred \(runner budget exhausted\)/);
   assert.equal(listJobs(ws).length, 2, "deferred jobs remain QUEUED (unclaimed) for the forced next Stop");
 });
+
+test("MERGE block: a transient git failure at BLOCK time never retires the block (unstamped → self-heal)", async () => {
+  // NON-git ws → the block-time recompute fails exactly like a transient `git rev-parse` blip.
+  const ws = freshWs();
+  enqueue(ws, { kind: "merge", range: "A..B", contentKey: deepKey("merge:A..B", "refsha-at-enqueue") });
+  const first = await runRunner(ws, {
+    runPushReviewImpl: async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: bad" })
+  });
+  assert.equal(first.exit, 2);
+  let [blocked] = listBlocked(ws);
+  assert.equal(blocked.contentKey, null, "failed recompute persists UNSTAMPED — never the stale enqueue key");
+
+  // Next Stop, git still broken: unstamped block survives and re-delivers (never retired on uncertainty).
+  const second = await runRunner(ws, {});
+  assert.equal(second.exit, 2, "unstamped block re-wakes");
+  assert.equal(listBlocked(ws).length, 1, "survives while git is unavailable");
+
+  // git heals → the block self-heals (stamped with the recompute) instead of being retired.
+  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  g("init", "-q", "-b", "main");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "post-merge head");
+  const third = await runRunner(ws, {});
+  assert.equal(third.exit, 2, "still delivered — healing is not retiring");
+  [blocked] = listBlocked(ws);
+  assert.equal(blocked.contentKey, currentContentKey(ws, blocked), "self-healed: stamped at the first successful recompute");
+  assert.match(blocked.findings || "", /BLOCK: bad/, "payload survives the heal rewrite");
+
+  // From here, normal addressed-retirement: the fix commit moves HEAD → retired.
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "fix");
+  const fourth = await runRunner(ws, {});
+  assert.equal(fourth.exit, 0);
+  assert.equal(listBlocked(ws).length, 0, "addressed (HEAD moved) → retired");
+});
