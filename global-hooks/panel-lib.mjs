@@ -100,11 +100,26 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // --output-format json: grok streams working NARRATION into plain stdout (even mid-sentence around
 // the verdict — broke first-line parsing, seen on Grok's first live review). JSON cleanly separates
 // the final answer (.text) from .thought/narration.
-// Grok's OWN --sandbox read-only is a silent NO-OP on this build (verified live: with permissions
-// bypassed it wrote breach.txt into the workspace cwd, no warning, exit 0 — caught by the Codex stop
-// gate). So the HARD read-only guarantee is OURS: wrap grok in macOS Seatbelt (sandbox-exec, the same
-// mechanism codex uses) via grokSpawnSpec below. The grok flags stay as defense-in-depth only.
+// Grok's OWN --sandbox read-only is a silent NO-OP (verified live on 0.2.93 AND re-verified on
+// 0.2.101 after xAI open-sourced the harness: with permissions bypassed it wrote breach.txt into the
+// workspace cwd, no warning, exit 0). The OSS source (github.com/xai-org/grok-build) confirms WHY:
+// a real enforcement crate exists (crates/codegen/xai-grok-sandbox, Landlock/Seatbelt via nono) but
+// it isn't wired into shipped builds (its lib.rs opens with #![allow(unreachable_code, dead_code)]).
+// So the HARD read-only guarantee is OURS: wrap grok in macOS Seatbelt (sandbox-exec, the same
+// mechanism codex uses) via grokSpawnSpec below. The grok flags stay as defense-in-depth only —
+// and if their enforcement ever ships, it composes cleanly with ours: their read-only profile's
+// writable set is exactly grok_home()+temp (profiles.rs), which IS our ephemeral tmpdir redirect.
 export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--no-leader", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
+
+// Schema for --json-schema on the REVIEW path: grok's final answer is CONSTRAINED to this shape
+// (server-side structured output — the CLI puts the parsed object in .structuredOutput, live-verified
+// on 0.2.101), so the verdict can never be lost to narration/free-form prose ("unexpected reviewer
+// output"). TASK runs (hunt/deep findings) stay schema-free: their value IS the free-form prose.
+export const GROK_VERDICT_SCHEMA = JSON.stringify({
+  type: "object",
+  properties: { verdict: { type: "string", enum: ["ALLOW", "BLOCK"] }, reason: { type: "string" } },
+  required: ["verdict", "reason"],
+});
 
 // Seatbelt profile (last-match-wins). grok's ENTIRE writable state is redirected into the per-run
 // ephemeral tmpdir via GROK_HOME (see grokChildEnv), so this profile grants writes ONLY to that
@@ -135,7 +150,10 @@ export function sbplPathSafe(p) {
 //
 // The GRANT SHAPE depends on WHO owns the auth file (gateManaged):
 //  • Gate's OWN dedicated ~/.grok-headless (gateManaged=true) → grant the PARENT DIR as a subpath.
-//    Grok persists auth via atomic write (create sibling temp + rename over auth.json); Seatbelt
+//    Grok persists auth via atomic write (create sibling temp + rename over auth.json — source-
+//    confirmed: xai-org/grok-build auth/storage.rs write_auth_json_atomic; its non-atomic in-place
+//    fallback fires ONLY on disk-full, not on the sandbox's EPERM, so a literals-only grant can
+//    never rotate — exactly what we live-verified); Seatbelt
 //    `literal` allows open/write on the existing file but DENIES creating auth.json.tmp, surfacing as
 //    "auth update disk write failed: Operation not permitted" → RT rotates in-memory while disk keeps
 //    the dead RT → invalid_grant re-auth loop. Live-verified: literals = atomic FAIL, subpath = OK.
@@ -162,13 +180,15 @@ export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite, gateManaged = false) =>
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
 // darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
 // fail-open stderr check in the runners is the net.
-export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir, authWrite, authGateManaged = false } = {}) {
-  const args = GROK_ARGS(prompt);
+export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir, authWrite, authGateManaged = false, jsonSchema } = {}) {
+  const args = [...GROK_ARGS(prompt), ...(jsonSchema ? ["--json-schema", jsonSchema] : [])];
   if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir, authWrite, authGateManaged), bin, ...args] };
   return { cmd: bin, args };
 }
 
-// Which auth the gate's grok uses. Precedence:
+// Which auth the gate's grok uses. Precedence mirrors grok's own resolution — source-confirmed in
+// xai-org/grok-build (xai-grok-shell/src/auth/manager.rs): GROK_AUTH inline JSON (highest priority,
+// read-only) > GROK_AUTH_PATH (overrides the default) > $GROK_HOME/auth.json.
 //   1. GROK_AUTH inline token → null; nothing to inject, no file to persist.
 //   2. Caller's own GROK_AUTH_PATH → we don't inject (it's already in the env) but we DO mark it
 //      writable so the Seatbelt grants that file + its .lock: the caller designated it as grok's
@@ -270,6 +290,20 @@ export function grokText(stdout) {
   return raw;
 }
 
+// Schema-constrained verdict from a --json-schema run: .structuredOutput carries the validated
+// object (headless.rs puts the value there; on constraint failure it's null + .structuredOutputError).
+// Returns the parseVerdict-ready "ALLOW: reason" line, or null when absent/malformed — the caller
+// then falls back to grokText + first-line parsing, so a CLI shape change degrades instead of breaks.
+export function grokStructuredVerdict(stdout) {
+  try {
+    const so = JSON.parse(String(stdout ?? "").trim())?.structuredOutput;
+    if ((so?.verdict === "ALLOW" || so?.verdict === "BLOCK") && typeof so.reason === "string") {
+      return `${so.verdict}: ${so.reason}`;
+    }
+  } catch { /* not json */ }
+  return null;
+}
+
 export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
   const tmpDir = makeGrokTmpDir();
   // Fail CLOSED: without the private tmpdir there is no ephemeral GROK_HOME to absorb grok's writes
@@ -277,12 +311,12 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
   if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
   const auth = grokAuthPath(env, home);
   const childEnv = grokChildEnv(env, tmpDir, home);
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, jsonSchema: GROK_VERDICT_SCHEMA, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth, platform) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
-  const v = parseVerdict(grokText(r.stdout));
+  const v = parseVerdict(grokStructuredVerdict(r.stdout) ?? grokText(r.stdout));
   if (!v.verdict) return { name: "Grok", error: "unexpected reviewer output" };
   return { name: "Grok", ...v };
 }

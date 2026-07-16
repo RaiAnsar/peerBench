@@ -274,6 +274,35 @@ test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-
   assert.equal(l.cmd, "grok", "non-darwin spawns bare (fail-open stderr check is the net)");
 });
 
+test("GROK_VERDICT_SCHEMA pins the review verdict shape (ALLOW|BLOCK enum, reason, both required)", async () => {
+  const { GROK_VERDICT_SCHEMA } = await import("../global-hooks/panel-lib.mjs");
+  const s = JSON.parse(GROK_VERDICT_SCHEMA);
+  assert.deepEqual(s.properties.verdict.enum, ["ALLOW", "BLOCK"], "only the two verdicts parseVerdict accepts");
+  assert.deepEqual(s.required.sort(), ["reason", "verdict"], "a verdict without a reason is useless to the gate");
+});
+
+test("grokSpawnSpec: jsonSchema appends --json-schema (review path); absent by default (task path stays free-form)", async () => {
+  const { grokSpawnSpec, GROK_VERDICT_SCHEMA } = await import("../global-hooks/panel-lib.mjs");
+  const review = grokSpawnSpec("review", { platform: "darwin", tmpDir: "/tmp/t", jsonSchema: GROK_VERDICT_SCHEMA });
+  const i = review.args.indexOf("--json-schema");
+  assert.ok(i > 0, "schema flag present when requested");
+  assert.equal(review.args[i + 1], GROK_VERDICT_SCHEMA, "schema value rides along");
+  const task = grokSpawnSpec("hunt", { platform: "darwin", tmpDir: "/tmp/t" });
+  assert.ok(!task.args.includes("--json-schema"), "task/hunt runs must NOT be verdict-constrained — their findings are prose");
+});
+
+test("grokStructuredVerdict: extracts the schema-constrained verdict; null degrades to the text fallback", async () => {
+  const { grokStructuredVerdict } = await import("../global-hooks/panel-lib.mjs");
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: { verdict: "BLOCK", reason: "bug in x" }, text: "ignored" })), "BLOCK: bug in x");
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: { verdict: "ALLOW", reason: "" } })), "ALLOW: ", "empty reason is still a valid verdict");
+  // Constraint failure → CLI emits structuredOutput:null + structuredOutputError — fall back, don't throw.
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: null, structuredOutputError: "boom", text: "ALLOW: ok" })), null);
+  assert.equal(grokStructuredVerdict(JSON.stringify({ text: "ALLOW: ok" })), null, "no structuredOutput → text fallback");
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: { verdict: "MAYBE", reason: "x" } })), null, "unknown verdict never synthesizes a line");
+  assert.equal(grokStructuredVerdict("plain narration, not json"), null);
+  assert.equal(grokStructuredVerdict(undefined), null);
+});
+
 test("GROK_SEATBELT_PROFILE grants writes ONLY to the ephemeral tmpdir + /dev — all of ~/.grok is read-only (Codex gate)", async () => {
   const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
   const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x");
