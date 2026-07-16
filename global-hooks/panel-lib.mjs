@@ -178,8 +178,9 @@ export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite, gateManaged = false) =>
 };
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
-// darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags (best effort) and the
-// fail-open stderr check in the runners is the net.
+// darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags. NOTE the bare flags are
+// NOT a net: --sandbox read-only no-ops SILENTLY (no stderr warning — verified live), so off darwin
+// the runners REFUSE by default (BENCH_GROK_UNSANDBOXED=1 opts into plan-mode-only containment).
 export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir, authWrite, authGateManaged = false, jsonSchema } = {}) {
   const args = [...GROK_ARGS(prompt), ...(jsonSchema ? ["--json-schema", jsonSchema] : [])];
   if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir, authWrite, authGateManaged), bin, ...args] };
@@ -304,7 +305,21 @@ export function grokStructuredVerdict(stdout) {
   return null;
 }
 
+// Off darwin there is NO OS write-containment: no Seatbelt, and grok's own --sandbox read-only
+// no-ops SILENTLY (no warning to catch — the stderr check below never fires for it). Plan mode is
+// then the ONLY containment, and it's agent-level, not OS-level. Fail CLOSED unless the caller
+// explicitly accepts that with BENCH_GROK_UNSANDBOXED=1 (the panel continues with other reviewers).
+const grokPlatformRefusal = (env, platform) => {
+  const plat = platform || process.platform;
+  if (plat !== "darwin" && env?.BENCH_GROK_UNSANDBOXED !== "1") {
+    return "no OS write-containment for grok on this platform (Seatbelt is darwin-only; grok's own sandbox flags are verified non-enforcing) — refusing. Set BENCH_GROK_UNSANDBOXED=1 to accept plan-mode-only containment";
+  }
+  return null;
+};
+
 export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
+  const refusal = grokPlatformRefusal(env, platform);
+  if (refusal) return { name: "Grok", error: refusal };
   const tmpDir = makeGrokTmpDir();
   // Fail CLOSED: without the private tmpdir there is no ephemeral GROK_HOME to absorb grok's writes
   // and (off darwin) no Seatbelt either — grok would write ~/.grok unsandboxed. Refuse instead.
@@ -323,6 +338,8 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
 
 // Grok open-ended TASK → raw output (for hunt/deep gates; findings kept, no verdict parsing).
 export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
+  const refusal = grokPlatformRefusal(env, platform);
+  if (refusal) return { name: "Grok", error: refusal };
   const tmpDir = makeGrokTmpDir();
   // Fail CLOSED (see runGrokReview): no private tmpdir → no containment → refuse.
   if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };

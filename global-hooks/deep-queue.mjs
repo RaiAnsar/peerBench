@@ -159,10 +159,15 @@ export function currentContentKey(ws, job, {
   readImpl = (p) => fs.readFileSync(p, "utf8"),
   existsImpl = (p) => fs.existsSync(p)
 } = {}) {
-  if (job.kind === "push") {
+  if (job.kind === "push" || job.kind === "merge") {
     const [head, ok] = gitImpl(["rev-parse", "HEAD"], ws);
     if (!ok || !head) return null;          // transient git failure → uncertain → KEEP (never lose on a blip)
-    return deepKey(`push:${job.range}`, head);
+    // Kind-prefixed so a merge block's identity recomputes as `merge:…` — recomputing every range
+    // job as `push:…` made durable MERGE blocks always look "changed" → retired at the next Stop.
+    // HEAD as the seed = "addressed" signal: a new commit (the fix) retires the block. Merge blocks
+    // get their contentKey stamped at BLOCK time (deep-review-runner), not enqueue time, because the
+    // merge itself moves HEAD between enqueue and review.
+    return deepKey(`${job.kind}:${job.range}`, head);
   }
   // spec (default) — keyed on the FULL current file content, identically to the enqueue + the deep
   // run, so an unchanged spec (any size) yields the same key (no false retire) and a change anywhere

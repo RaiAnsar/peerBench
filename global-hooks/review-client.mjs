@@ -6,7 +6,9 @@ const DEFAULT_TIMEOUT_MS = 90_000;
 // Coding-plan endpoints (z.ai, etc.) throttle the bare Node/undici User-Agent with HTTP 429 — they
 // expect a coding-client UA. Without this, GLM/Qwen/MiMo (provider headers: {}) 429'd every call
 // while Kimi (which sets its own UA) worked. Providers can still override via their headers.
-const DEFAULT_USER_AGENT = "claude-cli/1.0.83 (external, cli)";
+// Exported: agentic-review builds its own fetch and needs the SAME UA (bare-UA agentic calls hit
+// the same deterministic 429 — caught by the push gate).
+export const DEFAULT_USER_AGENT = "claude-cli/1.0.83 (external, cli)";
 // HTTP 429/503 here is mostly the z.ai coding-plan CONCURRENCY CAP (~2-3 in-flight per key, code
 // 1305): peerbench fires GLM from every gate across every project onto one shared key, so the cap is
 // blown constantly. The cure for a concurrency cap is patience — wait for an in-flight call to free a

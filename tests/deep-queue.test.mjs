@@ -157,6 +157,12 @@ test("currentContentKey: spec re-reads the file; DELETED spec → GONE; push use
   assert.equal(currentContentKey(ws, { kind: "spec", specPath: "/no/such/file.md" }), GONE, "deleted/absent spec → GONE (definitive → retire)");
   assert.equal(currentContentKey(ws, { kind: "push", range: "a..b" }, { gitImpl: () => ["HEADSHA", true] }), deepKey("push:a..b", "HEADSHA"));
   assert.equal(currentContentKey(ws, { kind: "push", range: "a..b" }, { gitImpl: () => ["", false] }), null, "git fail → null (transient → keep)");
+  // merge recomputes with its OWN kind prefix — recomputing every range job as `push:` made durable
+  // MERGE blocks always look "changed" and retire at the next Stop (a push-gate catch).
+  assert.equal(currentContentKey(ws, { kind: "merge", range: "a..b" }, { gitImpl: () => ["HEADSHA", true] }), deepKey("merge:a..b", "HEADSHA"));
+  assert.notEqual(currentContentKey(ws, { kind: "merge", range: "a..b" }, { gitImpl: () => ["HEADSHA", true] }),
+    currentContentKey(ws, { kind: "push", range: "a..b" }, { gitImpl: () => ["HEADSHA", true] }), "merge and push identities never collide");
+  assert.equal(currentContentKey(ws, { kind: "merge", range: "a..b" }, { gitImpl: () => ["", false] }), null, "git fail → null (transient → keep)");
 });
 
 test("recoverOrphans: a stale .claimed whose .blocked already exists is DROPPED, not requeued (markBlocked crash window)", () => {

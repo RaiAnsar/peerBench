@@ -66,7 +66,39 @@ test("runMain: merge INTO a protected branch with a high BLOCK → deny + user-v
   assert.equal(cap.payload.hookSpecificOutput.permissionDecision, "deny");
   assert.match(cap.payload.systemMessage, /bench merge BLOCKED/);
   assert.match(cap.payload.systemMessage, /staging → main/);
-  assert.ok(enqueued && enqueued.range === "HEAD..staging", "a deep async review is enqueued for the incoming range");
+  // The queued deep review must be SHA-PINNED (never symbolic HEAD..ref — it runs AFTER the merge
+  // advances HEAD, where the symbolic range is empty/wrong) and kind:"merge" (its durable-block
+  // identity recomputes as merge:<range>; kind:"push" made every merge block retire at the next Stop).
+  const sha = (ref) => execFileSync("git", ["rev-parse", ref], { cwd: ws, encoding: "utf8" }).trim();
+  assert.ok(enqueued, "a deep async review is enqueued");
+  assert.equal(enqueued.kind, "merge");
+  assert.equal(enqueued.range, `${sha("HEAD")}..${sha("staging")}`, "range pinned to SHAs at enqueue time");
+});
+
+test("runMain: an OCTOPUS merge enqueues a deep review per ref and reviews every ref's commits", async () => {
+  const ws = repoWithIncoming();
+  // second incoming branch alongside staging
+  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  g("checkout", "-q", "-b", "feature-b", "main");
+  fs.writeFileSync(path.join(ws, "g.js"), "export const y = 2;\n");
+  g("add", "-A"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "feat: add y");
+  g("checkout", "-q", "main");
+  const sha = (ref) => execFileSync("git", ["rev-parse", ref], { cwd: ws, encoding: "utf8" }).trim();
+  const cap = capture();
+  const enqueued = [];
+  let userPrompt = "";
+  await runMain({
+    input: { cwd: ws, tool_input: { command: "git merge staging feature-b" } },
+    resolveReviewersImpl: () => [{ name: "MiMo", async run({ user }) { userPrompt = user; return { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }; } }],
+    enqueueImpl: (_ws, job) => { enqueued.push(job); return true; },
+    writeTraceImpl: () => {}, isBenchDisabledImpl: () => false,
+    emitter: cap.emitter, exit: () => {}
+  });
+  assert.equal(enqueued.length, 2, "every octopus ref gets its own deep review (refs[1..] must not bypass the gate)");
+  assert.deepEqual(enqueued.map((j) => j.range).sort(), [`${sha("HEAD")}..${sha("feature-b")}`, `${sha("HEAD")}..${sha("staging")}`].sort());
+  assert.ok(enqueued.every((j) => j.kind === "merge"));
+  assert.match(userPrompt, /add x/, "staging's commits are in the fast review");
+  assert.match(userPrompt, /add y/, "feature-b's commits are in the fast review too");
 });
 
 test("runMain: merge while on a NON-protected branch is not gated (reviewers never called)", async () => {

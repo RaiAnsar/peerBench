@@ -256,9 +256,23 @@ test("runGrokTask/runGrokReview spawn the grok CLI headless read-only and honor 
 
 test("runGrokTask reports a missing grok CLI with the install hint", async () => {
   const { runGrokTask } = await import("../global-hooks/panel-lib.mjs");
-  // platform:"linux" → unwrapped spawn so the ENOENT surfaces as our 127 path (pure, darwin-independent)
-  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "/nonexistent/grok-bin", platform: "linux" });
+  // platform:"linux" → unwrapped spawn so the ENOENT surfaces as our 127 path (pure, darwin-independent).
+  // BENCH_GROK_UNSANDBOXED=1 gets past the off-darwin refusal — this test is about the 127 path.
+  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: { BENCH_GROK_UNSANDBOXED: "1" }, bin: "/nonexistent/grok-bin", platform: "linux" });
   assert.match(r.error, /grok CLI not found/);
+});
+
+test("grok runners REFUSE off darwin by default (no OS containment; the no-op sandbox prints no warning to catch)", async () => {
+  const { runGrokReview, runGrokTask } = await import("../global-hooks/panel-lib.mjs");
+  for (const run of [runGrokReview, runGrokTask]) {
+    const r = await run({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
+    assert.equal(r.name, "Grok");
+    assert.match(r.error, /no OS write-containment .* refusing/i, "off darwin must fail CLOSED, not run bare");
+    assert.match(r.error, /BENCH_GROK_UNSANDBOXED=1/, "the refusal must name the explicit opt-in");
+  }
+  // darwin is never refused on platform grounds (Seatbelt wraps it).
+  const d = await runGrokReview({ prompt: "x", cwd: process.cwd(), env: {}, bin: "/nonexistent/grok-bin", platform: "darwin" });
+  assert.ok(!/no OS write-containment/.test(d.error || ""), "darwin must not hit the platform refusal");
 });
 
 test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-only profile", async () => {
@@ -505,11 +519,13 @@ test("runGrokReview fails CLOSED when the private tmpdir can't be created (no un
   const prev = process.env.TMPDIR;
   process.env.TMPDIR = "/nonexistent-bench-tmpdir-abc123/nope";  // makeGrokTmpDir → mkdtemp throws → null
   try {
-    // platform:"linux" = NO Seatbelt; the refusal is the ONLY thing preventing an unsandboxed grok write.
-    const r = await runGrokReview({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
+    // platform:"linux" + explicit unsandboxed opt-in = NO Seatbelt and NO platform refusal; the
+    // tmpdir refusal is then the ONLY thing preventing a grok spawn whose writes persist.
+    const env = { BENCH_GROK_UNSANDBOXED: "1" };
+    const r = await runGrokReview({ prompt: "x", cwd: process.cwd(), env, bin: "grok", platform: "linux" });
     assert.equal(r.name, "Grok");
     assert.match(r.error, /tmpdir could not be created|refusing unsandboxed/i);
-    const t = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
+    const t = await runGrokTask({ prompt: "x", cwd: process.cwd(), env, bin: "grok", platform: "linux" });
     assert.match(t.error, /tmpdir could not be created|refusing unsandboxed/i);
   } finally {
     if (prev === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = prev;
@@ -522,6 +538,6 @@ test("runGrokTask fail-closes when grok reports its sandbox could not be applied
   const fake = path.join(dir, "grok");
   fs.writeFileSync(fake, `#!/bin/sh\necho "warning: sandbox could not be applied: whatever" >&2\necho '{"text":"ALLOW: fine"}'\n`);
   fs.chmodSync(fake, 0o755);
-  const r = await runGrokTask({ prompt: "x", cwd: dir, env: {}, bin: fake, platform: "linux" });
+  const r = await runGrokTask({ prompt: "x", cwd: dir, env: { BENCH_GROK_UNSANDBOXED: "1" }, bin: fake, platform: "linux" });
   assert.match(r.error, /sandbox could not be applied/, "an unsandboxed run must be REFUSED, not accepted");
 });

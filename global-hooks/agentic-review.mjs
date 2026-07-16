@@ -1,5 +1,6 @@
 import { extractVerdict } from "./reviewers.mjs";
 import { allowedTemperatureFromError, isContentInspectionFailure, sanitizeForProviderInspection } from "./provider-compat.mjs";
+import { DEFAULT_USER_AGENT } from "./review-client.mjs";
 export { sanitizeForProviderInspection };
 
 // Parse an OpenAI-compatible SSE chat stream into one assembled message.
@@ -140,7 +141,7 @@ export async function agenticReview({
           try {
             resp = await doFetch(`${baseURL}/chat/completions`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              headers: { "Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, Authorization: `Bearer ${apiKey}`, ...safeHeaders },
               body, signal
             });
             netErr = null;
@@ -197,7 +198,7 @@ export async function agenticReview({
           try {
             resp = await doFetch(`${baseURL}/chat/completions`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              headers: { "Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, Authorization: `Bearer ${apiKey}`, ...safeHeaders },
               body, signal
             });
             if (resp.ok) parsed = await readSSE(resp);
@@ -222,7 +223,7 @@ export async function agenticReview({
           try {
             resp = await doFetch(`${baseURL}/chat/completions`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              headers: { "Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, Authorization: `Bearer ${apiKey}`, ...safeHeaders },
               body, signal
             });
             if (resp.ok) parsed = await readSSE(resp);

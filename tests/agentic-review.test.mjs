@@ -253,3 +253,16 @@ test("per-round watchdog caps a slow exploration round, forcing conclusion", asy
   const res = await agenticReview({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 10000, maxRoundMs: 50, mode: "report", maxSteps: 6, tools, fetchImpl });
   assert.equal(res.ok, true); assert.match(res.report, /q\.js:2/);
 });
+
+test("every agentic request carries the coding-client User-Agent (bare Node UA is deterministically 429'd by coding-plan endpoints)", async () => {
+  const { DEFAULT_USER_AGENT } = await import("../global-hooks/review-client.mjs");
+  const seen = [];
+  const fetchImpl = async (url, opts) => { seen.push(opts.headers); return sse([{ content: "ALLOW: fine" }]); };
+  await agenticReview({ ...baseArgs, tools: { schemas: SCHEMAS, execute: async () => "" }, fetchImpl });
+  assert.ok(seen.length > 0);
+  for (const h of seen) assert.equal(h["User-Agent"], DEFAULT_USER_AGENT, "agentic calls must send the same UA as review-client");
+  // provider-supplied headers still win (spread after the default)
+  seen.length = 0;
+  await agenticReview({ ...baseArgs, headers: { "User-Agent": "custom/1" }, tools: { schemas: SCHEMAS, execute: async () => "" }, fetchImpl });
+  for (const h of seen) assert.equal(h["User-Agent"], "custom/1", "provider header overrides the default UA");
+});

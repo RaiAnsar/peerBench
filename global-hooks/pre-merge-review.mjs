@@ -119,26 +119,44 @@ export async function runMain({
   const [branch] = gitTry(["rev-parse", "--abbrev-ref", "HEAD"], ws);
   if (!PROTECTED_BRANCHES.includes(branch)) return;   // silent allow — routine feature-branch merge
 
-  // 3. Incoming commits = HEAD..<ref>. `git merge` with no ref merges the upstream (@{u}).
-  const ref = merge.refs[0] || "@{u}";
-  const range = `HEAD..${ref}`;
-  const [commits, commitsOk] = gitTry(["log", "--oneline", range], ws);
-  if (!commitsOk) return;   // can't resolve the ref → FAIL OPEN (never block a merge over a parse miss)
-  if (!commits.trim()) { decision("allow", `⛩ bench merge: nothing to merge from ${ref} into ${branch} (up to date).`); return; }
+  // 3. Incoming commits per ref. `git merge` with no ref merges the upstream (@{u}); an octopus
+  // merge (`git merge a b`) lists several refs — EVERY ref's commits are incoming, so every ref is
+  // gathered (reviewing only refs[0] let the rest bypass the gate — a push-gate catch). Ranges are
+  // pinned to SHAs (`<headSha>..<refSha>`), never symbolic `HEAD..ref`: the queued deep review runs
+  // AFTER the merge advances HEAD, where a symbolic range is empty (ff) or wrong (non-ff).
+  const refNames = merge.refs.length ? merge.refs : ["@{u}"];
+  const [headSha, headOk] = gitTry(["rev-parse", "HEAD"], ws);
+  if (!headOk || !headSha) return;   // unresolvable HEAD → FAIL OPEN (weird repo state; never wedge a merge)
+  const incoming = [];
+  for (const ref of refNames) {
+    const [refSha, refOk] = gitTry(["rev-parse", ref], ws);
+    if (!refOk || !refSha) return;   // can't resolve a ref → FAIL OPEN (never block a merge over a parse miss)
+    const range = `${headSha}..${refSha}`;
+    const [commits, commitsOk] = gitTry(["log", "--oneline", range], ws);
+    if (!commitsOk) return;          // fail open
+    if (commits.trim()) incoming.push({ ref, refSha, range, commits });
+  }
+  const refsLabel = refNames.join(", ");
+  if (!incoming.length) { decision("allow", `⛩ bench merge: nothing to merge from ${refsLabel} into ${branch} (up to date).`); return; }
 
-  let diff = gitTry(["diff", range], ws)[0] || "";
+  const commits = incoming.map((i) => (incoming.length > 1 ? `# incoming from ${i.ref}\n${i.commits}` : i.commits)).join("\n");
+  let diff = incoming.map((i) => gitTry(["diff", i.range], ws)[0] || "").join("\n");
   if (diff.length > MAX_MERGE_DIFF_BYTES) diff = diff.slice(0, MAX_MERGE_DIFF_BYTES) + "\n\n[... diff truncated at 200 000 bytes ...]";
 
   const sessionKey = sessionKeyFromInput(input, env);
 
-  // 4. Enqueue the DEEP async review FIRST (best-effort) — it's delivered by the deep-review-runner via
-  // the visible rewake, non-blocking, so MiMo's thorough repo-aware pass happens even if the fast gate
-  // below times out or crashes. Reuses the push-review machinery (kind:"push", the incoming range).
-  try {
-    const [refSha] = gitTry(["rev-parse", ref], ws);
-    enqueueImpl(ws, { kind: "push", range, contentKey: deepKey(`merge:${range}`, refSha || range) }, { sessionKey });
-  } catch (e) {
-    process.stderr.write(`⛩ pre-merge: deep review enqueue failed (${e instanceof Error ? e.message : String(e)}); fast gate stands.\n`);
+  // 4. Enqueue the DEEP async reviews FIRST (best-effort), one per ref — delivered by the
+  // deep-review-runner via the visible rewake, non-blocking, so the thorough repo-aware pass happens
+  // even if the fast gate below times out or crashes. kind:"merge" (not "push"): the runner reviews
+  // it through the same range machinery, but its durable-block identity is recomputed as
+  // `merge:<range>` (deep-queue currentContentKey) — reusing kind:"push" made every recompute
+  // `push:<range>`-keyed, so a durable merge block was always "changed" and retired at the next Stop.
+  for (const i of incoming) {
+    try {
+      enqueueImpl(ws, { kind: "merge", range: i.range, contentKey: deepKey(`merge:${i.range}`, i.refSha) }, { sessionKey });
+    } catch (e) {
+      process.stderr.write(`⛩ pre-merge: deep review enqueue failed for ${i.ref} (${e instanceof Error ? e.message : String(e)}); fast gate stands.\n`);
+    }
   }
 
   // 5. Fast content-only review, HARD-capped. On timeout/error → FAIL OPEN (deep review already queued;
@@ -164,8 +182,8 @@ export async function runMain({
   if (results === "TIMEOUT" || results === null || !Array.isArray(results)) {
     decision(
       "allow",
-      `⛩ bench merge: fast review didn't finish in ${(budgetMs / 1000) | 0}s; merge allowed (a deep review is queued). Run \`/bench:review ${range}\` for a full pass.`,
-      `⛩ bench merge: fast review timed out (${ref} → ${branch}); merge allowed — deep review queued.`
+      `⛩ bench merge: fast review didn't finish in ${(budgetMs / 1000) | 0}s; merge allowed (a deep review is queued). Run \`/bench:review ${incoming[0].range}\` for a full pass.`,
+      `⛩ bench merge: fast review timed out (${refsLabel} → ${branch}); merge allowed — deep review queued.`
     );
     return exit(0);   // don't linger on a dangling reviewer promise
   }
@@ -187,9 +205,9 @@ export async function runMain({
     const detail = panel.findings || panel.summary || "(no details)";
     decision(
       "deny",
-      `[${panel.badge}] Pre-merge review found issues that should be fixed before merging ${ref} into ${branch}:\n\n${detail}\n\nFix these, then run git merge again.`,
+      `[${panel.badge}] Pre-merge review found issues that should be fixed before merging ${refsLabel} into ${branch}:\n\n${detail}\n\nFix these, then run git merge again.`,
       // USER-VISIBLE — a merge block is never "off the eyes".
-      `⛩ bench merge BLOCKED [${panel.badge}] (${ref} → ${branch})\n${detail.slice(0, 1200)}`
+      `⛩ bench merge BLOCKED [${panel.badge}] (${refsLabel} → ${branch})\n${detail.slice(0, 1200)}`
     );
     return;
   }

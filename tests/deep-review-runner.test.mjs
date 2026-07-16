@@ -279,3 +279,66 @@ test("bench disabled → exit 0 without touching the queue", async () => {
   assert.equal(exit, 0); assert.equal(ran, false);
   assert.equal(listJobs(ws).length, 1, "queue untouched when disabled");
 });
+
+// ── merge jobs (SHA-pinned ranges from the pre-merge gate) ─────────────────────────────────────────
+import { execFileSync } from "node:child_process";
+import { currentContentKey } from "../global-hooks/deep-queue.mjs";
+
+function gitWs() {
+  const ws = freshWs();
+  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  g("init", "-q", "-b", "main");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base");
+  return { ws, g };
+}
+
+test("MERGE job: routes through the PUSH review machinery and stamps its durable block key at BLOCK time", async () => {
+  const { ws, g } = gitWs();
+  // Enqueue exactly as the pre-merge gate does: SHA-pinned range, key seeded pre-merge (stale by review time).
+  const enqueueKey = deepKey("merge:A..B", "refsha-at-enqueue");
+  enqueue(ws, { kind: "merge", range: "A..B", contentKey: enqueueKey });
+  let reviewedRange = null;
+  const { exit } = await runRunner(ws, {
+    runPushReviewImpl: async (range) => { reviewedRange = range; return { maxSeverity: "high", findingCount: 1, findings: "BLOCK: bad" }; },
+    runSpecReviewImpl: async () => { throw new Error("merge job must NOT run the spec review"); }
+  });
+  assert.equal(exit, 2, "high merge block wakes");
+  assert.equal(reviewedRange, "A..B", "merge reviews its pinned range via the push machinery");
+  const [blocked] = listBlocked(ws);
+  assert.ok(blocked, "durable .blocked persisted");
+  // Stamped at BLOCK time (post-merge HEAD), NOT the stale enqueue key — the merge itself moved HEAD
+  // between enqueue and review, so the enqueue key would read as "changed" and retire the block at
+  // the very next Stop (a push-gate catch).
+  assert.notEqual(blocked.contentKey, enqueueKey, "enqueue-time key must not be the durable identity");
+  assert.equal(blocked.contentKey, currentContentKey(ws, blocked), "block key matches the recompute → survives the next Stop");
+
+  // Next Stop with HEAD unchanged: the block survives (re-delivered), not retired.
+  const second = await runRunner(ws, { runPushReviewImpl: async () => { throw new Error("no re-review"); } });
+  assert.equal(second.exit, 2, "unaddressed merge block re-wakes");
+  assert.equal(listBlocked(ws).length, 1, "block survives while unaddressed");
+
+  // The fix commit lands (HEAD moves) → the block retires at the following Stop.
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "fix: address findings");
+  const third = await runRunner(ws, {});
+  assert.equal(third.exit, 0);
+  assert.equal(listBlocked(ws).length, 0, "addressed (HEAD moved) → retired");
+});
+
+test("DRAIN DEADLINE: surplus that can't fit the runner budget is deferred + exit 2 (never stranded waiting on a Stop)", async () => {
+  const ws = freshWs();
+  for (let n = 0; n < MAX_BATCH + 2; n++) {
+    const f = path.join(ws, `d${n}.md`);
+    fs.writeFileSync(f, `body ${n}`);
+    enqueue(ws, { kind: "spec", specPath: f, contentKey: deepKey(f, `body ${n}`) });
+  }
+  let runCount = 0;
+  const { exit, err } = await runRunner(ws, {
+    runSpecReviewImpl: async () => { runCount++; return { maxSeverity: "none", findingCount: 0, findings: "" }; },
+    // Budgets that no second batch can fit: worst-case review (1s) + margin > 1ms runner budget.
+    env: { BENCH_DEEP_REVIEW_BUDGET_MS: "1000", BENCH_DEEP_RUNNER_BUDGET_MS: "1" }
+  });
+  assert.equal(runCount, MAX_BATCH, "only the first batch runs — a second would be killed mid-claim by the hook timeout");
+  assert.equal(exit, 2, "deferred surplus forces the next Stop instead of waiting on one that may never come");
+  assert.match(err, /deferred \(runner budget exhausted\)/);
+  assert.equal(listJobs(ws).length, 2, "deferred jobs remain QUEUED (unclaimed) for the forced next Stop");
+});

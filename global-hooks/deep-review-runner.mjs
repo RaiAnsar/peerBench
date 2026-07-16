@@ -20,6 +20,13 @@ export const MAX_BATCH = 3;                     // claim+run at most this many C
                                                 // on concurrent agentic load. Surplus is drained in later batches inside
                                                 // this same hook invocation, so Claude is not re-woken just to process
                                                 // queued clean reviews.
+export const RUNNER_BUDGET_MS = 12 * 60 * 1000; // MUST match the deep-runner Stop hook timeout in hooks/hooks.json (720s).
+                                                // A batch may consume the full per-review budget (~10 min), so starting
+                                                // another one near the end of this window gets the runner KILLED mid-claim —
+                                                // and with no later Stop, the orphaned claims sit unprocessed indefinitely
+                                                // (recovery only runs at the NEXT invocation). The drain loop therefore only
+                                                // starts a new batch when a worst-case batch still fits; deferred surplus
+                                                // forces a rewake (exit 2) so a next Stop is GUARANTEED to process it.
 export const WAKE_WINDOW_MS = 30 * 60 * 1000;   // re-WAKE a .blocked within this; after, downgrade to advisory (file kept)
 export const MAX_REVIEW_ATTEMPTS = 3;           // bound retries of a QUEUED job whose review keeps failing (git/transient).
                                                 // Safe to cap: a queued job has no completed finding, so dropping it after
@@ -48,6 +55,8 @@ export async function runMain({
   runSpecReviewImpl = defaultRunSpecReview,
   runPushReviewImpl = defaultRunPushReview,
   now = Date.now(),
+  clock = Date.now,                       // live clock for the drain deadline (`now` is a snapshot)
+  env = process.env,
   exitImpl = (code) => process.exit(code),
   stderr = (s) => process.stderr.write(s),
   stdout = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`)
@@ -82,11 +91,24 @@ export async function runMain({
 
   // 3-5. Drain queued jobs in bounded concurrent batches. Older builds exited 2 after a clean
   //    MAX_BATCH batch just to force another Stop and process surplus, which created visible
-  //    no-action Claude turns. Keep MAX_BATCH as the concurrency cap, but drain surplus here.
+  //    no-action Claude turns. Keep MAX_BATCH as the concurrency cap and drain surplus here — but
+  //    only while a worst-case batch still FITS in the runner's hook budget (see RUNNER_BUDGET_MS);
+  //    a deadline-deferred surplus rewakes instead (rare: only after a slow batch), so it is never
+  //    stranded waiting on a Stop that may not come.
+  const startTs = clock();
+  const reviewBudgetMs = Number(env.BENCH_DEEP_REVIEW_BUDGET_MS) || 10 * 60 * 1000;
+  const runnerBudgetMs = Number(env.BENCH_DEEP_RUNNER_BUDGET_MS) || RUNNER_BUDGET_MS;
+  let deferred = 0;
   const seenJobKeys = new Set();
   for (;;) {
     const queued = safe(() => listJobs(ws, { sessionKey }), []).filter((job) => !seenJobKeys.has(job._jobKey));
     if (!queued.length) break;
+    // Every batch after the first must fit its worst case (per-review budget + margin) inside the
+    // remaining hook budget, or the hook timeout kills the runner mid-claim.
+    if (seenJobKeys.size && (clock() - startTs) + reviewBudgetMs + 30_000 > runnerBudgetMs) {
+      deferred = queued.length;
+      break;
+    }
     const claimed = [];
     for (const job of queued.slice(0, MAX_BATCH)) {
       const claimedPath = claim(ws, job._jobKey);
@@ -99,7 +121,9 @@ export async function runMain({
 
     const outcomes = await Promise.all(claimed.map(async ({ job, claimedPath }) => {
       try {
-        const res = job.kind === "push"
+        // merge jobs review through the same range machinery as push (their range is SHA-pinned by
+        // the pre-merge gate, so reviewing after the merge has advanced HEAD is still exact).
+        const res = (job.kind === "push" || job.kind === "merge")
           ? await runPushReviewImpl(job.range, ws, { sessionKey: job.sessionKey || sessionKey })
           : await runSpecReviewImpl(job.specPath, ws, { sessionKey: job.sessionKey || sessionKey });
         return { job, claimedPath, res };
@@ -126,9 +150,15 @@ export async function runMain({
       }
       if (shouldRewake({ maxSeverity: o.res.maxSeverity, findingCount: o.res.findingCount })) {
         const findings = o.res.findings || o.res.summary || "(deep block)";
+        // A MERGE block's durable identity is stamped NOW (post-merge HEAD), not at enqueue: the
+        // merge itself moved HEAD between enqueue and review, so the enqueue-time key would read as
+        // "changed" at the very next Stop and instantly retire the block. Stamped here, it retires
+        // exactly when the agent lands the fix commit (HEAD moves again) — push-block semantics.
+        let contentKey = o.job.contentKey;
+        if (o.job.kind === "merge") { try { contentKey = currentContentKey(ws, o.job) || contentKey; } catch { /* keep enqueue key */ } }
         markBlocked(ws, o.job._jobKey, {
           kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
-          contentKey: o.job.contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,
+          contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,
           findings, traceId: o.res.traceId || null, firstBlockedTs: now
         }, { claimedPath: o.claimedPath });
         wake.push(findings + traceHint(o.res.traceId));
@@ -142,6 +172,12 @@ export async function runMain({
   // 6. Deliver. wake → stderr + exit 2 (wakes even idle); else advisory → stdout note; else quiet.
   if (wake.length) {
     stderr(`⛩ deep review found blocking issues — address them before continuing:\n\n${wake.join("\n\n")}\n`);
+    return exitImpl(2);
+  }
+  // Deadline-deferred surplus with nothing else waking: force the next Stop ourselves (exit 2) —
+  // queued jobs must never depend on a future Stop that may not come (idle session = stranded jobs).
+  if (deferred) {
+    stderr(`⛩ deep review: ${deferred} queued job(s) deferred (runner budget exhausted); ending turn so the next Stop runs them.\n`);
     return exitImpl(2);
   }
   if (advisory.length) {
