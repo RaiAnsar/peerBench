@@ -27,3 +27,28 @@ test("load-keys writes configured provider temperatures without printing secrets
   assert.equal(saved.providers.kimi.temperature, 0.6);
   assert.equal(saved.providers.glm.temperature, 0.2);
 });
+
+test("load-keys REPLACES managed fields (drops a removed override) but PRESERVES unmanaged companion fields", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "load-keys-root-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "load-keys-src-"));
+  // Pre-existing companion.json: kimi has a stale managed field (temperature) AND unmanaged fields
+  // (timeoutMs, concurrencyPerKey, a custom header) that .keys does not set.
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(root, "companion.json"), JSON.stringify({ providers: {
+    kimi: { baseURL: "https://old/v1", model: "kimi-k2.6", apiKey: "old", temperature: 0.6,
+            timeoutMs: 999000, concurrencyPerKey: 4, headers: { "X-Custom": "keep-me" } }
+  } }));
+  const keys = path.join(dir, ".keys");
+  // New .keys: K3, no KIMI_TEMPERATURE (must be DROPPED, not kept at 0.6).
+  fs.writeFileSync(keys, ["KIMI_API_KEY=newkey", "KIMI_MODEL=k3", ""].join("\n"));
+  execFileSync(process.execPath, [LOAD_KEYS, keys], { encoding: "utf8", env: { ...process.env, BENCH_ROOT: root } });
+  const kimi = JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8")).providers.kimi;
+  // Managed fields reflect the NEW .keys (stale temperature gone → resolveConfig will use the K3 default null).
+  assert.equal(kimi.model, "k3");
+  assert.equal(kimi.apiKey, "newkey");
+  assert.equal("temperature" in kimi, false, "a dropped .keys override must NOT survive as a stale companion field");
+  // Unmanaged fields PRESERVED across the reload (regression: full-object REPLACE wiped these).
+  assert.equal(kimi.timeoutMs, 999000, "timeoutMs preserved");
+  assert.equal(kimi.concurrencyPerKey, 4, "concurrencyPerKey preserved");
+  assert.deepEqual(kimi.headers, { "X-Custom": "keep-me" }, "custom companion headers preserved");
+});

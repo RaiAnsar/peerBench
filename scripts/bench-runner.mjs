@@ -254,10 +254,11 @@ async function main() {
     const codexHooksPath = path.join(os.homedir(), ".codex", "hooks.json");
     const codexPromptsDir = path.join(os.homedir(), ".codex", "prompts");
     // Report key status for the ACTIVE reviewers only, sourced the way the gates read them
-    // (resolveConfig merges env + companion.json/.keys). Hardcoded KIMI/MIMO env checks were
-    // misleading after the registry change — they named a disabled model and hid GLM/Qwen.
+    // (resolveConfig merges env + companion.json/.keys). CLI-backed reviewers (codex, grok) have NO
+    // provider entry — they bill their own plans, so an API-key check would falsely report
+    // "key MISSING" (a panel catch). Filter to reviewers that actually have a provider config.
     const keyLines = cfg.reviewers
-      .filter((name) => name !== "codex")
+      .filter((name) => cfg.providers[name])
       .map((name) => {
         const p = cfg.providers[name];
         return `  ${name}: ${p?.apiKey ? "key present" : "key MISSING"} (model ${p?.model || "?"})`;

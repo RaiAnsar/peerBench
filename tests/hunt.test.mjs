@@ -25,26 +25,27 @@ test("huntPanel runs kimi+mimo agentically and returns findings", async () => {
   assert.deepEqual(out.map((o) => o.name).sort(), ["Kimi", "MiMo"]);
   for (const o of out) assert.match(o.findings, /x\.js:3/);
 });
-test("huntPanel deep=true sends thinking:{type:'enabled'} in the request body", async () => {
+test("huntPanel deep=true flips a TOGGLE provider (GLM) to thinking:enabled but OMITS it for a null provider (K3 kimi)", async () => {
+  // Deep must turn thinking ON only where the param is a live toggle (GLM/Qwen: disabled↔enabled).
+  // A provider with thinking:null — kimi on K3 (param unsupported), MiMo/MiniMax (always-on) — must
+  // stay OMITTED, or the deep path reintroduces a field the fast path drops (K3 rejects it → hard fail).
   const root = process.env.BENCH_ROOT;
-  fs.writeFileSync(path.join(root, "companion.json"), JSON.stringify({ reviewers: ["kimi", "mimo"], providers: {
-    kimi: { baseURL: "https://x/v1", model: "kimi-for-coding", apiKey: "k" }, mimo: { baseURL: "https://y/v1", model: "mimo", apiKey: "m" } } }));
+  fs.writeFileSync(path.join(root, "companion.json"), JSON.stringify({ reviewers: ["kimi", "glm"], providers: {
+    kimi: { baseURL: "https://k/v1", apiKey: "k" }, glm: { baseURL: "https://g/v1", apiKey: "g" } } }));
   const enc = new TextEncoder();
-  const capturedThinking = [];
-  const reviewImpl = async (_url, opts) => {
-    const parsed = JSON.parse(opts.body);
-    capturedThinking.push(parsed.thinking);
+  const byHost = {};
+  const reviewImpl = async (url, opts) => {
+    const host = new URL(url).host;
+    (byHost[host] ||= []).push(JSON.parse(opts.body));
     const data = `data: ${JSON.stringify({ choices: [{ delta: { content: "deep finding at z.ts:1" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`;
     const body = new ReadableStream({ start(c) { c.enqueue(enc.encode(data)); c.close(); } });
     return { ok: true, status: 200, body, text: async () => "" };
   };
   const out = await huntPanel({ cwd: process.cwd(), seed: "x", deep: true, reviewImpl });
-  assert.deepEqual(out.map((o) => o.name).sort(), ["Kimi", "MiMo"]);
-  // every request body must include thinking:{type:"enabled"}
-  assert.ok(capturedThinking.length > 0, "reviewImpl must have been called");
-  for (const t of capturedThinking) {
-    assert.deepStrictEqual(t, { type: "enabled" });
-  }
+  assert.deepEqual(out.map((o) => o.name).sort(), ["GLM", "Kimi"]);
+  assert.ok(byHost["g"]?.length && byHost["k"]?.length, "both reviewers called");
+  for (const b of byHost["g"]) assert.deepStrictEqual(b.thinking, { type: "enabled" }, "GLM toggles ON for deep");
+  for (const b of byHost["k"]) assert.equal("thinking" in b, false, "K3 kimi: thinking OMITTED even on deep (unsupported param)");
 });
 
 // ── FIX 2 (deep-path consistency): a prose BLOCK (no `- ` bullets) must still rewake ──

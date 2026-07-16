@@ -2,7 +2,7 @@
 
 A Claude Code + Codex helper that reviews your work with a **panel of AI reviewers** —
 **Codex** (OpenAI) and **Grok** (xAI's [Grok Build](https://github.com/xai-org/grok-build)
-CLI) as plan-billed agentic CLIs, plus API providers **Kimi** (Moonshot `kimi-k2.6`),
+CLI) as plan-billed agentic CLIs, plus API providers **Kimi** (Moonshot `k3`),
 **GLM** (z.ai `glm-5.2`), **Qwen** (Alibaba MaaS `qwen3.7-max`), **MiMo** (Xiaomi), and
 **MiniMax** (`MiniMax-M3`) — instead of a single reviewer. The panel runs automatically as
 **gates** (plans/specs, code turns, pushes) and on demand as a **bug hunt** that
@@ -77,9 +77,10 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
   ephemeral per-run directory — grok's own `--sandbox read-only` is a verified
   no-op on shipped builds (the OSS enforcement crate isn't wired in yet), so
   the hard read-only guarantee is peerBench's, not grok's.
-- **Kimi** — Moonshot `kimi-k2.6` on the **coding-plan** endpoint
-  (`api.kimi.com/coding/v1`) with **thinking disabled** (`thinking:{type:"disabled"}`,
-  `temperature:0.6`). Fast, non-thinking, tool-calling — no Open Platform key needed.
+- **Kimi** — Moonshot **K3** (`k3`) on the **coding-plan** endpoint
+  (`api.kimi.com/coding/v1`). K3 is always-thinking with server-fixed sampling, so
+  peerBench omits `temperature` and the K2.x `thinking` param entirely. No Open
+  Platform key needed.
 - **GLM** — z.ai `glm-5.2` on the coding endpoint. Default fallback reviewer with Kimi.
 - **Qwen** — Alibaba MaaS `qwen3.7-max` through the OpenAI-compatible endpoint.
 - **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`). Uniquely good at
@@ -131,12 +132,12 @@ produce output:
 
 ### Thinking config
 
-`kimi-k2.6` supports thinking on **or** off via the `thinking` parameter:
-
-- **Default** — thinking **off**: fast and reliable for gates and hunts.
-- **Opt in** — set `KIMI_THINKING=enabled` in `.keys` and run
-  `node scripts/load-keys.mjs` if you want Kimi to use thinking. Leave it disabled
-  for the lowest-latency gates.
+Kimi is now on **K3**, which is always-thinking with server-fixed sampling — the
+K2.x `thinking` parameter and any `temperature` override are **rejected**, so
+peerBench omits both on every path (fast gates and deep/agentic reviews alike).
+`KIMI_THINKING` / `KIMI_TEMPERATURE` in `.keys` only apply if you pin an older
+K2.x model via `KIMI_MODEL`; on K3 leave them unset. Providers whose thinking
+param IS a live toggle (GLM, Qwen) still flip on for deep reviews automatically.
 
 ## Commands
 

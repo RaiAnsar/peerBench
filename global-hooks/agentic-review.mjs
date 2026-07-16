@@ -122,7 +122,7 @@ export async function agenticReview({
       // On conclude (force): OMIT the tools array entirely — a model can't call tools that aren't
       // offered, so it MUST produce content. (tool_choice:"none" alone is ignored by some models,
       // e.g. kimi-k2.6, which then reads until maxSteps and drops out with "no verdict".)
-      const makeBody = (bodyMessages = messages, bodyTemperature = currentTemperature) => JSON.stringify({ model, messages: bodyMessages, temperature: bodyTemperature, stream: true,
+      const makeBody = (bodyMessages = messages, bodyTemperature = currentTemperature) => JSON.stringify({ model, messages: bodyMessages, ...(bodyTemperature == null ? {} : { temperature: bodyTemperature }), stream: true,
         ...(force ? {} : { tools: tools.schemas, tool_choice: "auto" }),
         ...(thinking === "enabled" || thinking === "disabled" ? { thinking: { type: thinking } } : {}) });
       let body = makeBody();

@@ -56,10 +56,23 @@ let cur = {};
 try { cur = JSON.parse(fs.readFileSync(file, "utf8")); } catch { cur = {}; }
 cur.providers = cur.providers || {};
 
+// The scalar fields load-keys OWNS (sourced from .keys). On reload these are cleared-then-set from
+// .keys, so dropping a .keys override (e.g. KIMI_TEMPERATURE when K3 requires omitting it) actually
+// takes effect — a plain merge kept the stale value alive forever. Fields NOT listed (timeoutMs,
+// concurrencyPerKey) are PRESERVED. `headers` is handled separately: load-keys only sets the
+// User-Agent from <NAME>_USER_AGENT, so it's MERGED over any custom companion headers, not replaced.
+const MANAGED_FIELDS = ["baseURL", "model", "apiKey", "apiKeys", "temperature", "thinking"];
+
 const loaded = [];
 for (const name of PROVIDERS) {
   const p = buildProvider(env, name);
-  if (p.apiKey) { cur.providers[name] = { ...cur.providers[name], ...p }; loaded.push(name); }
+  if (p.apiKey) {
+    const preserved = { ...cur.providers[name] };
+    for (const f of MANAGED_FIELDS) delete preserved[f];        // clear stale managed scalars, keep the rest
+    const headers = { ...(preserved.headers || {}), ...(p.headers || {}) };   // preserve custom headers, overlay .keys UA
+    cur.providers[name] = { ...preserved, ...p, ...(Object.keys(headers).length ? { headers } : {}) };
+    loaded.push(name);
+  }
 }
 
 fs.mkdirSync(sharedRoot(), { recursive: true });

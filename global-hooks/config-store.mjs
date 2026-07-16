@@ -11,10 +11,16 @@ import path from "node:path";
 // from this object, so there are no parallel lists to keep in sync. Disable a model by dropping it
 // from the active set (companion.json `reviewers` / `/bench:reviewers`); its config stays here.
 const DEFAULTS = {
-  kimi: { displayName: "Kimi", baseURL: "https://api.kimi.com/coding/v1", model: "kimi-k2.6", keyEnv: "KIMI_API_KEY",
-          temperature: 0.6, thinking: "disabled", thinkingEnv: "KIMI_THINKING",
+  // Kimi K3 (launched 2026-07-16; `k3` is the coding-plan endpoint's id for it). K3 rules differ
+  // from K2.x: temperature/top_p are FIXED server-side and must be OMITTED from requests
+  // (temperature: null = omit), the K2.x `thinking` param is NOT supported (always-thinking model;
+  // reasoning arrives separately in reasoning_content, so .content stays clean), and
+  // reasoning_effort currently only supports its default "max" (omitted). Slower than K2.6
+  // (~28 tok/s, thinking always on) → longer timeout.
+  kimi: { displayName: "Kimi", baseURL: "https://api.kimi.com/coding/v1", model: "k3", keyEnv: "KIMI_API_KEY",
+          temperature: null, thinking: null, thinkingEnv: "KIMI_THINKING",
           headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
-          timeoutMs: 300_000 },  // 5 min
+          timeoutMs: 420_000 },  // 7 min
   // MiMo (Xiaomi) — currently DISABLED (token plan exhausted) but kept wired so it's a one-word
   // re-add (`/bench:reviewers ... mimo`). Earned its slot: uniquely caught secret/PII/deploy-hygiene issues.
   mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
@@ -161,7 +167,11 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
     const rawThinking = f.thinking !== undefined ? f.thinking : (envThinking !== undefined ? envThinking : (d.thinking || null));
     const thinking = rawThinking === "" ? null : rawThinking;
     const model = env[`${name.toUpperCase()}_MODEL`] || f.model || d.model;
-    const temperature = typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0);
+    // null is MEANINGFUL (omit temperature from requests — K3 fixes it server-side); only an
+    // absent/undefined default falls back to 0.
+    const temperature = typeof f.temperature === "number" || f.temperature === null
+      ? f.temperature
+      : (d.temperature !== undefined ? d.temperature : 0);
     // Key POOL: env var (comma-separated) > companion apiKeys[] > companion single apiKey. apiKey
     // stays the first key for back-compat; review-client rotates the pool on a 429 (per-key cap).
     const envKey = env[d.keyEnv];

@@ -194,7 +194,12 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
           baseURL: p.baseURL, apiKey: slotIdx == null ? pool[0] : pool[slotIdx % pool.length], model: p.model,
           temperature: p.temperature, headers: p.headers,
           system, user: userMsg, tools: createReviewTools(cwd), mode: "report",
-          thinking: deep ? "enabled" : p.thinking,
+          // Deep reviews flip thinking ON — but ONLY for providers whose thinking param is a live
+          // toggle (disabled↔enabled, e.g. GLM/Qwen). A provider with thinking:null (K3 — the param
+          // is unsupported; MiMo/MiniMax — always-on) must STAY omitted, or the deep/agentic path
+          // reintroduces a field the fast path correctly drops → K3 rejects it and every deep gate
+          // for kimi hard-fails (all three reviewers caught this on the panel's first run).
+          thinking: deep ? (p.thinking == null ? null : "enabled") : p.thinking,
           maxSteps: deep ? INVESTIGATE_MAX_STEPS : HUNT_MAX_STEPS,
           timeoutMs: apiTimeout,
           maxRoundMs: deep ? INVESTIGATE_ROUND_MS : undefined,

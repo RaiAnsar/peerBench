@@ -266,3 +266,11 @@ test("every agentic request carries the coding-client User-Agent (bare Node UA i
   await agenticReview({ ...baseArgs, headers: { "User-Agent": "custom/1" }, tools: { schemas: SCHEMAS, execute: async () => "" }, fetchImpl });
   for (const h of seen) assert.equal(h["User-Agent"], "custom/1", "provider header overrides the default UA");
 });
+
+test("agentic: temperature null → omitted from every request body (K3 contract)", async () => {
+  const bodies = [];
+  const fetchImpl = async (url, opts) => { bodies.push(JSON.parse(opts.body)); return sse([{ content: "ALLOW: fine" }]); };
+  await agenticReview({ ...baseArgs, temperature: null, tools: { schemas: SCHEMAS, execute: async () => "" }, fetchImpl });
+  assert.ok(bodies.length > 0);
+  for (const b of bodies) assert.equal("temperature" in b, false, "null must mean ABSENT on the agentic path too");
+});

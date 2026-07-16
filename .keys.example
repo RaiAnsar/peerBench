@@ -12,7 +12,9 @@ MIMO_API_KEY=
 
 # Optional provider overrides. Leave commented to use peerBench defaults.
 # KIMI_BASE_URL=https://api.kimi.com/coding/v1
-# KIMI_MODEL=kimi-k2.6
+# KIMI_MODEL=k3
+# K3 note: temperature/top_p are FIXED server-side and the K2.x thinking param is unsupported —
+# leave KIMI_TEMPERATURE / KIMI_THINKING UNSET on K3 (only set them if you pin a K2.x model).
 # KIMI_TEMPERATURE=0.6
 # KIMI_THINKING=disabled
 #

@@ -39,7 +39,8 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
   const makeBody = (systemContent = system, userContent = user, bodyTemperature = temperature) => JSON.stringify({
     model,
     messages: [{ role: "system", content: systemContent }, { role: "user", content: userContent }],
-    temperature: bodyTemperature,
+    // null/undefined = OMIT temperature (K3 fixes sampling server-side and rejects overrides).
+    ...(bodyTemperature == null ? {} : { temperature: bodyTemperature }),
     stream: false,
     ...(thinking === "disabled" || thinking === "enabled" ? { thinking: { type: thinking } } : {})
   });

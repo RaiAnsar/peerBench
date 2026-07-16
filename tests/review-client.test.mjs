@@ -217,3 +217,12 @@ test("reserved headers (Authorization, Content-Type) in provider headers are str
   assert.equal(cap.headers["Content-Type"], "application/json");
   assert.equal(cap.headers["User-Agent"], "x");
 });
+
+test("temperature null → OMITTED from the request body (K3 fixes sampling server-side); thinking null → omitted too", async () => {
+  const cap = {};
+  await review({ baseURL: "https://x/v1", apiKey: "k", model: "k3", system: "s", user: "u", timeoutMs: 5000,
+    temperature: null, thinking: null,
+    fetchImpl: (url, opts) => { cap.body = JSON.parse(opts.body); return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
+  assert.equal("temperature" in cap.body, false, "K3 rejects sampling overrides — the field must be ABSENT, not null");
+  assert.equal("thinking" in cap.body, false, "K2.x thinking param is unsupported on K3");
+});

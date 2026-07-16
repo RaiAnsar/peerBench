@@ -25,9 +25,9 @@ test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => 
   const a = resolveConfig({ env: { ...base } });
   const b = resolveConfig({ env: { ...base, CLAUDE_PLUGIN_DATA: "/tmp/whatever" } });
   assert.equal(a.providers.kimi.apiKey, "mk");
-  assert.equal(a.providers.kimi.model, "kimi-k2.6");
+  assert.equal(a.providers.kimi.model, "k3");
   assert.equal(a.providers.kimi.baseURL, "https://api.kimi.com/coding/v1");
-  assert.equal(a.providers.kimi.temperature, 0.6);
+  assert.equal(a.providers.kimi.temperature, null, "K3 fixes sampling server-side — null means OMIT from requests");
   assert.match(a.providers.kimi.headers["User-Agent"], /claude-cli/);
   assert.equal(a.providers.mimo.apiKey, "xk");
   assert.equal(a.providers.mimo.temperature, 0);
@@ -63,9 +63,10 @@ test("QWEN_MODEL / QWEN_BASE_URL env overrides win (quick-swap without code edit
 });
 test("companion.json can override temperature/headers (via file param seam)", () => {
   // resolveConfig reads companion.json from sharedRoot; we can't write there in a unit test,
-  // so just assert the default headers/temperature object shape is present and overridable in code.
-  const a = resolveConfig({ env: { KIMI_API_KEY: "k" } });
-  assert.equal(typeof a.providers.kimi.temperature, "number");
+  // so just assert the default headers/temperature shape is present and overridable in code.
+  const a = resolveConfig({ env: { KIMI_API_KEY: "k", MIMO_API_KEY: "x" } });
+  assert.equal(a.providers.kimi.temperature, null, "kimi (K3): null = omit — MEANINGFUL, must survive resolution");
+  assert.equal(typeof a.providers.mimo.temperature, "number");
   assert.equal(typeof a.providers.kimi.headers, "object");
 });
 test("workspaceStateDir lands under the env-independent shared root", () => {
@@ -122,16 +123,16 @@ test("setReviewers de-dupes (kimi kimi mimo → kimi mimo) — no double API cal
 test("resolveConfig de-dupes a duplicated reviewer override", () => {
   assert.deepEqual(resolveConfig({ env: {}, reviewers: ["kimi", "kimi"] }).reviewers, ["kimi"]);
 });
-test("resolveConfig includes per-provider timeoutMs defaults (kimi=300000, mimo=180000)", () => {
+test("resolveConfig includes per-provider timeoutMs defaults (kimi=420000, mimo=180000)", () => {
   const cfg = resolveConfig({ env: { KIMI_API_KEY: "k" } });
-  assert.equal(cfg.providers.kimi.timeoutMs, 300_000);
+  assert.equal(cfg.providers.kimi.timeoutMs, 420_000, "K3 always thinks at max effort — needs the longer budget");
   assert.equal(cfg.providers.mimo.timeoutMs, 180_000);
 });
-test("resolveConfig kimi defaults: model kimi-k2.6, temperature 0.6, thinking disabled", () => {
+test("resolveConfig kimi defaults: model k3, temperature null (omit), thinking null (K2.x param unsupported)", () => {
   const cfg = resolveConfig({ env: { KIMI_API_KEY: "k" } });
-  assert.equal(cfg.providers.kimi.model, "kimi-k2.6");
-  assert.equal(cfg.providers.kimi.temperature, 0.6);
-  assert.equal(cfg.providers.kimi.thinking, "disabled");
+  assert.equal(cfg.providers.kimi.model, "k3");
+  assert.equal(cfg.providers.kimi.temperature, null);
+  assert.equal(cfg.providers.kimi.thinking, null);
 });
 test("resolveConfig KIMI_THINKING env overrides kimi thinking", () => {
   const cfg = resolveConfig({ env: { KIMI_API_KEY: "k", KIMI_THINKING: "enabled" } });
