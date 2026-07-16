@@ -397,3 +397,44 @@ test("MERGE block: a fix committed while UNSTAMPED retires at heal — never ado
   assert.equal(second.exit, 0, "no re-wake — the post-block commit IS the addressed signal");
   assert.equal(listBlocked(ws).length, 0, "retired at heal: tip is newer than firstBlockedTs");
 });
+
+test("MERGE block: a FUTURE-dated but UNMOVED HEAD never retires an unstamped block (reflog, not commit metadata)", async () => {
+  // The %ct trap: fast-forwarding onto a clock-skewed remote commit gives HEAD a FUTURE committer
+  // date while the local reflog entry (the actual movement record) is honest local time. Simulate
+  // with plumbing: commit-tree forges the future commit metadata; the reset that moves HEAD onto it
+  // runs WITHOUT date overrides, so its reflog entry is local-now (pre-block).
+  const ws = freshWs();
+  const g = (...a) => execFileSync("git", a, { cwd: ws, encoding: "utf8" });
+  g("init", "-q", "-b", "main");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base");
+  const futureSha = execFileSync("git", ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "future-dated tip"],
+    { cwd: ws, encoding: "utf8", env: { ...process.env, GIT_COMMITTER_DATE: "@32472144000 +0000", GIT_AUTHOR_DATE: "@32472144000 +0000", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t" } }).trim();
+  g("reset", "-q", "--hard", futureSha);
+  assert.ok(Number(g("log", "-1", "--format=%ct", "HEAD").trim()) * 1000 > Date.now(), "precondition: tip commit metadata is future-dated");
+
+  // Block AFTER the ff, with the block-time stamp failing (simulated via a doomed recompute is not
+  // injectable here — instead enqueue and force the unstamped path by breaking rev-parse... simplest
+  // honest route: block in a ws whose queue entry points at this repo but whose stamp failed is not
+  // constructible without a git outage, so persist the unstamped block directly, as the runner does).
+  const contentKey = deepKey("merge:A..B", "refsha-at-enqueue");
+  enqueue(ws, { kind: "merge", range: "A..B", contentKey });
+  const jobKey = listJobs(ws)[0]._jobKey;
+  const claimed = (await import("../global-hooks/deep-queue.mjs")).claim(ws, jobKey);
+  markBlocked(ws, jobKey, { kind: "merge", range: "A..B", contentKey: null, findings: "BLOCK: bad", traceId: null, firstBlockedTs: Date.now() }, { claimedPath: claimed });
+  assert.equal(listBlocked(ws)[0].contentKey, null, "precondition: unstamped");
+
+  // Heal: HEAD has NOT moved since before the block (reflog's newest entry = the pre-block reset).
+  // Commit-metadata reasoning would read the future %ct as "commit landed after the block" → retire
+  // → HIGH finding lost. The reflog says: same SHA → stamp it as baseline, keep delivering.
+  const heal = await runRunner(ws, {});
+  assert.equal(heal.exit, 2, "unmoved HEAD → block kept + delivered");
+  const [blocked] = listBlocked(ws);
+  assert.ok(blocked, "NOT retired — commit dates are metadata, not movement");
+  assert.equal(blocked.contentKey, currentContentKey(ws, blocked), "stamped with the true (unmoved) baseline");
+
+  // And the normal ending: a real fix commit moves HEAD → retired.
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "fix");
+  const after = await runRunner(ws, {});
+  assert.equal(after.exit, 0);
+  assert.equal(listBlocked(ws).length, 0);
+});

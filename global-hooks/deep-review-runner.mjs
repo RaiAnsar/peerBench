@@ -10,7 +10,7 @@
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput } from "./config-store.mjs";
-import { shouldRewake } from "./deep-review.mjs";
+import { shouldRewake, deepKey } from "./deep-review.mjs";
 import { runSpecReview as defaultRunSpecReview, runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 import {
   recoverOrphans, listBlocked, listJobs, claim, requeueForRetry, markBlocked, deleteJob, currentContentKey, GONE
@@ -38,12 +38,30 @@ function workspaceRoot(cwd) {
   catch { return cwd; }
 }
 
-// Committer time (ms) of the current HEAD tip, or null when it can't be determined.
-function headTipMs(ws) {
+// Where HEAD pointed at `atMs`, reconstructed from the LOCAL reflog — git's actual HEAD-movement
+// record (each entry is stamped by the local clock AT UPDATE TIME, unlike %ct commit metadata,
+// which is mutable/non-monotonic: a fast-forward onto a future-dated remote commit has a future
+// %ct but an honest local reflog entry). Returns:
+//   { sha }        — the newest entry at/before atMs (entry times floor to the second → a
+//                    same-second movement counts as at-or-before: errs toward KEEP, never lose);
+//   { sha: null }  — every recorded HEAD position postdates atMs (repo initialized after, or all
+//                    pre-atMs entries pruned BECAUSE later movements exist) → HEAD moved for sure;
+//   null           — reflog unavailable/unparseable → indeterminate.
+// Residual (documented, not fixable locally): reflog entry idents honor an exported
+// GIT_COMMITTER_DATE, so deliberately forged local commit dates can still skew this — but that
+// requires explicit local action; the realistic failure (clock-skewed REMOTE commit metadata)
+// never reaches the local reflog.
+function reflogHeadAt(ws, atMs) {
   try {
-    const s = execFileSync("git", ["log", "-1", "--format=%ct", "HEAD"], { cwd: ws, encoding: "utf8" }).trim();
-    const ms = Number(s) * 1000;
-    return Number.isFinite(ms) && ms > 0 ? ms : null;
+    const out = execFileSync("git", ["log", "-g", "--date=unix", "--format=%H %gd", "HEAD"],
+      { cwd: ws, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+    const entries = out.trim().split("\n").map((l) => {
+      const m = l.match(/^([0-9a-f]{40,}) HEAD@\{(\d+)\}$/);
+      return m ? { sha: m[1], ts: Number(m[2]) * 1000 } : null;
+    });
+    if (!entries.length || entries.some((e) => !e)) return null;
+    const hit = entries.find((e) => e.ts <= atMs);   // newest-first → first at-or-before = position at atMs
+    return { sha: hit ? hit.sha : null };
   } catch { return null; }
 }
 
@@ -93,15 +111,17 @@ export async function runMain({
       // grounds. Self-heal at the first successful recompute — but the RIGHT baseline is HEAD as of
       // BLOCK time, which may be gone by now: if the agent already landed the fix while the block was
       // unstamped, stamping current HEAD would adopt the FIX as baseline and the addressed block
-      // would keep re-waking (a stop-gate catch). The tip's committer time disambiguates: a tip
-      // NEWER than firstBlockedTs means a commit landed AFTER the findings were delivered → that is
-      // the addressed signal → retire; a tip at/before firstBlockedTs means HEAD hasn't moved since
-      // the block, so current HEAD IS the block-time baseline → stamp it.
-      if (cur !== null && cur !== GONE) {
-        const tipMs = headTipMs(ws);
+      // would keep re-waking (a stop-gate catch). The reflog reconstructs the block-time HEAD by SHA
+      // (see reflogHeadAt — an actual movement record; commit timestamps like %ct are mutable
+      // metadata that can retire an unmoved-but-future-dated HEAD, another stop-gate catch):
+      // same SHA as now → HEAD never moved → current HEAD IS the baseline → stamp it; a different
+      // (or no pre-block) SHA → HEAD moved after delivery → that IS the addressed signal → retire.
+      if ((b.kind === "merge" || b.kind === "push") && cur !== null && cur !== GONE) {
         const blockedTs = Number(b.firstBlockedTs) || 0;
-        if (tipMs !== null && blockedTs > 0 && tipMs > blockedTs) { deleteJob(b._path); continue; }   // addressed while unstamped → retired
-        if (tipMs !== null) {
+        const rec = blockedTs > 0 ? reflogHeadAt(ws, blockedTs) : null;
+        if (rec) {
+          const baselineKey = rec.sha ? deepKey(`${b.kind}:${b.range}`, rec.sha) : null;
+          if (baselineKey !== cur) { deleteJob(b._path); continue; }   // moved since block → addressed → retired
           try {
             markBlocked(ws, b._jobKey, {
               kind: b.kind, specPath: b.specPath, range: b.range, contentKey: cur,
@@ -110,7 +130,8 @@ export async function runMain({
             });
           } catch { /* best-effort — deliver regardless; heal again next Stop */ }
         }
-        // tipMs null (partial git health) → keep unstamped; deliver and retry the heal next Stop.
+        // rec null (no usable reflog) or blockedTs missing → keep unstamped; deliver, retry next
+        // Stop. Bounded noise: past WAKE_WINDOW it downgrades to a non-waking advisory (file kept).
       }
     } else if (cur === GONE || (cur !== null && cur !== b.contentKey)) {
       // Retire on a DEFINITIVELY-gone target (deleted spec → GONE; the block is moot) OR a CONFIRMED
