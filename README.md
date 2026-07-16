@@ -1,12 +1,14 @@
 # peerbench
 
 A Claude Code + Codex helper that reviews your work with a **panel of AI reviewers** —
-**Codex** (OpenAI), **Kimi** (Moonshot `kimi-k2.6`), **GLM**
-(z.ai `glm-5.2`), **Qwen** (Alibaba MaaS), and **MiMo** (Xiaomi) — instead of a single reviewer. The panel runs automatically as
+**Codex** (OpenAI) and **Grok** (xAI's [Grok Build](https://github.com/xai-org/grok-build)
+CLI) as plan-billed agentic CLIs, plus API providers **Kimi** (Moonshot `kimi-k2.6`),
+**GLM** (z.ai `glm-5.2`), **Qwen** (Alibaba MaaS `qwen3.7-max`), **MiMo** (Xiaomi), and
+**MiniMax** (`MiniMax-M3`) — instead of a single reviewer. The panel runs automatically as
 **gates** (plans/specs, code turns, pushes) and on demand as a **bug hunt** that
-scours the repo read-only. Kimi, GLM, Qwen, and MiMo are cheap; the goal is Codex-grade
-review at a fraction of the cost, with Codex kept alongside as a benchmark you can
-drop with one command.
+scours the repo read-only. The API providers are cheap and the CLI reviewers ride
+existing subscription plans; the goal is frontier-grade review from several
+independent models at once, each swappable with one command.
 
 > **Project:** `peerbench`. **Command prefix:** `bench` — e.g. `/bench:hunt`,
 > `/bench:investigate`, `/bench:review` (short to type; the project is peerbench).
@@ -50,7 +52,10 @@ exact ahead-of-remote commit range **before** the push is allowed. It runs the s
 deep push review inline, blocks on high/critical findings, and also blocks if peerBench cannot
 resolve or inspect the commit range. Delete-only pushes and pushes with no commits ahead are
 allowed without running the reviewer. Use `/bench:off` only when you intentionally want to bypass
-the gate.
+the gate. The thorough inline review holds the session for the review's duration; if you'd
+rather trade depth for latency, `BENCH_PUSH_GATE_MODE=fast` switches the gate to a 90-second
+content-capped inline pass that fails open and enqueues the full repo-aware review to run
+asynchronously after the push (any other value, or unset, means blocking).
 
 **2. Bug hunt (on demand).** `/bench:hunt [focus]` runs the panel **agentically** —
 each reviewer explores the repository read-only via tools (read_file, grep, glob,
@@ -63,18 +68,29 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
 - **Codex** — OpenAI, via the
   [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
   `codex@openai-codex` Claude plugin's shared runtime (an agentic CLI that
-  already reads files). The reliable reference.
+  already reads files). ChatGPT-plan billing. The reliable reference.
+- **Grok** — xAI's [Grok Build](https://github.com/xai-org/grok-build) CLI
+  (now open source), run headless in plan mode. Grok-plan billing, no metered
+  API key. Review verdicts are **schema-constrained** (`--json-schema`), so the
+  verdict can't be lost to narration. peerBench wraps every run in its own
+  **macOS Seatbelt sandbox** with grok's writable state redirected to an
+  ephemeral per-run directory — grok's own `--sandbox read-only` is a verified
+  no-op on shipped builds (the OSS enforcement crate isn't wired in yet), so
+  the hard read-only guarantee is peerBench's, not grok's.
 - **Kimi** — Moonshot `kimi-k2.6` on the **coding-plan** endpoint
   (`api.kimi.com/coding/v1`) with **thinking disabled** (`thinking:{type:"disabled"}`,
   `temperature:0.6`). Fast, non-thinking, tool-calling — no Open Platform key needed.
-- **GLM** — z.ai `glm-5.2` on the coding endpoint. Default active reviewer with Kimi.
+- **GLM** — z.ai `glm-5.2` on the coding endpoint. Default fallback reviewer with Kimi.
 - **Qwen** — Alibaba MaaS `qwen3.7-max` through the OpenAI-compatible endpoint.
-- **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`). Wired and selectable, but not
-  active by default.
+- **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`). Uniquely good at
+  secret/PII/deploy-hygiene catches.
+- **MiniMax** — `MiniMax-M3` on the flat coding plan. A reasoning model whose
+  inline `<think>` output is stripped automatically; thinking tokens are free on
+  the flat plan.
 
-Switch the active panel any time with `/bench:reviewers` (for example `kimi glm qwen`,
-or `codex kimi glm`). Selectable reviewers come from the registry (`kimi`, `mimo`,
-`glm`, `qwen`, `codex`).
+Switch the active panel any time with `/bench:reviewers` (for example `codex grok mimo`,
+or `kimi glm qwen`). Selectable reviewers come from the registry (`kimi`, `mimo`,
+`glm`, `qwen`, `minimax`, `codex`, `grok`).
 
 ### Read-only by construction
 
@@ -82,6 +98,14 @@ Reviewers **cannot modify your code**. Content-only gate calls send no tools at 
 The agentic hunt exposes only read tools (read_file / grep / glob / list_dir),
 sandboxed to the repo — there is no write, edit, or shell tool. (A model that tries
 to "fix" a file during review simply can't.)
+
+The CLI reviewers get OS-level containment on top of their flags: Grok runs inside
+a peerBench-built macOS Seatbelt profile (`sandbox-exec`) that denies all writes
+except an ephemeral per-run temp dir its entire state (`GROK_HOME`) is redirected
+into — nothing a review run writes survives it, and all of `~/.grok` (binaries,
+plugins, config, model routing) stays read-only. Its CLI containment flags are
+passed too, but only as defense-in-depth: they're verified non-enforcing on
+current builds.
 
 ## Agentic engine (the hunt loop)
 
@@ -126,6 +150,9 @@ produce output:
 - `/bench:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo` or
   `codex kimi glm qwen`). Selectable: `kimi`, `mimo`, `glm`, `qwen`, `codex`.
 - `/bench:status [id]` — recent gate/hunt runs for this workspace; pass a trace id to expand it.
+- `/bench:scorecard` — cross-project reviewer performance: objective stats computed from
+  traces plus your TP/FP/miss grades (`bench-runner.mjs grade <traceId> <Reviewer>:<tp|fp|miss>`),
+  so swap-or-keep panel decisions stay evidence-based.
 - `/bench:setup` — check reviewer availability and per-workspace state.
 - `/bench:off` / `/bench:on` — disable / re-enable the gates for this workspace (`--global` for everywhere).
 
@@ -138,9 +165,12 @@ when a task calls for finding or root-causing a bug. The rest are user-invoked.
   `~/.claude/plugins/data/bench-shared/`) — the active `reviewers` list and
   each provider's `baseURL`, `model`, `apiKey`, `temperature`, `thinking`, headers.
 - **`.keys`** (repo, **gitignored** — never commit) — source secrets/config for the
-  providers (`KIMI_*`, `GLM_*`, `QWEN_*`, `MIMO_*`). Start from `.keys.example`.
+  providers (`KIMI_*`, `GLM_*`, `QWEN_*`, `MIMO_*`, `MINIMAX_*`). Start from `.keys.example`.
+  The CLI reviewers (`codex`, `grok`) need no keys — they use their own plan sign-ins.
 - `BENCH_ROOT` — override the shared dir (used for test isolation).
 - `BENCH_DEBUG=1` — verbose agentic diagnostics.
+- `BENCH_PUSH_GATE_MODE=fast` — opt the pre-push gate into the bounded fast pass
+  (default is the thorough blocking review).
 
 State is keyed first by **workspace** (git top-level). Git facts that are truly
 workspace-wide, such as `/bench:off` and the stop gate's `reviewed-head` marker,
@@ -151,8 +181,8 @@ The provider config in `companion.json` is global/shared.
 
 When peerBench is installed for direct Codex work, the Codex Stop hook uses the
 same stop-review logic but always removes the `codex` reviewer before the panel
-runs. That means Codex work is reviewed by Kimi/GLM/Qwen/etc., never by Codex
-itself. Codex processes launched as Claude reviewers/delegates are skipped with
+runs. That means Codex work is reviewed by Grok/Kimi/GLM/Qwen/etc., never by
+Codex itself. Codex processes launched as Claude reviewers/delegates are skipped with
 `BENCH_SUPPRESS_HOOKS` / `CODEX_COMPANION_SESSION_ID`, so `codex-plugin-cc`
 does not recursively trigger peerBench.
 
@@ -169,7 +199,7 @@ does not recursively trigger peerBench.
 
 A compact segment renders the latest gate/hunt for the current workspace and,
 when Claude provides a `session_id`, the current chat —
-`⛩ plan: Codex✓ Kimi✓ MiMo✓` (green all-allow, red on block, `!` on error/skip,
+`⛩ plan: Codex✓ Grok✓ MiMo✓` (green all-allow, red on block, `!` on error/skip,
 `✓` for hunt findings). Verdicts older than ~45 min dim to `(idle)` so a stale
 result never looks like an active block. If no session id is available, the
 segment falls back to workspace-level trace selection for compatibility.
@@ -181,8 +211,12 @@ segment falls back to workspace-level trace selection for compatibility.
 - Codex with hook support for direct Codex Stop reviews and `/prompts:bench-*`.
 - The [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
   Claude plugin only if you enable the `codex` reviewer inside Claude.
-- At least one non-Codex provider key in `.keys` / `companion.json`. Defaults are
-  `kimi` + `glm`.
+- The [Grok Build CLI](https://github.com/xai-org/grok-build)
+  (`curl -fsSL https://x.ai/cli/install.sh | bash`, then sign in once with
+  `GROK_HOME=~/.grok-headless grok -p OK` for the gate's dedicated auth) only if
+  you enable the `grok` reviewer.
+- At least one provider key in `.keys` / `companion.json` if no CLI reviewer is
+  set up. Fallback defaults are `kimi` + `glm`.
 
 ## Install
 
