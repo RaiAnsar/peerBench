@@ -220,10 +220,14 @@ export async function runMain({
           try { contentKey = currentContentKey(ws, o.job); } catch { contentKey = null; }
           if (contentKey === GONE) contentKey = null;
         }
+        // firstBlockedTs = the moment the block is PERSISTED/DELIVERED (live clock) — NOT the
+        // invocation-start `now`: the review above can run ~10 min, and a commit landed DURING it
+        // predates the delivery, so the unstamped-heal must not read it as "addressed the findings"
+        // and discard the block (a push-gate catch).
         markBlocked(ws, o.job._jobKey, {
           kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
           contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,
-          findings, traceId: o.res.traceId || null, firstBlockedTs: now
+          findings, traceId: o.res.traceId || null, firstBlockedTs: clock()
         }, { claimedPath: o.claimedPath });
         wake.push(findings + traceHint(o.res.traceId));
       } else {

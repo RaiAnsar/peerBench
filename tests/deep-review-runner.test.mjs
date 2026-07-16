@@ -380,9 +380,10 @@ test("MERGE block: a transient git failure at BLOCK time never retires the block
 test("MERGE block: a fix committed while UNSTAMPED retires at heal — never adopts the fix as its baseline (gate catch)", async () => {
   const ws = freshWs();   // non-git → block persists unstamped
   enqueue(ws, { kind: "merge", range: "A..B", contentKey: deepKey("merge:A..B", "refsha-at-enqueue") });
-  // Block a minute in the past so the fix commit below is unambiguously NEWER than firstBlockedTs.
+  // Block a minute in the past (clock drives firstBlockedTs at markBlocked time) so the fix commit
+  // below is unambiguously NEWER than the delivery.
   const first = await runRunner(ws, {
-    now: Date.now() - 60_000,
+    clock: () => Date.now() - 60_000,
     runPushReviewImpl: async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: bad" })
   });
   assert.equal(first.exit, 2);
@@ -437,4 +438,19 @@ test("MERGE block: a FUTURE-dated but UNMOVED HEAD never retires an unstamped bl
   const after = await runRunner(ws, {});
   assert.equal(after.exit, 0);
   assert.equal(listBlocked(ws).length, 0);
+});
+
+test("firstBlockedTs is stamped when the block PERSISTS (markBlocked), not at invocation start", async () => {
+  // The review can run ~10 min after runMain's `now` snapshot; a commit landed DURING it predates
+  // delivery, so pinning firstBlockedTs to invocation start would let the unstamped-heal misread
+  // that commit as 'addressed' and discard a HIGH block (a push-gate catch).
+  const ws = freshWs();
+  planSpecJob(ws);
+  const before = Date.now();
+  await runRunner(ws, {
+    now: 12345,   // ancient invocation-start snapshot — must NOT become the block's timestamp
+    runSpecReviewImpl: async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: bad" })
+  });
+  const [blocked] = listBlocked(ws);
+  assert.ok(blocked.firstBlockedTs >= before, `stamped at persist time (got ${blocked.firstBlockedTs}, invocation now=12345)`);
 });
