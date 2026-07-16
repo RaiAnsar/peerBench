@@ -359,8 +359,9 @@ test("MERGE block: a transient git failure at BLOCK time never retires the block
   assert.equal(second.exit, 2, "unstamped block re-wakes");
   assert.equal(listBlocked(ws).length, 1, "survives while git is unavailable");
 
-  // git heals → the block self-heals (stamped with the recompute) instead of being retired.
-  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  // git heals with a tip that PREDATES the block (backdated committer time = HEAD hasn't moved since
+  // block time) → the block self-heals: stamped with current HEAD as the baseline, NOT retired.
+  const g = (...a) => execFileSync("git", a, { cwd: ws, env: { ...process.env, GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z", GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z" } });
   g("init", "-q", "-b", "main");
   g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "post-merge head");
   const third = await runRunner(ws, {});
@@ -370,8 +371,29 @@ test("MERGE block: a transient git failure at BLOCK time never retires the block
   assert.match(blocked.findings || "", /BLOCK: bad/, "payload survives the heal rewrite");
 
   // From here, normal addressed-retirement: the fix commit moves HEAD → retired.
-  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "fix");
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "fix"], { cwd: ws });
   const fourth = await runRunner(ws, {});
   assert.equal(fourth.exit, 0);
   assert.equal(listBlocked(ws).length, 0, "addressed (HEAD moved) → retired");
+});
+
+test("MERGE block: a fix committed while UNSTAMPED retires at heal — never adopts the fix as its baseline (gate catch)", async () => {
+  const ws = freshWs();   // non-git → block persists unstamped
+  enqueue(ws, { kind: "merge", range: "A..B", contentKey: deepKey("merge:A..B", "refsha-at-enqueue") });
+  // Block a minute in the past so the fix commit below is unambiguously NEWER than firstBlockedTs.
+  const first = await runRunner(ws, {
+    now: Date.now() - 60_000,
+    runPushReviewImpl: async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: bad" })
+  });
+  assert.equal(first.exit, 2);
+  assert.equal(listBlocked(ws)[0].contentKey, null, "unstamped");
+
+  // The agent (woken by the block) lands the fix while git recovery + a fresh commit both happen
+  // before the next heal attempt. Stamping NOW would adopt the fix as baseline and re-wake forever.
+  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  g("init", "-q", "-b", "main");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "fix: address findings");
+  const second = await runRunner(ws, {});
+  assert.equal(second.exit, 0, "no re-wake — the post-block commit IS the addressed signal");
+  assert.equal(listBlocked(ws).length, 0, "retired at heal: tip is newer than firstBlockedTs");
 });

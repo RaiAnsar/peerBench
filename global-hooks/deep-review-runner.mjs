@@ -38,6 +38,15 @@ function workspaceRoot(cwd) {
   catch { return cwd; }
 }
 
+// Committer time (ms) of the current HEAD tip, or null when it can't be determined.
+function headTipMs(ws) {
+  try {
+    const s = execFileSync("git", ["log", "-1", "--format=%ct", "HEAD"], { cwd: ws, encoding: "utf8" }).trim();
+    const ms = Number(s) * 1000;
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  } catch { return null; }
+}
+
 // Retrieval footer stamped on every block so the full per-reviewer findings are always one command
 // away (`show <traceId>`) even if the inline text is truncated — no manual dig through the state dir.
 const traceHint = (id) => (id ? `\n↳ full findings: /bench:show ${id}` : "");
@@ -80,16 +89,28 @@ export async function runMain({
     try { cur = currentContentKey(ws, b); } catch { cur = null; }
     if (!b.contentKey) {
       // UNSTAMPED merge block: it was persisted while the block-time recompute failed (transient git
-      // blip), so there is no key to compare against — an unstamped block is NEVER retired. Self-heal
-      // at the first successful recompute so normal addressed-retirement resumes from here.
+      // blip), so there is no key to compare against — an unstamped block is NEVER retired on key
+      // grounds. Self-heal at the first successful recompute — but the RIGHT baseline is HEAD as of
+      // BLOCK time, which may be gone by now: if the agent already landed the fix while the block was
+      // unstamped, stamping current HEAD would adopt the FIX as baseline and the addressed block
+      // would keep re-waking (a stop-gate catch). The tip's committer time disambiguates: a tip
+      // NEWER than firstBlockedTs means a commit landed AFTER the findings were delivered → that is
+      // the addressed signal → retire; a tip at/before firstBlockedTs means HEAD hasn't moved since
+      // the block, so current HEAD IS the block-time baseline → stamp it.
       if (cur !== null && cur !== GONE) {
-        try {
-          markBlocked(ws, b._jobKey, {
-            kind: b.kind, specPath: b.specPath, range: b.range, contentKey: cur,
-            sessionKey: b.sessionKey, findings: b.findings, traceId: b.traceId ?? null,
-            firstBlockedTs: b.firstBlockedTs
-          });
-        } catch { /* best-effort — deliver regardless; heal again next Stop */ }
+        const tipMs = headTipMs(ws);
+        const blockedTs = Number(b.firstBlockedTs) || 0;
+        if (tipMs !== null && blockedTs > 0 && tipMs > blockedTs) { deleteJob(b._path); continue; }   // addressed while unstamped → retired
+        if (tipMs !== null) {
+          try {
+            markBlocked(ws, b._jobKey, {
+              kind: b.kind, specPath: b.specPath, range: b.range, contentKey: cur,
+              sessionKey: b.sessionKey, findings: b.findings, traceId: b.traceId ?? null,
+              firstBlockedTs: b.firstBlockedTs
+            });
+          } catch { /* best-effort — deliver regardless; heal again next Stop */ }
+        }
+        // tipMs null (partial git health) → keep unstamped; deliver and retry the heal next Stop.
       }
     } else if (cur === GONE || (cur !== null && cur !== b.contentKey)) {
       // Retire on a DEFINITIVELY-gone target (deleted spec → GONE; the block is moot) OR a CONFIRMED
