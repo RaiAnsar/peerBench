@@ -24,6 +24,14 @@ test("parseMergeSegment skips value-flag values so refs[0] is the branch, not th
   assert.deepEqual(parseMergeSegment("git merge --no-ff -m msg -s recursive staging")?.refs, ["staging"]);
 });
 
+test("parseMergeSegment stops at shell redirects/operators — `2>&1` never becomes a 2nd (octopus) ref", () => {
+  assert.deepEqual(parseMergeSegment("git merge feature 2>&1")?.refs, ["feature"]);
+  assert.deepEqual(parseMergeSegment("git merge --no-ff release 2>&1")?.refs, ["release"]);
+  assert.deepEqual(parseMergeSegment("git merge feature 2>&1 | tee log")?.refs, ["feature"]);
+  // a GENUINE octopus merge is still parsed with both refs
+  assert.deepEqual(parseMergeSegment("git merge feature-a feature-b 2>&1")?.refs, ["feature-a", "feature-b"]);
+});
+
 test("findMergeSegment ignores --abort/--continue/--quit and non-merge git commands", () => {
   assert.equal(findMergeSegment("git merge --abort"), null);
   assert.equal(findMergeSegment("git merge --continue"), null);

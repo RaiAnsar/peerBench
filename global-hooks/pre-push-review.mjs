@@ -126,6 +126,12 @@ export function parsePushCommand(text) {
       i++;
       for (; i < toks.length; i++) {
         const t = toks[i];
+        // STOP at a shell redirect / control operator — everything after belongs to the shell, not
+        // the push. `git push origin main 2>&1` must yield refspecs [main], NOT [main, "2>&1"]: the
+        // stray token counted as a 2nd refspec and pushed the command onto the multi-ref path (the
+        // likely real trigger of a spurious "2 refspecs" block, since agentic pushes append 2>&1).
+        // Git remotes/refspecs never contain < > | & ; so this can't drop a real arg.
+        if (/[<>]/.test(t) || /^(\|\|?|&&?|;|\|&)$/.test(t)) break;
         if (t.startsWith("-")) { flags.push(t); if (PUSH_VALUE_FLAGS.has(t)) i++; }   // skip a value-flag's separate value token
         else positionals.push(t);
       }
@@ -317,18 +323,23 @@ export function resolvePushRange(cwd, parsed) {
     return { range: "", ok: false, deleteOnly: true };
   }
 
-  // Cases where an EXACT push range can't be scoped — multiple refspecs (`git push beta main develop`,
-  // a common deploy form) or whole-ref flags (--all/--tags/--mirror). Best-effort: review the current
-  // branch's ahead-commits IF a cheap base exists — but stay FAIL-CLOSED (block) otherwise. These
-  // pushes carry commits on refs OTHER than HEAD, so the robust HEAD-scoped remote-ahead tier would
-  // silently UNDER-review (e.g. `push beta main develop` with no beta refs would review only main and
-  // skip develop's commits — a push-gate catch). currentBranchBaseRange has no such always-ok tier.
+  // A push that spans SEVERAL refs — multiple refspecs (`git push beta main develop`) or whole-ref
+  // flags (--all/--branches/--tags/--mirror) — can't be scoped to peerBench's ONE reviewable diff
+  // range. The old "best effort" reviewed only the current branch and then ALLOWED, silently shipping
+  // the OTHER refs' commits unreviewed (a stop-gate catch). Fail CLOSED: block with an actionable note
+  // (push each ref on its own so every commit is reviewed). Carve-out below for a harmless tags push.
   const wholeRefFlag = ["--all", "--branches", "--tags", "--mirror"].find((f) => flags.includes(f));   // --branches = git 2.50 alias for --all
   if (wholeRefFlag || refspecs.length > 1) {
+    // Tags-only push (`git push --tags`, no branch refspecs) that introduces NO new commits — tags
+    // reference commits already on the remote (i.e. already-reviewed branches). Nothing to review →
+    // clean allow, so the common release flow (push branch, then push --tags) stays unblocked.
+    if (wholeRefFlag === "--tags" && refspecs.length === 0) {
+      const [newTagCommits, ok] = gitTry(["rev-list", "--tags", "--not", `--remotes=${remote}`], cwd);
+      if (ok && !newTagCommits.trim()) return { range: "", ok: false, cleanAllow: true };
+      // else: a tag points at commits not yet on the remote → they'd ship unreviewed → block below.
+    }
     const why = wholeRefFlag ? `${wholeRefFlag} pushes multiple refs` : `${refspecs.length} refspecs`;
-    const fb = currentBranchBaseRange(cwd, remote);
-    if (fb.ok) return { ...fb, note: `⛩ pre-push: ${why} — reviewing current-branch commits (${fb.range}); exact push set not range-resolved.` };
-    return { range: "", ok: false, note: `⛩ pre-push: ${why} and no branch base resolved; push blocked until peerBench can review a commit range.` };
+    return { range: "", ok: false, note: `⛩ pre-push: ${why} — peerBench reviews one commit range and can't scope a multi-ref push, so it can't confirm every ref's commits are reviewed; push each ref on its own (git push ${remote} <ref>) so all commits are reviewed.` };
   }
 
   // Single explicit refspec.
@@ -491,10 +502,11 @@ export async function runMain({
   // 3. Compute push range from the PARSED command. If a real push might transmit commits but
   // peerBench cannot resolve a review range, fail closed instead of allowing an unreviewed push.
   const parsed = parsePushCommand(pushSeg.text);
-  const { range, ok: rangeOk, note: rangeNote, deleteOnly } = resolvePushRange(ws, parsed);
+  const { range, ok: rangeOk, note: rangeNote, deleteOnly, cleanAllow } = resolvePushRange(ws, parsed);
   if (!rangeOk) {
-    if (deleteOnly) {
-      // delete refspec → pushes no commits → clean allow, no review, no noisy note.
+    if (deleteOnly || cleanAllow) {
+      // No commits transmitted (delete refspec, or a tags-only push referencing already-pushed
+      // commits) → clean allow, no review, no noisy note.
       return;
     }
     const note = rangeNote || "⛩ pre-push: no reviewable commit range; push blocked.";

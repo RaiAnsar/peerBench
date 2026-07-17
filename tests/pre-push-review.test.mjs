@@ -809,6 +809,19 @@ test("A2: parsePushCommand extracts remote, refspecs, flags (origin default)", (
   assert.ok(tags.flags.includes("--tags"));
 });
 
+test("A2: parsePushCommand stops at shell redirects/operators — a `2>&1` never counts as a refspec", () => {
+  // Agentic pushes append `2>&1` / pipes; the stray token used to count as a 2nd refspec, mis-routing
+  // a single-branch push onto the multi-ref path (a spurious '2 refspecs' block — the likely real
+  // trigger of the reported new-branch failure). Redirects/pipes must be dropped entirely.
+  assert.deepEqual(parsePushCommand("git push origin main 2>&1"), { remote: "origin", refspecs: ["main"], flags: [] });
+  assert.deepEqual(parsePushCommand("git push -u origin feature 2>&1"), { remote: "origin", refspecs: ["feature"], flags: ["-u"] });
+  assert.deepEqual(parsePushCommand("git push origin main 2>&1 | tail -25"), { remote: "origin", refspecs: ["main"], flags: [] });
+  assert.deepEqual(parsePushCommand("git push origin main 2>/dev/null"), { remote: "origin", refspecs: ["main"], flags: [] });
+  assert.deepEqual(parsePushCommand("git push origin main > log.txt"), { remote: "origin", refspecs: ["main"], flags: [] });
+  // a GENUINE 2-branch push is still detected (the redirect strip must not over-eat real refspecs)
+  assert.deepEqual(parsePushCommand("git push origin main develop 2>&1"), { remote: "origin", refspecs: ["main", "develop"], flags: [] });
+});
+
 test("A2: resolvePushRange — explicit HEAD:<dst> → <remote>/<dst>..HEAD", () => {
   const { ws } = repoWithRemoteRefs("origin", ["main"], "main");
   const r = resolvePushRange(ws, parsePushCommand("git push origin HEAD:main"));
@@ -854,42 +867,36 @@ test("A2: resolvePushRange — delete refspec :stale → clean allow, no review"
   assert.ok(!r.note || !/fail-open|limitation/i.test(r.note), "delete push is a clean allow");
 });
 
-test("A2: resolvePushRange — --tags falls back to reviewing current-branch commits (not skipped)", () => {
+test("A2: resolvePushRange — a multi-refspec push is FAIL-CLOSED (can't scope every ref to one review range)", () => {
+  // `git push beta main develop` transmits commits on BOTH main AND develop. peerBench reviews ONE
+  // diff range, so it can't confirm every ref is reviewed — reviewing only the current branch and
+  // then allowing silently shipped the other refs' commits unreviewed (a stop-gate catch). Block,
+  // even WITH a cheap base — the presence of a base doesn't make the OTHER refs reviewable.
+  const { ws } = repoWithRemoteRefs("beta", ["main"], "main");
+  const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
+  assert.equal(r.ok, false, "multi-refspec must block (can't scope every ref), base or not");
+  assert.ok(r.note && /push each ref on its own/.test(r.note), "note tells the user to push refs individually");
+});
+
+test("A2: resolvePushRange — --tags with NO new commits → clean allow (release flow unblocked)", () => {
+  // Tags referencing commits already on the remote ship nothing new → nothing to review → allow.
   const { ws } = repoWithRemoteRefs("origin", ["main"], "main");
+  // Tag the base commit (which IS on origin/main) → rev-list --tags --not --remotes is empty.
+  execFileSync("git", ["tag", "v1.0.0"], { cwd: ws });
   const r = resolvePushRange(ws, parsePushCommand("git push --tags"));
-  assert.equal(r.ok, true, "--tags now reviews the current branch's ahead-commits instead of skipping");
-  assert.match(r.range, /\.\.HEAD$/, "range targets HEAD (current-branch ahead-commits)");
-  assert.ok(r.note && /--tags/.test(r.note), "note explains the --tags fallback");
+  assert.equal(r.ok, false, "no reviewable range object");
+  assert.equal(r.cleanAllow, true, "tags-only push with no new commits is a clean no-op allow, not a block");
 });
 
-test("A2: resolvePushRange — multiple refspecs (deploy push) are REVIEWED, not skipped", () => {
-  // Real-world bug: `git push beta main develop` (a deploy form seen in VisualSentinel + Ryan P)
-  // used to skip review entirely. It must now review the current branch's ahead-commits.
-  const { ws } = repoWithRemoteRefs("beta", ["main"], "main");
-  const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
-  assert.equal(r.ok, true, "multi-refspec deploy push is now reviewed");
-  assert.match(r.range, /\.\.HEAD$/, "reviews current-branch ahead-commits");
-  assert.ok(r.note && /2 refspecs/.test(r.note), "note explains the multi-refspec fallback");
-});
-
-test("A2: resolvePushRange — multi-refspec push with NO cheap base stays FAIL-CLOSED (never under-reviews to HEAD-only)", () => {
-  // A multi-ref push carries commits on refs OTHER than HEAD, so the robust HEAD-scoped remote-ahead
-  // tier must NOT apply here: `git push beta main develop` with no beta refs would review only main's
-  // ahead-set and skip develop's commits. Fail closed (block) instead — the safe pre-fix behavior.
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-norefs-"));
-  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
-  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base"], { cwd: ws });
-  const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
-  assert.equal(r.ok, false, "multi-ref with no @{u} and no beta/* ref must BLOCK, not review HEAD-only");
-  assert.ok(r.note && /blocked/.test(r.note), "carries a visible strict-gate note");
-});
-
-test("A2: resolvePushRange — multi-refspec WITH a cheap base reviews current-branch commits (best effort)", () => {
-  const { ws } = repoWithRemoteRefs("beta", ["main"], "main");
-  const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
-  assert.equal(r.ok, true, "a resolvable base (beta/main) → best-effort current-branch review");
-  assert.match(r.range, /\.\.HEAD$/);
-  assert.ok(r.note && /2 refspecs/.test(r.note), "note explains the multi-ref best-effort fallback");
+test("A2: resolvePushRange — --tags that carries a NEW (unpushed) commit is BLOCKED (would ship unreviewed)", () => {
+  const { ws } = repoWithRemoteRefs("origin", ["main"], "main");
+  // A commit NOT on origin/main, tagged → the tag push would transmit it unreviewed.
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "new"], { cwd: ws });
+  execFileSync("git", ["tag", "v2.0.0"], { cwd: ws });
+  const r = resolvePushRange(ws, parsePushCommand("git push --tags"));
+  assert.equal(r.ok, false);
+  assert.ok(!r.cleanAllow, "a tag pointing at an unpushed commit must NOT be a clean allow");
+  assert.ok(r.note && /--tags/.test(r.note), "blocked with an actionable note");
 });
 
 test("A2: resolvePushRange — NEW BRANCH off a non-standard remote default (no main/master, no @{u}) → tight base..HEAD", () => {

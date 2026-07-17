@@ -50,6 +50,10 @@ export function parseMergeSegment(text) {
   const refs = [];
   for (let j = 0; j < rest.length; j++) {
     const t = rest[j];
+    // STOP at a shell redirect / control operator — `git merge feature 2>&1` must yield refs
+    // [feature], not [feature, "2>&1"] (the stray token would trip the octopus-merge path). Git refs
+    // never contain < > | & ; so this can't drop a real ref.
+    if (/[<>]/.test(t) || /^(\|\|?|&&?|;|\|&)$/.test(t)) break;
     if (t.startsWith("-")) { if (MERGE_VALUE_FLAGS.has(t)) j++; continue; }   // skip a value-flag's value token
     refs.push(t);
   }
