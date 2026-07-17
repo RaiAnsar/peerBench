@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { sharedRoot, PROVIDER_NAMES } from "../global-hooks/config-store.mjs";
+import { ensurePrivateDir, sharedRoot, PROVIDER_NAMES, writePrivateFileAtomic } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const keysPath = process.argv[2] || path.join(ROOT, ".keys");
@@ -75,8 +75,6 @@ for (const name of PROVIDERS) {
   }
 }
 
-fs.mkdirSync(sharedRoot(), { recursive: true });
-const tmp = `${file}.tmp.${process.pid}`;
-fs.writeFileSync(tmp, `${JSON.stringify(cur, null, 2)}\n`);
-fs.renameSync(tmp, file);
+ensurePrivateDir(sharedRoot());
+writePrivateFileAtomic(file, `${JSON.stringify(cur, null, 2)}\n`);
 console.log(`load-keys: wrote providers to companion.json → ${loaded.join(", ") || "(none found)"} (key values redacted)`);

@@ -1,8 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin, removeClaudeSettingsPeerBenchHooks, removeCodexSettingsPeerBenchHooks, deployPluginRuntime, latestClaudeBenchPluginRoot, latestCodexBenchPluginRoot } from "../scripts/deploy-global-hooks.mjs";
+
+function writePluginVersions(root, version) {
+  fs.mkdirSync(path.join(root, ".claude-plugin"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".codex-plugin"), { recursive: true });
+  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({ name: "peerbench", version })}\n`);
+  fs.writeFileSync(path.join(root, ".claude-plugin", "plugin.json"), `${JSON.stringify({ name: "bench", version })}\n`);
+  fs.writeFileSync(path.join(root, ".codex-plugin", "plugin.json"), `${JSON.stringify({ name: "bench", version })}\n`);
+}
 
 test("migrateDataDir: clean legacy → rename", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mig-"));
@@ -52,11 +61,14 @@ test("snapshot captures existing hooks + settings", () => {
   const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "hk-")), backup = fs.mkdtempSync(path.join(os.tmpdir(), "bk-"));
   fs.writeFileSync(path.join(hooks, "codex-plan-review.mjs"), "// old\n");
   const settingsPath = path.join(hooks, "settings.json");
-  fs.writeFileSync(settingsPath, "{}");
+  fs.writeFileSync(settingsPath, "{}", { mode: 0o644 });
   const r = snapshot({ hooksDir: hooks, settingsPath, backupDir: path.join(backup, "b1") });
   assert.ok(r.files.includes("codex-plan-review.mjs"));
   assert.equal(r.settingsBackedUp, true);
   assert.ok(fs.existsSync(path.join(backup, "b1", "settings.json")));
+  assert.equal(r.settingsMode, 0o644);
+  assert.equal(fs.statSync(path.join(backup, "b1")).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(backup, "b1", "settings.json")).mode & 0o777, 0o600);
 });
 
 test("snapshotCodex captures existing Codex hooks + hooks.json", () => {
@@ -64,11 +76,19 @@ test("snapshotCodex captures existing Codex hooks + hooks.json", () => {
   const backup = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bk-"));
   fs.writeFileSync(path.join(hooks, "old.mjs"), "// old\n");
   const hooksPath = path.join(hooks, "hooks.json");
-  fs.writeFileSync(hooksPath, '{"hooks":{}}');
-  const r = snapshotCodex({ hooksDir: hooks, hooksPath, backupDir: path.join(backup, "b1") });
+  fs.writeFileSync(hooksPath, '{"hooks":{}}', { mode: 0o644 });
+  const promptsDir = path.join(backup, "live-prompts");
+  fs.mkdirSync(promptsDir);
+  fs.writeFileSync(path.join(promptsDir, "bench-review.md"), "old prompt\n");
+  const r = snapshotCodex({ hooksDir: hooks, hooksPath, backupDir: path.join(backup, "b1"), promptsDir });
   assert.ok(r.files.includes("old.mjs"));
   assert.equal(r.hooksJsonBackedUp, true);
+  assert.deepEqual(r.promptFiles, ["bench-review.md"]);
   assert.ok(fs.existsSync(path.join(backup, "b1", "hooks.json")));
+  assert.equal(r.hooksJsonMode, 0o644);
+  assert.equal(fs.statSync(path.join(backup, "b1")).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(backup, "b1", "hooks.json")).mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(path.join(backup, "b1", "prompts", "bench-review.md"), "utf8"), "old prompt\n");
 });
 
 test("syncStatuslineSessionArg passes Claude session_id to peerBench statusline segment", () => {
@@ -110,9 +130,10 @@ test("syncStatuslineSessionArg no-ops when there is no peerBench segment", () =>
   assert.equal(fs.readFileSync(statuslinePath, "utf8"), before);
 });
 
-test("syncCodexHooks registers only the Codex wrapper stop hook and is idempotent", () => {
+test("syncCodexHooks registers native SessionStart plus the Codex wrapper Stop hook idempotently", () => {
   const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "codex-sync-hk-"));
   fs.writeFileSync(path.join(hooks, "codex-stop-review.mjs"), "// wrapper\n");
+  fs.writeFileSync(path.join(hooks, "native-session-start.mjs"), "// native armer\n");
   const hooksPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "codex-sync-cfg-")), "hooks.json");
   fs.writeFileSync(hooksPath, JSON.stringify({
     hooks: {
@@ -123,6 +144,9 @@ test("syncCodexHooks registers only the Codex wrapper stop hook and is idempoten
   syncCodexHooks({ hooksDir: hooks, hooksPath });
   syncCodexHooks({ hooksDir: hooks, hooksPath });
   const s = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
+  const session = s.hooks.SessionStart.flatMap((b) => b.hooks || []);
+  assert.equal(session.filter((h) => h.command.includes("native-session-start.mjs")).length, 1, "native SessionStart armer appears exactly once");
+  assert.equal(session.find((h) => h.command.includes("native-session-start.mjs")).timeout, 30);
   const stop = s.hooks.Stop.flatMap((b) => b.hooks || []);
   assert.equal(stop.filter((h) => h.command.includes("codex-stop-review.mjs")).length, 1, "Codex wrapper appears exactly once");
   assert.equal(stop.filter((h) => h.command.includes("stop-review.mjs") && !h.command.includes("codex-stop-review.mjs")).length, 0, "Claude stop hook is not registered directly in Codex");
@@ -161,7 +185,9 @@ test("removeClaudeSettingsPeerBenchHooks removes old settings hooks and preserve
       Stop: [
         { hooks: [
           { type: "command", command: 'node "/x/stop-review.mjs"' },
-          { type: "command", command: 'node "/x/unrelated-stop.mjs"' }
+          { type: "command", command: 'node "/x/unrelated-stop.mjs"' },
+          { type: "command", command: 'node "/x/custom-stop-review.mjs"' },
+          { type: "command", command: 'node "/x/codex-stop-review.mjs"' }
         ] }
       ],
       PreToolUse: [
@@ -176,10 +202,13 @@ test("removeClaudeSettingsPeerBenchHooks removes old settings hooks and preserve
   const commands = JSON.stringify(saved.hooks);
   assert.equal(result.pluginManaged, true);
   assert.equal(result.removedEntries, 2);
-  assert.doesNotMatch(commands, /stop-review\.mjs/);
+  assert.equal(commands.includes("/x/stop-review.mjs"), false);
   assert.doesNotMatch(commands, /pre-push-review\.mjs/);
   assert.match(commands, /unrelated-stop\.mjs/);
+  assert.match(commands, /custom-stop-review\.mjs/);
+  assert.match(commands, /codex-stop-review\.mjs/);
   assert.match(commands, /other\.mjs/);
+  assert.equal(fs.statSync(settingsPath).mode & 0o777, 0o600);
 });
 
 test("removeCodexSettingsPeerBenchHooks removes only the peerBench Codex wrapper", () => {
@@ -189,7 +218,8 @@ test("removeCodexSettingsPeerBenchHooks removes only the peerBench Codex wrapper
       Stop: [
         { hooks: [
           { type: "command", command: 'node "/x/codex-stop-review.mjs"' },
-          { type: "command", command: 'node "/x/unrelated-stop.mjs"' }
+          { type: "command", command: 'node "/x/unrelated-stop.mjs"' },
+          { type: "command", command: 'node "/x/custom-codex-stop-review.mjs"' }
         ] }
       ]
     }
@@ -200,8 +230,10 @@ test("removeCodexSettingsPeerBenchHooks removes only the peerBench Codex wrapper
   const commands = JSON.stringify(saved.hooks);
   assert.equal(result.pluginManaged, true);
   assert.equal(result.removedEntries, 1);
-  assert.doesNotMatch(commands, /codex-stop-review\.mjs/);
+  assert.equal(commands.includes("/x/codex-stop-review.mjs"), false);
   assert.match(commands, /unrelated-stop\.mjs/);
+  assert.match(commands, /custom-codex-stop-review\.mjs/);
+  assert.equal(fs.statSync(hooksPath).mode & 0o777, 0o600);
 });
 
 test("plugin root discovery finds installed Claude and newest Codex bench plugin cache", () => {
@@ -226,26 +258,59 @@ test("plugin root discovery finds installed Claude and newest Codex bench plugin
   assert.equal(latestCodexBenchPluginRoot({ home }), newCodexRoot);
 });
 
-test("deployPluginRuntime refreshes hook/runtime files in an installed plugin cache", () => {
+test("deployPluginRuntime refreshes a matching-version installed plugin cache", () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-src-"));
-  const pluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-dest-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-dest-"));
+  const pluginRoot = path.join(home, ".codex", "plugins", "cache", "aiwithrai", "bench", "0.3.1");
   fs.mkdirSync(path.join(repo, "global-hooks"), { recursive: true });
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
   fs.mkdirSync(path.join(repo, "hooks"), { recursive: true });
-  fs.mkdirSync(path.join(repo, ".codex-plugin"), { recursive: true });
+  writePluginVersions(repo, "0.3.1");
+  writePluginVersions(pluginRoot, "0.3.1");
   fs.writeFileSync(path.join(repo, "global-hooks", "stop-review.mjs"), "new stop\n");
   fs.writeFileSync(path.join(repo, "scripts", "bench-runner.mjs"), "new runner\n");
   fs.writeFileSync(path.join(repo, "hooks", "hooks.json"), "{\"hooks\":{}}\n");
-  fs.writeFileSync(path.join(repo, ".codex-plugin", "plugin.json"), "{\"name\":\"bench\"}\n");
   fs.mkdirSync(path.join(pluginRoot, "global-hooks"), { recursive: true });
   fs.writeFileSync(path.join(pluginRoot, "global-hooks", "stop-review.mjs"), "old stop\n");
 
-  const result = deployPluginRuntime({ repoRoot: repo, pluginRoot });
+  const result = deployPluginRuntime({ repoRoot: repo, pluginRoot, platform: "codex" });
   assert.ok(result.copied.includes("global-hooks/"));
   assert.ok(result.copied.includes("scripts/"));
   assert.equal(fs.readFileSync(path.join(pluginRoot, "global-hooks", "stop-review.mjs"), "utf8"), "new stop\n");
   assert.equal(fs.readFileSync(path.join(pluginRoot, "scripts", "bench-runner.mjs"), "utf8"), "new runner\n");
-  assert.equal(fs.readFileSync(path.join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"), "{\"name\":\"bench\"}\n");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8")).version, "0.3.1");
+});
+
+test("deployPluginRuntime refuses mismatched Claude and Codex cache versions without copying", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-mismatch-src-"));
+  fs.mkdirSync(path.join(repo, "global-hooks"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  writePluginVersions(repo, "0.3.1");
+  fs.writeFileSync(path.join(repo, "global-hooks", "stop-review.mjs"), "new stop\n");
+  fs.writeFileSync(path.join(repo, "scripts", "bench-runner.mjs"), "new runner\n");
+
+  for (const platform of ["claude", "codex"]) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), `pb-${platform}-mismatch-`));
+    const pluginRoot = path.join(home, `.${platform}`, "plugins", "cache", "aiwithrai", "bench", "0.3.0");
+    writePluginVersions(pluginRoot, "0.3.0");
+    fs.mkdirSync(path.join(pluginRoot, "global-hooks"), { recursive: true });
+    fs.writeFileSync(path.join(pluginRoot, "global-hooks", "stop-review.mjs"), "old stop\n");
+
+    assert.throws(
+      () => deployPluginRuntime({ repoRoot: repo, pluginRoot, platform }),
+      (error) => {
+        assert.match(error.message, /checkout=0\.3\.1/);
+        assert.match(error.message, /cache directory=0\.3\.0/);
+        const instructionPattern = platform === "codex"
+          ? /codex plugin marketplace upgrade aiwithrai/
+          : /claude plugin remove bench@aiwithrai/;
+        assert.match(error.message, instructionPattern);
+        return true;
+      }
+    );
+    assert.equal(fs.readFileSync(path.join(pluginRoot, "global-hooks", "stop-review.mjs"), "utf8"), "old stop\n");
+    assert.equal(fs.existsSync(path.join(pluginRoot, "scripts", "bench-runner.mjs")), false);
+  }
 });
 
 test("compareLocalWithOrigin reports same, dirty, and differing states", () => {
@@ -302,12 +367,16 @@ test("syncSettings removes only matching legacy commands, drops empty entries, r
   assert.ok(s.hooks.PostToolUse.some((e) => e.matcher === "Write|Edit" && e.hooks.some((h) => h.command.includes("plan-file-review.mjs"))));
 });
 
-test("syncSettings registers all four gates: plan-review(ExitPlanMode), pre-push-review(Bash), plan-file-review(Write|Edit), stop-review(Stop) with asyncRewake", () => {
+test("syncSettings registers native SessionStart and every Claude review hook", () => {
   const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss4-"));
   const settingsPath = path.join(hooks, "settings.json");
   fs.writeFileSync(settingsPath, "{}");
   syncSettings({ hooksDir: hooks, settingsPath });
   const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+
+  const sessionStart = s.hooks.SessionStart.flatMap((b) => b.hooks || []).find((h) => h.command.includes("native-session-start.mjs"));
+  assert.ok(sessionStart, "native pre-push armer must be registered under SessionStart");
+  assert.equal(sessionStart.timeout, 30);
 
   // PreToolUse: ExitPlanMode → plan-review.mjs
   assert.ok(
@@ -336,13 +405,13 @@ test("syncSettings registers all four gates: plan-review(ExitPlanMode), pre-push
 
   // Quick wins (hooks-doc optimizations): statusMessage on every gate (visible spinner) + an
   // `if` narrowing pre-push to git commands (fails open, so compound pushes stay covered).
-  const allEntries = [...s.hooks.PreToolUse, ...s.hooks.PostToolUse, ...s.hooks.Stop];
+  const allEntries = [...s.hooks.SessionStart, ...s.hooks.PreToolUse, ...s.hooks.PostToolUse, ...s.hooks.Stop];
   const byFile = (name) => allEntries.flatMap((b) => b.hooks || []).find((h) => h.command.includes(name));
-  for (const f of ["plan-review.mjs", "plan-file-review.mjs", "pre-push-review.mjs", "stop-review.mjs"]) {
+  for (const f of ["native-session-start.mjs", "plan-review.mjs", "plan-file-review.mjs", "pre-push-review.mjs", "stop-review.mjs"]) {
     assert.ok(byFile(f)?.statusMessage, `${f} must carry a statusMessage (visible spinner)`);
   }
   assert.equal(byFile("pre-push-review.mjs").if, "Bash(git *)", "pre-push must narrow to git commands via `if`");
-  assert.equal(byFile("pre-push-review.mjs").timeout, 1320, "pre-push full review needs room for the 20-minute investigate budget");
+  assert.equal(byFile("pre-push-review.mjs").timeout, 30, "Bash hook only arms the native Git gate and must never freeze the session");
 });
 
 test("syncSettings is idempotent: running twice does not duplicate any gate", () => {
@@ -353,6 +422,9 @@ test("syncSettings is idempotent: running twice does not duplicate any gate", ()
   syncSettings({ hooksDir: hooks, settingsPath });
   const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
 
+  const countSessionStart = s.hooks.SessionStart.flatMap((b) => b.hooks || []).filter(
+    (h) => h.command.includes("native-session-start.mjs")
+  ).length;
   const countPlanReview = s.hooks.PreToolUse.filter(
     (e) => e.matcher === "ExitPlanMode" && e.hooks.some((h) => h.command.includes("plan-review.mjs"))
   ).length;
@@ -364,10 +436,28 @@ test("syncSettings is idempotent: running twice does not duplicate any gate", ()
   ).length;
   const countStop = s.hooks.Stop.flatMap((b) => b.hooks || []).filter((h) => h.command.includes("stop-review.mjs")).length;
 
+  assert.equal(countSessionStart, 1, "native-session-start must appear exactly once after two syncSettings calls");
   assert.equal(countPlanReview, 1, "plan-review must appear exactly once after two syncSettings calls");
   assert.equal(countPrePush, 1, "pre-push-review must appear exactly once after two syncSettings calls");
   assert.equal(countPlanFile, 1, "plan-file-review must appear exactly once after two syncSettings calls");
   assert.equal(countStop, 1, "stop-review must appear exactly once after two syncSettings calls");
+});
+
+test("syncSettings preserves unmanaged hooks whose filenames only contain peerBench basenames", () => {
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "ss-substring-"));
+  const settingsPath = path.join(hooks, "settings.json");
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: {
+    SessionStart: [{ hooks: [{ type: "command", command: 'node "/user/custom-native-session-start.mjs"' }] }],
+    Stop: [{ hooks: [
+      { type: "command", command: 'node "/user/custom-stop-review.mjs"' },
+      { type: "command", command: '(node /old/stop-review.mjs)' }
+    ] }]
+  } }));
+  syncSettings({ hooksDir: hooks, settingsPath });
+  const saved = fs.readFileSync(settingsPath, "utf8");
+  assert.match(saved, /custom-native-session-start\.mjs/);
+  assert.match(saved, /custom-stop-review\.mjs/);
+  assert.doesNotMatch(saved, /\/old\/stop-review\.mjs/);
 });
 
 test("syncSettings removes legacy Codex stop-gate hooks but preserves unrelated Stop hooks", () => {
@@ -457,4 +547,71 @@ test("syncSettings DE-DUPES pre-existing stop/pre-push entries across path forms
   assert.ok(!stop.some((h) => h.command.includes("codex-multirepo-gate.mjs")), "legacy Codex stop gate removed");
   const stopCmd = stop.find((h) => h.command.includes("stop-review.mjs")).command;
   assert.ok(stopCmd.includes(path.join(hooks, "stop-review.mjs")) && !stopCmd.includes("$HOME"), "canonical entry uses the absolute deploy path");
+});
+
+test("JSON hook sync fails closed on malformed files and symlinks without touching external targets", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pb-json-fail-closed-"));
+  const hooks = path.join(root, "hooks");
+  fs.mkdirSync(hooks);
+  const legacy = path.join(hooks, "codex-plan-review.mjs");
+  fs.writeFileSync(legacy, "keep legacy\n");
+  const malformed = path.join(root, "settings.json");
+  fs.writeFileSync(malformed, "{broken");
+  assert.throws(() => syncSettings({ hooksDir: hooks, settingsPath: malformed }), /invalid JSON/);
+  assert.equal(fs.readFileSync(malformed, "utf8"), "{broken");
+  assert.equal(fs.readFileSync(legacy, "utf8"), "keep legacy\n");
+
+  const external = path.join(root, "external.json");
+  const linked = path.join(root, "hooks.json");
+  fs.writeFileSync(external, '{"keep":"external"}\n');
+  fs.symlinkSync(external, linked);
+  assert.throws(() => syncCodexHooks({ hooksDir: hooks, hooksPath: linked }), /symlink/);
+  assert.equal(fs.readFileSync(external, "utf8"), '{"keep":"external"}\n');
+  assert.equal(fs.lstatSync(linked).isSymbolicLink(), true);
+});
+
+test("deploy replaces a destination symlink itself and never writes through it", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pb-deploy-symlink-"));
+  const src = path.join(root, "src");
+  const dest = path.join(root, "dest");
+  fs.mkdirSync(src);
+  fs.mkdirSync(dest);
+  fs.writeFileSync(path.join(src, "gate.mjs"), "new managed hook\n");
+  const external = path.join(root, "external.mjs");
+  fs.writeFileSync(external, "external user hook\n");
+  fs.symlinkSync(external, path.join(dest, "gate.mjs"));
+
+  deploy({ src, dest });
+  assert.equal(fs.readFileSync(external, "utf8"), "external user hook\n");
+  assert.equal(fs.lstatSync(path.join(dest, "gate.mjs")).isSymbolicLink(), false);
+  assert.equal(fs.readFileSync(path.join(dest, "gate.mjs"), "utf8"), "new managed hook\n");
+});
+
+test("deployPluginRuntime atomically replaces owned directories and prunes stale runtime files", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-prune-"));
+  const repo = path.join(root, "repo");
+  const pluginRoot = path.join(root, "plugin");
+  writePluginVersions(repo, "1.2.3");
+  writePluginVersions(pluginRoot, "1.2.3");
+  fs.mkdirSync(path.join(repo, "global-hooks"), { recursive: true });
+  fs.mkdirSync(path.join(pluginRoot, "global-hooks"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "global-hooks", "current.mjs"), "current\n");
+  fs.writeFileSync(path.join(pluginRoot, "global-hooks", "stale.mjs"), "stale\n");
+
+  deployPluginRuntime({ repoRoot: repo, pluginRoot, platform: "plugin" });
+  assert.equal(fs.existsSync(path.join(pluginRoot, "global-hooks", "stale.mjs")), false);
+  assert.equal(fs.readFileSync(path.join(pluginRoot, "global-hooks", "current.mjs"), "utf8"), "current\n");
+});
+
+test("legacy direct deploy entrypoint delegates to the transactional installer", () => {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "deploy-global-hooks.mjs");
+  const source = fs.readFileSync(script, "utf8");
+  const cli = source.slice(source.indexOf('if (import.meta.url === `file://${process.argv[1]}`)'));
+  assert.match(cli, /install\.mjs/);
+  assert.doesNotMatch(cli, /snapshotCodex\(/);
+  assert.doesNotMatch(cli, /deployPluginRuntime\(/);
+  const child = spawnSync(process.execPath, [script, "--help"], { encoding: "utf8", timeout: 5_000 });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0);
+  assert.match(child.stdout, /Usage: node scripts\/install\.mjs/);
 });

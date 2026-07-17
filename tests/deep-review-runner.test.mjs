@@ -5,7 +5,10 @@ import fs from "node:fs"; import os from "node:os"; import path from "node:path"
 
 process.env.BENCH_ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "drr-root-")));
 
-import { runMain, WAKE_WINDOW_MS, MAX_BATCH, MAX_REVIEW_ATTEMPTS } from "../global-hooks/deep-review-runner.mjs";
+import {
+  runMain, WAKE_WINDOW_MS, MAX_BATCH, MAX_REVIEW_ATTEMPTS, MAX_BLOCK_WAKES,
+  MAX_RUNNER_FOLLOWUP_WAKES, RUNNER_FOLLOWUP_WINDOW_MS
+} from "../global-hooks/deep-review-runner.mjs";
 import { enqueue, listJobs, listBlocked, markBlocked } from "../global-hooks/deep-queue.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
 import { normalizeSessionId, workspaceStateDir } from "../global-hooks/config-store.mjs";
@@ -42,6 +45,93 @@ test("empty queue → exit 0, no output", async () => {
   assert.equal(exit, 0); assert.equal(out.length, 0); assert.equal(err, "");
 });
 
+test("same-session concurrent runners are single-flight and cannot double-deliver a wake", async () => {
+  const ws = freshWs();
+  planSpecJob(ws, "concurrent body");
+  let releaseReview;
+  let enteredReview;
+  const entered = new Promise((resolve) => { enteredReview = resolve; });
+  const barrier = new Promise((resolve) => { releaseReview = resolve; });
+  let calls = 0;
+  const blocker = async () => {
+    calls++;
+    enteredReview();
+    await barrier;
+    return { maxSeverity: "high", findingCount: 1, findings: "BLOCK: concurrent finding" };
+  };
+
+  const firstPromise = runRunner(ws, { runSpecReviewImpl: blocker });
+  await entered;
+  const contending = await runRunner(ws, { runSpecReviewImpl: blocker });
+  assert.equal(contending.exit, 0, "the owner drains the queue; a parallel Stop stays quiet");
+  releaseReview();
+  const first = await firstPromise;
+
+  assert.equal(first.exit, 2);
+  assert.equal(calls, 1, "only the lease owner can run the panel");
+  assert.equal(listBlocked(ws).length, 1);
+  assert.equal(listBlocked(ws)[0].wakeCount, 1, "one completed review produces exactly one delivered wake");
+  const followup = JSON.parse(fs.readFileSync(path.join(workspaceStateDir(ws), "deep-runner-followup"), "utf8"));
+  assert.equal(followup.count, 1, "the global wake ledger cannot lose a concurrent update");
+});
+
+test("same-session contention hands off a job enqueued after the owner's last empty read", async () => {
+  const ws = freshWs();
+  let ownerReachedEmpty;
+  const ownerAtEmpty = new Promise((resolve) => { ownerReachedEmpty = resolve; });
+  let releaseOwner;
+  const ownerMayContinue = new Promise((resolve) => { releaseOwner = resolve; });
+  let contentionPublished;
+  const contentionWasPublished = new Promise((resolve) => { contentionPublished = resolve; });
+  let ownerChecks = 0;
+  let ownerCalls = 0;
+  let contenderCalls = 0;
+
+  const ownerPromise = runRunner(ws, {
+    onQueueQuiescent: async () => {
+      ownerChecks++;
+      if (ownerChecks !== 1) return;
+      ownerReachedEmpty();
+      await ownerMayContinue;
+    },
+    runSpecReviewImpl: async () => { ownerCalls++; return CLEAN(); }
+  });
+  await ownerAtEmpty;
+
+  // Reproduce the exact loss window: durable work appears only after the owner observed an empty
+  // queue, then another Stop invocation finds the same-session lease occupied.
+  planSpecJob(ws, "handoff body");
+  const contenderPromise = runRunner(ws, {
+    contentionWaitMs: 1_000,
+    contentionPollMs: 1,
+    onContentionRequest: () => { contentionPublished(); },
+    runSpecReviewImpl: async () => { contenderCalls++; return CLEAN(); }
+  });
+  await contentionWasPublished;
+  releaseOwner();
+
+  const [owner, contender] = await Promise.all([ownerPromise, contenderPromise]);
+  assert.equal(owner.exit, 0);
+  assert.equal(contender.exit, 0);
+  assert.equal(ownerCalls, 1, "the epoch change makes the owner re-drain before releasing its lease");
+  assert.equal(contenderCalls, 0, "the bounded takeover sees an already-drained queue and cannot double-review");
+  assert.ok(ownerChecks >= 2, "the owner performs a second quiescence check after the handoff request");
+  assert.equal(listJobs(ws).length, 0, "the late queued job cannot be stranded without another natural Stop");
+});
+
+test("a dead deep-runner lease is recovered without losing queued work", async () => {
+  const ws = freshWs();
+  planSpecJob(ws, "dead owner body");
+  const lock = path.join(workspaceStateDir(ws), "deep-runner-leases", "session-unscoped.lock");
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ schema: 1, pid: 99_999_999, nonce: "dead", ts: Date.now() }));
+
+  const result = await runRunner(ws, { runSpecReviewImpl: CLEAN });
+  assert.equal(result.exit, 0);
+  assert.equal(listJobs(ws).length, 0, "the replacement owner drains the durable job");
+  assert.equal(fs.existsSync(lock), false, "the recovered lease is released after the run");
+});
+
 test("happy path: a CLEAN spec job → claim deleted, exit 0, no wake/advisory", async () => {
   const ws = freshWs();
   planSpecJob(ws);
@@ -75,6 +165,33 @@ test("session isolation: runner claims only this chat's queued jobs in the same 
   assert.deepEqual(reviewed, ["b.md"], "chat B must not claim chat A's queued job");
   assert.equal(listJobs(ws, { sessionKey: sessionA }).length, 1, "chat A's job remains queued for chat A");
   assert.equal(listJobs(ws, { sessionKey: sessionB }).length, 0, "chat B's own job was processed");
+});
+
+test("session isolation honors the injected env when hook input has no session id", async () => {
+  const ws = freshWs();
+  const fileA = path.join(ws, "env-a.md");
+  const fileB = path.join(ws, "env-b.md");
+  fs.writeFileSync(fileA, "body A");
+  fs.writeFileSync(fileB, "body B");
+  const sessionA = normalizeSessionId("chat-A");
+  const sessionB = normalizeSessionId("chat-B");
+  enqueue(ws, { kind: "spec", specPath: fileA, contentKey: deepKey(fileA, "body A") }, { sessionKey: sessionA });
+  enqueue(ws, { kind: "spec", specPath: fileB, contentKey: deepKey(fileB, "body B") }, { sessionKey: sessionB });
+
+  const reviewed = [];
+  const { exit } = await runRunner(ws, {
+    input: { cwd: ws },
+    env: { BENCH_SESSION_ID: "chat-B" },
+    runSpecReviewImpl: async (filePath, _ws, options) => {
+      reviewed.push(path.basename(filePath));
+      assert.equal(options.env.BENCH_SESSION_ID, "chat-B", "the same injected env reaches the review implementation");
+      return { maxSeverity: "none", findingCount: 0, findings: "" };
+    }
+  });
+  assert.equal(exit, 0);
+  assert.deepEqual(reviewed, ["env-b.md"], "the env-owned session must not claim another chat's queued work");
+  assert.equal(listJobs(ws, { sessionKey: sessionA }).length, 1);
+  assert.equal(listJobs(ws, { sessionKey: sessionB }).length, 0);
 });
 
 test("session isolation: runner re-delivers only this chat's blocked findings", async () => {
@@ -120,6 +237,23 @@ test("CRASH-SAFETY: a pre-existing .blocked (content unchanged) is RE-DELIVERED 
   assert.equal(exit, 2, "unchanged .blocked within window → re-delivered");
   assert.match(err, /prior block/, "re-delivers the stored findings");
   assert.equal(listBlocked(ws).length, 1, ".blocked NOT deleted before/at delivery (no loss window)");
+});
+
+test("BLOCK WAKE CEILING: one unchanged completed block wakes at most 3 times, then stays advisory", async () => {
+  const ws = freshWs();
+  planSpecJob(ws);
+  const first = await runRunner(ws, {
+    runSpecReviewImpl: async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: persistent" })
+  });
+  assert.equal(first.exit, 2, "initial persist+delivery is wake 1");
+  assert.equal(listBlocked(ws)[0].wakeCount, 1);
+
+  const exits = [];
+  for (let i = 0; i < MAX_BLOCK_WAKES + 1; i++) exits.push((await runRunner(ws)).exit);
+  assert.deepEqual(exits, [2, 2, 0, 0], "only wakes 2 and 3 repeat; later Stops are non-waking advisories");
+  const [blocked] = listBlocked(ws);
+  assert.equal(blocked.wakeCount, MAX_BLOCK_WAKES, "the durable counter stops exactly at the ceiling");
+  assert.equal(blocked.findings, "BLOCK: persistent", "the completed finding remains durable");
 });
 
 test("NO COUNTER / time downgrade: a .blocked older than WAKE_WINDOW → advisory (exit 0), file KEPT", async () => {
@@ -193,7 +327,7 @@ test("SURPLUS DRAIN: > MAX_BATCH queued → all clean jobs drain in one invocati
   assert.equal(listJobs(ws).length, 0, "all jobs processed without needing a second Stop");
 });
 
-test("SURPLUS DRAIN: a block in a later batch still wakes and leaves later surplus queued", async () => {
+test("SURPLUS DRAIN: a block in a later batch still drains all in-budget jobs before one wake", async () => {
   const ws = freshWs();
   const N = MAX_BATCH * 2 + 1;
   for (let n = 1; n <= N; n++) {
@@ -211,7 +345,27 @@ test("SURPLUS DRAIN: a block in a later batch still wakes and leaves later surpl
   assert.equal(exit, 2, "a block found in a later batch still wakes");
   assert.match(err, /later block/);
   assert.equal(listBlocked(ws).length, 1, "blocking job persisted");
-  assert.equal(listJobs(ws).length, 1, "unprocessed jobs after the blocking batch remain queued");
+  assert.equal(runCount, N, "later eligible jobs are reviewed in this same pass, never drip-fed");
+  assert.equal(listJobs(ws).length, 0, "all in-budget jobs were processed before the consolidated wake");
+});
+
+test("CONSOLIDATION: blockers and unavailable jobs from one batch share one wake", async () => {
+  const ws = freshWs();
+  for (const name of ["a.md", "b.md"]) {
+    const file = path.join(ws, name);
+    fs.writeFileSync(file, name);
+    enqueue(ws, { kind: "spec", specPath: file, contentKey: deepKey(file, name) });
+  }
+  const { exit, err } = await runRunner(ws, {
+    runSpecReviewImpl: async (file) => path.basename(file) === "a.md"
+      ? { maxSeverity: "high", findingCount: 1, findings: "BLOCK: a is broken" }
+      : { retry: true, reason: "provider down", reviewers: [] }
+  });
+  assert.equal(exit, 2);
+  assert.match(err, /Blocking findings \(1\)[\s\S]*a is broken/);
+  assert.match(err, /Unavailable reviews \(1\)[\s\S]*b\.md[\s\S]*provider down/);
+  assert.equal(listBlocked(ws).length, 1);
+  assert.equal(listJobs(ws).length, 1, "only the unavailable job remains queued for its bounded retry");
 });
 
 test("N ≤ MAX_BATCH all-clean → exit 0, no continuation-wake", async () => {
@@ -238,13 +392,14 @@ test("ORPHAN RECOVERY: a dead-pid .claimed is requeued then processed", async ()
   assert.equal(listJobs(ws).length, 0);
 });
 
-test("RESILIENCE: a review that throws requeues its job (.json), runner exits 0", async () => {
+test("RESILIENCE: a review that throws requeues its job and forces a bounded follow-up Stop", async () => {
   const ws = freshWs();
   planSpecJob(ws);
   const { exit, err } = await runRunner(ws, { runSpecReviewImpl: async () => { throw new Error("reviewer down"); } });
-  assert.equal(exit, 0, "a throwing review must not crash the runner");
+  assert.equal(exit, 2, "requeued work must force the next Stop instead of becoming stranded while idle");
   assert.equal(listJobs(ws).length, 1, "job requeued to .json (never dropped)");
   assert.match(err, /requeued/i);
+  assert.match(err, /next Stop retries/i);
 });
 
 test("RETRY SIGNAL: a review returning {retry:true} (e.g. git error) REQUEUES the job, never deletes it", async () => {
@@ -253,22 +408,57 @@ test("RETRY SIGNAL: a review returning {retry:true} (e.g. git error) REQUEUES th
   const { exit } = await runRunner(ws, {
     runSpecReviewImpl: async () => ({ retry: true, reason: "git error", maxSeverity: "none", findingCount: 0, findings: "" })
   });
-  assert.equal(exit, 0);
+  assert.equal(exit, 2, "retryable work forces a follow-up Stop");
   assert.equal(listJobs(ws).length, 1, "retry signal → requeued as .json (the never-lose guarantee), NOT treated as clean+deleted");
   assert.equal(listBlocked(ws).length, 0);
 });
 
-test("RETRY CAP: a queued job that keeps failing is dropped after MAX_REVIEW_ATTEMPTS (no infinite retry; loses no finding)", async () => {
+test("NO VERDICT DEFENSE: an all-error deep result is requeued, never deleted as clean", async () => {
+  const ws = freshWs();
+  planSpecJob(ws);
+  const { exit, err } = await runRunner(ws, {
+    runSpecReviewImpl: async () => ({
+      reviewers: [
+        { name: "Kimi", verdict: null, error: "timeout" },
+        { name: "Grok", verdict: null, error: "auth" }
+      ],
+      maxSeverity: "none", findingCount: 0, findings: ""
+    })
+  });
+  assert.equal(exit, 2);
+  assert.equal(listJobs(ws).length, 1, "all-error result remains queued for retry");
+  assert.equal(listBlocked(ws).length, 0);
+  assert.match(err, /no reviewer verdicts/);
+});
+
+test("RETRY CAP: repeated failure stops waking but persists a durable unreviewed advisory", async () => {
   const ws = freshWs();
   const file = path.join(ws, "s.md"); fs.writeFileSync(file, "body");
   const ck = deepKey(file, "body");
   const dir = path.join(workspaceStateDir(ws), "deep-queue"); fs.mkdirSync(dir, { recursive: true });
   // pre-set attempts at the cap-1 so this failing run hits the cap
   fs.writeFileSync(path.join(dir, `${ck}.json`), JSON.stringify({ kind: "spec", specPath: file, contentKey: ck, attempts: MAX_REVIEW_ATTEMPTS - 1 }));
-  const { exit, err } = await runRunner(ws, { runSpecReviewImpl: async () => { throw new Error("still down"); } });
+  const { exit, err, out } = await runRunner(ws, { runSpecReviewImpl: async () => { throw new Error("still down"); } });
   assert.equal(exit, 0);
-  assert.equal(listJobs(ws).length, 0, "dropped after the cap — a never-completed review (no finding), safe to drop");
-  assert.match(err, /giving up/i);
+  assert.equal(listJobs(ws).length, 0, "the active retry job is retired at the cap");
+  const [failed] = listBlocked(ws);
+  assert.ok(failed, "retry exhaustion is durably recorded instead of silently deleted");
+  assert.equal(failed.advisoryOnly, true);
+  assert.equal(failed.reviewStatus, "unavailable");
+  assert.match(failed.findings, /UNREVIEWED after 3 attempts/);
+  assert.match(err, /durable unreviewed advisory/i);
+  assert.match(out[0]?.systemMessage || "", /UNREVIEWED after 3 attempts/);
+
+  let reran = false;
+  const second = await runRunner(ws, { runSpecReviewImpl: async () => { reran = true; return CLEAN(); } });
+  assert.equal(second.exit, 0, "the durable warning does not restart the asyncRewake loop");
+  assert.equal(reran, false, "unchanged exhausted work is not automatically retried forever");
+  assert.match(second.out[0]?.systemMessage || "", /UNREVIEWED after 3 attempts/, "the warning remains visible");
+
+  fs.writeFileSync(file, "changed target");
+  const third = await runRunner(ws);
+  assert.equal(third.exit, 0);
+  assert.equal(listBlocked(ws).length, 0, "changing the target retires the stale unreviewed advisory");
 });
 
 test("bench disabled → exit 0 without touching the queue", async () => {
@@ -341,6 +531,112 @@ test("DRAIN DEADLINE: surplus that can't fit the runner budget is deferred + exi
   assert.equal(exit, 2, "deferred surplus forces the next Stop instead of waiting on one that may never come");
   assert.match(err, /deferred \(runner budget exhausted\)/);
   assert.equal(listJobs(ws).length, 2, "deferred jobs remain QUEUED (unclaimed) for the forced next Stop");
+});
+
+test("DRAIN DEADLINE CEILING: a long slow queue forces at most 3 automatic continuation Stops", async () => {
+  const ws = freshWs();
+  const total = (MAX_RUNNER_FOLLOWUP_WAKES + 2) * MAX_BATCH + 1;
+  for (let n = 0; n < total; n++) {
+    const file = path.join(ws, `slow-${n}.md`);
+    fs.writeFileSync(file, `body ${n}`);
+    enqueue(ws, { kind: "spec", specPath: file, contentKey: deepKey(file, `body ${n}`) });
+  }
+  const env = { BENCH_DEEP_REVIEW_BUDGET_MS: "1000", BENCH_DEEP_RUNNER_BUDGET_MS: "1" };
+  const exits = [];
+  let cappedMessage = "";
+  for (let n = 0; n < MAX_RUNNER_FOLLOWUP_WAKES + 2; n++) {
+    const result = await runRunner(ws, { env, runSpecReviewImpl: CLEAN });
+    exits.push(result.exit);
+    cappedMessage += result.out.map((entry) => entry.systemMessage || "").join("\n");
+  }
+  assert.deepEqual(exits, [2, 2, 2, 0, 0], "only three deadline continuations are automatic; natural Stops still make bounded progress");
+  assert.match(cappedMessage, /automatic wake ceiling exhausted at 3\/3/);
+  assert.ok(listJobs(ws).length > 0, "remaining work stays durably queued instead of being dropped");
+
+  const finalNatural = await runRunner(ws, { env, runSpecReviewImpl: CLEAN });
+  assert.equal(finalNatural.exit, 0);
+  assert.equal(listJobs(ws).length, 0, "a later natural Stop finishes the durable remainder without restarting a wake loop");
+});
+
+test("GLOBAL DEEP CEILING: new blockers in successive slow batches still cause at most 3 automatic Stops", async () => {
+  const ws = freshWs();
+  const total = (MAX_RUNNER_FOLLOWUP_WAKES + 2) * MAX_BATCH + 1;
+  for (let n = 0; n < total; n++) {
+    const file = path.join(ws, `slow-block-${n}.md`);
+    fs.writeFileSync(file, `body ${n}`);
+    enqueue(ws, { kind: "spec", specPath: file, contentKey: deepKey(file, `body ${n}`) });
+  }
+  const env = { BENCH_DEEP_REVIEW_BUDGET_MS: "1000", BENCH_DEEP_RUNNER_BUDGET_MS: "1" };
+  const BLOCK = async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: batch finding" });
+  const exits = [];
+  let advisoryText = "";
+  for (let n = 0; n < MAX_RUNNER_FOLLOWUP_WAKES + 2; n++) {
+    const result = await runRunner(ws, { env, runSpecReviewImpl: BLOCK });
+    exits.push(result.exit);
+    advisoryText += result.out.map((entry) => entry.systemMessage || "").join("\n");
+  }
+  assert.deepEqual(exits, [2, 2, 2, 0, 0], "fresh blockers cannot bypass the task/session wake ceiling");
+  assert.match(advisoryText, /automatic wake ceiling exhausted at 3\/3/);
+  assert.ok(listBlocked(ws).length > 0, "suppressed findings remain durable rather than being discarded");
+});
+
+test("GLOBAL DEEP CEILING: TTL expiry cannot reopen the cycle while durable queued work remains", async () => {
+  const ws = freshWs();
+  const total = (MAX_RUNNER_FOLLOWUP_WAKES + 3) * MAX_BATCH + 1;
+  for (let n = 0; n < total; n++) {
+    const file = path.join(ws, `ttl-${n}.md`);
+    fs.writeFileSync(file, `body ${n}`);
+    enqueue(ws, { kind: "spec", specPath: file, contentKey: deepKey(file, `body ${n}`) });
+  }
+  const env = { BENCH_DEEP_REVIEW_BUDGET_MS: "1000", BENCH_DEEP_RUNNER_BUDGET_MS: "1" };
+  const base = Date.now();
+  const exits = [];
+  for (let n = 0; n < MAX_RUNNER_FOLLOWUP_WAKES; n++) {
+    exits.push((await runRunner(ws, { env, now: base, clock: () => base, runSpecReviewImpl: CLEAN })).exit);
+  }
+  assert.deepEqual(exits, [2, 2, 2]);
+  const queuedAtCeiling = listJobs(ws).length;
+  assert.ok(queuedAtCeiling > MAX_BATCH, "enough unchanged durable work remains to request continuation");
+
+  const afterTtl = base + RUNNER_FOLLOWUP_WINDOW_MS + 1;
+  const expiredRun = await runRunner(ws, { env, now: afterTtl, clock: () => afterTtl, runSpecReviewImpl: CLEAN });
+  assert.equal(expiredRun.exit, 0, "elapsed wall time alone cannot authorize a fourth automatic Stop");
+  assert.ok(listJobs(ws).length > 0, "the capped invocation still makes bounded progress without dropping the remainder");
+  assert.match(expiredRun.out[0]?.systemMessage || "", /automatic wake ceiling exhausted at 3\/3/);
+});
+
+test("GLOBAL DEEP CEILING: a persistent reset env value is consumed once; changing its nonce resets once", async () => {
+  const ws = freshWs();
+  const runsPerCappedCycle = MAX_RUNNER_FOLLOWUP_WAKES + 2;
+  const totalRuns = MAX_RUNNER_FOLLOWUP_WAKES + (2 * runsPerCappedCycle);
+  const total = totalRuns * MAX_BATCH + 1;
+  for (let n = 0; n < total; n++) {
+    const file = path.join(ws, `reset-${n}.md`);
+    fs.writeFileSync(file, `body ${n}`);
+    enqueue(ws, { kind: "spec", specPath: file, contentKey: deepKey(file, `body ${n}`) });
+  }
+  const baseEnv = { BENCH_DEEP_REVIEW_BUDGET_MS: "1000", BENCH_DEEP_RUNNER_BUDGET_MS: "1" };
+  const initialExits = [];
+  for (let n = 0; n < MAX_RUNNER_FOLLOWUP_WAKES; n++) {
+    initialExits.push((await runRunner(ws, { env: baseEnv, runSpecReviewImpl: CLEAN })).exit);
+  }
+  assert.deepEqual(initialExits, [2, 2, 2], "the ordinary cycle first reaches its ceiling");
+
+  const inheritedEnv = { ...baseEnv, BENCH_DEEP_CYCLE_RESET: "manual-retry-1" };
+  const exits = [];
+  for (let n = 0; n < runsPerCappedCycle; n++) {
+    exits.push((await runRunner(ws, { env: inheritedEnv, runSpecReviewImpl: CLEAN })).exit);
+  }
+  assert.deepEqual(exits, [2, 2, 2, 0, 0], "one reset nonce grants one bounded cycle, even when inherited by every Stop");
+  assert.ok(listJobs(ws).length > MAX_BATCH, "durable work remains so a deliberate fresh reset is observable");
+
+  const changedEnv = { ...baseEnv, BENCH_DEEP_CYCLE_RESET: "manual-retry-2" };
+  const changedExits = [];
+  for (let n = 0; n < runsPerCappedCycle; n++) {
+    changedExits.push((await runRunner(ws, { env: changedEnv, runSpecReviewImpl: CLEAN })).exit);
+  }
+  assert.deepEqual(changedExits, [2, 2, 2, 0, 0], "a changed nonce authorizes exactly one more bounded cycle, never an unbounded reset");
+  assert.equal(listJobs(ws).length, 1, "all unprocessed work remains durable after both capped reset cycles");
 });
 
 test("MERGE block: a transient git failure at BLOCK time never retires the block (unstamped → self-heal)", async () => {

@@ -3,13 +3,37 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
+  installPeerBench,
   parseInstallArgs,
   renderInstallSummary,
   scrubSensitivePluginCacheFiles,
   syncClaudePluginRegistry,
   syncClaudePluginSettings
 } from "../scripts/install.mjs";
+
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function copyInstallRepo() {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pb-install-fixture-"));
+  for (const relativePath of ["global-hooks", "codex-prompts", ".claude-plugin", ".codex-plugin"]) {
+    fs.cpSync(path.join(PROJECT_ROOT, relativePath), path.join(repo, relativePath), { recursive: true });
+  }
+  fs.copyFileSync(path.join(PROJECT_ROOT, "package.json"), path.join(repo, "package.json"));
+  return repo;
+}
+
+function fakeNativeStatus(repo) {
+  const hooks = path.join(repo, ".git", "hooks");
+  return {
+    ok: true,
+    managed: false,
+    installed: false,
+    hookPath: path.join(hooks, "pre-push"),
+    localPath: path.join(hooks, "pre-push.local")
+  };
+}
 
 test("syncClaudePluginSettings installs aiwithrai and migrates legacy ids only when they point at this repo", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-install-home-"));
@@ -69,19 +93,106 @@ test("parseInstallArgs defaults to Claude+Codex and supports focused installs", 
   assert.equal(parseInstallArgs(["--load-keys", "--keys", "/tmp/.keys"]).keysPath, "/tmp/.keys");
 });
 
+test("installPeerBench refuses a stale Codex cache before creating transaction state", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-install-version-home-"));
+  const checkoutVersion = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8")).version;
+  const staleVersion = checkoutVersion === "0.0.0" ? "9.9.9" : "0.0.0";
+  const pluginRoot = path.join(home, ".codex", "plugins", "cache", "aiwithrai", "bench", staleVersion);
+  fs.mkdirSync(path.join(pluginRoot, ".codex-plugin"), { recursive: true });
+  fs.mkdirSync(path.join(pluginRoot, "global-hooks"), { recursive: true });
+  fs.writeFileSync(path.join(pluginRoot, "package.json"), `${JSON.stringify({ name: "peerbench", version: staleVersion })}\n`);
+  fs.writeFileSync(path.join(pluginRoot, ".codex-plugin", "plugin.json"), `${JSON.stringify({ name: "bench", version: staleVersion })}\n`);
+  fs.writeFileSync(path.join(pluginRoot, "global-hooks", "sentinel.mjs"), "unchanged\n");
+
+  assert.throws(
+    () => installPeerBench({ repoRoot: PROJECT_ROOT, home, claude: false, codex: true, now: () => 1234 }),
+    (error) => {
+      assert.equal(error.message.includes(`checkout=${checkoutVersion}`), true);
+      assert.match(error.message, /codex plugin marketplace upgrade aiwithrai/);
+      assert.match(error.message, /codex plugin add bench@aiwithrai/);
+      return true;
+    }
+  );
+  assert.equal(fs.readFileSync(path.join(pluginRoot, "global-hooks", "sentinel.mjs"), "utf8"), "unchanged\n");
+  assert.equal(fs.existsSync(path.join(home, ".claude", "plugins", "data", "bench-shared", "backup-1234")), false);
+  assert.equal(fs.existsSync(path.join(home, ".codex", "hooks.json")), false);
+});
+
+test("installPeerBench rolls back a Claude CLI install that returns the wrong cache version", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-install-claude-version-home-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pb-install-claude-version-repo-"));
+  for (const relativePath of ["global-hooks", "codex-prompts", ".claude-plugin", ".codex-plugin"]) {
+    fs.cpSync(path.join(PROJECT_ROOT, relativePath), path.join(repo, relativePath), { recursive: true });
+  }
+  fs.copyFileSync(path.join(PROJECT_ROOT, "package.json"), path.join(repo, "package.json"));
+  const checkoutVersion = JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8")).version;
+  const staleVersion = checkoutVersion === "0.0.0" ? "9.9.9" : "0.0.0";
+  const pluginRoot = path.join(home, ".claude", "plugins", "cache", "aiwithrai", "bench", staleVersion);
+  const installedPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
+  const knownPath = path.join(home, ".claude", "plugins", "known_marketplaces.json");
+  const settingsPath = path.join(home, ".claude", "settings.json");
+
+  const claudeRunner = (_command, args) => {
+    if (args[0] === "--version") return { status: 0, stdout: "1.0.0\n", stderr: "" };
+    if (args[0] === "plugin" && args[1] === "install") {
+      fs.mkdirSync(path.join(pluginRoot, ".claude-plugin"), { recursive: true });
+      fs.writeFileSync(path.join(pluginRoot, "package.json"), `${JSON.stringify({ name: "peerbench", version: staleVersion })}\n`);
+      fs.writeFileSync(path.join(pluginRoot, ".claude-plugin", "plugin.json"), `${JSON.stringify({ name: "bench", version: staleVersion })}\n`);
+      fs.mkdirSync(path.dirname(installedPath), { recursive: true });
+      fs.writeFileSync(installedPath, JSON.stringify({
+        plugins: { "bench@aiwithrai": [{ scope: "user", installPath: pluginRoot }] }
+      }));
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+
+  assert.throws(
+    () => installPeerBench({
+      repoRoot: repo,
+      home,
+      claude: true,
+      codex: false,
+      now: () => 2345,
+      syncClaudePlugin: true,
+      claudeRunner
+    }),
+    (error) => {
+      assert.equal(error.message.includes(`checkout=${checkoutVersion}`), true);
+      assert.match(error.message, /claude plugin remove bench@aiwithrai/);
+      assert.match(error.message, /claude plugin install bench@aiwithrai/);
+      return true;
+    }
+  );
+  assert.equal(fs.existsSync(pluginRoot), false, "the mismatched CLI-created cache is removed by rollback");
+  assert.equal(fs.existsSync(installedPath), false, "the plugin registry is restored");
+  assert.equal(fs.existsSync(knownPath), false, "the marketplace registry is restored");
+  assert.equal(fs.existsSync(settingsPath), false, "Claude settings are restored");
+});
+
 test("scrubSensitivePluginCacheFiles removes local secrets but keeps examples", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-cache-"));
   const nested = path.join(root, "nested");
   fs.mkdirSync(nested);
-  for (const name of [".keys", "prod.keys", ".env", "prod.env", "bench.log", "resultsofHunt.txt"]) {
+  for (const name of [
+    ".keys", ".keys.local", "prod.keys",
+    ".env", ".env.local", ".env.production", ".envrc", "prod.env",
+    "bench.log", "resultsofHunt.txt"
+  ]) {
     fs.writeFileSync(path.join(nested, name), "secret");
   }
   fs.writeFileSync(path.join(nested, ".keys.example"), "placeholder");
+  fs.writeFileSync(path.join(nested, ".env.example"), "placeholder");
+  fs.writeFileSync(path.join(nested, ".env.production.example"), "placeholder");
   fs.writeFileSync(path.join(nested, "companion.json"), "{}");
 
   const removed = scrubSensitivePluginCacheFiles(root).map((p) => path.basename(p)).sort();
-  assert.deepEqual(removed, [".env", ".keys", "bench.log", "prod.env", "prod.keys", "resultsofHunt.txt"].sort());
+  assert.deepEqual(removed, [
+    ".env", ".env.local", ".env.production", ".envrc", ".keys", ".keys.local",
+    "bench.log", "prod.env", "prod.keys", "resultsofHunt.txt"
+  ].sort());
   assert.equal(fs.existsSync(path.join(nested, ".keys.example")), true);
+  assert.equal(fs.existsSync(path.join(nested, ".env.example")), true);
+  assert.equal(fs.existsSync(path.join(nested, ".env.production.example")), true);
   assert.equal(fs.existsSync(path.join(nested, "companion.json")), true);
 });
 
@@ -109,6 +220,8 @@ test("syncClaudePluginRegistry migrates Claude marketplace registry, installs pl
     if (args.join(" ") === "plugin install bench@aiwithrai") {
       fs.mkdirSync(installPath, { recursive: true });
       fs.writeFileSync(path.join(installPath, ".keys"), "secret");
+      fs.writeFileSync(path.join(installPath, ".keys.local"), "secret");
+      fs.writeFileSync(path.join(installPath, ".env.production"), "secret");
       fs.writeFileSync(path.join(installPath, ".keys.example"), "placeholder");
       fs.writeFileSync(installedPath, JSON.stringify({
         plugins: {
@@ -146,6 +259,8 @@ test("syncClaudePluginRegistry migrates Claude marketplace registry, installs pl
   assert.equal(result.scrubbed.map((p) => path.basename(p)).includes(".keys"), true);
   assert.equal(result.scrubbed.map((p) => path.basename(p)).includes(".env"), true);
   assert.equal(fs.existsSync(path.join(installPath, ".keys")), false);
+  assert.equal(fs.existsSync(path.join(installPath, ".keys.local")), false);
+  assert.equal(fs.existsSync(path.join(installPath, ".env.production")), false);
   assert.equal(fs.existsSync(path.join(legacyInstallPath, ".env")), false);
   assert.equal(fs.existsSync(path.join(installPath, ".keys.example")), true);
 });
@@ -209,4 +324,148 @@ test("renderInstallSummary reports origin comparison and never includes secret v
   assert.match(out, /origin: main same-as-origin/);
   assert.match(out, /key values redacted/);
   assert.doesNotMatch(out, /sk-/);
+});
+
+test("native hook failure aborts install, rolls back Claude and Codex, and cannot render a false success", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-native-install-fail-"));
+  const repo = copyInstallRepo();
+  const claudeSettings = path.join(home, ".claude", "settings.json");
+  const codexHooks = path.join(home, ".codex", "hooks.json");
+  fs.mkdirSync(path.dirname(claudeSettings), { recursive: true });
+  fs.mkdirSync(path.dirname(codexHooks), { recursive: true });
+  const claudeBefore = '{"sentinel":"claude"}\n';
+  const codexBefore = '{"sentinel":"codex"}\n';
+  fs.writeFileSync(claudeSettings, claudeBefore);
+  fs.writeFileSync(codexHooks, codexBefore);
+
+  assert.throws(() => installPeerBench({
+    repoRoot: repo,
+    home,
+    syncClaudePlugin: false,
+    now: () => 7001,
+    nativeStatus: () => fakeNativeStatus(repo),
+    ensureNativeHook: () => ({ ok: false, installed: false, changed: false, reason: "injected native failure" })
+  }), /native Git pre-push hook installation failed: injected native failure/);
+
+  assert.equal(fs.readFileSync(claudeSettings, "utf8"), claudeBefore);
+  assert.equal(fs.readFileSync(codexHooks, "utf8"), codexBefore);
+  assert.equal(fs.existsSync(path.join(home, ".claude", "plugins", "data", ".peerbench-install.lock")), false);
+});
+
+test("malformed registry fails closed before settings are changed", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-invalid-registry-"));
+  const repo = copyInstallRepo();
+  const settingsPath = path.join(home, ".claude", "settings.json");
+  const registryPath = path.join(home, ".claude", "plugins", "known_marketplaces.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+  fs.writeFileSync(settingsPath, '{"keep":true}\n');
+  fs.writeFileSync(registryPath, "{broken");
+  assert.throws(() => installPeerBench({ repoRoot: repo, home, claude: true, codex: false }), /invalid JSON/);
+  assert.equal(fs.readFileSync(settingsPath, "utf8"), '{"keep":true}\n');
+  assert.equal(fs.readFileSync(registryPath, "utf8"), "{broken");
+
+  const linkedHome = fs.mkdtempSync(path.join(os.tmpdir(), "pb-symlink-registry-"));
+  const linkedSettings = path.join(linkedHome, ".claude", "settings.json");
+  const linkedRegistry = path.join(linkedHome, ".claude", "plugins", "known_marketplaces.json");
+  const external = path.join(linkedHome, "external.json");
+  fs.mkdirSync(path.dirname(linkedSettings), { recursive: true });
+  fs.mkdirSync(path.dirname(linkedRegistry), { recursive: true });
+  fs.writeFileSync(linkedSettings, '{"keep":true}\n');
+  fs.writeFileSync(external, '{"external":true}\n');
+  fs.symlinkSync(external, linkedRegistry);
+  assert.throws(() => installPeerBench({ repoRoot: repo, home: linkedHome, claude: true, codex: false }), /symlink/);
+  assert.equal(fs.readFileSync(external, "utf8"), '{"external":true}\n');
+  assert.equal(fs.lstatSync(linkedRegistry).isSymbolicLink(), true);
+});
+
+test("all Codex snapshots complete before any Claude mutation", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-codex-preflight-"));
+  const repo = copyInstallRepo();
+  const settingsPath = path.join(home, ".claude", "settings.json");
+  const hooksPath = path.join(home, ".codex", "hooks.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+  fs.writeFileSync(settingsPath, '{"keep":"claude"}\n');
+  fs.writeFileSync(hooksPath, "{}\n");
+  const badHook = fs.readdirSync(path.join(repo, "global-hooks")).find((name) => name.endsWith(".mjs"));
+  fs.mkdirSync(path.join(home, ".codex", "hooks", badHook), { recursive: true });
+
+  assert.throws(() => installPeerBench({
+    repoRoot: repo,
+    home,
+    syncClaudePlugin: false,
+    now: () => 7002,
+    nativeStatus: () => fakeNativeStatus(repo)
+  }), /refusing to snapshot non-file target/);
+  assert.equal(fs.readFileSync(settingsPath, "utf8"), '{"keep":"claude"}\n');
+});
+
+test("zero-exit Claude install must prove its plugin root and preserves fallback hooks on failure", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-claude-postcondition-"));
+  const repo = copyInstallRepo();
+  const settingsPath = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  const before = `${JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "node fallback-stop.mjs" }] }] } }, null, 2)}\n`;
+  fs.writeFileSync(settingsPath, before);
+  const runner = (_command, args) => ({ status: 0, stdout: args[0] === "--version" ? "1.0.0" : "", stderr: "" });
+
+  assert.throws(() => installPeerBench({
+    repoRoot: repo,
+    home,
+    claude: true,
+    codex: false,
+    syncClaudePlugin: true,
+    claudeRunner: runner,
+    now: () => 7003,
+    nativeStatus: () => fakeNativeStatus(repo)
+  }), /no installed plugin root was registered/);
+  assert.equal(fs.readFileSync(settingsPath, "utf8"), before);
+});
+
+test("automatic rollback reports partial failure instead of hiding an ok:false restore", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-partial-auto-rollback-"));
+  const repo = copyInstallRepo();
+  const settingsPath = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, '{"before":true}\n');
+  const backupDir = path.join(home, ".claude", "plugins", "data", "bench-shared", "backup-7004");
+
+  assert.throws(() => installPeerBench({
+    repoRoot: repo,
+    home,
+    claude: true,
+    codex: false,
+    syncClaudePlugin: false,
+    now: () => 7004,
+    nativeStatus: () => fakeNativeStatus(repo),
+    ensureNativeHook: () => {
+      fs.rmSync(path.join(backupDir, "settings.json"), { force: true });
+      return { ok: false, installed: false, changed: false, reason: "injected" };
+    }
+  }), /automatic rollback was partial/);
+});
+
+test("install lock rejects overlap and backup allocation never reuses an existing directory", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-install-lock-"));
+  const dataDir = path.join(home, ".claude", "plugins", "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, ".peerbench-install.lock"), JSON.stringify({ pid: process.pid, token: "other" }));
+  assert.throws(() => installPeerBench({ repoRoot: PROJECT_ROOT, home, claude: false, codex: false }), /already running/);
+
+  fs.rmSync(path.join(dataDir, ".peerbench-install.lock"));
+  const existing = path.join(dataDir, "bench-shared", "backup-7005");
+  fs.mkdirSync(existing, { recursive: true });
+  fs.writeFileSync(path.join(existing, "sentinel"), "keep");
+  const result = installPeerBench({
+    repoRoot: PROJECT_ROOT,
+    home,
+    claude: false,
+    codex: false,
+    now: () => 7005,
+    nativeStatus: () => fakeNativeStatus(PROJECT_ROOT),
+    ensureNativeHook: () => ({ ok: true, installed: true, changed: false })
+  });
+  assert.notEqual(result.backupDir, existing);
+  assert.equal(fs.readFileSync(path.join(existing, "sentinel"), "utf8"), "keep");
 });

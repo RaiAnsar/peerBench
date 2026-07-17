@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-root-"));
-import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers, isBenchDisabled, displayName, PROVIDER_NAMES, normalizeSessionId, sessionKeyFromInput } from "../global-hooks/config-store.mjs";
+import { resolveConfig, workspaceStateDir, sharedRoot, KNOWN_REVIEWERS, setReviewers, isBenchDisabled, displayName, PROVIDER_NAMES, normalizeSessionId, sessionKeyFromInput, hardenSharedDataPermissions } from "../global-hooks/config-store.mjs";
 
 test("registry: display names + KNOWN_REVIEWERS + PROVIDER_NAMES all derive from the single DEFAULTS source", () => {
   // Adding/swapping a model is one DEFAULTS entry — these are derived, not hand-maintained lists.
@@ -111,6 +111,22 @@ test("setReviewers writes companion.json and filters unknowns", () => {
   assert.deepEqual(out, ["codex", "kimi"]);
   const saved = JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8"));
   assert.deepEqual(saved.reviewers, ["codex", "kimi"]);
+  assert.equal(fs.statSync(root).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(root, "companion.json")).mode & 0o777, 0o600);
+});
+test("hardenSharedDataPermissions repairs existing shared and backup directory modes without reading secrets", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj-hardening-"));
+  const backup = path.join(root, "backup-old", "nested");
+  fs.mkdirSync(backup, { recursive: true, mode: 0o755 });
+  fs.chmodSync(root, 0o755);
+  fs.chmodSync(path.join(root, "backup-old"), 0o755);
+  fs.chmodSync(backup, 0o755);
+  fs.writeFileSync(path.join(root, "companion.json"), '{"providers":{"x":{"apiKey":"redacted"}}}', { mode: 0o644 });
+  hardenSharedDataPermissions({ root });
+  assert.equal(fs.statSync(root).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(root, "backup-old")).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(backup).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(root, "companion.json")).mode & 0o777, 0o600);
 });
 test("setReviewers throws on all-invalid", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cj2-"));

@@ -6,20 +6,32 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   compareLocalWithOrigin,
+  atomicWriteFile,
+  capturePathState,
   deploy,
+  ensurePrivateBackupDir,
   migrateDataDir,
   snapshot,
   snapshotCodex,
+  writeRollbackMetadata,
   syncCodexHooks,
   syncCodexPrompts,
+  assertPluginCacheVersionMatch,
   deployPluginRuntime,
   latestCodexBenchPluginRoot,
+  isSensitivePluginCachePath,
+  snapshotPluginInstallRoot,
+  snapshotPluginRuntime,
   removeClaudeSettingsPeerBenchHooks,
   removeCodexSettingsPeerBenchHooks,
+  readJsonObjectStrict,
   syncSettings,
   syncStatuslineSessionArg
 } from "./deploy-global-hooks.mjs";
+import { rollback } from "./rollback.mjs";
+import { hardenSharedDataPermissions } from "../global-hooks/config-store.mjs";
 import { disableLegacyCodexStopGateStates, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
+import { ensureNativePrePushHook, nativePrePushStatus } from "../global-hooks/native-git-hook.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -28,8 +40,7 @@ export const LEGACY_CLAUDE_MARKETPLACES = ["rai-tools", "peerbench"];
 export const CLAUDE_PLUGIN_NAME = "bench";
 
 function readJson(pathname) {
-  try { return JSON.parse(fs.readFileSync(pathname, "utf8")); }
-  catch { return {}; }
+  return readJsonObjectStrict(pathname, { label: `JSON config ${pathname}` });
 }
 
 function expandHome(value, home = os.homedir()) {
@@ -55,23 +66,18 @@ function marketplacePath(entry) {
 }
 
 function writeJsonIfChanged(pathname, value) {
-  const before = fs.existsSync(pathname) ? fs.readFileSync(pathname, "utf8") : "";
+  const beforeState = capturePathState(pathname);
+  if (beforeState.exists && beforeState.type !== "file") {
+    throw new Error(`JSON config is not a regular file; refusing to follow or overwrite ${pathname}`);
+  }
+  const before = beforeState.exists ? fs.readFileSync(pathname, "utf8") : "";
   const after = `${JSON.stringify(value, null, 2)}\n`;
   if (before !== after) {
-    fs.mkdirSync(path.dirname(pathname), { recursive: true });
-    fs.writeFileSync(pathname, after);
+    atomicWriteFile(pathname, after, { mode: 0o600, rejectSymlink: true, label: "JSON config" });
     return true;
   }
+  if (fs.existsSync(pathname)) fs.chmodSync(pathname, 0o600);
   return false;
-}
-
-function isSensitivePluginCacheFile(name) {
-  return name === ".keys"
-    || name.endsWith(".keys")
-    || name === ".env"
-    || name.endsWith(".env")
-    || name.endsWith(".log")
-    || name === "resultsofHunt.txt";
 }
 
 export function scrubSensitivePluginCacheFiles(root) {
@@ -84,7 +90,7 @@ export function scrubSensitivePluginCacheFiles(root) {
       const p = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(p);
-      } else if (isSensitivePluginCacheFile(entry.name)) {
+      } else if (isSensitivePluginCachePath(entry.name)) {
         try {
           fs.rmSync(p, { force: true });
           removed.push(p);
@@ -94,6 +100,57 @@ export function scrubSensitivePluginCacheFiles(root) {
   }
   if (root) walk(root);
   return removed;
+}
+
+function snapshotRollbackFile({ target, backupDir, name }) {
+  const backupPath = path.join(backupDir, name);
+  const before = capturePathState(target);
+  const existed = before.exists;
+  let mode = before.mode ?? null;
+  let type = before.type ?? null;
+  let linkTarget = before.linkTarget ?? null;
+  if (existed && type === "file") {
+    ensurePrivateBackupDir(path.dirname(backupPath));
+    fs.copyFileSync(target, backupPath);
+    fs.chmodSync(backupPath, 0o600);
+  } else if (existed && type !== "symlink") {
+    throw new Error(`refusing to snapshot non-file registry target: ${target}`);
+  }
+  return { target: path.resolve(target), backupPath, existed, mode, type, linkTarget };
+}
+
+function snapshotNativePrePushState({ status, repoRoot, backupDir }) {
+  const state = {
+    repoRoot: path.resolve(repoRoot),
+    captured: Boolean(status?.ok && status?.hookPath),
+    managedBefore: Boolean(status?.managed),
+    hookPath: status?.hookPath || null,
+    localPath: status?.localPath || null,
+    hook: null,
+    local: null
+  };
+  if (!state.captured) return state;
+  const capture = (target, name) => {
+    let stat = null;
+    try { stat = fs.lstatSync(target); } catch { /* absent */ }
+    const existed = Boolean(stat);
+    const backupPath = path.join(backupDir, name);
+    let mode = null, type = null, linkTarget = null;
+    if (existed) {
+      ensurePrivateBackupDir(path.dirname(backupPath));
+      type = stat.isSymbolicLink() ? "symlink" : "file";
+      if (type === "symlink") {
+        linkTarget = fs.readlinkSync(target);
+      } else {
+        fs.copyFileSync(target, backupPath);
+        mode = stat.mode & 0o777;
+      }
+    }
+    return { existed, backupPath, mode, type, linkTarget };
+  };
+  state.hook = capture(state.hookPath, "pre-push");
+  state.local = capture(state.localPath, "pre-push.local");
+  return state;
 }
 
 function latestInstalledPluginPath({
@@ -110,6 +167,65 @@ function latestInstalledPluginPath({
 
 function legacyPluginCachePath({ home, marketplace, pluginName }) {
   return path.join(home, ".claude", "plugins", "cache", marketplace, pluginName);
+}
+
+export function claudePluginInstallRoots({
+  home = os.homedir(),
+  repoRoot = ROOT,
+  marketplaceName = DEFAULT_CLAUDE_MARKETPLACE,
+  pluginName = CLAUDE_PLUGIN_NAME,
+  legacyMarketplaces = LEGACY_CLAUDE_MARKETPLACES
+} = {}) {
+  const known = readJson(path.join(home, ".claude", "plugins", "known_marketplaces.json"));
+  const installed = readJson(path.join(home, ".claude", "plugins", "installed_plugins.json"));
+  const marketplaces = [marketplaceName];
+  for (const legacy of legacyMarketplaces) {
+    const entry = known[legacy];
+    if (entry && sameDirectory(marketplacePath(entry.source) || entry.installLocation, repoRoot, home)) {
+      marketplaces.push(legacy);
+    }
+  }
+  const roots = [];
+  for (const marketplace of marketplaces) {
+    const entries = installed?.plugins?.[`${pluginName}@${marketplace}`];
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (entry?.scope && entry.scope !== "user") continue;
+      if (typeof entry?.installPath !== "string") continue;
+      const root = path.resolve(expandHome(entry.installPath, home));
+      if (!fs.existsSync(root)) continue;
+      if (!roots.includes(root)) roots.push(root);
+    }
+  }
+  return roots;
+}
+
+function allClaudeBenchCacheRoots({
+  home,
+  marketplaceName,
+  pluginName = CLAUDE_PLUGIN_NAME,
+  legacyMarketplaces = LEGACY_CLAUDE_MARKETPLACES
+}) {
+  const roots = new Set();
+  const marketplaces = [...new Set([marketplaceName, ...legacyMarketplaces].filter(Boolean))];
+  const installed = readJson(path.join(home, ".claude", "plugins", "installed_plugins.json"));
+  for (const marketplace of marketplaces) {
+    const entries = installed?.plugins?.[`${pluginName}@${marketplace}`];
+    if (Array.isArray(entries)) {
+      for (const entry of entries) {
+        if (typeof entry?.installPath !== "string") continue;
+        const candidate = path.resolve(expandHome(entry.installPath, home));
+        if (fs.existsSync(candidate)) roots.add(candidate);
+      }
+    }
+    const cacheRoot = path.join(home, ".claude", "plugins", "cache", marketplace, pluginName);
+    let versions = [];
+    try { versions = fs.readdirSync(cacheRoot, { withFileTypes: true }); } catch { versions = []; }
+    for (const version of versions) {
+      if (version.isDirectory()) roots.add(path.join(cacheRoot, version.name));
+    }
+  }
+  return [...roots];
 }
 
 function runCommand(runner, command, args, opts = {}) {
@@ -132,7 +248,8 @@ export function syncClaudePluginRegistry({
   runner = spawnSync,
   env = process.env,
   now = () => new Date().toISOString(),
-  skipCli = false
+  skipCli = false,
+  onBeforeMutation = () => {}
 } = {}) {
   const knownPath = path.join(home, ".claude", "plugins", "known_marketplaces.json");
   const installedPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
@@ -170,9 +287,15 @@ export function syncClaudePluginRegistry({
     installPath: null,
     scrubbed: []
   };
+  const hardenRegistryFiles = () => {
+    for (const target of [knownPath, installedPath]) {
+      try { if (fs.statSync(target).isFile()) fs.chmodSync(target, 0o600); } catch { /* absent */ }
+    }
+  };
 
   if (skipCli) {
     result.knownUpdated = writeJsonIfChanged(knownPath, nextKnown);
+    hardenRegistryFiles();
     result.cli.skipped = true;
     result.cli.reason = "disabled";
     return result;
@@ -185,11 +308,13 @@ export function syncClaudePluginRegistry({
   });
   if (probe.error || probe.status !== 0) {
     result.knownUpdated = writeJsonIfChanged(knownPath, nextKnown);
+    hardenRegistryFiles();
     result.cli.skipped = true;
     result.cli.reason = probe.error || probe.stderr || probe.stdout || "claude CLI not available";
     return result;
   }
   result.cli.attempted = true;
+  onBeforeMutation();
 
   for (const legacy of removedLegacy) {
     const uninstall = runCommand(runner, "claude", ["plugin", "remove", `${pluginName}@${legacy}`, "--keep-data", "-s", "user"], {
@@ -227,6 +352,7 @@ export function syncClaudePluginRegistry({
   }
 
   result.knownUpdated = writeJsonIfChanged(knownPath, nextKnown);
+  hardenRegistryFiles();
   result.installPath = latestInstalledPluginPath({ installedPath, pluginId: result.pluginId, scope: "user" });
   if (result.installPath) result.scrubbed = scrubSensitivePluginCacheFiles(result.installPath);
   for (const legacy of removedLegacy) {
@@ -242,15 +368,17 @@ export function syncClaudePluginSettings({
   legacyMarketplaces = LEGACY_CLAUDE_MARKETPLACES,
   home = os.homedir()
 } = {}) {
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  const before = fs.existsSync(settingsPath) ? fs.readFileSync(settingsPath, "utf8") : "";
-  const settings = readJson(settingsPath);
-  settings.extraKnownMarketplaces = settings.extraKnownMarketplaces && typeof settings.extraKnownMarketplaces === "object"
-    ? settings.extraKnownMarketplaces
-    : {};
-  settings.enabledPlugins = settings.enabledPlugins && typeof settings.enabledPlugins === "object"
-    ? settings.enabledPlugins
-    : {};
+  const settings = readJsonObjectStrict(settingsPath, { label: "Claude settings" });
+  if (settings.extraKnownMarketplaces !== undefined
+      && (!settings.extraKnownMarketplaces || typeof settings.extraKnownMarketplaces !== "object" || Array.isArray(settings.extraKnownMarketplaces))) {
+    throw new Error("Claude settings has an invalid extraKnownMarketplaces value; expected an object");
+  }
+  if (settings.enabledPlugins !== undefined
+      && (!settings.enabledPlugins || typeof settings.enabledPlugins !== "object" || Array.isArray(settings.enabledPlugins))) {
+    throw new Error("Claude settings has an invalid enabledPlugins value; expected an object");
+  }
+  settings.extraKnownMarketplaces ||= {};
+  settings.enabledPlugins ||= {};
 
   const migrated = [];
   for (const legacy of legacyMarketplaces) {
@@ -306,6 +434,77 @@ export function parseInstallArgs(argv = []) {
   return opts;
 }
 
+const LEGACY_CLAUDE_HOOK_FILES = ["codex-plan-review.mjs", "codex-plan-file-review.mjs"];
+
+function acquireInstallLock({ home, now = () => Date.now() }) {
+  const dataDir = path.join(home, ".claude", "plugins", "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  if (capturePathState(dataDir).type !== "directory") {
+    throw new Error(`peerBench data directory is not a regular directory: ${dataDir}`);
+  }
+  const lockPath = path.join(dataDir, ".peerbench-install.lock");
+  const token = `${process.pid}:${now()}:${Math.random().toString(16).slice(2)}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, token, createdAt: Date.now() })}\n`);
+      fs.closeSync(fd);
+      return {
+        lockPath,
+        release() {
+          try {
+            const current = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+            if (current?.token === token) fs.rmSync(lockPath, { force: true });
+          } catch {}
+        }
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        if (fs.lstatSync(lockPath).isSymbolicLink()) throw new Error(`peerBench install lock is a symlink: ${lockPath}`);
+      } catch (statError) {
+        if (statError?.code !== "ENOENT") throw statError;
+      }
+      let ownerPid = null, lockAgeMs = 0;
+      try {
+        ownerPid = Number(JSON.parse(fs.readFileSync(lockPath, "utf8"))?.pid);
+        lockAgeMs = Math.max(0, Date.now() - fs.lstatSync(lockPath).mtimeMs);
+      } catch {
+        try { lockAgeMs = Math.max(0, Date.now() - fs.lstatSync(lockPath).mtimeMs); } catch {}
+      }
+      let alive = false;
+      if (Number.isInteger(ownerPid) && ownerPid > 0) {
+        try { process.kill(ownerPid, 0); alive = true; } catch (probeError) { alive = probeError?.code === "EPERM"; }
+      }
+      // A second process can observe the lock between O_EXCL creation and the owner writing its
+      // payload. Treat a fresh malformed lock as live; only recover it after a generous stale age.
+      if (!Number.isInteger(ownerPid) && lockAgeMs < 30 * 60_000) alive = true;
+      if (alive || attempt > 0) throw new Error(`another peerBench install is already running (lock: ${lockPath})`);
+      fs.rmSync(lockPath, { force: true });
+    }
+  }
+  throw new Error(`could not acquire peerBench install lock: ${lockPath}`);
+}
+
+function createUniqueBackupDir({ sharedRoot, stamp }) {
+  fs.mkdirSync(sharedRoot, { recursive: true, mode: 0o700 });
+  if (capturePathState(sharedRoot).type !== "directory") {
+    throw new Error(`peerBench backup root is not a regular directory: ${sharedRoot}`);
+  }
+  fs.chmodSync(sharedRoot, 0o700);
+  const base = path.join(sharedRoot, `backup-${stamp}`);
+  for (let index = 0; index < 100; index++) {
+    const candidate = index === 0 ? base : `${base}-${process.pid}-${index}`;
+    try {
+      fs.mkdirSync(candidate, { mode: 0o700 });
+      return candidate;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error("could not allocate a unique peerBench backup directory");
+}
+
 export function installPeerBench({
   repoRoot = ROOT,
   home = os.homedir(),
@@ -316,91 +515,290 @@ export function installPeerBench({
   marketplaceName = DEFAULT_CLAUDE_MARKETPLACE,
   now = () => Date.now(),
   env = process.env,
-  syncClaudePlugin = home === os.homedir()
+  syncClaudePlugin = home === os.homedir(),
+  claudeRunner = spawnSync,
+  ensureNativeHook = ensureNativePrePushHook,
+  nativeStatus = nativePrePushStatus
 } = {}) {
-  const result = {
-    repoRoot: path.resolve(repoRoot),
-    origin: compareLocalWithOrigin({ cwd: repoRoot }),
-    claude: null,
-    codex: null,
-    keys: { loaded: false, keysPath, present: fs.existsSync(keysPath) }
-  };
-  const globalHooksSrc = path.join(repoRoot, "global-hooks");
-  const backupDir = path.join(home, ".claude", "plugins", "data", "bench-shared", `backup-${now()}`);
+  const resolvedRepo = path.resolve(repoRoot);
+  const globalHooksSrc = path.join(resolvedRepo, "global-hooks");
+  const promptsSrc = path.join(resolvedRepo, "codex-prompts");
+  const plannedHookNames = fs.readdirSync(globalHooksSrc).filter((name) => name.endsWith(".mjs")).sort();
+  const promptNames = fs.readdirSync(promptsSrc).filter((name) => name.endsWith(".md")).sort();
+  const codexPluginRootAtStart = codex ? latestCodexBenchPluginRoot({ home }) : null;
+  if (codexPluginRootAtStart) assertPluginCacheVersionMatch({ repoRoot: resolvedRepo, pluginRoot: codexPluginRootAtStart, platform: "codex" });
 
+  const claudeSettingsPath = path.join(home, ".claude", "settings.json");
+  const knownPath = path.join(home, ".claude", "plugins", "known_marketplaces.json");
+  const installedPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
+  const codexHooksPath = path.join(home, ".codex", "hooks.json");
+  // Distinguish missing configuration (fresh install) from malformed, unreadable, or symlinked
+  // configuration before any platform mutation occurs.
   if (claude) {
-    const hooksDir = path.join(home, ".claude", "hooks");
-    const settingsPath = path.join(home, ".claude", "settings.json");
-    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-    const migrate = migrateDataDir({ base: path.join(home, ".claude", "plugins", "data") });
-    const snap = snapshot({ hooksDir, settingsPath, backupDir });
-    const plugin = syncClaudePluginSettings({ settingsPath, repoRoot, marketplaceName, home });
-    const pluginRegistry = syncClaudePluginRegistry({
-      repoRoot,
-      home,
-      marketplaceName,
-      env,
-      skipCli: !syncClaudePlugin
-    });
-    const pluginDeploy = pluginRegistry.installPath
-      ? deployPluginRuntime({ repoRoot, pluginRoot: pluginRegistry.installPath })
-      : null;
-    const dep = deploy({ src: globalHooksSrc, dest: hooksDir });
-    const sync = pluginRegistry.cli.skipped
-      ? syncSettings({ hooksDir, settingsPath })
-      : removeClaudeSettingsPeerBenchHooks({ settingsPath });
-    // Default: KEEP the Codex stop gate — and actively RESTORE any state a prior disable turned off.
-    const codexPluginData = path.join(home, ".claude", "plugins", "data", "codex-openai-codex");
-    const legacyCodexGate = (env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true")
-      ? disableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData })
-      : { ...enableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData }), kept: true };
-    const statusline = syncStatuslineSessionArg({
-      statuslinePath: path.join(home, ".claude", "statusline-command.sh")
-    });
-    result.claude = { plugin, pluginRegistry, pluginDeploy, migrate, snapshot: snap, deploy: dep, sync, legacyCodexGate, statusline };
+    readJsonObjectStrict(claudeSettingsPath, { label: "Claude settings" });
+    readJsonObjectStrict(knownPath, { label: "Claude marketplace registry" });
+    readJsonObjectStrict(installedPath, { label: "Claude installed-plugin registry" });
   }
+  if (codex) readJsonObjectStrict(codexHooksPath, { label: "Codex hooks config" });
 
-  if (codex) {
-    const hooksDir = path.join(home, ".codex", "hooks");
-    const hooksPath = path.join(home, ".codex", "hooks.json");
-    const promptsDir = path.join(home, ".codex", "prompts");
-    const codexBackupDir = path.join(backupDir, "codex");
-    const snap = snapshotCodex({ hooksDir, hooksPath, backupDir: codexBackupDir });
-    const dep = deploy({ src: globalHooksSrc, dest: hooksDir });
-    const pluginRoot = latestCodexBenchPluginRoot({ home });
-    const pluginDeploy = pluginRoot ? deployPluginRuntime({ repoRoot, pluginRoot }) : null;
-    const sync = pluginRoot
-      ? removeCodexSettingsPeerBenchHooks({ hooksPath })
-      : syncCodexHooks({ hooksDir, hooksPath });
-    const prompts = syncCodexPrompts({
-      srcDir: path.join(repoRoot, "codex-prompts"),
-      promptsDir,
-      benchRunnerPath: path.join(repoRoot, "scripts", "bench-runner.mjs")
-    });
-    result.codex = { snapshot: snap, deploy: dep, pluginDeploy, sync, prompts };
-  }
-
-  if (loadKeys) {
-    const res = spawnSync(process.execPath, [path.join(repoRoot, "scripts", "load-keys.mjs"), keysPath], {
-      cwd: repoRoot,
-      env,
-      encoding: "utf8"
-    });
-    result.keys = {
-      loaded: res.status === 0,
-      keysPath,
-      present: fs.existsSync(keysPath),
-      stdout: (res.stdout || "").trim(),
-      stderr: (res.stderr || "").trim(),
-      status: res.status
-    };
-    if (res.status !== 0) {
-      const detail = result.keys.stderr || result.keys.stdout || `exit ${res.status}`;
-      throw new Error(`load-keys failed: ${detail}`);
+  const lock = acquireInstallLock({ home, now });
+  let backupDir = null;
+  let transactionPrepared = false;
+  let pluginMutationStarted = false;
+  let captureCreatedPluginRoots = () => {};
+  let persistTransaction = () => {};
+  try {
+    const sharedRoot = path.join(home, ".claude", "plugins", "data", "bench-shared");
+    const sharedState = capturePathState(sharedRoot);
+    if (sharedState.exists && sharedState.type !== "directory") {
+      throw new Error(`peerBench backup root is not a regular directory: ${sharedRoot}`);
     }
-  }
+    const migrate = claude ? migrateDataDir({ base: path.join(home, ".claude", "plugins", "data") }) : { migrated: false };
+    const sharedPermissions = hardenSharedDataPermissions({ root: sharedRoot });
+    backupDir = createUniqueBackupDir({ sharedRoot, stamp: now() });
+    const result = {
+      repoRoot: resolvedRepo,
+      backupDir,
+      origin: compareLocalWithOrigin({ cwd: resolvedRepo }),
+      claude: null,
+      codex: null,
+      nativePrePush: null,
+      sharedPermissions,
+      keys: { loaded: false, keysPath, present: fs.existsSync(keysPath) }
+    };
+    const transactionMetadata = { repoRoot: resolvedRepo, claude: null, codex: null, nativePrePush: null };
+    persistTransaction = () => {
+      result.rollbackMetadata = writeRollbackMetadata({ backupDir, metadata: transactionMetadata });
+      return result.rollbackMetadata;
+    };
 
-  return result;
+    let claudeContext = null;
+    if (claude) {
+      const hooksDir = path.join(home, ".claude", "hooks");
+      const statuslinePath = path.join(home, ".claude", "statusline-command.sh");
+      const restoreNames = [...new Set([...plannedHookNames, ...LEGACY_CLAUDE_HOOK_FILES])];
+      const snap = snapshot({
+        hooksDir,
+        settingsPath: claudeSettingsPath,
+        backupDir,
+        statuslinePath,
+        fileNames: restoreNames
+      });
+      const pluginRegistryFiles = [
+        snapshotRollbackFile({ target: knownPath, backupDir: path.join(backupDir, "claude-plugin-registry"), name: "known_marketplaces.json" }),
+        snapshotRollbackFile({ target: installedPath, backupDir: path.join(backupDir, "claude-plugin-registry"), name: "installed_plugins.json" })
+      ];
+      const pluginRootsBefore = claudePluginInstallRoots({ home, repoRoot: resolvedRepo, marketplaceName });
+      let pluginInstallSnapshots = pluginRootsBefore.map((pluginRoot, index) => snapshotPluginInstallRoot({
+        pluginRoot,
+        backupDir: path.join(backupDir, "plugin-installs", `claude-before-${index}`)
+      })).filter(Boolean);
+      const cacheRootsBefore = new Set(allClaudeBenchCacheRoots({ home, marketplaceName }).map((value) => path.resolve(value)));
+      const transactionClaude = {
+        hooksDir,
+        settingsPath: claudeSettingsPath,
+        statuslinePath,
+        deployedNames: plannedHookNames,
+        restoreNames,
+        fileSnapshots: snap.entries,
+        hookAfterStates: [],
+        settingsSnapshot: snap.settingsEntry,
+        settingsAfterState: null,
+        settingsBackedUp: snap.settingsBackedUp,
+        settingsMode: snap.settingsMode,
+        statuslineSnapshot: snap.statuslineEntry,
+        statuslineAfterState: null,
+        statuslineBackedUp: snap.statuslineBackedUp,
+        statuslineMode: snap.statuslineMode,
+        statuslineUpdated: false,
+        pluginInstallSnapshots: pluginInstallSnapshots.map((entry) => ({ pluginRoot: entry.pluginRoot, backupDir: entry.backupDir })),
+        pluginMutationStarted: false,
+        pluginRegistryFiles
+      };
+      transactionMetadata.claude = transactionClaude;
+      captureCreatedPluginRoots = () => {
+        const recorded = new Set(pluginInstallSnapshots.map((entry) => path.resolve(entry.pluginRoot)));
+        for (const candidate of allClaudeBenchCacheRoots({ home, marketplaceName })) {
+          const root = path.resolve(candidate);
+          if (cacheRootsBefore.has(root) || recorded.has(root)) continue;
+          const entry = snapshotPluginInstallRoot({
+            pluginRoot: root,
+            backupDir: path.join(backupDir, "plugin-installs", `claude-created-${pluginInstallSnapshots.length}`),
+            existedBefore: false
+          });
+          if (entry) { pluginInstallSnapshots.push(entry); recorded.add(root); }
+        }
+        transactionClaude.pluginInstallSnapshots = pluginInstallSnapshots.map((entry) => ({ pluginRoot: entry.pluginRoot, backupDir: entry.backupDir }));
+      };
+      claudeContext = { hooksDir, statuslinePath, snap, pluginRegistryFiles, transactionClaude, get pluginInstallSnapshots() { return pluginInstallSnapshots; }, migrate };
+    }
+
+    let codexContext = null;
+    if (codex) {
+      const hooksDir = path.join(home, ".codex", "hooks");
+      const promptsDir = path.join(home, ".codex", "prompts");
+      const codexBackupDir = path.join(backupDir, "codex");
+      const snap = snapshotCodex({
+        hooksDir,
+        hooksPath: codexHooksPath,
+        backupDir: codexBackupDir,
+        promptsDir,
+        promptNames,
+        fileNames: plannedHookNames
+      });
+      const pluginRuntimeSnapshots = codexPluginRootAtStart ? [snapshotPluginRuntime({
+        pluginRoot: codexPluginRootAtStart,
+        backupDir: path.join(backupDir, "plugin-runtime", "codex-before")
+      })].filter(Boolean) : [];
+      const transactionCodex = {
+        hooksDir,
+        hooksPath: codexHooksPath,
+        promptsDir,
+        deployedNames: plannedHookNames,
+        restoreNames: plannedHookNames,
+        fileSnapshots: snap.entries,
+        hookAfterStates: [],
+        promptNames,
+        promptSnapshots: snap.promptEntries,
+        promptAfterStates: [],
+        hooksJsonSnapshot: snap.hooksJsonEntry,
+        hooksJsonAfterState: null,
+        hooksJsonBackedUp: snap.hooksJsonBackedUp,
+        hooksJsonMode: snap.hooksJsonMode,
+        pluginRuntimeSnapshots: pluginRuntimeSnapshots.map((entry) => ({ backupDir: entry.backupDir }))
+      };
+      transactionMetadata.codex = transactionCodex;
+      codexContext = { hooksDir, promptsDir, snap, pluginRuntimeSnapshots, transactionCodex };
+    }
+
+    const nativeBefore = nativeStatus(resolvedRepo);
+    const nativeSnapshot = snapshotNativePrePushState({ status: nativeBefore, repoRoot: resolvedRepo, backupDir: path.join(backupDir, "native-pre-push") });
+    transactionMetadata.nativePrePush = {
+      repoRoot: resolvedRepo,
+      installed: false,
+      changed: false,
+      installedBefore: Boolean(nativeBefore.managed),
+      snapshot: nativeSnapshot
+    };
+    persistTransaction();
+    transactionPrepared = true;
+
+    if (claudeContext) {
+      const { hooksDir, statuslinePath, snap, pluginRegistryFiles, transactionClaude } = claudeContext;
+      const plugin = syncClaudePluginSettings({ settingsPath: claudeSettingsPath, repoRoot: resolvedRepo, marketplaceName, home });
+      transactionClaude.settingsAfterState = capturePathState(claudeSettingsPath);
+      persistTransaction();
+      const pluginRegistry = syncClaudePluginRegistry({
+        repoRoot: resolvedRepo,
+        home,
+        marketplaceName,
+        env,
+        runner: claudeRunner,
+        skipCli: !syncClaudePlugin,
+        onBeforeMutation: () => {
+          pluginMutationStarted = true;
+          transactionClaude.pluginMutationStarted = true;
+          persistTransaction();
+        }
+      });
+      if (pluginRegistry.cli.attempted) {
+        captureCreatedPluginRoots();
+        if (!pluginRegistry.installPath) throw new Error(`Claude reported a successful install of ${pluginRegistry.pluginId}, but no installed plugin root was registered`);
+        const expectedCacheBase = path.resolve(home, ".claude", "plugins", "cache", marketplaceName, CLAUDE_PLUGIN_NAME);
+        const installedRoot = path.resolve(expandHome(pluginRegistry.installPath, home));
+        if (!installedRoot.startsWith(`${expectedCacheBase}${path.sep}`)) {
+          throw new Error(`Claude reported an unexpected plugin root for ${pluginRegistry.pluginId}: ${installedRoot}`);
+        }
+        assertPluginCacheVersionMatch({ repoRoot: resolvedRepo, pluginRoot: pluginRegistry.installPath, platform: "claude" });
+      }
+      for (const entry of pluginRegistryFiles) entry.expectedAfter = capturePathState(entry.target);
+      transactionClaude.pluginInstallSnapshots = claudeContext.pluginInstallSnapshots.map((entry) => ({ pluginRoot: entry.pluginRoot, backupDir: entry.backupDir }));
+      persistTransaction();
+      const pluginDeploy = pluginRegistry.installPath
+        ? deployPluginRuntime({ repoRoot: resolvedRepo, pluginRoot: pluginRegistry.installPath, platform: "claude" })
+        : null;
+      const dep = deploy({ src: globalHooksSrc, dest: hooksDir });
+      transactionClaude.hookAfterStates = dep.states;
+      persistTransaction();
+      const sync = pluginRegistry.cli.skipped
+        ? syncSettings({ hooksDir, settingsPath: claudeSettingsPath })
+        : removeClaudeSettingsPeerBenchHooks({ settingsPath: claudeSettingsPath });
+      transactionClaude.settingsAfterState = capturePathState(claudeSettingsPath);
+      persistTransaction();
+      const codexPluginData = path.join(home, ".claude", "plugins", "data", "codex-openai-codex");
+      const legacyCodexGate = (env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true")
+        ? disableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData })
+        : { ...enableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData }), kept: true };
+      const statusline = syncStatuslineSessionArg({ statuslinePath });
+      transactionClaude.statuslineUpdated = statusline.updated;
+      transactionClaude.statuslineAfterState = statusline.updated ? capturePathState(statuslinePath) : null;
+      persistTransaction();
+      result.claude = { plugin, pluginRegistry, pluginRegistryFiles, pluginDeploy, pluginInstallSnapshots: claudeContext.pluginInstallSnapshots, migrate: claudeContext.migrate, snapshot: snap, deploy: dep, sync, legacyCodexGate, statusline, hooksDir, settingsPath: claudeSettingsPath, statuslinePath };
+    }
+
+    if (codexContext) {
+      const { hooksDir, promptsDir, snap, pluginRuntimeSnapshots, transactionCodex } = codexContext;
+      const dep = deploy({ src: globalHooksSrc, dest: hooksDir });
+      transactionCodex.hookAfterStates = dep.states;
+      persistTransaction();
+      const pluginDeploy = codexPluginRootAtStart
+        ? deployPluginRuntime({ repoRoot: resolvedRepo, pluginRoot: codexPluginRootAtStart, platform: "codex" })
+        : null;
+      const sync = codexPluginRootAtStart
+        ? removeCodexSettingsPeerBenchHooks({ hooksPath: codexHooksPath })
+        : syncCodexHooks({ hooksDir, hooksPath: codexHooksPath });
+      transactionCodex.hooksJsonAfterState = capturePathState(codexHooksPath);
+      persistTransaction();
+      const prompts = syncCodexPrompts({
+        srcDir: promptsSrc,
+        promptsDir,
+        benchRunnerPath: path.join(resolvedRepo, "scripts", "bench-runner.mjs")
+      });
+      transactionCodex.promptNames = prompts.copied;
+      transactionCodex.promptAfterStates = prompts.states;
+      persistTransaction();
+      result.codex = { snapshot: snap, deploy: dep, pluginDeploy, pluginRuntimeSnapshots, sync, prompts, hooksDir, hooksPath: codexHooksPath, promptsDir };
+    }
+
+    result.nativePrePush = ensureNativeHook(resolvedRepo, { runtimePath: path.join(globalHooksSrc, "git-pre-push-review.mjs") });
+    transactionMetadata.nativePrePush.installed = Boolean(result.nativePrePush?.ok && result.nativePrePush?.installed);
+    transactionMetadata.nativePrePush.changed = Boolean(result.nativePrePush?.changed);
+    persistTransaction();
+    if (!result.nativePrePush?.ok || !result.nativePrePush?.installed) {
+      throw new Error(`native Git pre-push hook installation failed: ${result.nativePrePush?.reason || "hook was not installed"}`);
+    }
+
+    if (loadKeys) {
+      const res = spawnSync(process.execPath, [path.join(resolvedRepo, "scripts", "load-keys.mjs"), keysPath], { cwd: resolvedRepo, env, encoding: "utf8" });
+      result.keys = {
+        loaded: res.status === 0,
+        keysPath,
+        present: fs.existsSync(keysPath),
+        stdout: (res.stdout || "").trim(),
+        stderr: (res.stderr || "").trim(),
+        status: res.status
+      };
+      if (res.status !== 0) throw new Error(`load-keys failed: ${result.keys.stderr || result.keys.stdout || `exit ${res.status}`}`);
+    }
+    return result;
+  } catch (error) {
+    if (pluginMutationStarted) {
+      try { captureCreatedPluginRoots(); persistTransaction(); } catch {}
+    }
+    if (transactionPrepared && backupDir) {
+      let rollbackResult;
+      try { rollbackResult = rollback({ backupDir }); }
+      catch (rollbackError) {
+        throw new Error(`peerBench install failed (${error instanceof Error ? error.message : String(error)}); automatic rollback also failed (${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)})`, { cause: error });
+      }
+      if (!rollbackResult.ok) {
+        throw new Error(`peerBench install failed (${error instanceof Error ? error.message : String(error)}); automatic rollback was partial (${rollbackResult.failures.join("; ")})`, { cause: error });
+      }
+    }
+    throw error;
+  } finally {
+    lock.release();
+  }
 }
 
 function shortSha(value) {
@@ -446,6 +844,12 @@ export function renderInstallSummary(result) {
       lines.push(`Codex hooks: copied ${c.deploy.copied.length}, backed up ${c.deploy.backedUp.length}; Stop gate synced in ${c.sync.hooksPath}`);
     }
     lines.push(`Codex prompts: copied ${c.prompts.copied.length}, backed up ${c.prompts.backedUp.length} in ${c.prompts.promptsDir}`);
+  }
+  if (result.nativePrePush) {
+    const n = result.nativePrePush;
+    lines.push(n.ok && n.installed
+      ? `Git pre-push: native authoritative gate installed${n.chained ? " (existing hook chained first)" : ""}`
+      : `Git pre-push: not installed (${n.reason || "unknown error"}); pushes fail closed until setup succeeds or an explicit bypass is used`);
   }
   if (result.keys.loaded) {
     lines.push(`Keys: loaded from ${result.keys.keysPath} (${result.keys.stdout || "key values redacted"})`);

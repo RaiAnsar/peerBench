@@ -76,8 +76,15 @@ export function parseSeverity(raw, verdict) {
 export function summarizeSpecReview(results) {
   const list = Array.isArray(results) ? results : [];
   // Carry per-reviewer severity so the surfaced badge + statusline can render a
-  // sub-threshold BLOCK as `~` (advisory) rather than the alarming `✗`.
-  const reviewers = list.map((r) => ({ name: r.name, verdict: r.verdict ?? null, severity: r.severity ?? null }));
+  // sub-threshold BLOCK as `~` (advisory) rather than the alarming `✗`. Errors
+  // are part of the durable result contract too: dropping them made an all-error
+  // panel indistinguishable from a clean review once only the summary survived.
+  const reviewers = list.map((r) => ({
+    name: r.name,
+    verdict: r.verdict ?? null,
+    severity: r.severity ?? null,
+    error: r.error ?? null
+  }));
   const findingCount = list.reduce((n, r) => n + (Number(r.findingCount) || 0), 0);
   let maxSeverity = "none";
   for (const r of list) {

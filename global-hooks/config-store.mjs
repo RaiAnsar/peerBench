@@ -63,6 +63,45 @@ export function sharedRoot() {
   return process.env.BENCH_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
 }
+
+export function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
+export function hardenSharedDataPermissions({ root = sharedRoot() } = {}) {
+  const hardenedDirs = [], hardenedFiles = [];
+  const walk = (dir) => {
+    let entries = [];
+    ensurePrivateDir(dir);
+    hardenedDirs.push(dir);
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const target = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(target);
+    }
+  };
+  walk(root);
+  const companion = path.join(root, "companion.json");
+  try {
+    if (fs.statSync(companion).isFile()) {
+      fs.chmodSync(companion, 0o600);
+      hardenedFiles.push(companion);
+    }
+  } catch { /* companion is absent */ }
+  return { root, hardenedDirs, hardenedFiles };
+}
+
+export function writePrivateFileAtomic(file, content) {
+  ensurePrivateDir(path.dirname(file));
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
+  return file;
+}
 // The canonical per-workspace KEY (`<slug>-<hash>`) — the ownership identity of a workspace's
 // state. Slug AND hash both come from the CANONICAL path, so a workspace reached via a
 // differently-named symlink resolves to the same key (otherwise the slug differed while the hash
@@ -115,13 +154,11 @@ function truthy(value) {
 export function setReviewers(list, { root = sharedRoot() } = {}) {
   const reviewers = [...new Set((Array.isArray(list) ? list : []).filter((n) => KNOWN_REVIEWERS.includes(n)))];
   if (!reviewers.length) throw new Error(`no valid reviewers in [${list}]; known: ${KNOWN_REVIEWERS.join(", ")}`);
-  fs.mkdirSync(root, { recursive: true });
+  ensurePrivateDir(root);
   const file = path.join(root, "companion.json");
   let cur = {}; try { cur = JSON.parse(fs.readFileSync(file, "utf8")); } catch { cur = {}; }
   cur.reviewers = reviewers;
-  const tmp = path.join(root, `companion.json.tmp.${process.pid}`);
-  fs.writeFileSync(tmp, `${JSON.stringify(cur, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  writePrivateFileAtomic(file, `${JSON.stringify(cur, null, 2)}\n`);
   return reviewers;
 }
 const GLOBAL_DISABLE = (root) => path.join(root || sharedRoot(), "disabled-global");
@@ -137,7 +174,11 @@ export function readReviewedHead(ws) {
 }
 export function writeReviewedHead(ws, sha) {
   if (!sha) return;
-  try { fs.mkdirSync(workspaceStateDir(ws), { recursive: true }); fs.writeFileSync(REVIEWED_HEAD(ws), `${sha}\n`); } catch { /* best-effort marker */ }
+  try {
+    ensurePrivateDir(sharedRoot());
+    ensurePrivateDir(workspaceStateDir(ws));
+    fs.writeFileSync(REVIEWED_HEAD(ws), `${sha}\n`);
+  } catch { /* best-effort marker */ }
 }
 
 // Disabled if the global marker exists OR this workspace's marker exists.
@@ -152,7 +193,8 @@ export function isBenchDisabled(ws, { root } = {}) {
 // scope: "global" writes/removes the global marker; otherwise the workspace marker.
 export function setBenchDisabled(ws, disabled, { scope = "workspace", root } = {}) {
   const file = scope === "global" ? GLOBAL_DISABLE(root) : WS_DISABLE(ws);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  ensurePrivateDir(root || sharedRoot());
+  ensurePrivateDir(path.dirname(file));
   if (disabled) fs.writeFileSync(file, `disabled ${scope}\n`);
   else { try { fs.rmSync(file); } catch { /* already gone */ } }
   return { scope, disabled, file };

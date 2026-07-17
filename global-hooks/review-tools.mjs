@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -50,11 +51,54 @@ function safePath(cwd, p) {
   return probe;
 }
 
-export function createReviewTools(cwd, { execImpl = spawnSync } = {}) {
-  const git = (argv) => execImpl("git", argv, { cwd, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+function safeGitPath(p, { allowRoot = false, pathspec = false } = {}) {
+  const value = String(p ?? (allowRoot ? "." : ""));
+  if (allowRoot && ["", "."].includes(value)) return ".";
+  const slash = value.replaceAll("\\", "/");
+  if (!slash || slash.startsWith("/") || /^[A-Za-z]:\//.test(slash)) throw new Error(`path escapes workspace: ${p}`);
+  const parts = slash.split("/");
+  if (parts.includes("..") || parts.includes(".git")) throw new Error(`path escapes workspace: ${p}`);
+  if (!pathspec && parts.includes(".")) throw new Error(`path escapes workspace: ${p}`);
+  return slash.replace(/^\.\//, "");
+}
+
+function lineRangeFromText(text, offset, limit) {
+  const start = Math.max(0, (Number.isInteger(offset) ? offset : 1) - 1);
+  const want = Number.isInteger(limit) ? Math.max(0, limit) : Infinity;
+  return String(text).split(/\r?\n/).slice(start, start + want).join("\n");
+}
+
+export function createReviewTools(cwd, { execImpl = spawnSync, treeish = null } = {}) {
+  if (treeish != null && !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(String(treeish))) {
+    throw new Error("review treeish must be an immutable object id");
+  }
+  const git = (argv, maxBuffer = 32 * 1024 * 1024) => execImpl("git", ["-c", "advice.graftFileDeprecated=false", "--no-replace-objects", ...argv], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer,
+    env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_GRAFT_FILE: os.devNull }
+  });
 
   const tools = {
     read_file({ path: p, offset, limit }) {
+      if (treeish) {
+        const gitPath = safeGitPath(p);
+        const spec = `${treeish}:${gitPath}`;
+        const sizeResult = git(["cat-file", "-s", spec]);
+        if (sizeResult.status !== 0 || !/^\d+\s*$/.test(String(sizeResult.stdout || ""))) {
+          throw new Error(`file does not exist in pushed tip: ${p}`);
+        }
+        const size = Number(String(sizeResult.stdout).trim());
+        const hasRange = Number.isInteger(offset) || Number.isInteger(limit);
+        if (!hasRange && size > 2_000_000) return `[file too large to read: ${size} bytes; use grep or read with offset/limit]`;
+        if (hasRange && size > 64 * 1024 * 1024) return `[file too large for a bounded line read: ${size} bytes; use grep]`;
+        const result = git(["cat-file", "blob", spec], Math.max(32 * 1024 * 1024, size + 1024));
+        if (result.status !== 0) throw new Error(`could not read pushed-tip file: ${p}`);
+        let text = hasRange ? lineRangeFromText(result.stdout || "", offset, limit) : String(result.stdout || "");
+        let truncated = "";
+        if (text.length > READ_FILE_MAX) { text = text.slice(0, READ_FILE_MAX); truncated = "\n…[truncated]"; }
+        return text + truncated;
+      }
       const abs = safePath(cwd, p);
       const hasRange = Number.isInteger(offset) || Number.isInteger(limit);
       let text;
@@ -71,20 +115,37 @@ export function createReviewTools(cwd, { execImpl = spawnSync } = {}) {
     },
     grep({ pattern, path: p }) {
       if (!pattern) throw new Error("grep requires a pattern");
-      if (p) safePath(cwd, p);
-      const r = git(["grep", "-n", "-I", "--no-color", "-e", String(pattern), ...(p ? ["--", p] : [])]);
+      if (treeish) {
+        if (p) safeGitPath(p, { pathspec: true });
+      } else if (p) safePath(cwd, p);
+      const r = git(["grep", "-n", "-I", "--no-color", "-e", String(pattern), ...(treeish ? [treeish] : []), ...(p ? ["--", p] : [])]);
       if (r.status !== 0 && !r.stdout) return r.status === 1 ? "(no matches)" : `grep error: ${(r.stderr || "").slice(0, 200)}`;
       const lines = String(r.stdout).split(/\r?\n/).filter(Boolean);
       const shown = lines.slice(0, GREP_MAX_LINES).join("\n");
       return lines.length > GREP_MAX_LINES ? `${shown}\n…[${lines.length - GREP_MAX_LINES} more matches]` : (shown || "(no matches)");
     },
     glob({ pattern }) {
-      const r = git(["ls-files", "--", pattern || "*"]);
+      const requested = pattern || "*";
+      if (treeish) safeGitPath(requested, { pathspec: true });
+      const r = treeish
+        ? git(["ls-tree", "-r", "--name-only", treeish, "--", requested])
+        : git(["ls-files", "--", requested]);
       const files = String(r.stdout || "").split(/\r?\n/).filter(Boolean);
       const shown = files.slice(0, GLOB_MAX).join("\n");
       return files.length > GLOB_MAX ? `${shown}\n…[${files.length - GLOB_MAX} more files]` : (shown || "(no files)");
     },
     list_dir({ path: p }) {
+      if (treeish) {
+        const gitPath = safeGitPath(p || ".", { allowRoot: true });
+        const target = gitPath === "." ? treeish : `${treeish}:${gitPath}`;
+        const r = git(["ls-tree", target]);
+        if (r.status !== 0) throw new Error(`directory does not exist in pushed tip: ${p || "."}`);
+        const entries = String(r.stdout || "").split(/\r?\n/).filter(Boolean).slice(0, LIST_MAX).map((line) => {
+          const match = line.match(/^\d+\s+(blob|tree|commit)\s+[0-9a-f]+\t([\s\S]+)$/);
+          return match ? `${match[2]}${match[1] === "tree" ? "/" : ""}` : line;
+        });
+        return entries.join("\n") || "(empty)";
+      }
       const abs = safePath(cwd, p || ".");
       const entries = fs.readdirSync(abs, { withFileTypes: true })
         .slice(0, LIST_MAX)

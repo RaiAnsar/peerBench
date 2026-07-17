@@ -13,6 +13,7 @@ import { combinePanel } from "./panel-lib.mjs";
 import { deepKey, shouldRewake } from "./deep-review.mjs";
 import { enqueue as defaultEnqueue } from "./deep-queue.mjs";
 import { runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
+import { ensureNativePrePushHook } from "./native-git-hook.mjs";
 
 const DEFAULT_PUSH_GATE_BUDGET_MS = 90_000;   // hard cap on the INLINE gate → it can never freeze the session (env-tunable per invocation)
 const MAX_PUSH_DIFF_BYTES = 200_000;
@@ -204,21 +205,141 @@ export function shellTokenize(text) {
 // `echo git push` prints, it doesn't push — and with escape normalization `echo g\it push` could
 // SHADOW a real push in a LATER segment (findPushSegment returns the first match), reviewing the
 // wrong command entirely (a stop-gate catch; the merge path failed OPEN through the fake ref).
-// Skipped on the way to `git`: leading NAME=value assignments, exec-style wrappers that run their
-// argv (`sudo git push`, `env -i git push`, `timeout 30 git push`), a wrapper's -flags and bare
-// numeric args. A wrapper flag with a non-numeric value (`sudo -u root git push`) is not understood —
-// the scan stops at `root` and the segment simply isn't treated as git (the stop gate still reviews).
-const EXEC_WRAPPERS = new Set(["sudo", "doas", "command", "env", "exec", "nohup", "nice", "ionice", "time", "timeout", "stdbuf", "chronic"]);
-export function gitCommandIndex(toks) {
+// Skipped on the way to `git`: leading NAME=value assignments and exec-style wrappers that run
+// their argv (`sudo git push`, `env -i git push`, `timeout 30 git push`). Common wrapper options are
+// parsed with their documented value arity, including attached short values (`sudo -uroot`) and
+// cwd-changing `env -C` / `sudo -D`. Unknown wrapper options remain deliberately unproven: the
+// native armer must deny a plausible push instead of guessing which word is the command.
+const EXEC_WRAPPERS = new Set(["sudo", "doas", "command", "env", "exec", "nohup", "nice", "ionice", "time", "timeout", "stdbuf", "chronic", "xcrun"]);
+const commandBasename = (value) => path.basename(String(value || ""));
+
+// Only option shapes that determine argv boundaries belong here. Effects are consumed later by the
+// native target resolver; `chroot` is intentionally unprovable because an in-chroot path is not the
+// same host path where the bootstrapper would install a hook.
+const WRAPPER_OPTION_SPECS = {
+  sudo: {
+    shortFlags: "ABbEHikKlnPSsVve",
+    shortFlagEffects: { e: "non-exec", l: "non-exec", V: "non-exec", v: "non-exec" },
+    shortValues: { C: "value", D: "chdir", g: "value", h: "value", p: "value", R: "chroot", T: "value", u: "value", U: "value", r: "value", t: "value" },
+    longFlags: ["askpass", "bell", "background", "edit", "help", "list", "login", "non-interactive", "preserve-env", "preserve-groups", "remove-timestamp", "reset-timestamp", "set-home", "shell", "stdin", "validate", "version"],
+    longFlagEffects: { edit: "non-exec", help: "non-exec", list: "non-exec", validate: "non-exec", version: "non-exec" },
+    longValues: { "close-from": "value", chdir: "chdir", group: "value", host: "value", prompt: "value", chroot: "chroot", "command-timeout": "value", user: "value", "other-user": "value", role: "value", type: "value" },
+    selfContainedPrefixes: ["--preserve-env="]
+  },
+  doas: {
+    shortFlags: "Lns",
+    shortValues: { C: "non-exec", u: "value" },
+    longFlags: [],
+    longValues: {}
+  },
+  command: { shortFlags: "pvV", shortFlagEffects: { v: "non-exec", V: "non-exec" }, shortValues: {}, longFlags: [], longValues: {} },
+  env: {
+    shortFlags: "0iv",
+    shortFlagEffects: { i: "clear-env" },
+    shortValues: { C: "chdir", P: "value", S: "split-string", u: "unset-env" },
+    longFlags: ["ignore-environment", "null"],
+    longFlagEffects: { "ignore-environment": "clear-env" },
+    longValues: { chdir: "chdir", "split-string": "split-string", unset: "unset-env", argv0: "value" }
+  },
+  exec: { shortFlags: "cl", shortValues: { a: "value" }, longFlags: [], longValues: {} },
+  nohup: { shortFlags: "", shortValues: {}, longFlags: [], longValues: {} },
+  nice: { shortFlags: "", shortValues: { n: "value" }, longFlags: [], longValues: { adjustment: "value" } },
+  ionice: { shortFlags: "t", shortValues: { c: "value", n: "value", p: "value", P: "value", u: "value" }, longFlags: ["ignore"], longValues: { class: "value", classdata: "value", pid: "value", pgid: "value", uid: "value" } },
+  time: { shortFlags: "apvl", shortValues: { f: "value", o: "value" }, longFlags: ["append", "portability", "verbose"], longValues: { format: "value", output: "value" } },
+  timeout: { shortFlags: "fv", shortValues: { k: "value", s: "value" }, longFlags: ["foreground", "preserve-status", "verbose"], longValues: { "kill-after": "value", signal: "value" } },
+  stdbuf: { shortFlags: "", shortValues: { i: "value", o: "value", e: "value" }, longFlags: [], longValues: { input: "value", output: "value", error: "value" } },
+  chronic: { shortFlags: "", shortValues: {}, longFlags: [], longValues: {} },
+  xcrun: {
+    shortFlags: "hvlfrnk",
+    shortFlagEffects: { h: "non-exec", f: "non-exec", k: "non-exec" },
+    shortValues: {},
+    longFlags: ["help", "version", "verbose", "log", "find", "run", "no-cache", "kill-cache", "show-sdk-path", "show-sdk-version", "show-sdk-build-version", "show-sdk-platform-path", "show-sdk-platform-version", "show-toolchain-path"],
+    longFlagEffects: { help: "non-exec", version: "non-exec", find: "non-exec", "kill-cache": "non-exec", "show-sdk-path": "non-exec", "show-sdk-version": "non-exec", "show-sdk-build-version": "non-exec", "show-sdk-platform-path": "non-exec", "show-sdk-platform-version": "non-exec", "show-toolchain-path": "non-exec" },
+    longValues: { sdk: "value", toolchain: "value" }
+  }
+};
+
+function wrapperOption(toks, index, wrapper) {
+  const spec = WRAPPER_OPTION_SPECS[wrapper];
+  const token = toks[index];
+  if (!spec || token === "--") return null;
+  if (spec.selfContainedPrefixes?.some((prefix) => token.startsWith(prefix))) {
+    return { consumed: 1, effects: [] };
+  }
+  if (token.startsWith("--")) {
+    const body = token.slice(2);
+    const equals = body.indexOf("=");
+    const name = equals >= 0 ? body.slice(0, equals) : body;
+    const effect = spec.longValues?.[name];
+    if (effect) {
+      const value = equals >= 0 ? body.slice(equals + 1) : toks[index + 1];
+      return { consumed: equals >= 0 ? 1 : 2, effects: [{ kind: effect, value }], missing: value == null || value === "" };
+    }
+    if (spec.longFlags?.includes(name)) {
+      const flagEffect = spec.longFlagEffects?.[name];
+      return { consumed: 1, effects: flagEffect ? [{ kind: flagEffect, value: null }] : [] };
+    }
+    return null;
+  }
+  if (!token.startsWith("-") || token === "-") return null;
+
+  // POSIX short options may be clustered. The first option that takes a value consumes the rest of
+  // the cluster, or the following argv word when no attached value remains.
+  const cluster = token.slice(1);
+  const effects = [];
+  for (let offset = 0; offset < cluster.length; offset++) {
+    const option = cluster[offset];
+    if (spec.shortFlags?.includes(option)) {
+      const flagEffect = spec.shortFlagEffects?.[option];
+      if (flagEffect) effects.push({ kind: flagEffect, value: null });
+      continue;
+    }
+    const effect = spec.shortValues?.[option];
+    if (!effect) return null;
+    const attached = cluster.slice(offset + 1);
+    const value = attached || toks[index + 1];
+    effects.push({ kind: effect, value });
+    return { consumed: attached ? 1 : 2, effects, missing: value == null || value === "" };
+  }
+  return { consumed: 1, effects };
+}
+
+function scanGitCommand(toks) {
+  let wrapper = null;
+  let wrapperSeen = false;
+  let uncertainOption = false;
+  const effects = [];
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
-    if (t === "git") return i;
+    const command = commandBasename(t);
+    if (command === "git") {
+      const nonExecuting = effects.some((effect) => effect.kind === "non-exec");
+      return uncertainOption || nonExecuting
+        ? { index: -1, candidateIndex: i, wrapper, wrapperSeen, effects, uncertain: uncertainOption, nonExecuting }
+        : { index: i, candidateIndex: i, wrapper, wrapperSeen, effects, uncertain: false, nonExecuting: false };
+    }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue;   // env-assignment prefix
-    if (EXEC_WRAPPERS.has(t)) continue;
-    if (t.startsWith("-") || /^\d+(\.\d+)?[smhd]?$/.test(t)) continue;   // a wrapper's flag / numeric arg
-    return -1;                                          // a real command that isn't git
+    if (EXEC_WRAPPERS.has(command)) { wrapper = command; wrapperSeen = true; continue; }
+    if (wrapper) {
+      const option = wrapperOption(toks, i, wrapper);
+      if (option) {
+        if (option.missing) return { index: -1, wrapper, wrapperSeen, effects, stopIndex: i, uncertain: true };
+        for (const effect of option.effects || []) effects.push({ wrapper, index: i, ...effect });
+        i += option.consumed - 1;
+        continue;
+      }
+      if (t === "--") continue;
+      if (wrapper === "nice" && /^-\d+$/.test(t)) continue;  // legacy `nice -10 command`
+      if (t.startsWith("-")) { uncertainOption = true; continue; }
+      if (wrapper === "timeout" && (/^\d+(\.\d+)?[smhd]?$/.test(t) || t === "infinity")) continue;
+    }
+    return { index: -1, wrapper, wrapperSeen, effects, stopIndex: i, uncertain: uncertainOption };
   }
-  return -1;
+  return { index: -1, wrapper, wrapperSeen, effects, stopIndex: -1, uncertain: uncertainOption };
+}
+
+export function gitCommandIndex(toks) {
+  return scanGitCommand(toks).index;
 }
 
 // True if a single segment is a real `git push` (allowing leading env assignments and git
@@ -277,6 +398,308 @@ function dashCTargets(text) {
     if (GIT_VALUE_OPTS.has(t)) i++;
   }
   return targets;
+}
+
+// Resolve the repository whose native hook Git will actually invoke for a push. This is only a
+// bootstrap aid: Git's pre-push stdin remains the authoritative source of refs. The important
+// property here is that we never install in input.cwd and then silently allow a push whose static
+// shell context points at another repository.
+//
+// Keep this deliberately conservative. If a directory depends on shell expansion/state that this
+// hook cannot prove (for example `cd "$REPO"`, `pushd +1`, or command substitution), callers deny
+// the push with an actionable message instead of pretending this is a complete shell parser.
+function staticShellPath(value, cwd, env) {
+  const raw = String(value ?? "");
+  // The lexer intentionally strips quotes, so it cannot distinguish `~/repo` (shell-expanded) from
+  // "~/repo" (literal path below cwd). Treat either as unproven instead of arming the wrong repo.
+  if (!raw || raw === "-" || raw === "~" || raw.startsWith("~/") || /[$`*?\[\]{}]/.test(raw)) return null;
+  return path.resolve(cwd, raw);
+}
+
+function stripStaticGrouping(text) {
+  let out = String(text ?? "").trim();
+  while (out.startsWith("(") || out.startsWith("{")) out = out.slice(1).trimStart();
+  while (out.endsWith(")") || out.endsWith("}")) out = out.slice(0, -1).trimEnd();
+  return out;
+}
+
+function applyWrapperEffects(analysis, shellCwd, env) {
+  let cwd = shellCwd;
+  for (const effect of analysis.effects || []) {
+    if (effect.kind === "chroot") {
+      return { proven: false, cwd, reason: `${effect.wrapper} chroot changes host path semantics` };
+    }
+    if (effect.kind === "split-string") {
+      return { proven: false, cwd, reason: `${effect.wrapper} split-string command cannot be resolved safely` };
+    }
+    if (effect.kind !== "chdir") continue;
+    const resolved = staticShellPath(effect.value, cwd, env);
+    if (!resolved) {
+      return { proven: false, cwd, reason: `could not resolve ${effect.wrapper} chdir ${effect.value || "(missing path)"}` };
+    }
+    cwd = resolved;
+  }
+  return { proven: true, cwd };
+}
+
+const NESTED_SHELLS = new Set(["sh", "bash", "dash", "ksh", "zsh"]);
+
+function exactGitPushCandidate(toks) {
+  for (let i = 0; i < toks.length; i++) {
+    if (commandBasename(toks[i]) !== "git") continue;
+    if (toks.slice(i + 1).includes("push")) return i;
+  }
+  return -1;
+}
+
+// If a known argv wrapper has an option we do not understand, a later literal `git ... push`
+// remains plausibly executable. Do not silently classify it as "no push". Conversely, once wrapper
+// parsing reaches a definite non-Git command (`sudo echo "git push"`), later words are its argv and
+// must not trigger a denial. Explicit query modes (`command -v`, `xcrun --find`) are non-executing.
+function plausibleWrappedGitPush(toks) {
+  const analysis = scanGitCommand(toks);
+  if (analysis.index >= 0 || !analysis.wrapperSeen || analysis.nonExecuting) return false;
+  const candidate = analysis.candidateIndex ?? exactGitPushCandidate(toks);
+  if (candidate < 0) return false;
+  return analysis.uncertain === true;
+}
+
+function nestedShellPayload(toks) {
+  const analysis = scanGitCommand(toks);
+  if (analysis.index >= 0 || analysis.stopIndex < 0) return null;
+  const command = commandBasename(toks[analysis.stopIndex]);
+  if (command === "eval") {
+    const payload = toks.slice(analysis.stopIndex + 1).join(" ");
+    return payload ? { payload, analysis, command } : null;
+  }
+  if (!NESTED_SHELLS.has(command)) return null;
+  for (let i = analysis.stopIndex + 1; i < toks.length; i++) {
+    const option = toks[i];
+    if (option === "--") continue;
+    if (option === "-c" || (/^-[^-]+$/.test(option) && option.slice(1).includes("c"))) {
+      const payload = toks[i + 1];
+      return payload == null ? null : { payload, analysis, command };
+    }
+    if (!option.startsWith("-")) break;   // script path: its contents are not visible here
+    if (option === "-O" || option === "-o") i++; // common shell options with a separate value
+  }
+  return null;
+}
+
+function nativeTargetFromPushSegment(text, shellCwd, env) {
+  const toks = shellTokenize(text).filter(Boolean);
+  const analysis = scanGitCommand(toks);
+  const gitIndex = analysis.index;
+  if (gitIndex < 0) return { proven: false, reason: "could not identify the git invocation" };
+
+  const wrapperTarget = applyWrapperEffects(analysis, shellCwd, env);
+  if (!wrapperTarget.proven) return wrapperTarget;
+  let gitCwd = wrapperTarget.cwd;
+  let gitDir = null;
+  let workTree = null;
+
+  // Inline assignments (`GIT_DIR=/repo/.git git push`) and env's `-i`/`-u` options are applied in
+  // argv order. This matters for opposite forms such as `GIT_DIR=x env -i git push` (cleared) and
+  // `env -i GIT_DIR=x git push` (restored explicitly).
+  const assignments = { GIT_DIR: env.GIT_DIR, GIT_WORK_TREE: env.GIT_WORK_TREE };
+  const envEvents = (analysis.effects || [])
+    .filter((effect) => effect.kind === "clear-env" || effect.kind === "unset-env")
+    .map((effect) => ({ index: effect.index, effect }));
+  const assignmentEvents = [];
+  for (let index = 0; index < gitIndex; index++) {
+    const token = toks[index];
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(token);
+    if (match && (match[1] === "GIT_DIR" || match[1] === "GIT_WORK_TREE")) {
+      assignmentEvents.push({ index, name: match[1], value: match[2] });
+    }
+  }
+  for (const event of [...envEvents, ...assignmentEvents].sort((a, b) => a.index - b.index)) {
+    if (event.effect?.kind === "clear-env") {
+      assignments.GIT_DIR = undefined;
+      assignments.GIT_WORK_TREE = undefined;
+    } else if (event.effect?.kind === "unset-env") {
+      if (event.effect.value === "GIT_DIR" || event.effect.value === "GIT_WORK_TREE") assignments[event.effect.value] = undefined;
+    } else {
+      assignments[event.name] = event.value;
+    }
+  }
+
+  for (let i = gitIndex + 1; i < toks.length && toks[i] !== "push"; i++) {
+    const token = toks[i];
+    if (token === "-C") {
+      const next = toks[++i];
+      const resolved = staticShellPath(next, gitCwd, env);
+      if (!resolved) return { proven: false, reason: `could not resolve git -C ${next || "(missing path)"}` };
+      gitCwd = resolved;
+      continue;
+    }
+    if (token === "--git-dir" || token === "--work-tree") {
+      const next = toks[++i];
+      if (!next) return { proven: false, reason: `${token} has no path` };
+      if (token === "--git-dir") gitDir = next;
+      else workTree = next;
+      continue;
+    }
+    if (token.startsWith("--git-dir=")) gitDir = token.slice("--git-dir=".length);
+    else if (token.startsWith("--work-tree=")) workTree = token.slice("--work-tree=".length);
+    else if (token === "-c" || token === "--namespace" || token === "--exec-path" || token === "--super-prefix") i++;
+  }
+
+  gitDir ??= assignments.GIT_DIR || null;
+  workTree ??= assignments.GIT_WORK_TREE || null;
+  const resolvedGitDir = gitDir == null ? null : staticShellPath(gitDir, gitCwd, env);
+  if (gitDir != null && !resolvedGitDir) return { proven: false, reason: "GIT_DIR/--git-dir is dynamic" };
+  if (workTree != null && !staticShellPath(workTree, gitCwd, env)) {
+    return { proven: false, reason: "GIT_WORK_TREE/--work-tree is dynamic" };
+  }
+
+  // Hooks belong to the Git directory, not the work tree. A conventional /repo/.git can be fed to
+  // the installer as /repo (friendlier status/output); unusual and bare git dirs are valid cwd
+  // targets themselves and resolveGitHooksDir handles them correctly.
+  let target = resolvedGitDir || gitCwd;
+  if (resolvedGitDir && path.basename(resolvedGitDir) === ".git") target = path.dirname(resolvedGitDir);
+  return { proven: true, cwd: target };
+}
+
+export function resolveNativePushTarget(command, fallbackCwd, { env = process.env, nestedDepth = 0 } = {}) {
+  const segments = shellSegments(command);
+  let cwd = path.resolve(fallbackCwd);
+  const directoryStack = [];
+  let sawUnprovenDirectoryChange = null;
+  let subshellDepth = 0;
+  const scopedDirectoryChanges = [];
+  let conditionalDirectoryChain = false;
+
+  for (let index = 0; index < segments.length; index++) {
+    const rawSegment = String(segments[index].text ?? "").trim();
+    const leadingParens = /^\(+/.exec(rawSegment)?.[0].length || 0;
+    const trailingParens = /\)+$/.exec(rawSegment)?.[0].length || 0;
+    subshellDepth += leadingParens;
+    const segment = stripStaticGrouping(rawSegment);
+    const closeTrailingSubshells = () => {
+      if (trailingParens === 0) return;
+      const depthAfter = Math.max(0, subshellDepth - trailingParens);
+      if (scopedDirectoryChanges.some((depth) => depth > depthAfter)) {
+        sawUnprovenDirectoryChange ||= "directory change was confined to a closed subshell";
+      }
+      subshellDepth = depthAfter;
+    };
+
+    // A directory change that was itself conditional is useful only while the same && chain is
+    // intact. Once `;`, `||`, `&`, or a pipeline breaks that chain, Git may run even though the
+    // change never did (`false && cd /other; git push`). We cannot prove the cwd in that case.
+    if (conditionalDirectoryChain && segments[index].joiner !== "&&") {
+      sawUnprovenDirectoryChange ||= "conditional directory change may not have executed";
+    }
+    const preWords = shellTokenize(segment).filter(Boolean);
+    const envIndex = preWords.findIndex((token) => commandBasename(token) === "env");
+    if (envIndex >= 0) {
+      for (let i = envIndex + 1; i < preWords.length; i++) {
+        const token = preWords[i];
+        const payload = token === "-S" || token === "--split-string"
+          ? preWords[i + 1]
+          : (token.startsWith("--split-string=") ? token.slice("--split-string=".length) : null);
+        if (payload != null) {
+          const payloadResult = nestedDepth < 4
+            ? resolveNativePushTarget(payload, cwd, { env, nestedDepth: nestedDepth + 1 })
+            : { push: /(?:^|\s)(?:[^\s/]+\/)*git(?:\s|$)[\s\S]*\bpush\b/.test(payload) };
+          if (payloadResult.push) {
+            return { push: true, proven: false, reason: "env split-string command cannot be resolved safely", segmentText: payloadResult.segmentText || payload };
+          }
+        }
+      }
+    }
+
+    // A static `bash -c 'git … push'` or `eval 'git … push'` still exposes its exact command
+    // argument, so recurse through a small bounded number of literal nesting layers. A script path,
+    // alias, function, make target, or expansion does not expose its body and cannot be inferred
+    // here; those repos must already have the persistent native hook installed (documented below).
+    const nested = nestedShellPayload(preWords);
+    if (nested) {
+      const wrapperTarget = applyWrapperEffects(nested.analysis, cwd, env);
+      const nestedResult = nestedDepth < 4
+        ? resolveNativePushTarget(nested.payload, wrapperTarget.cwd, { env, nestedDepth: nestedDepth + 1 })
+        : { push: /(?:^|\s)(?:[^\s/]+\/)*git(?:\s|$)[\s\S]*\bpush\b/.test(nested.payload), proven: false, reason: "nested shell command exceeds the static resolution limit" };
+      if (nestedResult.push) {
+        if (sawUnprovenDirectoryChange) {
+          return { push: true, proven: false, reason: sawUnprovenDirectoryChange, segmentText: nestedResult.segmentText || nested.payload };
+        }
+        if (!wrapperTarget.proven) {
+          return { push: true, proven: false, reason: wrapperTarget.reason, segmentText: nestedResult.segmentText || nested.payload };
+        }
+        return nestedResult;
+      }
+    }
+    if (isGitPushSegment(segment)) {
+      if (sawUnprovenDirectoryChange) return { push: true, proven: false, reason: sawUnprovenDirectoryChange, segmentText: segment };
+      return { push: true, ...nativeTargetFromPushSegment(segment, cwd, env), segmentText: segment };
+    }
+    if (plausibleWrappedGitPush(preWords)) {
+      return {
+        push: true,
+        proven: false,
+        reason: "wrapper options make the git command position ambiguous",
+        segmentText: segment
+      };
+    }
+
+    const words = preWords;
+    const commandName = words[0];
+    if (commandName === "cd" || commandName === "pushd") {
+      const args = words.slice(1).filter((word) => word !== "--");
+      const stackSelector = commandName === "pushd" && args.length === 1 && /^[+-]\d+$/.test(args[0]);
+      const target = args.length === 1 && !stackSelector ? staticShellPath(args[0], cwd, env) : null;
+      const previousJoiner = segments[index].joiner;
+      const nextJoiner = segments[index + 1]?.joiner;
+      const nextSegment = stripStaticGrouping(segments[index + 1]?.text || "");
+      const nextIsPush = isGitPushSegment(nextSegment);
+
+      if (previousJoiner === "||" || previousJoiner === "|") {
+        sawUnprovenDirectoryChange ||= `${commandName} execution depends on prior shell control flow`;
+      } else if (previousJoiner === "&&") {
+        conditionalDirectoryChain = true;
+      }
+      if (nextJoiner === "&" || nextJoiner === "|") {
+        sawUnprovenDirectoryChange ||= `${commandName} runs in a background or pipeline scope`;
+      }
+
+      // The one provable failure branch is `cd target || git push`: if the push runs, cd failed and
+      // cwd is unchanged. With any intervening command, a later unconditional push could instead
+      // observe either cwd, so fail closed.
+      if (nextJoiner === "||") {
+        if (commandName !== "cd" || !nextIsPush) {
+          sawUnprovenDirectoryChange ||= `${commandName} success across || makes the later cwd ambiguous`;
+        }
+        closeTrailingSubshells();
+        continue;
+      }
+      if (!target) {
+        sawUnprovenDirectoryChange = `${commandName} target is dynamic or state-dependent`;
+        closeTrailingSubshells();
+        continue;
+      }
+      if (commandName === "pushd") directoryStack.push(cwd);
+      cwd = target;
+      if (subshellDepth > 0) scopedDirectoryChanges.push(subshellDepth);
+      closeTrailingSubshells();
+      continue;
+    }
+    if (commandName === "popd") {
+      if (segments[index].joiner === "||" || segments[index].joiner === "|" || segments[index + 1]?.joiner === "&" || segments[index + 1]?.joiner === "|") {
+        sawUnprovenDirectoryChange ||= "popd execution or scope is ambiguous";
+      } else if (segments[index].joiner === "&&") {
+        conditionalDirectoryChain = true;
+      }
+      if (words.length !== 1 || directoryStack.length === 0) {
+        sawUnprovenDirectoryChange = "popd target is state-dependent";
+      } else {
+        cwd = directoryStack.pop();
+      }
+    }
+
+    closeTrailingSubshells();
+  }
+  return { push: false, proven: true, cwd: commandCwd(command, fallbackCwd) };
 }
 
 // The first segment that is a real git push, or null. Also detects a subshell-wrapped push
@@ -563,6 +986,20 @@ export function buildPrompt(commits, diff) {
   return { system, user };
 }
 
+function bootstrapReviewedHead(command, input, env, isBenchDisabledImpl) {
+  // This must run from the production arming entrypoint as well as the explicitly-invoked legacy
+  // preflight. The Bash hook is the only lifecycle point guaranteed to run BEFORE `git commit`; if
+  // production merely installs the native pre-push hook, a first clean committed turn in a repo with
+  // no upstream has no earlier base and Stop incorrectly treats it as a no-op.
+  try {
+    const bootWs = workspaceRoot(commandCwd(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd()));
+    if (!isBenchDisabledImpl(bootWs) && !readReviewedHead(bootWs)) {
+      const [head, ok] = gitTry(["rev-parse", "HEAD"], bootWs);
+      if (ok && head.trim()) writeReviewedHead(bootWs, head.trim());
+    }
+  } catch { /* baseline bootstrap is best-effort — it must not affect the Git command */ }
+}
+
 export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   pushReviewImpl = defaultRunPushReview,
@@ -590,13 +1027,7 @@ export async function runMain({
   // already have advanced past it. Resolve the repo the command actually TOUCHES (cd + `git -C`),
   // not a stale input.cwd. Only WRITES when the marker is missing; best-effort, never affects the
   // git command itself.
-  try {
-    const bootWs = workspaceRoot(commandCwd(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd()));
-    if (!isBenchDisabledImpl(bootWs) && !readReviewedHead(bootWs)) {
-      const [head, ok] = gitTry(["rev-parse", "HEAD"], bootWs);
-      if (ok && head.trim()) writeReviewedHead(bootWs, head.trim());
-    }
-  } catch { /* baseline bootstrap is best-effort — must not affect the push gate */ }
+  bootstrapReviewedHead(command, input, env, isBenchDisabledImpl);
 
   // 1. Only act on a real `git push` (not help/dry-run, not another git command, not a quoted mention).
   const pushSeg = findPushSegment(command);
@@ -768,16 +1199,99 @@ export async function runMain({
   );
 }
 
+// Production entrypoint: install/refresh Git's authoritative native hook and otherwise stay out of
+// the way. The legacy shell-string preflight remains exported (and can be explicitly enabled) for a
+// degraded fallback when native hook installation is impossible, but it is no longer the security
+// boundary. This also fixes compound `git add && git commit --amend && git push`: Git invokes the
+// native hook after the amend, so reviewers see the commit that will actually leave.
+export async function runHookMain({
+  env = process.env,
+  input: inputOverride,
+  ensureNativeHookImpl = ensureNativePrePushHook,
+  ...legacyOptions
+} = {}) {
+  const input = inputOverride ?? readInput();
+  const command = String(input.tool_input?.command ?? "");
+  const baseCwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
+  const isBenchDisabledImpl = legacyOptions.isBenchDisabledImpl ?? defaultIsBenchDisabled;
+
+  // Production no longer runs the shell-string review, but it still owns the pre-command baseline
+  // needed by Stop. Do this before any commit/push can advance HEAD; the native Git hook runs too late
+  // to reconstruct where this task began.
+  bootstrapReviewedHead(command, input, env, isBenchDisabledImpl);
+
+  const pushSeg = findPushSegment(command);
+  const target = resolveNativePushTarget(command, baseCwd, { env });
+  const emitter = legacyOptions.emitter || createEmitter();
+  const bypassEnabled = (value) => ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
+  let nativeBypass = env.BENCH_NATIVE_PUSH_BYPASS;
+  const hasPotentialPush = !!pushSeg || target.push;
+  const pushTexts = [command, target.segmentText].filter((value, index, all) => value && all.indexOf(value) === index);
+  for (const text of pushTexts) {
+    for (const segment of shellSegments(text)) {
+      const tokens = shellTokenize(segment.text).filter(Boolean);
+      const analysis = scanGitCommand(tokens);
+      const boundary = analysis.candidateIndex >= 0
+        ? analysis.candidateIndex
+        : (analysis.stopIndex >= 0 ? analysis.stopIndex : tokens.length);
+      for (const token of tokens.slice(0, boundary)) {
+        const assignment = /^BENCH_NATIVE_PUSH_BYPASS=(.*)$/.exec(token);
+        if (assignment) nativeBypass = assignment[1];
+      }
+    }
+  }
+  // This bypass skips peerBench only; Git still runs every other pre-push hook in the chain.
+  if (hasPotentialPush && bypassEnabled(nativeBypass)) return;
+  // Git itself skips pre-push hooks for this explicit flag. Treat it as the documented deliberate
+  // all-hooks bypass here too; otherwise our repair message would recommend a flag that the
+  // bootstrap hook immediately denied before Git could honor it.
+  if (hasPotentialPush && pushTexts.some((text) => shellTokenize(text).includes("--no-verify"))) return;
+  if (target.push && !target.proven) {
+    emitter.emit(decisionPayload(
+      "deny",
+      `peerBench could not prove which repository this push targets (${target.reason || "dynamic shell context"}). Push blocked before bootstrap. Run peerbench setup inside the target repository or use a static cd/git -C/GIT_DIR path. For a deliberate one-off bypass, prefix the git command with BENCH_NATIVE_PUSH_BYPASS=1 to skip peerBench only; git push --no-verify skips all pre-push hooks.`,
+      "⛩ peerBench: push target is dynamic; native pre-push gate could not be armed."
+    ));
+    return;
+  }
+  const hookCwd = target.cwd;
+  let install;
+  try {
+    install = ensureNativeHookImpl(workspaceRoot(hookCwd));
+  } catch (error) {
+    install = { ok: false, installed: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+
+  const forceLegacy = ["1", "true", "yes", "on"].includes(String(env.BENCH_LEGACY_PUSH_PREFLIGHT || "").toLowerCase());
+  if (install?.ok && install?.installed && !forceLegacy) return;
+
+  if (forceLegacy) {
+    return runMain({ ...legacyOptions, emitter, env, input });
+  }
+
+  // An advisory shell-string review is not a substitute for the native gate. If installation is
+  // conflicted/unwritable, fail closed with a direct repair path instead of reviewing the wrong
+  // repository or the pre-mutation commit and then allowing the push.
+  if (target.push || pushSeg) {
+    const reason = install?.reason || "native hook installation failed";
+    emitter.emit(decisionPayload(
+      "deny",
+      `peerBench could not arm the authoritative native pre-push hook (${reason}). Push blocked. Run peerbench setup inside the target repository and resolve the reported hook conflict. For a deliberate one-off bypass, prefix the git command with BENCH_NATIVE_PUSH_BYPASS=1 to skip peerBench only; git push --no-verify skips all pre-push hooks.`,
+      `⛩ peerBench: native pre-push gate not armed (${reason}).`
+    ));
+  }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const emitter = createEmitter();
-  runMain({ emitter }).catch((error) => {
+  runHookMain({ emitter }).catch((error) => {
     // Top-level catch → fail closed. Only emit if runMain hasn't already decided — a 2nd stdout
     // line would be dropped by the harness (A4). Else log to stderr.
     const msg = error instanceof Error ? error.message : String(error);
     if (!emitter.hasEmitted()) {
       emitter.emit(decisionPayload(
         "deny",
-        `⛩ pre-push: hook errored (${msg}); push blocked so commits do not leave unreviewed. Retry, or run /bench:off if you intentionally need to bypass peerBench.`
+        `⛩ pre-push: hook errored (${msg}); push blocked so commits do not leave unreviewed. Retry, use BENCH_NATIVE_PUSH_BYPASS=1 git push to skip peerBench only, or use git push --no-verify to skip every hook.`
       ));
     } else {
       process.stderr.write(`⛩ pre-push: error after decision already emitted — ${msg}\n`);

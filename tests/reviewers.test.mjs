@@ -39,6 +39,9 @@ test("codex resolves to named CLI adapter", () => {
 });
 test("kimi adapter run still accepts the extended params and ignores cwd/env", async () => {
   const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: true, text: "ALLOW: ok" }) });
+  assert.equal(kimi.reviewIdentity.kind, "api");
+  assert.ok(kimi.reviewIdentity.model, "ALLOW cache identity carries the configured model");
+  assert.ok(kimi.reviewIdentity.baseURL, "ALLOW cache identity carries the configured endpoint");
   const res = await kimi.run({ system: "s", user: "u", cwd: "/tmp", env: {} });
   assert.equal(res.verdict, "ALLOW");
 });

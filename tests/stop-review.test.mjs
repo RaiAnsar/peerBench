@@ -3,7 +3,7 @@
 // All reviewer calls are injected so NO real API or Codex call happens.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,8 +12,8 @@ import path from "node:path";
 const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, resolveReviewBase, readReviewedHead, writeReviewedHead, readReviewedWorktree } from "../global-hooks/stop-review.mjs";
-import { normalizeSessionId, setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
+import { runMain, buildPrompt, resolveReviewBase, readReviewedHead, writeReviewedHead, readReviewedWorktree, captureGitSnapshot, reviewPromptChunks, acquireStopGateLock } from "../global-hooks/stop-review.mjs";
+import { normalizeSessionId, setBenchDisabled, workspaceStateDir, wsKey } from "../global-hooks/config-store.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "stop-review.mjs");
@@ -129,61 +129,407 @@ test("reviews even when stop_hook_active=true (decoupled from the shared Stop fl
 });
 
 // ---------------------------------------------------------------------------
-// Test: own consecutive-block cap → allows without reviewing after MAX_STOP_LOOPS
+// Test: own same-snapshot block cap → allows after 3, but changed code resets it
 // ---------------------------------------------------------------------------
 
-test("caps its own consecutive blocks → allows without reviewing once the cap is hit", async () => {
+test("caps its own unchanged snapshot at 3 automatic block cycles", async () => {
   const ws = freshRepo({ withChange: true });
-  fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
-  fs.writeFileSync(path.join(workspaceStateDir(ws), "stop-loop"), JSON.stringify({ count: 4, ts: Date.now() }));
-
-  let called = false;
-  const resolveReviewersImpl = () => { called = true; return [fakeReviewer("Kimi", "BLOCK")]; };
-
-  await runMain({
-    resolveReviewersImpl,
+  let calls = 0;
+  const reviewer = { name: "Kimi", async run() { calls += 1; return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: same bug", raw: "BLOCK: same bug" }; } };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
     writeTraceImpl: () => {},
     isBenchDisabledImpl: () => false,
     env: process.env,
-    input: { cwd: ws, stop_hook_active: false }
-  });
+    input: { cwd: ws, stop_hook_active: false },
+    blockHandler: async () => {}
+  };
 
-  assert.equal(called, false, "after MAX_STOP_LOOPS consecutive blocks the gate allows without reviewing (loop broken)");
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    await runMain(opts);
+    await runMain(opts);
+    await runMain(opts);   // same fourth snapshot is allowed without another reviewer call
+    await runMain(opts);   // exhausted marker persists; fifth+ Stops never restart the panel
+    await runMain(opts);
+  } finally { restore(); }
+
+  assert.equal(calls, 3, "the hard ceiling is exactly three reviewer blocks for one unchanged snapshot");
+  assert.match(lines.join(""), /automatic review ceiling reached after 3 blocked repair cycles/, "the fourth Stop explains the anti-loop pause");
+});
+
+test("unresolved coverage wakes at most 3 times, then remains a persistent UNREVIEWED advisory", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-coverage-loop-"));
+  process.env.BENCH_ROOT = root;
+  const big = path.join(ws, "oversized.js");
+  fs.writeFileSync(big, "export const base = 1;\n");
+  gitC(ws, "add", "oversized.js");
+  gitC(ws, "commit", "-qm", "add oversized fixture");
+  const oversized = Array.from({ length: 18_000 }, (_, i) => `export const value${i} = ${i};\n`).join("");
+  fs.writeFileSync(big, oversized);
+
+  let reviewerResolutions = 0;
+  let coverageBlocks = 0;
+  const emitted = [];
+  const opts = {
+    resolveReviewersImpl: () => {
+      reviewerResolutions += 1;
+      throw new Error("coverage failures must not depend on reviewer resolution");
+    },
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: "coverage-loop" },
+    emitter: { emit(payload) { emitted.push(payload); return true; } },
+    blockHandler: async ({ panel }) => {
+      coverageBlocks += 1;
+      assert.equal(panel.decision, "block");
+      assert.match(panel.findings, /bounded review limit/);
+    }
+  };
+
+  let reviewedHeadBeforeReset = "unset";
+  let reviewedWorktreeBeforeReset = "unset";
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) await runMain(opts);
+    reviewedHeadBeforeReset = readReviewedHead(ws);
+    reviewedWorktreeBeforeReset = readReviewedWorktree(ws, "coverage-loop");
+
+    // A real snapshot transition clears the persistent coverage ceiling. Restoring the exact old
+    // oversized bytes is then a fresh unreviewed edit and must wake again, not inherit the advisory.
+    fs.writeFileSync(big, "export const base = 1;\n");
+    await runMain(opts);
+    fs.writeFileSync(big, oversized);
+    await runMain(opts);
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(reviewerResolutions, 0, "incomplete evidence is handled before panel resolution and never mislabeled as a model review");
+  assert.equal(coverageBlocks, 4, "three wakes occur, then a changed-away-and-restored snapshot gets one fresh wake");
+  assert.equal(emitted.length, 2, "later unchanged Stops use a non-waking persistent advisory");
+  for (const payload of emitted) assert.match(payload.systemMessage, /UNREVIEWED \/ coverage incomplete/);
+  assert.equal(reviewedHeadBeforeReset, null, "the advisory never advances reviewed-head for unreviewed work");
+  assert.equal(reviewedWorktreeBeforeReset, null, "the advisory never writes a reviewed-worktree marker");
+});
+
+test("three blocked revisions cap automatic review even when every repair changes the snapshot", async () => {
+  const ws = freshRepo({ withChange: true });
+  let calls = 0;
+  const reviewer = { name: "Kimi", async run() { calls += 1; return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug" }; } };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws },
+    blockHandler: async () => {}
+  };
+
+  await runMain(opts);
+  await runMain(opts);
+  await runMain(opts);
+  fs.appendFileSync(path.join(ws, "changed.js"), "export const fixed = 2;\n");
+  const emitted = [];
+  await runMain({ ...opts, emitter: { emit(payload) { emitted.push(payload); return true; } } });
+
+  assert.equal(calls, 3, "changed revisions do not reset the hard task/session cycle ceiling");
+  assert.match(emitted[0]?.systemMessage || "", /automatic review ceiling reached after 3 blocked repair cycles/);
+});
+
+test("BENCH_STOP_CYCLE_RESET explicitly starts a fresh review cycle", async () => {
+  const ws = freshRepo({ withChange: true });
+  let calls = 0;
+  const reviewer = { name: "Kimi", async run() { calls += 1; return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug" }; } };
+  const common = {
+    resolveReviewersImpl: () => [reviewer], writeTraceImpl: () => {}, isBenchDisabledImpl: () => false,
+    input: { cwd: ws, session_id: "reset-test" }, blockHandler: async () => {}
+  };
+  await runMain({ ...common, env: process.env });
+  fs.appendFileSync(path.join(ws, "changed.js"), "// repair 1\n");
+  await runMain({ ...common, env: process.env });
+  fs.appendFileSync(path.join(ws, "changed.js"), "// repair 2\n");
+  await runMain({ ...common, env: process.env });
+  fs.appendFileSync(path.join(ws, "changed.js"), "// repair 3\n");
+  await runMain({ ...common, env: { ...process.env, BENCH_STOP_CYCLE_RESET: "1" } });
+  assert.equal(calls, 4, "the explicit one-shot reset permits a fresh automatic review");
+});
+
+test("an exported BENCH_STOP_CYCLE_RESET nonce cannot disable the three-cycle ceiling", async () => {
+  const ws = freshRepo({ withChange: true });
+  let calls = 0;
+  const reviewer = { name: "Kimi", async run() { calls += 1; return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug" }; } };
+  const common = {
+    resolveReviewersImpl: () => [reviewer], writeTraceImpl: () => {}, isBenchDisabledImpl: () => false,
+    input: { cwd: ws, session_id: "persistent-reset-test" }, blockHandler: async () => {},
+    env: { ...process.env, BENCH_STOP_CYCLE_RESET: "persistent-a" }
+  };
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    fs.appendFileSync(path.join(ws, "changed.js"), `// persistent repair ${attempt}\n`);
+    await runMain(common);
+  }
+  assert.equal(calls, 3, "the same inherited nonce resets once, then the hard ceiling applies");
+
+  const changedNonce = { ...common, env: { ...process.env, BENCH_STOP_CYCLE_RESET: "persistent-b" } };
+  fs.appendFileSync(path.join(ws, "changed.js"), "// explicitly reopen once\n");
+  await runMain(changedNonce);
+  assert.equal(calls, 4, "changing the nonce explicitly starts one fresh bounded cycle");
+});
+
+test("a clean transition resets the streak even if the exact old bytes are later restored", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-loop-clean-reset-"));
+  process.env.BENCH_ROOT = root;
+  let calls = 0;
+  const reviewer = { name: "Kimi", async run() { calls += 1; return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug" }; } };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws },
+    blockHandler: async () => {}
+  };
+
+  try {
+    await runMain(opts);
+    await runMain(opts);
+    await runMain(opts);
+    fs.unlinkSync(path.join(ws, "changed.js"));
+    await runMain(opts);   // clean no-op observes and resets the old streak
+    fs.writeFileSync(path.join(ws, "changed.js"), "export const x = 1;\n");
+    await runMain(opts);
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 4, "restoring old bytes after a clean state is reviewed as a fresh edit cycle");
 });
 
 test("same-project stop-loop cap is session-scoped", async () => {
   const ws = freshRepo({ withChange: true });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-loop-"));
   process.env.BENCH_ROOT = root;
-  const sessionA = normalizeSessionId("chat-A");
-  fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
-  fs.writeFileSync(path.join(workspaceStateDir(ws), `stop-loop.${sessionA}`), JSON.stringify({ count: 4, ts: Date.now() }));
-
-  let calledB = false;
-  let calledA = false;
+  let callsB = 0;
+  let callsA = 0;
+  const blockerA = { name: "Kimi", async run() { callsA += 1; return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug" }; } };
   const { restore } = captureEmit(() => {});
   try {
+    const optsA = {
+      resolveReviewersImpl: () => [blockerA],
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, session_id: "chat-A" },
+      blockHandler: async () => {}
+    };
+    await runMain(optsA);
+    await runMain(optsA);
+    await runMain(optsA);
     await runMain({
-      resolveReviewersImpl: () => { calledB = true; return [fakeReviewer("Kimi", "ALLOW")]; },
+      resolveReviewersImpl: () => [{ ...fakeReviewer("Kimi", "ALLOW"), async run() { callsB += 1; return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }; } }],
       writeTraceImpl: () => {},
       isBenchDisabledImpl: () => false,
       env: process.env,
       input: { cwd: ws, session_id: "chat-B" }
     });
-    await runMain({
-      resolveReviewersImpl: () => { calledA = true; return [fakeReviewer("Kimi", "ALLOW")]; },
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws, session_id: "chat-A" }
-    });
+    await runMain(optsA);   // chat A is capped; chat B's review did not clear A's loop state
   } finally {
     restore();
     process.env.BENCH_ROOT = TEMP_GCR;
   }
 
-  assert.equal(calledB, true, "chat B must not inherit chat A's exhausted stop-loop counter");
-  assert.equal(calledA, false, "chat A still honors its own exhausted stop-loop counter");
+  assert.equal(callsB, 1, "chat B must not inherit chat A's exhausted stop-loop counter");
+  assert.equal(callsA, 3, "chat A still honors its own exhausted stop-loop counter");
+});
+
+test("six parallel same-session BLOCK hooks deliver exactly three wakes", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-parallel-blocks-"));
+  process.env.BENCH_ROOT = root;
+  let reviewerCalls = 0;
+  let deliveredWakes = 0;
+  const reviewer = {
+    name: "Kimi",
+    async run() {
+      reviewerCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: concurrent bug", raw: "BLOCK: concurrent bug" };
+    }
+  };
+  const common = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: "parallel-blocks" },
+    emitter: { emit() { return true; } },
+    blockHandler: async () => { deliveredWakes += 1; }
+  };
+
+  try {
+    await Promise.all(Array.from({ length: 6 }, () => runMain(common)));
+    const marker = JSON.parse(fs.readFileSync(
+      path.join(workspaceStateDir(ws), `stop-loop.${normalizeSessionId("parallel-blocks")}`),
+      "utf8"
+    ));
+    assert.equal(marker.count, 3, "the durable counter and delivered wake count stay identical");
+    assert.equal(fs.existsSync(path.join(workspaceStateDir(ws), "stop-review.lock")), false, "the transaction lock is released");
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(reviewerCalls, 3, "only three BLOCK reviews are admitted across parallel processes");
+  assert.equal(deliveredWakes, 3, "the hard ceiling applies to delivered wakes, not racy file writes");
+});
+
+test("six parallel Stop processes also exit 2 exactly three times", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-parallel-processes-"));
+  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "sr-parallel-processes-"));
+  const wrapper = path.join(wrapperDir, "block.mjs");
+  fs.writeFileSync(wrapper, `
+import { runMain } from ${JSON.stringify(path.join(ROOT, "global-hooks", "stop-review.mjs"))};
+await runMain({
+  resolveReviewersImpl: () => [{
+    name: "Kimi",
+    async run() {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: process bug", raw: "BLOCK: process bug" };
+    }
+  }],
+  writeTraceImpl: () => {},
+  isBenchDisabledImpl: () => false,
+  env: process.env,
+  input: { cwd: ${JSON.stringify(ws)}, session_id: "parallel-processes" }
+});
+`);
+  const runChild = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [wrapper], {
+      env: { ...process.env, BENCH_ROOT: root },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+
+  const results = await Promise.all(Array.from({ length: 6 }, runChild));
+  assert.deepEqual(results.map((result) => result.status).sort(), [0, 0, 0, 2, 2, 2]);
+  for (const result of results.filter((entry) => entry.status === 2)) assert.match(result.stderr, /process bug/);
+  const marker = JSON.parse(fs.readFileSync(
+    path.join(root, "state", wsKey(ws), `stop-loop.${normalizeSessionId("parallel-processes")}`),
+    "utf8"
+  ));
+  assert.equal(marker.count, 3);
+});
+
+test("a concurrent BLOCK invalidates an earlier delayed ALLOW and cannot be de-duplicated away", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-allow-block-race-"));
+  process.env.BENCH_ROOT = root;
+  let releaseAllow;
+  let announceAllow;
+  const allowRelease = new Promise((resolve) => { releaseAllow = resolve; });
+  const allowEntered = new Promise((resolve) => { announceAllow = resolve; });
+  let blockCalls = 0;
+  let followupCalls = 0;
+  let followupMustSkip = false;
+  const followupReviewer = {
+    name: "Kimi",
+    async run() {
+      if (followupMustSkip) throw new Error("exact follow-up ALLOW should de-duplicate");
+      followupCalls += 1;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: fixed", raw: "ALLOW: fixed" };
+    }
+  };
+  const common = {
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: "allow-block-race" },
+    emitter: { emit() { return true; } }
+  };
+
+  try {
+    const delayedAllow = runMain({
+      ...common,
+      resolveReviewersImpl: () => [{
+        name: "Kimi",
+        async run() {
+          announceAllow();
+          await allowRelease;
+          return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: stale", raw: "ALLOW: stale" };
+        }
+      }]
+    });
+    await allowEntered;
+    const concurrentBlock = runMain({
+      ...common,
+      resolveReviewersImpl: () => [{
+        name: "Kimi",
+        async run() {
+          blockCalls += 1;
+          return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: authoritative", raw: "BLOCK: authoritative" };
+        }
+      }],
+      blockHandler: async () => {}
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(blockCalls, 0, "the second snapshot cannot review or commit while the first transaction is open");
+    releaseAllow();
+    await Promise.all([delayedAllow, concurrentBlock]);
+
+    assert.equal(blockCalls, 1);
+    assert.equal(readReviewedWorktree(ws, "allow-block-race"), null, "BLOCK invalidates the exact ALLOW marker");
+
+    await runMain({
+      ...common,
+      resolveReviewersImpl: () => [followupReviewer]
+    });
+    followupMustSkip = true;
+    await runMain({
+      ...common,
+      resolveReviewersImpl: () => [followupReviewer]
+    });
+  } finally {
+    releaseAllow?.();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(followupCalls, 1, "the unresolved BLOCK forces one later review before an exact ALLOW can be cached");
+});
+
+test("Stop transaction lock reclaims dead and stale owners", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-lock-recovery-"));
+  process.env.BENCH_ROOT = root;
+  const lockDir = path.join(workspaceStateDir(ws), "stop-review.lock");
+  const makeLock = (owner) => {
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, "owner.json"), `${JSON.stringify(owner)}\n`);
+  };
+
+  try {
+    makeLock({ schema: 1, pid: 99_999_999, token: "dead-owner", startedAt: Date.now(), heartbeatAt: Date.now() });
+    const releaseDead = await acquireStopGateLock(ws, { pollMs: 1 });
+    assert.notEqual(JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8")).token, "dead-owner");
+    releaseDead();
+
+    makeLock({ schema: 1, pid: process.pid, token: "stale-owner", startedAt: 100, heartbeatAt: 100 });
+    const releaseStale = await acquireStopGateLock(ws, { staleMs: 10, pollMs: 1, now: () => 1_000 });
+    assert.notEqual(JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8")).token, "stale-owner");
+    releaseStale();
+    assert.equal(fs.existsSync(lockDir), false);
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -294,6 +640,209 @@ test("dirty ALLOW snapshot is reviewed once, then skipped until the worktree cha
   assert.ok(marker, "ALLOW should persist a reviewed-worktree fingerprint");
 });
 
+test("unchanged committed+dirty ALLOW snapshot is not reviewed again after reviewed-head advances", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-commit-dirty-once-"));
+  process.env.BENCH_ROOT = root;
+  const initial = gitC(ws, "rev-parse", "HEAD").trim();
+  writeReviewedHead(ws, initial);
+  fs.writeFileSync(path.join(ws, "feature.js"), "export const committed = 1;\n");
+  gitC(ws, "add", "feature.js");
+  gitC(ws, "commit", "-qm", "feat: committed slice");
+  fs.appendFileSync(path.join(ws, "feature.js"), "export const stillDirty = 2;\n");
+  const head = gitC(ws, "rev-parse", "HEAD").trim();
+
+  let calls = 0;
+  let traces = 0;
+  const reviewer = {
+    name: "Kimi",
+    async run() {
+      calls += 1;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => { traces += 1; },
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, last_assistant_message: "committed then kept editing" }
+  };
+
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    assert.equal(readReviewedHead(ws), head, "first ALLOW advances the committed baseline");
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 1, "the unchanged dirty remainder is not re-reviewed just because the committed section disappeared");
+  assert.equal(traces, 1, "the duplicate Stop writes no second trace");
+  assert.equal(lines.length, 1, "only the first Stop emits ALLOW");
+});
+
+test("codex-only/no-eligible Stop panel advances the committed baseline once", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-no-eligible-once-"));
+  process.env.BENCH_ROOT = root;
+  const initial = gitC(ws, "rev-parse", "HEAD").trim();
+  writeReviewedHead(ws, initial);
+  fs.writeFileSync(path.join(ws, "committed.js"), "export const committed = true;\n");
+  gitC(ws, "add", "committed.js");
+  gitC(ws, "commit", "-qm", "feat: committed slice");
+  const head = gitC(ws, "rev-parse", "HEAD").trim();
+
+  const opts = {
+    resolveReviewersImpl: () => [],
+    writeTraceImpl: () => { throw new Error("no trace should be written without an eligible reviewer"); },
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: "codex-only" }
+  };
+  const { lines, restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    assert.equal(readReviewedHead(ws), head, "the explicit no-eligible-reviewer policy advances reviewed-head");
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(lines.length, 1, "later Stops do not repeat the same no-reviewer status for an already-seen commit");
+  assert.match(lines[0], /no non-Codex reviewers configured/);
+});
+
+test("untracked continuation chunks review changed content in the 21st file", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-untracked-full-id-"));
+  process.env.BENCH_ROOT = root;
+  for (let i = 0; i < 20; i++) fs.writeFileSync(path.join(ws, `${String(i).padStart(2, "0")}-filler.txt`), `filler-${i}`);
+  const omitted = path.join(ws, "zz-omitted-large.txt");
+  fs.writeFileSync(omitted, `${"Z".repeat(25_000)}TAIL-A`);
+
+  let calls = 0;
+  const prompts = [];
+  const reviewer = {
+    name: "Kimi",
+    async run({ user }) {
+      calls += 1;
+      prompts.push(user);
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, last_assistant_message: "untracked batch" }
+  };
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    fs.writeFileSync(omitted, `${"Z".repeat(25_000)}TAIL-B`);
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 6, "each snapshot gets two bounded chunk calls plus one bounded synthesis call");
+  assert.match(prompts[1], /TAIL-A/, "the initially omitted tail is actually reviewed in the first continuation");
+  assert.match(prompts[2], /TAIL-A/, "the first synthesis call receives the continuation evidence in one coherent context");
+  assert.match(prompts[4], /TAIL-B/, "the changed tail is actually reviewed in the second continuation");
+  assert.match(prompts[5], /TAIL-B/, "the second synthesis call receives the changed continuation evidence");
+  assert.notEqual(prompts[4], prompts[1], "a hidden-byte change changes reviewer evidence, not only a local fingerprint");
+});
+
+test("a BLOCK in any bounded continuation chunk wins after all chunks are inspected", async () => {
+  const seen = [];
+  const [result] = await reviewPromptChunks([{
+    name: "Kimi",
+    async run({ user }) {
+      seen.push(user);
+      return user.includes("late bug")
+        ? { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: late bug", raw: "BLOCK: late bug\n- concrete" }
+        : { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: first clean", raw: "ALLOW: first clean" };
+    }
+  }], [
+    { system: "review", user: "first chunk" },
+    { system: "review", user: "second chunk has late bug" },
+    { system: "review", user: "third chunk" }
+  ], { cwd: process.cwd(), env: process.env });
+
+  assert.equal(seen.length, 4, "all three chunks plus exactly one bounded synthesis call run");
+  assert.equal(result.verdict, "BLOCK");
+  assert.match(result.raw, /review chunk 2\/3[\s\S]*late bug/);
+  assert.match(result.raw, /review chunk 3\/3/, "later sibling chunks remain included in the combined evidence");
+  assert.match(result.raw, /cross-chunk synthesis/, "the final synthesis result is preserved in the combined evidence");
+});
+
+test("one bounded synthesis call can discover a relationship split across stateless chunk calls", async () => {
+  const calls = [];
+  const [result] = await reviewPromptChunks([{
+    name: "Kimi",
+    async run({ system, user }) {
+      calls.push({ system, user });
+      if (system.includes("final synthesis pass")) {
+        const related = user.includes("TRACKED_API_CHANGE") && user.includes("UNTRACKED_CALLSITE");
+        return related
+          ? { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: callsite violates changed API", raw: "BLOCK: callsite violates changed API" }
+          : { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: no relationship visible", raw: "ALLOW: no relationship visible" };
+      }
+      // These are deliberately stateless calls: neither individual chunk can see both sides.
+      assert.equal(user.includes("TRACKED_API_CHANGE") && user.includes("UNTRACKED_CALLSITE"), false);
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: chunk locally clean", raw: "ALLOW: chunk locally clean" };
+    }
+  }], [
+    buildPrompt("M api.js", "TRACKED_API_CHANGE", "", "", "", "", { chunkIndex: 0, chunkCount: 2 }),
+    buildPrompt("?? caller.js", "", "UNTRACKED_CALLSITE", "", "", "", { chunkIndex: 1, chunkCount: 2 })
+  ], { cwd: process.cwd(), env: process.env });
+
+  assert.equal(calls.length, 3, "two bounded chunk calls get exactly one synthesis call, never an unbounded loop");
+  assert.match(calls[2].user, /TRACKED_API_CHANGE/);
+  assert.match(calls[2].user, /UNTRACKED_CALLSITE/);
+  assert.ok(Buffer.byteLength(calls[2].user) <= 120_000, "synthesis evidence stays within its hard byte budget");
+  assert.equal(result.verdict, "BLOCK", "the cross-chunk defect is no longer falsely combined as ALLOW");
+});
+
+test("dirty ALLOW de-duplication is session-scoped", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-dedupe-"));
+  process.env.BENCH_ROOT = root;
+  let calls = 0;
+  const reviewer = {
+    name: "Kimi",
+    async run() {
+      calls += 1;
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
+    }
+  };
+  const common = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env
+  };
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({ ...common, input: { cwd: ws, session_id: "chat-A" } });
+    await runMain({ ...common, input: { cwd: ws, session_id: "chat-B" } });
+    await runMain({ ...common, input: { cwd: ws, session_id: "chat-A" } });
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 2, "chat B gets its own review while chat A still reuses only chat A's ALLOW");
+});
+
 test("dirty ALLOW snapshot is reviewed again after the worktree content changes", async () => {
   const ws = freshRepo({ withChange: true });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-change-"));
@@ -370,6 +919,38 @@ test("dirty ALLOW snapshot is reviewed again when the reviewer panel changes", a
 
   assert.equal(kimiCalls, 2, "the existing reviewer should run again when the panel changes");
   assert.equal(glmCalls, 1, "the newly-added reviewer must review the already-dirty snapshot");
+});
+
+test("dirty ALLOW cache invalidates when the same reviewer name changes model or endpoint", async () => {
+  const ws = freshRepo({ withChange: true });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-policy-"));
+  process.env.BENCH_ROOT = root;
+  let oldCalls = 0;
+  let newCalls = 0;
+  const oldReviewer = {
+    name: "Kimi", reviewIdentity: { kind: "api", model: "kimi-old", baseURL: "https://old.example/v1" },
+    async run() { oldCalls += 1; return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: old", raw: "ALLOW: old" }; }
+  };
+  const newReviewer = {
+    name: "Kimi", reviewIdentity: { kind: "api", model: "kimi-new", baseURL: "https://new.example/v1" },
+    async run() { newCalls += 1; return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: new", raw: "ALLOW: new" }; }
+  };
+  let current = oldReviewer;
+  const opts = {
+    resolveReviewersImpl: () => [current], writeTraceImpl: () => {}, isBenchDisabledImpl: () => false,
+    env: process.env, input: { cwd: ws, session_id: "policy-change" }
+  };
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    current = newReviewer;
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(oldCalls, 1);
+  assert.equal(newCalls, 1, "same-name model/endpoint change must not reuse the old ALLOW");
 });
 
 test("dirty BLOCK snapshot is not marked reviewed and repeats until fixed", async () => {
@@ -640,6 +1221,44 @@ await runMain({
   const { user } = JSON.parse(line);
   const occurrences = user.split("UNIQUE_STAGED_MARKER").length - 1;
   assert.equal(occurrences, 1, `staged hunk must appear exactly once (no duplication), saw ${occurrences}`);
+});
+
+test("streamed tracked snapshot cannot mistake a >64MiB diff for clean", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-large-diff-"));
+  process.env.BENCH_ROOT = root;
+  const big = path.join(ws, "large.txt");
+  fs.writeFileSync(big, "base\n");
+  gitC(ws, "add", "large.txt");
+  gitC(ws, "commit", "-qm", "add base file");
+  fs.writeFileSync(big, Buffer.alloc(66 * 1024 * 1024, 0x41));
+
+  try {
+    const snapshot = await captureGitSnapshot(["diff", "HEAD"], ws, { maxPromptBytes: 1024 });
+    assert.equal(snapshot.ok, true, "streaming succeeds where the old 64MiB execFile maxBuffer threw");
+    assert.ok(snapshot.totalBytes > 64 * 1024 * 1024, "the full diff was consumed into the identity hash");
+    assert.equal(snapshot.truncated, true);
+    assert.ok(Buffer.byteLength(snapshot.text) <= 1024, "only a bounded prefix is retained");
+
+    let reviewerCalls = 0;
+    let blockedPanel = null;
+    await runMain({
+      input: { cwd: ws, session_id: "large-diff" },
+      env: process.env,
+      isBenchDisabledImpl: () => false,
+      resolveReviewersImpl: () => [{
+        name: "Kimi",
+        async run() { reviewerCalls += 1; return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }; }
+      }],
+      writeTraceImpl: () => {},
+      blockHandler: async ({ panel }) => { blockedPanel = panel; }
+    });
+    assert.equal(reviewerCalls, 0, "incomplete bounded evidence is not sent to a model and mislabeled clean");
+    assert.equal(blockedPanel?.decision, "block", "oversized evidence fails closed visibly");
+    assert.match(blockedPanel?.findings || "", /above the 200000-byte bounded review limit/);
+  } finally {
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
 });
 
 // ---------------------------------------------------------------------------

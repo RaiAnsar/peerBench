@@ -9,6 +9,20 @@ import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { parseSeverity } from "./deep-review.mjs";
 import { execFileSync } from "node:child_process";
+import {
+  PLAN_REVIEW_POLICY_VERSION,
+  beginPlanReview,
+  completePlanReview,
+  planApprovalIdentity,
+  planCycleAdvisory,
+  readPlanCycle,
+  sha256,
+  truthy,
+  waitForPlanReview
+} from "./plan-gate-state.mjs";
+
+const HOOK_KIND = "exit-plan-mode";
+const PLAN_TARGET = "inline-plan";
 
 function workspaceRoot(cwd) {
   try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
@@ -43,6 +57,7 @@ function decisionPayload(permissionDecision, reason, systemMessage) {
 export function buildPrompt(plan) {
   return {
     system: "You are reviewing an implementation plan from ONLY the text provided. Do not assume filesystem access. " +
+      "Complete ONE exhaustive discovery pass before deciding, and never stop after the first blocker. Enumerate every verified independent blocking issue from that pass; group sibling manifestations under their shared root cause and do not impose a finding-count cap. " +
       "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>`. BLOCK only for issues that would cause wrong " +
       "behavior or significant rework if executed as written; otherwise ALLOW (minor notes may follow the first line). " +
       "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
@@ -67,6 +82,7 @@ export async function runMain({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
   isBenchDisabledImpl = defaultIsBenchDisabled,
+  env = process.env,
   input: inputOverride,
   emitter = createEmitter()
 } = {}) {
@@ -75,7 +91,7 @@ export async function runMain({
     emitter.emit(decisionPayload(permissionDecision, reason, systemMessage));
 
   const input = inputOverride ?? readInput();
-  const sessionKey = sessionKeyFromInput(input, process.env);
+  const sessionKey = sessionKeyFromInput(input, env);
 
   const plan = String(input.tool_input?.plan ?? "").trim();
   if (!plan) {
@@ -83,12 +99,108 @@ export async function runMain({
     return;
   }
 
-  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const cwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);              // git top-level — matches where /bench:off writes the marker + the stop/push gates
-  if (isBenchDisabledImpl(ws)) process.exit(0);    // bench layer disabled for this workspace
+  if (isBenchDisabledImpl(ws)) return;         // bench layer disabled for this workspace
+
+  let reviewers;
+  try { reviewers = resolveReviewersImpl({ env }); }
+  catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    decision("allow", `Plan panel unavailable (${msg}); plan allowed without review.`, `⛩ plan panel skipped: ${msg.slice(0, 250)}`);
+    return;
+  }
+  const approvalKey = planApprovalIdentity({
+    policy: PLAN_REVIEW_POLICY_VERSION,
+    hookKind: HOOK_KIND,
+    target: PLAN_TARGET,
+    contentDigest: sha256(plan),
+    reviewers
+  });
+  const emitCompleted = (completed) => {
+    const outcome = completed?.outcome;
+    const payload = completed?.payload || {};
+    if (outcome === "block") {
+      const detail = payload.detail || payload.summary || "(no details)";
+      const cycle = Number(payload.cycle) || 1;
+      decision(
+        "deny",
+        `[${payload.badge || "review✗"}] Exhaustive review pass found issues that must be fixed before this plan can be presented (automatic repair cycle ${cycle}/3):\n\n${detail}\n\n${payload.skipNotes?.length ? `${payload.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address ALL findings in one complete update, then call ExitPlanMode again.`,
+        `⛩ bench plan-review BLOCKED — cycle ${cycle}/3 [${payload.badge || "review✗"}]\n${String(detail).slice(0, 1200)}`
+      );
+      return true;
+    }
+    if (outcome === "advisory") {
+      const advisory = planCycleAdvisory(readPlanCycle(ws, sessionKey));
+      decision("allow", advisory, `⛩ bench plan-review: ${advisory.slice(0, 1800)}`);
+      return true;
+    }
+    if (outcome === "superseded") {
+      decision(
+        "deny",
+        "This plan review was superseded by a newer plan revision or reset before it could commit. Submit the current complete plan once more; no repair-cycle slot was consumed.",
+        "⛩ bench plan-review: stale review discarded; resubmit the current complete plan."
+      );
+      return true;
+    }
+    if (outcome === "fail-open") {
+      decision("allow", payload.reason || "Plan panel unavailable; plan allowed without review.", payload.systemMessage);
+      return true;
+    }
+    if (outcome === "allow") {
+      decision("allow", payload.reason || "Exact plan revision approved by the review panel.", payload.systemMessage);
+      return true;
+    }
+    return false;
+  };
+
+  let flight;
+  for (;;) {
+    flight = beginPlanReview(ws, sessionKey, {
+      hookKind: HOOK_KIND,
+      target: PLAN_TARGET,
+      identity: approvalKey,
+      refresh: truthy(env.BENCH_PLAN_REVIEW_REFRESH),
+      resetNonce: env.BENCH_PLAN_CYCLE_RESET,
+      sessionScoped: true
+    });
+    if (flight.role !== "follower") break;
+    const joined = await waitForPlanReview(ws, sessionKey, flight.flight);
+    if (joined.role === "retry") continue;
+    flight = joined;
+    break;
+  }
+
+  if (flight.role === "cached-allow") {
+    const remaining = readPlanCycle(ws, sessionKey);
+    if (remaining.exhausted) {
+      const advisory = planCycleAdvisory(remaining);
+      decision("allow", advisory, `⛩ bench plan-review: ${advisory.slice(0, 1800)}`);
+      return;
+    }
+    decision("allow", "Exact plan revision already approved by this reviewer/model/policy configuration.");
+    return;
+  }
+  if (flight.role === "exhausted") {
+    const advisory = planCycleAdvisory(flight.cycle.state);
+    decision("allow", advisory, `⛩ bench plan-review: ${advisory.slice(0, 1800)}`);
+    return;
+  }
+  if (flight.role === "completed") {
+    if (emitCompleted(flight.result)) return;
+    decision("allow", "Plan review completed without a reusable result; submit again to re-validate.");
+    return;
+  }
+  const reviewTicket = flight.ticket;
+
   const { system, user } = buildPrompt(plan);
 
-  const results = await Promise.all(resolveReviewersImpl().map((r) => r.run({ system, user, cwd: ws })));
+  const results = await Promise.all(reviewers.map(async (reviewer) => {
+    try { return await reviewer.run({ system, user, cwd: ws, env }); }
+    catch (error) {
+      return { name: reviewer.name || "reviewer", error: error instanceof Error ? error.message : String(error) };
+    }
+  }));
   // Severity-gate the plan gate: block only on HIGH+ findings; medium/low/none are advisory.
   const panel = combinePanel(results, { blockMinSeverity: "high" });
 
@@ -110,32 +222,48 @@ export async function runMain({
   }
 
   if (panel.decision === "fail-open") {
-    decision("allow", `[${panel.badge}] Review panel unavailable (${panel.summary}); plan allowed without review.`, `⛩ plan panel skipped [${panel.badge}]: ${panel.summary.slice(0, 200)}`);
+    const reason = `[${panel.badge}] Review panel unavailable (${panel.summary}); plan allowed without review.`;
+    const systemMessage = `⛩ plan panel skipped [${panel.badge}]: ${panel.summary.slice(0, 200)}`;
+    const completed = completePlanReview(ws, sessionKey, reviewTicket, {
+      status: "fail-open",
+      payload: { reason, systemMessage }
+    });
+    if (!emitCompleted(completed)) decision("allow", reason, systemMessage);
     return;
   }
 
   if (panel.decision === "block") {
     const detail = panel.findings || panel.summary || "(no details)";
-    decision(
-      "deny",
-      `[${panel.badge}] Review panel found issues that must be fixed before this plan can be presented:\n\n${detail}\n\n${panel.skipNotes.length ? `${panel.skipNotes.join(" | ")}\n\n` : ""}Revise the plan to address these findings, then call ExitPlanMode again.`,
-      // USER-VISIBLE: the block was previously silent (model-only), so a blocked plan churned unseen.
-      `⛩ bench plan-review BLOCKED [${panel.badge}]\n${detail.slice(0, 1200)}`
-    );
+    const completed = completePlanReview(ws, sessionKey, reviewTicket, {
+      status: "block",
+      badge: panel.badge,
+      findings: detail,
+      payload: {
+        badge: panel.badge,
+        detail,
+        summary: panel.summary,
+        skipNotes: panel.skipNotes
+      }
+    });
+    emitCompleted(completed);
     return;
   }
 
   // ALLOW — but if any sub-threshold BLOCKs were carried as advisories, surface them as a
   // note (they did NOT block: medium/low findings are advisory under severity-gating).
+  let allowReason;
+  let allowSystemMessage;
   if (panel.advisories && panel.advisories.length) {
-    decision(
-      "allow",
-      `[${panel.badge}] Review panel approved the plan (advisories below are NOT blocking). ${panel.summary}`,
-      `⛩ plan panel: ALLOW [${panel.badge}] — advisories (not blocking): ${panel.advisories.join(" · ").slice(0, 220)}`
-    );
-    return;
+    allowReason = `[${panel.badge}] Review panel approved the plan (advisories below are NOT blocking). ${panel.summary}`;
+    allowSystemMessage = `⛩ plan panel: ALLOW [${panel.badge}] — advisories (not blocking): ${panel.advisories.join(" · ").slice(0, 220)}`;
+  } else {
+    allowReason = `[${panel.badge}] Review panel approved the plan. ${panel.summary}`;
   }
-  decision("allow", `[${panel.badge}] Review panel approved the plan. ${panel.summary}`);
+  const completed = completePlanReview(ws, sessionKey, reviewTicket, {
+    status: "allow",
+    payload: { reason: allowReason, systemMessage: allowSystemMessage }
+  });
+  emitCompleted(completed);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

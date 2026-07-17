@@ -26,6 +26,8 @@ test("load-keys writes configured provider temperatures without printing secrets
   const saved = JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8"));
   assert.equal(saved.providers.kimi.temperature, 0.6);
   assert.equal(saved.providers.glm.temperature, 0.2);
+  assert.equal(fs.statSync(root).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(root, "companion.json")).mode & 0o777, 0o600);
 });
 
 test("load-keys REPLACES managed fields (drops a removed override) but PRESERVES unmanaged companion fields", () => {
@@ -51,4 +53,6 @@ test("load-keys REPLACES managed fields (drops a removed override) but PRESERVES
   assert.equal(kimi.timeoutMs, 999000, "timeoutMs preserved");
   assert.equal(kimi.concurrencyPerKey, 4, "concurrencyPerKey preserved");
   assert.deepEqual(kimi.headers, { "X-Custom": "keep-me" }, "custom companion headers preserved");
+  assert.equal(fs.statSync(root).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(root, "companion.json")).mode & 0o777, 0o600);
 });

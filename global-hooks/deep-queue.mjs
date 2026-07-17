@@ -5,10 +5,12 @@
 //
 //   <jobKey>.json            queued
 //   <jobKey>.claimed.<pid>   a runner is reviewing it
-//   <jobKey>.blocked         review found a HIGH block (DURABLE; {kind,specPath?,range?,contentKey,findings,firstBlockedTs})
+//   <jobKey>.blocked         review found a HIGH block, or retry exhaustion left the target visibly
+//                            unreviewed (DURABLE; advisoryOnly distinguishes the latter)
 //
 // jobKey == contentKey (a hash): deepKey(specPath,content) for spec, deepKey(`push:<range>`,headSha)
-// for push. There is NO delivery counter — a .blocked file is retired ONLY on content-change.
+// for push. Completed blocks carry a bounded wakeCount, but remain durable and are retired ONLY on
+// content-change; exhausting automatic delivery downgrades them to a visible non-waking advisory.
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";

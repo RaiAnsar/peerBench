@@ -24,6 +24,7 @@ import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mj
 import { shouldRewake } from "../global-hooks/deep-review.mjs";
 import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
 import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates, enableLegacyCodexStopGateForWorkspace, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
+import { ensureNativePrePushHook, nativePrePushStatus } from "../global-hooks/native-git-hook.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -253,6 +254,10 @@ async function main() {
     const settingsPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "settings.json");
     const codexHooksPath = path.join(os.homedir(), ".codex", "hooks.json");
     const codexPromptsDir = path.join(os.homedir(), ".codex", "prompts");
+    // Setup is an action, not merely a diagnostic: install or refresh the authoritative native
+    // dispatcher in the repository where the command was run, then report its verified status.
+    const nativeInstall = ensureNativePrePushHook(ws);
+    const nativePush = nativePrePushStatus(ws);
     // Report key status for the ACTIVE reviewers only, sourced the way the gates read them
     // (resolveConfig merges env + companion.json/.keys). CLI-backed reviewers (codex, grok) have NO
     // provider entry — they bill their own plans, so an API-key check would falsely report
@@ -268,6 +273,7 @@ async function main() {
       `Codex plugin: ${codexFound ? "found" : "not found"}`,
       ...keyLines,
       `Bench disabled: ${disabled ? "yes" : "no"}`,
+      `Git native pre-push: ${nativeInstall.ok && nativeInstall.installed && nativePush.installed ? `installed (authoritative exact-ref gate${nativeInstall.changed ? "; refreshed" : ""})` : `unhealthy${nativeInstall.reason || nativePush.reason ? ` (${nativeInstall.reason || nativePush.reason})` : ""}`}`,
       setupStatus(settingsPath, { pluginHooksPath: latestClaudeBenchPluginHooksPath() }),
       codexSetupStatus(codexHooksPath, { pluginHooksPath: latestCodexBenchPluginHooksPath() }),
       codexPromptStatus(codexPromptsDir),
@@ -607,9 +613,10 @@ export function gradeCommand(args, { recordImpl = recordGrade } = {}) {
   if (recorded.length) process.stdout.write(`Graded ${traceId}: ${recorded.join(", ")}${note ? ` — ${note}` : ""}\n`);
 }
 
-// The four gates, keyed by event + matcher + hook file (mirror deploy-global-hooks.mjs).
+// The six automatic hook registrations, keyed by event + matcher + hook file (mirror deploy-global-hooks.mjs).
 // matcher === undefined means the Stop hook MUST live in a matcher-less block.
 const SETUP_GATES = [
+  { event: "SessionStart", matcher: undefined, file: "native-session-start.mjs" },
   { event: "PreToolUse", matcher: "ExitPlanMode", file: "plan-review.mjs" },
   { event: "PostToolUse", matcher: "Write|Edit", file: "plan-file-review.mjs" },
   { event: "PreToolUse", matcher: "Bash", file: "pre-push-review.mjs" },
@@ -670,21 +677,27 @@ export function codexSetupStatus(hooksPath, { pluginHooksPath = null } = {}) {
   if (!settings && !pluginSettings) {
     return `Codex gate registration: unable to check (${hooksPath} unreadable or malformed; no installed bench@aiwithrai Codex hooks found).`;
   }
-  const settingsBlocks = Array.isArray(settings?.hooks?.Stop) ? settings.hooks.Stop : [];
-  const pluginBlocks = Array.isArray(pluginSettings?.hooks?.Stop) ? pluginSettings.hooks.Stop : [];
-  const has = (block) =>
-    Array.isArray(block.hooks) &&
-    block.hooks.some((h) => String((h && h.command) || "").includes("codex-stop-review.mjs"));
-  const correctSettings = settingsBlocks.some((b) => has(b) && !b.matcher);
-  const correctPlugin = pluginBlocks.some((b) => has(b) && !b.matcher);
-  const elsewhere = [...settingsBlocks, ...pluginBlocks].some((b) => has(b));
-  let state;
-  if (correctPlugin && correctSettings) state = "DUPLICATE (plugin + settings both active)";
-  else if (correctPlugin) state = "registered (plugin)";
-  else if (correctSettings) state = "registered (settings)";
-  else if (elsewhere) state = "MISREGISTERED (wrong matcher block)";
-  else state = "MISSING (not registered)";
-  return `Codex gate registration (plugin/~/.codex/hooks.json): Stop(matcher-less) → codex-stop-review.mjs: ${state}`;
+  const checks = [
+    { event: "SessionStart", file: "native-session-start.mjs" },
+    { event: "Stop", file: "codex-stop-review.mjs" }
+  ];
+  const lines = ["Codex gate registration (plugin/~/.codex/hooks.json):"];
+  for (const check of checks) {
+    const settingsBlocks = Array.isArray(settings?.hooks?.[check.event]) ? settings.hooks[check.event] : [];
+    const pluginBlocks = Array.isArray(pluginSettings?.hooks?.[check.event]) ? pluginSettings.hooks[check.event] : [];
+    const has = (block) => Array.isArray(block.hooks) && block.hooks.some((h) => String((h && h.command) || "").includes(check.file));
+    const correctSettings = settingsBlocks.some((b) => has(b) && !b.matcher);
+    const correctPlugin = pluginBlocks.some((b) => has(b) && !b.matcher);
+    const elsewhere = [...settingsBlocks, ...pluginBlocks].some((b) => has(b));
+    let state;
+    if (correctPlugin && correctSettings) state = "DUPLICATE (plugin + settings both active)";
+    else if (correctPlugin) state = "registered (plugin)";
+    else if (correctSettings) state = "registered (settings)";
+    else if (elsewhere) state = "MISREGISTERED (wrong matcher block)";
+    else state = "MISSING (not registered)";
+    lines.push(`  ${check.event}(matcher-less) → ${check.file}: ${state}`);
+  }
+  return lines.join("\n");
 }
 
 export function codexPromptStatus(promptsDir) {

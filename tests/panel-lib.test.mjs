@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { parseVerdict, combinePanel, untrackedBlock, runCodexReview, runCodexTask } from "../global-hooks/panel-lib.mjs";
+import { parseVerdict, combinePanel, untrackedBlock, untrackedSnapshot, runCodexReview, runCodexTask } from "../global-hooks/panel-lib.mjs";
 
 test("untrackedBlock embeds a real untracked file but NEVER follows a symlink out of the workspace", () => {
   const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-")));
@@ -16,6 +16,58 @@ test("untrackedBlock embeds a real untracked file but NEVER follows a symlink ou
   assert.match(out, /REAL_UNTRACKED_CONTENT/, "the real untracked file content is included");
   assert.doesNotMatch(out, /TOP_SECRET_SHOULD_NOT_LEAK/, "symlink target content must NOT leak");
   assert.match(out, /symlink skipped/, "the symlink is reported as skipped");
+});
+
+test("untrackedSnapshot fingerprints full content beyond prompt caps and all files beyond the first 20", () => {
+  const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-full-id-")));
+  execFileSync("git", ["init", "-q"], { cwd: ws });
+  const large = path.join(ws, "00-large.txt");
+  fs.writeFileSync(large, `${"A".repeat(25_000)}TAIL-A`);
+  for (let i = 1; i < 20; i++) fs.writeFileSync(path.join(ws, `${String(i).padStart(2, "0")}-filler.txt`), `filler-${i}`);
+  const omitted = path.join(ws, "zz-omitted.txt");
+  fs.writeFileSync(omitted, "OMITTED-A");
+
+  const first = untrackedSnapshot(ws);
+  assert.equal(first.coverageComplete, true);
+  assert.ok(first.reviewBlocks.length > 1, "large/many files are split into bounded review chunks");
+  assert.match(first.reviewBlocks.join("\n"), /TAIL-A/, "bytes beyond the first per-file segment are covered by a continuation chunk");
+  assert.match(first.reviewBlocks.join("\n"), /OMITTED-A/, "the 21st file is covered by a continuation chunk");
+
+  fs.writeFileSync(large, `${"A".repeat(25_000)}TAIL-B`);       // change only beyond the 20KB prompt cap
+  const beyondBytes = untrackedSnapshot(ws);
+  assert.match(beyondBytes.reviewBlocks.join("\n"), /TAIL-B/, "changed tail bytes enter a bounded review chunk");
+  assert.notEqual(beyondBytes.fingerprint, first.fingerprint, "full-file identity sees bytes beyond the prompt cap");
+
+  fs.writeFileSync(omitted, "OMITTED-B");                       // change only the 21st (omitted) file
+  const beyondFiles = untrackedSnapshot(ws);
+  assert.match(beyondFiles.reviewBlocks.join("\n"), /OMITTED-B/, "changed 21st-file bytes enter a bounded review chunk");
+  assert.notEqual(beyondFiles.fingerprint, beyondBytes.fingerprint, "identity covers every omitted untracked file");
+});
+
+test("untrackedSnapshot never hashes the content behind an outside-workspace symlink", () => {
+  const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-link-id-")));
+  execFileSync("git", ["init", "-q"], { cwd: ws });
+  const outside = path.join(os.tmpdir(), `ub-link-secret-${process.pid}-${Date.now()}.txt`);
+  fs.writeFileSync(outside, "OUTSIDE-SECRET-A");
+  fs.symlinkSync(outside, path.join(ws, "outside-link"));
+
+  const first = untrackedSnapshot(ws);
+  fs.writeFileSync(outside, "OUTSIDE-SECRET-B");
+  const second = untrackedSnapshot(ws);
+  assert.equal(second.fingerprint, first.fingerprint, "outside target content is not part of the workspace identity");
+  assert.doesNotMatch(second.block, /OUTSIDE-SECRET-[AB]/, "outside target content never enters the prompt");
+  assert.match(second.block, /NEW UNTRACKED SYMLINK/);
+});
+
+test("untrackedSnapshot fails coverage visibly instead of building unbounded prompts", () => {
+  const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-overflow-")));
+  execFileSync("git", ["init", "-q"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "too-large.txt"), "X".repeat(61));
+
+  const snapshot = untrackedSnapshot(ws, { maxFiles: 1, maxBytesEach: 10, maxReviewChunks: 3 });
+  assert.equal(snapshot.reviewBlocks.length, 3, "single prompts stay within the configured chunk ceiling");
+  assert.equal(snapshot.coverageComplete, false, "bytes beyond the ceiling cannot be mislabeled fully reviewed");
+  assert.match(snapshot.coverageReason, /exceeds 3 bounded chunk/);
 });
 
 test("parseVerdict extracts ALLOW/BLOCK/null", () => {

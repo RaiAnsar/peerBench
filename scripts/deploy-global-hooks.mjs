@@ -1,7 +1,133 @@
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
-import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { disableLegacyCodexStopGateStates, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
+import crypto from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+
+export function ensurePrivateBackupDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
+function lstatOrNull(target) {
+  try { return fs.lstatSync(target); }
+  catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function uniqueSibling(target, label) {
+  return path.join(path.dirname(target), `.${path.basename(target)}.${label}-${process.pid}-${crypto.randomUUID()}`);
+}
+
+export function capturePathState(target) {
+  const stat = lstatOrNull(target);
+  if (!stat) return { exists: false };
+  if (stat.isSymbolicLink()) {
+    return { exists: true, type: "symlink", linkTarget: fs.readlinkSync(target) };
+  }
+  if (!stat.isFile()) return { exists: true, type: stat.isDirectory() ? "directory" : "other" };
+  return {
+    exists: true,
+    type: "file",
+    mode: stat.mode & 0o777,
+    size: stat.size,
+    sha256: crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex")
+  };
+}
+
+export function pathStateMatches(target, expected) {
+  if (!expected || typeof expected !== "object") return false;
+  const actual = capturePathState(target);
+  if (Boolean(actual.exists) !== Boolean(expected.exists)) return false;
+  if (!actual.exists) return true;
+  if (actual.type !== expected.type) return false;
+  if (actual.type === "symlink") return actual.linkTarget === expected.linkTarget;
+  if (actual.type === "file") {
+    return actual.sha256 === expected.sha256
+      && (!Number.isInteger(expected.mode) || actual.mode === expected.mode);
+  }
+  return true;
+}
+
+function assertRegularJsonTarget(pathname, label) {
+  const stat = lstatOrNull(pathname);
+  if (!stat) return { exists: false };
+  if (stat.isSymbolicLink()) throw new Error(`${label} is a symlink; refusing to follow or overwrite ${pathname}`);
+  if (!stat.isFile()) throw new Error(`${label} is not a regular file: ${pathname}`);
+  return { exists: true, stat };
+}
+
+export function readJsonObjectStrict(pathname, { label = "JSON config", missing = {} } = {}) {
+  const state = assertRegularJsonTarget(pathname, label);
+  if (!state.exists) return missing;
+  let raw;
+  try { raw = fs.readFileSync(pathname, "utf8"); }
+  catch (error) { throw new Error(`${label} is unreadable at ${pathname}: ${error?.message || error}`); }
+  let value;
+  try { value = JSON.parse(raw); }
+  catch (error) { throw new Error(`${label} contains invalid JSON at ${pathname}: ${error?.message || error}`); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must contain a JSON object: ${pathname}`);
+  }
+  return value;
+}
+
+export function atomicWriteFile(pathname, data, { mode = null, rejectSymlink = false, label = "file" } = {}) {
+  const existing = lstatOrNull(pathname);
+  if (rejectSymlink && existing?.isSymbolicLink()) {
+    throw new Error(`${label} is a symlink; refusing to follow or overwrite ${pathname}`);
+  }
+  if (existing && !existing.isFile() && !existing.isSymbolicLink()) {
+    throw new Error(`${label} is not a regular file: ${pathname}`);
+  }
+  fs.mkdirSync(path.dirname(pathname), { recursive: true });
+  const tmp = uniqueSibling(pathname, "tmp");
+  try {
+    fs.writeFileSync(tmp, data, { mode: Number.isInteger(mode) ? mode : 0o600, flag: "wx" });
+    if (Number.isInteger(mode)) fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, pathname);
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+  }
+}
+
+function atomicCopyFile(source, destination, { mode = null } = {}) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const tmp = uniqueSibling(destination, "copy");
+  try {
+    fs.copyFileSync(source, tmp, fs.constants.COPYFILE_EXCL);
+    const effectiveMode = Number.isInteger(mode) ? mode : (fs.statSync(source).mode & 0o777);
+    fs.chmodSync(tmp, effectiveMode);
+    fs.renameSync(tmp, destination);
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+  }
+}
+
+function hardenBackupDirectories(root) {
+  let entries = [];
+  try {
+    fs.chmodSync(root, 0o700);
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    hardenBackupDirectories(path.join(root, entry.name));
+  }
+}
+
+function copySensitiveSnapshot(source, destination) {
+  const stat = lstatOrNull(source);
+  if (!stat?.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`refusing to snapshot non-regular or symlinked sensitive file: ${source}`);
+  }
+  ensurePrivateBackupDir(path.dirname(destination));
+  atomicCopyFile(source, destination, { mode: 0o600 });
+  fs.chmodSync(destination, 0o600);
+}
 
 // ONE-TIME data-dir migration: pre-rename installs kept reviewer config + traces under
 // 'grok-companion-shared'; move it to 'bench-shared' once. No-op on fresh installs or after
@@ -32,50 +158,153 @@ export function migrateDataDir({ base = path.join(os.homedir(), ".claude", "plug
 // Copy every global-hooks/*.mjs FLAT into dest; back up a differing pre-existing file once.
 export function deploy({ src, dest }) {
   fs.mkdirSync(dest, { recursive: true });
-  const copied = [], backedUp = [];
+  const destStat = lstatOrNull(dest);
+  if (!destStat?.isDirectory() || destStat.isSymbolicLink()) throw new Error(`hook destination is not a regular directory: ${dest}`);
+  const copied = [], backedUp = [], states = [];
   for (const f of fs.readdirSync(src).filter((f) => f.endsWith(".mjs"))) {
     const from = path.join(src, f), to = path.join(dest, f);
-    if (fs.existsSync(to)) {
+    const targetStat = lstatOrNull(to);
+    if (targetStat) {
       const bak = `${to}.pre-panel.bak`;
-      if (fs.readFileSync(to, "utf8") !== fs.readFileSync(from, "utf8") && !fs.existsSync(bak)) { fs.copyFileSync(to, bak); backedUp.push(f); }
+      if (targetStat.isFile() && !targetStat.isSymbolicLink()
+          && !fs.readFileSync(to).equals(fs.readFileSync(from))
+          && !lstatOrNull(bak)) {
+        atomicCopyFile(to, bak);
+        backedUp.push(f);
+      }
+      if (!targetStat.isFile() && !targetStat.isSymbolicLink()) {
+        throw new Error(`refusing to replace non-file hook target: ${to}`);
+      }
     }
-    fs.copyFileSync(from, to); copied.push(f);
+    atomicCopyFile(from, to);
+    copied.push(f);
+    states.push({ name: f, state: capturePathState(to) });
   }
-  return { copied, backedUp };
+  return { copied, backedUp, states };
 }
 
 // LAYER-3 BACKUP: snapshot the current live hooks + settings BEFORE we mutate them, so rollback.mjs can
 // restore exactly. Snapshot EVERY live *.mjs in hooksDir (not a hardcoded list, which silently missed
 // newly-added hooks like stop-review/pre-push-review — found by the bench's own hunt).
-export function snapshot({ hooksDir, settingsPath, backupDir }) {
-  fs.mkdirSync(backupDir, { recursive: true });
-  const files = [];
-  let live = [];
-  try { live = fs.readdirSync(hooksDir).filter((f) => f.endsWith(".mjs")); } catch { live = []; }
-  for (const f of live) {
-    const p = path.join(hooksDir, f);
-    try { fs.copyFileSync(p, path.join(backupDir, f)); files.push(f); } catch { /* skip unreadable */ }
-  }
-  let settingsBackedUp = false;
-  if (fs.existsSync(settingsPath)) { fs.copyFileSync(settingsPath, path.join(backupDir, "settings.json")); settingsBackedUp = true; }
-  return { files, settingsBackedUp, backupDir };
+export const ROLLBACK_METADATA_FILE = "install-metadata.json";
+
+export function writeRollbackMetadata({ backupDir, metadata }) {
+  ensurePrivateBackupDir(backupDir);
+  const target = path.join(backupDir, ROLLBACK_METADATA_FILE);
+  const tmp = `${target}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, `${JSON.stringify({ schemaVersion: 1, ...metadata }, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, target);
+  return target;
 }
 
-export function snapshotCodex({ hooksDir, hooksPath, backupDir }) {
-  fs.mkdirSync(backupDir, { recursive: true });
-  const files = [];
+function snapshotEntry({ target, backupPath, name = path.basename(target), sensitive = false }) {
+  const stat = lstatOrNull(target);
+  const entry = {
+    name,
+    target: path.resolve(target),
+    backupPath: path.resolve(backupPath),
+    existed: Boolean(stat),
+    type: null,
+    mode: null,
+    linkTarget: null
+  };
+  if (!stat) return entry;
+  if (stat.isSymbolicLink()) {
+    entry.type = "symlink";
+    entry.linkTarget = fs.readlinkSync(target);
+    return entry;
+  }
+  if (!stat.isFile()) throw new Error(`refusing to snapshot non-file target: ${target}`);
+  entry.type = "file";
+  entry.mode = stat.mode & 0o777;
+  entry.sha256 = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+  if (sensitive) copySensitiveSnapshot(target, backupPath);
+  else {
+    ensurePrivateBackupDir(path.dirname(backupPath));
+    atomicCopyFile(target, backupPath, { mode: 0o600 });
+  }
+  return entry;
+}
+
+export function snapshot({ hooksDir, settingsPath, backupDir, statuslinePath = null, fileNames = null }) {
+  ensurePrivateBackupDir(backupDir);
+  const files = [], entries = [];
   let live = [];
-  try { live = fs.readdirSync(hooksDir).filter((f) => f.endsWith(".mjs")); } catch { live = []; }
+  if (Array.isArray(fileNames)) live = [...new Set(fileNames)].filter((f) => typeof f === "string" && f === path.basename(f) && f.endsWith(".mjs"));
+  else try { live = fs.readdirSync(hooksDir).filter((f) => f.endsWith(".mjs")); } catch { live = []; }
   for (const f of live) {
     const p = path.join(hooksDir, f);
-    try { fs.copyFileSync(p, path.join(backupDir, f)); files.push(f); } catch { /* skip unreadable */ }
+    const entry = snapshotEntry({ target: p, backupPath: path.join(backupDir, f), name: f });
+    entries.push(entry);
+    if (entry.existed) files.push(f);
   }
-  let hooksJsonBackedUp = false;
-  if (fs.existsSync(hooksPath)) {
-    fs.copyFileSync(hooksPath, path.join(backupDir, "hooks.json"));
-    hooksJsonBackedUp = true;
+  const settingsEntry = snapshotEntry({
+    target: settingsPath,
+    backupPath: path.join(backupDir, "settings.json"),
+    name: "settings.json",
+    sensitive: true
+  });
+  const statuslineEntry = statuslinePath ? snapshotEntry({
+    target: statuslinePath,
+    backupPath: path.join(backupDir, "statusline-command.sh"),
+    name: "statusline-command.sh"
+  }) : null;
+  return {
+    files,
+    entries,
+    settingsEntry,
+    settingsBackedUp: settingsEntry.existed,
+    settingsMode: settingsEntry.mode,
+    statuslineEntry,
+    statuslineBackedUp: Boolean(statuslineEntry?.existed),
+    statuslineMode: statuslineEntry?.mode ?? null,
+    backupDir
+  };
+}
+
+export function snapshotCodex({ hooksDir, hooksPath, backupDir, promptsDir = null, promptNames = null, fileNames = null }) {
+  ensurePrivateBackupDir(backupDir);
+  const files = [], entries = [];
+  let live = [];
+  if (Array.isArray(fileNames)) live = [...new Set(fileNames)].filter((f) => typeof f === "string" && f === path.basename(f) && f.endsWith(".mjs"));
+  else try { live = fs.readdirSync(hooksDir).filter((f) => f.endsWith(".mjs")); } catch { live = []; }
+  for (const f of live) {
+    const p = path.join(hooksDir, f);
+    const entry = snapshotEntry({ target: p, backupPath: path.join(backupDir, f), name: f });
+    entries.push(entry);
+    if (entry.existed) files.push(f);
   }
-  return { files, hooksJsonBackedUp, backupDir };
+  const hooksJsonEntry = snapshotEntry({
+    target: hooksPath,
+    backupPath: path.join(backupDir, "hooks.json"),
+    name: "hooks.json",
+    sensitive: true
+  });
+  const promptFiles = [], promptEntries = [];
+  if (promptsDir) {
+    const livePrompts = Array.isArray(promptNames)
+      ? [...new Set(promptNames)].filter((f) => typeof f === "string" && f === path.basename(f) && f.endsWith(".md"))
+      : (() => { try { return fs.readdirSync(promptsDir).filter((f) => f.endsWith(".md")); } catch { return []; } })();
+    for (const f of livePrompts) {
+      const entry = snapshotEntry({
+        target: path.join(promptsDir, f),
+        backupPath: path.join(backupDir, "prompts", f),
+        name: f
+      });
+      promptEntries.push(entry);
+      if (entry.existed) promptFiles.push(f);
+    }
+  }
+  return {
+    files,
+    entries,
+    hooksJsonEntry,
+    hooksJsonBackedUp: hooksJsonEntry.existed,
+    hooksJsonMode: hooksJsonEntry.mode,
+    promptFiles,
+    promptEntries,
+    backupDir
+  };
 }
 
 const STATUSLINE_SESSION_LINE =
@@ -87,6 +316,9 @@ const STATUSLINE_SESSION_LINE =
 export function syncStatuslineSessionArg({
   statuslinePath = path.join(os.homedir(), ".claude", "statusline-command.sh")
 } = {}) {
+  const stat = lstatOrNull(statuslinePath);
+  if (stat?.isSymbolicLink()) throw new Error(`statusline is a symlink; refusing to follow or overwrite ${statuslinePath}`);
+  if (stat && !stat.isFile()) throw new Error(`statusline is not a regular file: ${statuslinePath}`);
   let text;
   try { text = fs.readFileSync(statuslinePath, "utf8"); }
   catch { return { statuslinePath, updated: false, reason: "missing" }; }
@@ -118,7 +350,11 @@ export function syncStatuslineSessionArg({
   }
   if (!replaced) return { statuslinePath, updated: false, reason: "could not patch segment command" };
 
-  fs.writeFileSync(statuslinePath, lines.join("\n"));
+  atomicWriteFile(statuslinePath, lines.join("\n"), {
+    mode: stat?.mode & 0o777,
+    rejectSymlink: true,
+    label: "statusline"
+  });
   return { statuslinePath, updated: true };
 }
 
@@ -132,6 +368,7 @@ const LEGACY_COMMANDS = [
   "codex-stop-gate-autoenable.mjs"
 ];
 const PEERBENCH_SETTINGS_HOOKS = [
+  "native-session-start.mjs",
   "plan-review.mjs",
   "plan-file-review.mjs",
   "pre-push-review.mjs",
@@ -139,7 +376,7 @@ const PEERBENCH_SETTINGS_HOOKS = [
   "stop-review.mjs",
   "deep-review-runner.mjs"
 ];
-const PEERBENCH_CODEX_HOOKS = ["codex-stop-review.mjs"];
+const PEERBENCH_CODEX_HOOKS = ["native-session-start.mjs", "codex-stop-review.mjs"];
 // Register our hook canonically AND de-dupe: remove any existing entries referencing this hook
 // FILE (matched by basename, so it catches ANY path form — $HOME, absolute, different quoting),
 // then add exactly one absolute-path entry. Idempotent + self-healing against duplicates.
@@ -150,7 +387,7 @@ function register(list, matcher, absCmd, extra = {}) {
   for (const b of list) {
     if (!Array.isArray(b.hooks)) continue;
     if (matcher !== undefined && b.matcher !== matcher) continue;   // matcher-scoped: only same-matcher blocks
-    b.hooks = b.hooks.filter((h) => !String(h.command || "").includes(base));
+    b.hooks = b.hooks.filter((h) => !commandReferencesHookFile(h.command, base));
   }
   const cmd = { type: "command", command: `node "${absCmd}"`, ...extra };
   if (matcher !== undefined) {
@@ -164,6 +401,11 @@ function register(list, matcher, absCmd, extra = {}) {
   }
 }
 
+function commandReferencesHookFile(command, basename) {
+  const escaped = String(basename).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^A-Za-z0-9_.-])${escaped}(?=$|[^A-Za-z0-9_./\\\\-])`).test(String(command || ""));
+}
+
 function removeHookCommands(settings, basenames) {
   let removedEntries = 0;
   settings.hooks = settings.hooks || {};
@@ -172,7 +414,7 @@ function removeHookCommands(settings, basenames) {
     for (const entry of settings.hooks[ev]) {
       if (!Array.isArray(entry.hooks)) continue;
       const before = entry.hooks.length;
-      entry.hooks = entry.hooks.filter((h) => !basenames.some((f) => String(h.command || "").includes(f)));
+      entry.hooks = entry.hooks.filter((h) => !basenames.some((f) => commandReferencesHookFile(h.command, f)));
       removedEntries += before - entry.hooks.length;
     }
     settings.hooks[ev] = settings.hooks[ev].filter((entry) => !Array.isArray(entry.hooks) || entry.hooks.length > 0);
@@ -180,27 +422,125 @@ function removeHookCommands(settings, basenames) {
   return removedEntries;
 }
 
+function ensureHooksObject(settings, label) {
+  if (settings.hooks === undefined) settings.hooks = {};
+  if (!settings.hooks || typeof settings.hooks !== "object" || Array.isArray(settings.hooks)) {
+    throw new Error(`${label} has an invalid hooks value; expected a JSON object`);
+  }
+  for (const [event, blocks] of Object.entries(settings.hooks)) {
+    if (!Array.isArray(blocks)) throw new Error(`${label} has an invalid hooks.${event} value; expected an array`);
+  }
+  return settings.hooks;
+}
+
+function writeJsonConfig(pathname, value, label) {
+  atomicWriteFile(pathname, `${JSON.stringify(value, null, 2)}\n`, {
+    mode: 0o600,
+    rejectSymlink: true,
+    label
+  });
+}
+
 export function removeClaudeSettingsPeerBenchHooks({ settingsPath }) {
-  let s = {};
-  try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch { s = {}; }
+  const s = readJsonObjectStrict(settingsPath, { label: "Claude settings" });
+  ensureHooksObject(s, "Claude settings");
   const removedEntries = removeHookCommands(s, [...PEERBENCH_SETTINGS_HOOKS, ...LEGACY_COMMANDS]);
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  fs.writeFileSync(settingsPath, `${JSON.stringify(s, null, 2)}\n`);
+  writeJsonConfig(settingsPath, s, "Claude settings");
   return { removedEntries, removedFiles: [], pluginManaged: true };
 }
 
 export function removeCodexSettingsPeerBenchHooks({ hooksPath }) {
-  let s = {};
-  try { s = JSON.parse(fs.readFileSync(hooksPath, "utf8")); } catch { s = {}; }
+  const s = readJsonObjectStrict(hooksPath, { label: "Codex hooks config" });
+  ensureHooksObject(s, "Codex hooks config");
   const removedEntries = removeHookCommands(s, PEERBENCH_CODEX_HOOKS);
-  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
-  fs.writeFileSync(hooksPath, `${JSON.stringify(s, null, 2)}\n`);
+  writeJsonConfig(hooksPath, s, "Codex hooks config");
   return { removedEntries, pluginManaged: true };
 }
 
 function readJson(pathname) {
   try { return JSON.parse(fs.readFileSync(pathname, "utf8")); }
   catch { return null; }
+}
+
+const PLUGIN_VERSION_FILES = [
+  ["package.json", "package.json"],
+  [".claude-plugin/plugin.json", "Claude manifest"],
+  [".codex-plugin/plugin.json", "Codex manifest"]
+];
+
+function pluginVersionDeclarations(root) {
+  const declarations = [];
+  for (const [relativePath, label] of PLUGIN_VERSION_FILES) {
+    const version = readJson(path.join(root, relativePath))?.version;
+    if (typeof version === "string" && version.trim()) {
+      declarations.push({ label, version: version.trim() });
+    }
+  }
+  return declarations;
+}
+
+function inferredPluginPlatform(pluginRoot) {
+  const resolved = path.resolve(pluginRoot);
+  if (resolved.includes(`${path.sep}.claude${path.sep}plugins${path.sep}cache${path.sep}`)) return "claude";
+  if (resolved.includes(`${path.sep}.codex${path.sep}plugins${path.sep}cache${path.sep}`)) return "codex";
+  return "plugin";
+}
+
+function pluginRefreshInstruction(platform) {
+  if (platform === "claude") {
+    return [
+      "Refresh it through Claude's plugin manager, then rerun setup:",
+      "  claude plugin remove bench@aiwithrai --keep-data -s user",
+      "  claude plugin install bench@aiwithrai"
+    ].join("\n");
+  }
+  if (platform === "codex") {
+    return [
+      "After publishing this checkout, refresh it through Codex's plugin manager:",
+      "  codex plugin marketplace upgrade aiwithrai",
+      "  codex plugin add bench@aiwithrai",
+      "Then fully restart Codex and rerun setup."
+    ].join("\n");
+  }
+  return "Reinstall bench@aiwithrai through its plugin manager, then rerun setup.";
+}
+
+// Plugin cache directories are immutable versioned installs. Overlaying a different checkout
+// version into one leaves the manager's cache identity/provenance stale, so refuse before copying
+// even if a previous unsafe overlay already rewrote the cached manifests.
+export function assertPluginCacheVersionMatch({ repoRoot, pluginRoot, platform = inferredPluginPlatform(pluginRoot) }) {
+  const checkoutDeclarations = pluginVersionDeclarations(repoRoot);
+  const checkoutVersions = [...new Set(checkoutDeclarations.map((entry) => entry.version))];
+  if (checkoutVersions.length !== 1) {
+    const detail = checkoutDeclarations.length
+      ? checkoutDeclarations.map((entry) => `${entry.label}=${entry.version}`).join(", ")
+      : "no version declarations found";
+    throw new Error(`peerBench checkout version is not coherent (${detail}); refusing to deploy plugin runtime.`);
+  }
+
+  const checkoutVersion = checkoutVersions[0];
+  const cacheDeclarations = pluginVersionDeclarations(pluginRoot);
+  const cacheMarker = platform === "claude"
+    ? `${path.sep}.claude${path.sep}plugins${path.sep}cache${path.sep}`
+    : platform === "codex"
+      ? `${path.sep}.codex${path.sep}plugins${path.sep}cache${path.sep}`
+      : null;
+  if (cacheMarker && path.resolve(pluginRoot).includes(cacheMarker)) {
+    cacheDeclarations.push({ label: "cache directory", version: path.basename(path.resolve(pluginRoot)) });
+  }
+  const mismatches = cacheDeclarations.filter((entry) => entry.version !== checkoutVersion);
+  if (cacheDeclarations.length === 0 || mismatches.length > 0) {
+    const cacheDetail = cacheDeclarations.length
+      ? cacheDeclarations.map((entry) => `${entry.label}=${entry.version}`).join(", ")
+      : "no cache version declarations found";
+    const label = platform === "claude" ? "Claude" : platform === "codex" ? "Codex" : "plugin";
+    throw new Error([
+      `peerBench ${label} plugin cache version mismatch: checkout=${checkoutVersion}; cache=${cacheDetail}.`,
+      `Refusing to overwrite ${path.resolve(pluginRoot)} in place.`,
+      pluginRefreshInstruction(platform)
+    ].join("\n"));
+  }
+  return { ok: true, platform, checkoutVersion, cacheVersion: checkoutVersion, pluginRoot: path.resolve(pluginRoot) };
 }
 
 export function latestClaudeBenchPluginRoot({
@@ -241,37 +581,218 @@ export function latestCodexBenchPluginRoot({
   return null;
 }
 
-export function deployPluginRuntime({ repoRoot, pluginRoot }) {
-  const copied = [];
+export function deployPluginRuntime({ repoRoot, pluginRoot, platform = inferredPluginPlatform(pluginRoot) }) {
+  assertPluginCacheVersionMatch({ repoRoot, pluginRoot, platform });
+  const pluginStat = lstatOrNull(pluginRoot);
+  if (pluginStat?.isSymbolicLink() || (pluginStat && !pluginStat.isDirectory())) {
+    throw new Error(`plugin cache root is not a regular directory: ${pluginRoot}`);
+  }
+  fs.mkdirSync(pluginRoot, { recursive: true });
+  const copied = [], removed = [];
   const copyDir = (rel) => {
     const from = path.join(repoRoot, rel);
-    if (!fs.existsSync(from)) return;
-    fs.cpSync(from, path.join(pluginRoot, rel), { recursive: true, force: true });
+    const target = path.join(pluginRoot, rel);
+    const fromStat = lstatOrNull(from);
+    if (!fromStat) {
+      if (lstatOrNull(target)) { fs.rmSync(target, { recursive: true, force: true }); removed.push(`${rel}/`); }
+      return;
+    }
+    if (!fromStat.isDirectory() || fromStat.isSymbolicLink()) throw new Error(`plugin runtime source is not a regular directory: ${from}`);
+    const staged = uniqueSibling(target, "stage");
+    const old = uniqueSibling(target, "old");
+    let movedOld = false, preserveOld = false;
+    try {
+      fs.cpSync(from, staged, { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true });
+      if (lstatOrNull(target)) { fs.renameSync(target, old); movedOld = true; }
+      fs.renameSync(staged, target);
+      if (movedOld) fs.rmSync(old, { recursive: true, force: true });
+    } catch (error) {
+      if (!lstatOrNull(target) && movedOld && lstatOrNull(old)) {
+        try { fs.renameSync(old, target); movedOld = false; }
+        catch { preserveOld = true; }
+      }
+      throw error;
+    } finally {
+      try { fs.rmSync(staged, { recursive: true, force: true }); } catch {}
+      if (!preserveOld) try { fs.rmSync(old, { recursive: true, force: true }); } catch {}
+    }
     copied.push(`${rel}/`);
   };
   const copyFile = (rel) => {
     const from = path.join(repoRoot, rel);
-    if (!fs.existsSync(from)) return;
-    fs.mkdirSync(path.dirname(path.join(pluginRoot, rel)), { recursive: true });
-    fs.copyFileSync(from, path.join(pluginRoot, rel));
+    const target = path.join(pluginRoot, rel);
+    const fromStat = lstatOrNull(from);
+    if (!fromStat) {
+      if (lstatOrNull(target)) { fs.rmSync(target, { recursive: true, force: true }); removed.push(rel); }
+      return;
+    }
+    if (!fromStat.isFile() || fromStat.isSymbolicLink()) throw new Error(`plugin runtime source is not a regular file: ${from}`);
+    atomicCopyFile(from, target);
     copied.push(rel);
   };
-  fs.mkdirSync(pluginRoot, { recursive: true });
-  for (const rel of ["global-hooks", "scripts", "hooks", "commands", "skills", "codex-prompts"]) copyDir(rel);
-  for (const rel of ["hooks.json", "package.json", "README.md", "LICENSE", ".claude-plugin/plugin.json", ".codex-plugin/plugin.json"]) copyFile(rel);
-  return { pluginRoot, copied };
+  for (const rel of PLUGIN_RUNTIME_DIRS) copyDir(rel);
+  for (const rel of PLUGIN_RUNTIME_FILES) copyFile(rel);
+  return { pluginRoot, copied, removed };
+}
+
+const PLUGIN_RUNTIME_DIRS = ["global-hooks", "scripts", "hooks", "commands", "skills", "codex-prompts"];
+const PLUGIN_RUNTIME_FILES = ["hooks.json", "package.json", "README.md", "LICENSE", ".claude-plugin/plugin.json", ".codex-plugin/plugin.json"];
+
+// Snapshot only paths deployPluginRuntime can mutate. This keeps rollback exact without copying
+// provider data, logs, or other plugin-cache state that peerBench does not own.
+export function snapshotPluginRuntime({ pluginRoot, backupDir, existedBefore = fs.existsSync(pluginRoot) }) {
+  if (!pluginRoot) return null;
+  const root = path.resolve(pluginRoot);
+  const rootStat = lstatOrNull(root);
+  if (rootStat?.isSymbolicLink() || (rootStat && !rootStat.isDirectory())) {
+    throw new Error(`plugin cache root is not a regular directory: ${root}`);
+  }
+  const contentDir = path.join(backupDir, "content");
+  const entries = [];
+  for (const rel of [...PLUGIN_RUNTIME_DIRS, ...PLUGIN_RUNTIME_FILES]) {
+    const source = path.join(root, rel);
+    const existed = Boolean(existedBefore && lstatOrNull(source));
+    entries.push({ rel, existed });
+    if (!existed) continue;
+    const destination = path.join(contentDir, rel);
+    ensurePrivateBackupDir(path.dirname(destination));
+    fs.cpSync(source, destination, { recursive: true, force: true, verbatimSymlinks: true });
+    if (fs.lstatSync(destination).isDirectory()) hardenBackupDirectories(destination);
+  }
+  ensurePrivateBackupDir(backupDir);
+  const manifestPath = path.join(backupDir, "manifest.json");
+  fs.writeFileSync(manifestPath, `${JSON.stringify({ schemaVersion: 1, pluginRoot: root, existedBefore, entries }, null, 2)}\n`, { mode: 0o600 });
+  return { pluginRoot: root, backupDir, existedBefore, manifestPath };
+}
+
+export function restorePluginRuntime({ backupDir }) {
+  let manifest;
+  try { manifest = JSON.parse(fs.readFileSync(path.join(backupDir, "manifest.json"), "utf8")); }
+  catch { return { ok: false, changed: false, reason: "plugin runtime snapshot is missing or invalid" }; }
+  if (!manifest?.pluginRoot || !Array.isArray(manifest.entries)) {
+    return { ok: false, changed: false, reason: "plugin runtime snapshot is incomplete" };
+  }
+  const pluginRoot = path.resolve(manifest.pluginRoot);
+  try {
+    for (const entry of manifest.entries) {
+      if (!entry?.existed || ![...PLUGIN_RUNTIME_DIRS, ...PLUGIN_RUNTIME_FILES].includes(entry.rel)) continue;
+      if (!lstatOrNull(path.join(backupDir, "content", entry.rel))) {
+        return { ok: false, changed: false, pluginRoot, reason: `plugin runtime backup is missing ${entry.rel}` };
+      }
+    }
+    if (manifest.existedBefore === false) {
+      for (const entry of manifest.entries) {
+        if (!entry || ![...PLUGIN_RUNTIME_DIRS, ...PLUGIN_RUNTIME_FILES].includes(entry.rel)) continue;
+        fs.rmSync(path.join(pluginRoot, entry.rel), { recursive: true, force: true });
+      }
+      try { fs.rmdirSync(pluginRoot); } catch { /* preserve any cache state not owned by deployPluginRuntime */ }
+      return { ok: true, changed: true, pluginRoot, removed: true };
+    }
+    for (const entry of manifest.entries) {
+      if (!entry || ![...PLUGIN_RUNTIME_DIRS, ...PLUGIN_RUNTIME_FILES].includes(entry.rel)) continue;
+      const target = path.join(pluginRoot, entry.rel);
+      fs.rmSync(target, { recursive: true, force: true });
+      if (entry.existed) {
+        const source = path.join(backupDir, "content", entry.rel);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.cpSync(source, target, { recursive: true, force: true, verbatimSymlinks: true });
+      }
+    }
+    return { ok: true, changed: true, pluginRoot, removed: false };
+  } catch (error) {
+    return { ok: false, changed: true, pluginRoot, reason: error?.message || String(error) };
+  }
+}
+
+export function isSensitivePluginCachePath(source) {
+  const name = path.basename(source).toLowerCase();
+  const explicitTemplate = /\.(?:example|sample|template|dist)$/.test(name);
+  if (explicitTemplate && (name.startsWith(".env") || name.startsWith(".keys"))) return false;
+  return name === ".keys"
+    || name.endsWith(".keys")
+    || name.startsWith(".keys")
+    || name === ".env"
+    || name.endsWith(".env")
+    || name.startsWith(".env")
+    || name.endsWith(".log")
+    || name === "resultsofhunt.txt";
+}
+
+// Claude's plugin CLI can remove and recreate an entire install root, not just the runtime paths
+// deployPluginRuntime owns. Snapshot the complete managed package for that destructive path while
+// deliberately excluding secret-like cache files that must never be propagated into backups.
+export function snapshotPluginInstallRoot({ pluginRoot, backupDir, existedBefore = fs.existsSync(pluginRoot) }) {
+  if (!pluginRoot) return null;
+  const root = path.resolve(pluginRoot);
+  const rootStat = lstatOrNull(root);
+  if (rootStat?.isSymbolicLink() || (rootStat && !rootStat.isDirectory())) {
+    throw new Error(`Claude plugin install root is not a regular directory: ${root}`);
+  }
+  const contentDir = path.join(backupDir, "content");
+  if (existedBefore) {
+    ensurePrivateBackupDir(path.dirname(contentDir));
+    fs.cpSync(root, contentDir, {
+      recursive: true,
+      force: true,
+      filter: (source) => !isSensitivePluginCachePath(source)
+    });
+    hardenBackupDirectories(contentDir);
+  }
+  ensurePrivateBackupDir(backupDir);
+  const manifestPath = path.join(backupDir, "manifest.json");
+  fs.writeFileSync(manifestPath, `${JSON.stringify({ schemaVersion: 1, pluginRoot: root, existedBefore }, null, 2)}\n`, { mode: 0o600 });
+  return { pluginRoot: root, backupDir, existedBefore, manifestPath };
+}
+
+export function restorePluginInstallRoot({ backupDir, expectedPluginRoot = null }) {
+  let manifest;
+  try { manifest = JSON.parse(fs.readFileSync(path.join(backupDir, "manifest.json"), "utf8")); }
+  catch { return { ok: false, changed: false, reason: "plugin install snapshot is missing or invalid" }; }
+  if (!manifest?.pluginRoot || typeof manifest.existedBefore !== "boolean") {
+    return { ok: false, changed: false, reason: "plugin install snapshot is incomplete" };
+  }
+  const pluginRoot = path.resolve(manifest.pluginRoot);
+  if (expectedPluginRoot && pluginRoot !== path.resolve(expectedPluginRoot)) {
+    return { ok: false, changed: false, reason: "plugin install snapshot target does not match metadata" };
+  }
+  const cacheMarker = `${path.sep}.claude${path.sep}plugins${path.sep}cache${path.sep}`;
+  if (!pluginRoot.includes(cacheMarker)) {
+    return { ok: false, changed: false, reason: "refusing to restore a plugin install outside the Claude cache" };
+  }
+  try {
+    const source = path.join(backupDir, "content");
+    if (manifest.existedBefore && !lstatOrNull(source)) {
+      return { ok: false, changed: false, reason: "plugin install backup content is missing" };
+    }
+    fs.rmSync(pluginRoot, { recursive: true, force: true });
+    if (manifest.existedBefore) {
+      fs.mkdirSync(path.dirname(pluginRoot), { recursive: true });
+      fs.cpSync(source, pluginRoot, { recursive: true, force: true, verbatimSymlinks: true });
+    }
+    return { ok: true, changed: true, pluginRoot, removed: !manifest.existedBefore };
+  } catch (error) {
+    return { ok: false, changed: true, pluginRoot, reason: error?.message || String(error) };
+  }
 }
 
 // Remove ONLY the matching legacy hook COMMANDS (not whole entries unless they become empty); register the new plan-*.mjs with ABSOLUTE paths.
 export function syncSettings({ hooksDir, settingsPath }) {
+  const s = readJsonObjectStrict(settingsPath, { label: "Claude settings" });
+  ensureHooksObject(s, "Claude settings");
   const removedFiles = [];
-  for (const f of LEGACY) { const p = path.join(hooksDir, f); if (fs.existsSync(p)) { fs.rmSync(p, { force: true }); removedFiles.push(f); } }
-  let s = {}; try { s = JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch { s = {}; }
-  s.hooks = s.hooks || {};
+  for (const f of LEGACY) {
+    const p = path.join(hooksDir, f);
+    if (lstatOrNull(p)) { fs.rmSync(p, { force: true }); removedFiles.push(f); }
+  }
+  s.hooks.SessionStart = Array.isArray(s.hooks.SessionStart) ? s.hooks.SessionStart : [];
   const removedEntries = removeHookCommands(s, LEGACY_COMMANDS);
   s.hooks.PreToolUse = s.hooks.PreToolUse || [];
   s.hooks.PostToolUse = s.hooks.PostToolUse || [];
   s.hooks.Stop = s.hooks.Stop || [];
+  register(s.hooks.SessionStart, undefined, path.join(hooksDir, "native-session-start.mjs"), {
+    timeout: 30,
+    statusMessage: "⛩ bench: arming native push gate…"
+  });
   // statusMessage → the gate is VISIBLE in the spinner while it runs (~30–60s panel), so it never
   // looks like "nothing happened". ABSOLUTE homedir paths (no ~).
   register(s.hooks.PreToolUse, "ExitPlanMode", path.join(hooksDir, "plan-review.mjs"), {
@@ -281,11 +802,11 @@ export function syncSettings({ hooksDir, settingsPath }) {
     statusMessage: "⛩ bench: reviewing plan/spec…"
   });
   register(s.hooks.PreToolUse, "Bash", path.join(hooksDir, "pre-push-review.mjs"), {
-    statusMessage: "⛩ bench: reviewing push…",
-    timeout: 1320,
+    statusMessage: "⛩ bench: arming native push gate…",
+    timeout: 30,
     // Perf: only spawn on git commands instead of EVERY Bash. The `if` permission rule checks
-    // subcommands and FAILS OPEN (runs the hook anyway) if it can't parse — so compound pushes
-    // like `cd x && git push` are still covered; we just stop spawning Node for `ls`/`npm`/etc.
+    // subcommands and FAILS OPEN (runs the hook anyway) if it can't parse. This hook only installs
+    // Git's native pre-push dispatcher; the actual review happens later from Git's exact ref tuples.
     if: "Bash(git *)"
   });
   // Pre-MERGE gate: a FAST, content-only, VISIBLE review of the incoming commits before a merge INTO a
@@ -315,28 +836,37 @@ export function syncSettings({ hooksDir, settingsPath }) {
     rewakeSummary: "⛩ bench deep review"
   });
   // Drop any blocks left empty by de-duping.
-  for (const ev of ["PreToolUse", "PostToolUse", "Stop"]) {
+  for (const ev of ["SessionStart", "PreToolUse", "PostToolUse", "Stop"]) {
     s.hooks[ev] = (s.hooks[ev] || []).filter((b) => !Array.isArray(b.hooks) || b.hooks.length > 0);
   }
-  fs.writeFileSync(settingsPath, `${JSON.stringify(s, null, 2)}\n`);
-  return { removedFiles, removedEntries };
+  writeJsonConfig(settingsPath, s, "Claude settings");
+  return { removedFiles, removedEntries, state: capturePathState(settingsPath) };
 }
 
 export function syncCodexHooks({
   hooksDir,
   hooksPath = path.join(os.homedir(), ".codex", "hooks.json")
 }) {
-  let s = {}; try { s = JSON.parse(fs.readFileSync(hooksPath, "utf8")); } catch { s = {}; }
-  s.hooks = s.hooks || {};
+  const s = readJsonObjectStrict(hooksPath, { label: "Codex hooks config" });
+  ensureHooksObject(s, "Codex hooks config");
+  s.hooks.SessionStart = Array.isArray(s.hooks.SessionStart) ? s.hooks.SessionStart : [];
   s.hooks.Stop = Array.isArray(s.hooks.Stop) ? s.hooks.Stop : [];
+  register(s.hooks.SessionStart, undefined, path.join(hooksDir, "native-session-start.mjs"), {
+    timeout: 30,
+    statusMessage: "⛩ bench: arming native push gate…"
+  });
   register(s.hooks.Stop, undefined, path.join(hooksDir, "codex-stop-review.mjs"), {
     timeout: 900,
     statusMessage: "⛩ bench: reviewing turn…"
   });
   s.hooks.Stop = s.hooks.Stop.filter((b) => !Array.isArray(b.hooks) || b.hooks.length > 0);
-  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
-  fs.writeFileSync(hooksPath, `${JSON.stringify(s, null, 2)}\n`);
-  return { hooksPath, stopHook: path.join(hooksDir, "codex-stop-review.mjs") };
+  writeJsonConfig(hooksPath, s, "Codex hooks config");
+  return {
+    hooksPath,
+    sessionStartHook: path.join(hooksDir, "native-session-start.mjs"),
+    stopHook: path.join(hooksDir, "codex-stop-review.mjs"),
+    state: capturePathState(hooksPath)
+  };
 }
 
 export function syncCodexPrompts({
@@ -346,21 +876,28 @@ export function syncCodexPrompts({
 }) {
   if (!benchRunnerPath) throw new Error("syncCodexPrompts requires benchRunnerPath");
   fs.mkdirSync(promptsDir, { recursive: true });
-  const copied = [], backedUp = [];
+  const promptDirStat = lstatOrNull(promptsDir);
+  if (!promptDirStat?.isDirectory() || promptDirStat.isSymbolicLink()) throw new Error(`Codex prompts destination is not a regular directory: ${promptsDir}`);
+  const copied = [], backedUp = [], states = [];
   let files = [];
   try { files = fs.readdirSync(srcDir).filter((f) => f.endsWith(".md")).sort(); } catch { files = []; }
   for (const f of files) {
     const from = path.join(srcDir, f);
     const to = path.join(promptsDir, f);
     const rendered = fs.readFileSync(from, "utf8").replaceAll("{{BENCH_RUNNER}}", benchRunnerPath);
-    if (fs.existsSync(to) && fs.readFileSync(to, "utf8") !== rendered) {
-      const bak = `${to}.pre-peerbench.bak`;
-      if (!fs.existsSync(bak)) { fs.copyFileSync(to, bak); backedUp.push(f); }
+    const targetStat = lstatOrNull(to);
+    if (targetStat && !targetStat.isFile() && !targetStat.isSymbolicLink()) {
+      throw new Error(`refusing to replace non-file Codex prompt target: ${to}`);
     }
-    fs.writeFileSync(to, rendered);
+    if (targetStat?.isFile() && !targetStat.isSymbolicLink() && fs.readFileSync(to, "utf8") !== rendered) {
+      const bak = `${to}.pre-peerbench.bak`;
+      if (!lstatOrNull(bak)) { atomicCopyFile(to, bak); backedUp.push(f); }
+    }
+    atomicWriteFile(to, rendered, { mode: 0o644, label: "Codex prompt" });
     copied.push(f);
+    states.push({ name: f, state: capturePathState(to) });
   }
-  return { promptsDir, copied, backedUp };
+  return { promptsDir, copied, backedUp, states };
 }
 
 function gitOrNull(args, cwd) {
@@ -393,38 +930,18 @@ export function compareLocalWithOrigin({ cwd, remote = "origin", branch } = {}) 
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const repoRoot = path.join(here, "..");
-  const hooksDir = path.join(os.homedir(), ".claude", "hooks");
-  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
-  const codexHooksDir = path.join(os.homedir(), ".codex", "hooks");
-  const codexHooksPath = path.join(os.homedir(), ".codex", "hooks.json");
-  const backupDir = path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared", `backup-${Date.now()}`);
-  const migrate = migrateDataDir();   // FIRST — before snapshot's backupDir can create bench-shared
-  const origin = compareLocalWithOrigin({ cwd: repoRoot });
-  const snap = snapshot({ hooksDir, settingsPath, backupDir });
-  const dep = deploy({ src: path.join(repoRoot, "global-hooks"), dest: hooksDir });
-  const claudePluginRoot = latestClaudeBenchPluginRoot();
-  const claudePluginDeploy = claudePluginRoot ? deployPluginRuntime({ repoRoot, pluginRoot: claudePluginRoot }) : null;
-  const sync = claudePluginRoot
-    ? removeClaudeSettingsPeerBenchHooks({ settingsPath })
-    : syncSettings({ hooksDir, settingsPath });
-  // Default: KEEP the Codex stop gate — and actively RESTORE any state a prior disable turned off
-  // (skip-only left those workspaces silently Codex-less — caught by Grok). Single-gate mode disables.
-  const legacyCodexGate = (process.env.BENCH_SINGLE_GATE === "1" || process.env.BENCH_SINGLE_GATE === "true")
-    ? disableLegacyCodexStopGateStates()
-    : { ...enableLegacyCodexStopGateStates(), kept: true };
-  const statusline = syncStatuslineSessionArg();
-  const codexSnapshot = snapshotCodex({ hooksDir: codexHooksDir, hooksPath: codexHooksPath, backupDir: path.join(backupDir, "codex") });
-  const codexDeploy = deploy({ src: path.join(repoRoot, "global-hooks"), dest: codexHooksDir });
-  const codexPluginRoot = latestCodexBenchPluginRoot();
-  const codexPluginDeploy = codexPluginRoot ? deployPluginRuntime({ repoRoot, pluginRoot: codexPluginRoot }) : null;
-  const codexSync = codexPluginRoot
-    ? removeCodexSettingsPeerBenchHooks({ hooksPath: codexHooksPath })
-    : syncCodexHooks({ hooksDir: codexHooksDir, hooksPath: codexHooksPath });
-  const codexPrompts = syncCodexPrompts({
-    srcDir: path.join(repoRoot, "codex-prompts"),
-    benchRunnerPath: path.join(here, "bench-runner.mjs")
+  // Keep the legacy entrypoint, but route it through the same all-or-nothing transaction as the
+  // supported installer. Use a child process rather than a top-level dynamic import: install.mjs
+  // statically imports this module, so awaiting that cycle can deadlock module evaluation.
+  const installScript = path.join(path.dirname(process.argv[1]), "install.mjs");
+  const child = spawnSync(process.execPath, [installScript, ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: process.env
   });
-  console.log(JSON.stringify({ origin, migrate, snapshot: snap, deploy: dep, pluginDeploy: claudePluginDeploy, sync, legacyCodexGate, statusline, codex: { snapshot: codexSnapshot, deploy: codexDeploy, pluginDeploy: codexPluginDeploy, sync: codexSync, prompts: codexPrompts } }, null, 2));
+  if (child.error) {
+    process.stderr.write(`${child.error.message || child.error}\n`);
+    process.exitCode = 1;
+  } else {
+    process.exitCode = Number.isInteger(child.status) ? child.status : 1;
+  }
 }

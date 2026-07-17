@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { huntPanel, buildHuntUser, HUNT_SYSTEM, parseSpecFindings } from "../global-hooks/hunt.mjs";
+import {
+  huntPanel, buildHuntUser, HUNT_SYSTEM, parseSpecFindings,
+  PUSH_REVIEW_SYSTEM, pushReviewPanel, specReviewPanel, deepReviewBudgetMs
+} from "../global-hooks/hunt.mjs";
 import { summarizeSpecReview, shouldRewake } from "../global-hooks/deep-review.mjs";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-hunt-"));
@@ -8,6 +11,42 @@ process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-hunt-"));
 test("buildHuntUser uses the seed when given, broad sweep otherwise", () => {
   assert.match(buildHuntUser("monitor never alerted"), /monitor never alerted/);
   assert.match(buildHuntUser(""), /broad bug-hunt sweep/);
+});
+
+test("push review prompt requires one exhaustive, grouped pass without dropping sibling paths", () => {
+  assert.match(PUSH_REVIEW_SYSTEM, /ONE exhaustive review pass/i);
+  assert.match(PUSH_REVIEW_SYSTEM, /never stop after finding the first blocker/i);
+  assert.match(PUSH_REVIEW_SYSTEM, /every verified blocking manifestation/i);
+  assert.match(PUSH_REVIEW_SYSTEM, /never omit an independent verified blocker/i);
+  assert.doesNotMatch(PUSH_REVIEW_SYSTEM, /at most 3/i);
+  assert.match(PUSH_REVIEW_SYSTEM, /every affected file\/path or execution path/i);
+});
+
+test("deep review budget resolves per call and rejects unusable env values", () => {
+  assert.equal(deepReviewBudgetMs({ BENCH_DEEP_REVIEW_BUDGET_MS: "4321" }), 4321);
+  assert.equal(deepReviewBudgetMs({ BENCH_DEEP_REVIEW_BUDGET_MS: "0" }), 10 * 60 * 1000);
+  assert.equal(deepReviewBudgetMs({ BENCH_DEEP_REVIEW_BUDGET_MS: "not-a-number" }), 10 * 60 * 1000);
+});
+
+test("push/spec deep panels accept direct budgets and read env defaults at call time", async () => {
+  const seen = [];
+  const huntPanelImpl = async (opts) => {
+    seen.push(opts);
+    return [{ name: "Codex", findings: "ALLOW: clean\nSEVERITY: none", error: null }];
+  };
+
+  const push = await pushReviewPanel({
+    cwd: process.cwd(), range: "base..head", content: "diff", budgetMs: 1234, huntPanelImpl
+  });
+  const spec = await specReviewPanel({
+    cwd: process.cwd(), filePath: "plan.md", content: "plan",
+    env: { BENCH_DEEP_REVIEW_BUDGET_MS: "5678" }, huntPanelImpl
+  });
+
+  assert.equal(seen[0].budgetMs, 1234, "explicit push budget wins");
+  assert.equal(seen[1].budgetMs, 5678, "spec budget is resolved from this call's env");
+  assert.equal(push[0].verdict, "ALLOW");
+  assert.equal(spec[0].verdict, "ALLOW");
 });
 test("huntPanel runs kimi+mimo agentically and returns findings", async () => {
   // companion.json in the temp root with kimi+mimo keys, reviewers kimi+mimo (no codex to avoid spawning real codex)

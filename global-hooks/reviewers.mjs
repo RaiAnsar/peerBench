@@ -20,7 +20,7 @@ export function latestCodexRoot() {
 }
 
 function codexAdapter() {
-  return { name: "codex", async run({ system, user, cwd, env = process.env }) {
+  return { name: "codex", reviewIdentity: { kind: "codex-cli" }, async run({ system, user, cwd, env = process.env }) {
     const codexRoot = latestCodexRoot();
     if (!codexRoot) return { name: "Codex", error: "codex plugin not found" };
     const codexEnv = { ...env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA || CODEX_DATA };
@@ -31,7 +31,7 @@ function codexAdapter() {
 // Grok Build CLI (local x.ai harness, plan-billed — no API key). Same shape as codexAdapter:
 // spawn headless, read-only (plan mode), parse the ALLOW/BLOCK verdict from stdout.
 function grokAdapter() {
-  return { name: "grok", async run({ system, user, cwd, env = process.env }) {
+  return { name: "grok", reviewIdentity: { kind: "grok-cli" }, async run({ system, user, cwd, env = process.env }) {
     return runGrokReview({ prompt: `${system}\n\n${user}`, cwd, env });
   } };
 }
@@ -64,6 +64,16 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
     const display = displayName(name);
     return {
       name,
+      // Non-secret cache identity for gates that remember an ALLOW. A reviewer name alone is not
+      // enough: changing the model or endpoint must invalidate an earlier decision for unchanged
+      // bytes. Keep credentials/headers out of this public metadata.
+      reviewIdentity: {
+        kind: "api",
+        model: p.model || "",
+        baseURL: p.baseURL || "",
+        thinking: p.thinking ?? null,
+        temperature: p.temperature ?? null
+      },
       async run({ system, user, cwd, env: runEnv }) {
         if (!p.apiKey) return { name: display, error: "no api key" };
         // Bound in-flight calls across ALL gate processes (z.ai per-key concurrency cap) so bursts

@@ -14,7 +14,8 @@ import path from "node:path";
 const TEMP_GCR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-")));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, cdTargetBeforePush, commandCwd, findPushSegment, isGitPushSegment, shellTokenize, parsePushCommand, resolvePushRange, launchPushReview, assistantContextFromInput } from "../global-hooks/pre-push-review.mjs";
+import { runMain, runHookMain, resolveNativePushTarget, buildPrompt, cdTargetBeforePush, commandCwd, findPushSegment, isGitPushSegment, shellTokenize, gitCommandIndex, parsePushCommand, resolvePushRange, launchPushReview, assistantContextFromInput } from "../global-hooks/pre-push-review.mjs";
+import { runMain as runStopMain } from "../global-hooks/stop-review.mjs";
 import { normalizeSessionId, setBenchDisabled, readReviewedHead, writeReviewedHead } from "../global-hooks/config-store.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
 import { listJobs } from "../global-hooks/deep-queue.mjs";
@@ -210,6 +211,54 @@ test("bootstrap: a non-push git command records the reviewed-head baseline when 
     input: { cwd: ws, tool_input: { command: "git add -A" } }
   });
   assert.equal(readReviewedHead(ws), head, "first git command sets the baseline to HEAD (pre-commit)");
+});
+
+test("production bootstrap: first clean committed turn without an upstream is still Stop-reviewed", async () => {
+  const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-no-upstream-")));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "base.txt"), "base\n");
+  execFileSync("git", ["add", "base.txt"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"], { cwd: ws });
+  const baseline = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ws, encoding: "utf8" }).trim();
+  assert.equal(readReviewedHead(ws), null);
+
+  let ensured = 0;
+  await runHookMain({
+    input: { cwd: ws, tool_input: { command: "git status --short" } },
+    env: process.env,
+    isBenchDisabledImpl: () => false,
+    ensureNativeHookImpl: () => { ensured++; return { ok: true, installed: true }; }
+  });
+  assert.equal(ensured, 1, "the production entrypoint handles the ordinary pre-commit Git command");
+  assert.equal(readReviewedHead(ws), baseline, "runHookMain records the pre-commit HEAD even without an upstream");
+
+  fs.writeFileSync(path.join(ws, "first-turn.js"), "export const firstTurn = true;\n");
+  execFileSync("git", ["add", "first-turn.js"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "first clean turn"], { cwd: ws });
+  let reviewCalls = 0;
+  let reviewedPrompt = "";
+  let output = null;
+  await runStopMain({
+    input: { cwd: ws, session_id: "no-upstream-first-turn" },
+    env: process.env,
+    agentName: "Codex",
+    isBenchDisabledImpl: () => false,
+    resolveReviewersImpl: () => [{
+      name: "Kimi",
+      reviewIdentity: { kind: "api", model: "test-kimi" },
+      async run({ user }) {
+        reviewCalls++;
+        reviewedPrompt = user;
+        return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: reviewed", raw: "ALLOW: reviewed\nSEVERITY: none" };
+      }
+    }],
+    writeTraceImpl: () => {},
+    emitter: { hasEmitted: () => output !== null, emit: (value) => { if (output === null) output = value; return true; } }
+  });
+  assert.equal(reviewCalls, 1, "a clean worktree does not hide the commit from the first Stop review");
+  assert.match(reviewedPrompt, /first-turn\.js/);
+  assert.match(reviewedPrompt, /export const firstTurn = true/);
+  assert.match(output?.systemMessage || "", /bench stop: ALLOW/);
 });
 
 test("bootstrap: does NOT overwrite an existing marker (preserves a cross-session unreviewed range)", async () => {
@@ -1102,6 +1151,460 @@ test("A4: entrypoint .catch routes a post-emit error to stderr, never a second s
   assert.equal(result.status, 0);
   const stdoutLines = result.stdout.split("\n").filter((l) => l.trim());
   assert.ok(stdoutLines.length <= 1, "no spurious stdout lines");
+});
+
+test("production Bash hook only arms the authoritative native gate; compound pre-push mutations are not reviewed early", async () => {
+  const { ws } = freshPushRepo();
+  let ensured = null;
+  let legacyReviewerCalls = 0;
+  await runHookMain({
+    input: { cwd: ws, tool_input: { command: "git add -A && git commit --amend --no-edit && git push origin main" } },
+    env: {},
+    ensureNativeHookImpl: (cwd) => { ensured = cwd; return { ok: true, installed: true }; },
+    pushReviewImpl: async (...args) => { legacyReviewerCalls++; return fakePushReview()(...args); },
+    exit: () => {}
+  });
+  assert.equal(fs.realpathSync.native(ensured), fs.realpathSync.native(ws));
+  assert.equal(legacyReviewerCalls, 0, "Git's post-amend native hook owns the review");
+});
+
+test("production Bash hook installs the native gate in the actual git -C push target", async () => {
+  const outer = freshPushRepo();
+  const target = freshPushRepo();
+  let ensured = null;
+  await runHookMain({
+    input: { cwd: outer.ws, tool_input: { command: `git -C ${JSON.stringify(target.ws)} push origin main` } },
+    env: {},
+    ensureNativeHookImpl: (cwd) => { ensured = cwd; return { ok: true, installed: true }; },
+    exit: () => {}
+  });
+  assert.equal(fs.realpathSync.native(ensured), fs.realpathSync.native(target.ws));
+});
+
+for (const [label, commandFor] of [
+  ["subshell cd", (target) => `(cd ${JSON.stringify(target)} && git push origin main)`],
+  ["pushd", (target) => `pushd ${JSON.stringify(target)} && git push origin main`],
+  ["GIT_DIR assignment", (target) => `GIT_DIR=${JSON.stringify(path.join(target, ".git"))} git push origin main`],
+  ["git-dir/work-tree options", (target) => `git --git-dir=${JSON.stringify(path.join(target, ".git"))} --work-tree=${JSON.stringify(target)} push origin main`]
+]) {
+  test(`production Bash hook installs in the actual ${label} push target`, async () => {
+    const outer = freshPushRepo();
+    const target = freshPushRepo();
+    let ensured = null;
+    const command = commandFor(target.ws);
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, true);
+    assert.equal(resolution.proven, true);
+    assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(target.ws));
+    await runHookMain({
+      input: { cwd: outer.ws, tool_input: { command } },
+      env: {},
+      ensureNativeHookImpl: (cwd) => { ensured = cwd; return { ok: true, installed: true }; }
+    });
+    assert.equal(fs.realpathSync.native(ensured), fs.realpathSync.native(target.ws));
+  });
+}
+
+for (const commandFor of [
+  (target) => `env -C ${JSON.stringify(target)} git push origin main`,
+  (target) => `/usr/bin/env --chdir=${JSON.stringify(target)} git push origin main`,
+  (target) => `env -C${target} git push origin main`,
+  (target) => `env -iC${target} git push origin main`,
+  (target) => `/usr/bin/git -C ${JSON.stringify(target)} push origin main`,
+  (target) => `xcrun git -C ${JSON.stringify(target)} push origin main`
+]) {
+  test(`production Bash hook installs in wrapper/absolute Git target: ${commandFor("TARGET")}`, async () => {
+    const outer = freshPushRepo();
+    const target = freshPushRepo();
+    let ensured = null;
+    const command = commandFor(target.ws);
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, true);
+    assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(target.ws));
+    await runHookMain({
+      input: { cwd: outer.ws, tool_input: { command } }, env: {},
+      ensureNativeHookImpl: (cwd) => { ensured = cwd; return { ok: true, installed: true }; }
+    });
+    assert.equal(fs.realpathSync.native(ensured), fs.realpathSync.native(target.ws));
+  });
+}
+
+test("sudo user option no longer hides a git -C push from the native armer", async () => {
+  const outer = freshPushRepo();
+  const target = freshPushRepo();
+  const command = `sudo -u root git -C ${JSON.stringify(target.ws)} push origin main`;
+  const tokens = shellTokenize(command);
+  assert.equal(gitCommandIndex(tokens), 3, "-u consumes root before the git command");
+  const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+  assert.equal(resolution.push, true);
+  assert.equal(resolution.proven, true);
+  assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(target.ws));
+
+  let ensured = null;
+  await runHookMain({
+    input: { cwd: outer.ws, tool_input: { command } },
+    env: {},
+    ensureNativeHookImpl: (cwd) => { ensured = cwd; return { ok: true, installed: true }; }
+  });
+  assert.equal(fs.realpathSync.native(ensured), fs.realpathSync.native(target.ws));
+});
+
+for (const [label, commandFor] of [
+  ["sudo long user + chdir", (target) => `sudo --user root --chdir ${JSON.stringify(target)} git push origin main`],
+  ["sudo attached user + chdir", (target) => `sudo -uroot -D${target} git push origin main`],
+  ["doas user", (target) => `doas -u root git -C ${JSON.stringify(target)} push origin main`],
+  ["xcrun sdk", (target) => `xcrun --sdk macosx git -C ${JSON.stringify(target)} push origin main`],
+  ["timeout signal", (target) => `timeout --signal TERM 30 git -C ${JSON.stringify(target)} push origin main`],
+  ["stdbuf output mode", (target) => `stdbuf -o L git -C ${JSON.stringify(target)} push origin main`],
+  ["legacy nice adjustment", (target) => `nice -10 git -C ${JSON.stringify(target)} push origin main`],
+  ["BSD time resource flag", (target) => `/usr/bin/time -l git -C ${JSON.stringify(target)} push origin main`]
+]) {
+  test(`native target parser consumes common wrapper value options: ${label}`, () => {
+    const outer = freshPushRepo();
+    const target = freshPushRepo();
+    const command = commandFor(target.ws);
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, true, command);
+    assert.equal(resolution.proven, true, command);
+    assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(target.ws), command);
+  });
+}
+
+test("sudo -D chdir composes with a relative git -C target", () => {
+  const outer = freshPushRepo();
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-sudo-chdir-"));
+  const target = path.join(parent, "nested");
+  fs.mkdirSync(target);
+  execFileSync("git", ["init", "-q"], { cwd: target });
+  const command = `sudo -D ${JSON.stringify(parent)} -u root git -C nested push origin main`;
+  const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+  assert.equal(resolution.push, true);
+  assert.equal(resolution.proven, true);
+  assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(target));
+});
+
+test("unknown wrapper arity with a plausible git push fails closed instead of returning push:false", async () => {
+  const outer = freshPushRepo();
+  const target = freshPushRepo();
+  const command = `sudo --future-value root git -C ${JSON.stringify(target.ws)} push origin main`;
+  assert.equal(gitCommandIndex(shellTokenize(command)), -1, "unknown option arity is not guessed");
+  const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+  assert.equal(resolution.push, true);
+  assert.equal(resolution.proven, false);
+  assert.match(resolution.reason, /wrapper options.*ambiguous/i);
+
+  let ensureCalls = 0;
+  let stdout = "";
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+  try {
+    await runHookMain({
+      input: { cwd: outer.ws, tool_input: { command } },
+      env: {},
+      ensureNativeHookImpl: () => { ensureCalls += 1; return { ok: true, installed: true }; }
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(ensureCalls, 0, "an ambiguous wrapper never arms the fallback cwd");
+  assert.equal(JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("documented bypasses still work when wrapper arity is intentionally unproven", async () => {
+  const outer = freshPushRepo();
+  for (const command of [
+    "BENCH_NATIVE_PUSH_BYPASS=1 sudo --future-value root git push origin main",
+    "sudo --future-value root git push --no-verify origin main"
+  ]) {
+    let ensureCalls = 0;
+    let stdout = "";
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+    try {
+      await runHookMain({
+        input: { cwd: outer.ws, tool_input: { command } },
+        env: {},
+        ensureNativeHookImpl: () => { ensureCalls += 1; return { ok: true, installed: true }; }
+      });
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    assert.equal(ensureCalls, 0, command);
+    assert.equal(stdout, "", `the explicit bypass stays quiet: ${command}`);
+  }
+});
+
+test("provable data commands containing quoted git-push text remain non-pushes", () => {
+  const outer = freshPushRepo();
+  for (const command of [
+    'echo "git push"',
+    'printf "%s\\n" "git push"',
+    'sudo echo "git push"',
+    'sudo cat git push',
+    'timeout 30 /bin/echo git push',
+    'env -i printf "%s\\n" "git push"',
+    'bash -c \'echo "git push"\'',
+    'command -v git push',
+    'xcrun --find git push',
+    'sudo --list git push',
+    'doas -C /tmp/doas.conf git push'
+  ]) {
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, false, command);
+  }
+});
+
+test("static nested shell/eval pushes resolve; script bodies remain intentionally opaque", () => {
+  const outer = freshPushRepo();
+  const target = freshPushRepo();
+  for (const command of [
+    `bash -c 'git -C ${target.ws} push origin main'`,
+    `sudo -u root sh -c 'git -C ${target.ws} push origin main'`,
+    `eval 'git -C ${target.ws} push origin main'`
+  ]) {
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, true, command);
+    assert.equal(resolution.proven, true, command);
+    assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(target.ws), command);
+  }
+  assert.equal(resolveNativePushTarget("bash release.sh", outer.ws, { env: {} }).push, false,
+    "a script path does not reveal whether its body pushes another repository");
+});
+
+test("README states the one-time setup requirement for pushes hidden in automation", () => {
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  assert.match(readme, /bash release\.sh/);
+  assert.match(readme, /alias\/function/);
+  assert.match(readme, /Run `\/bench:setup` once inside every repository/);
+  assert.match(readme, /does not claim universal interception/);
+});
+
+test("sudo chroot push is detected but never mapped to a guessed host path", () => {
+  const outer = freshPushRepo();
+  const resolution = resolveNativePushTarget("sudo -R /jail -u root git -C /repo push origin main", outer.ws, { env: {} });
+  assert.equal(resolution.push, true);
+  assert.equal(resolution.proven, false);
+  assert.match(resolution.reason, /chroot.*host path/i);
+});
+
+test("real macOS env attached -C forms and resolver agree on the target", () => {
+  const target = freshPushRepo();
+  for (const option of [`-C${target.ws}`, `-iC${target.ws}`]) {
+    const actual = spawnSync("/usr/bin/env", [option, "pwd"], { encoding: "utf8" });
+    assert.equal(actual.status, 0, actual.stderr);
+    assert.equal(fs.realpathSync.native(actual.stdout.trim()), fs.realpathSync.native(target.ws));
+  }
+});
+
+test("env split-string pushes fail closed instead of arming a guessed repo", () => {
+  const outer = freshPushRepo();
+  const target = freshPushRepo();
+  for (const command of [
+    `env -S ${JSON.stringify(`git -C ${target.ws} push origin main`)}`,
+    `/usr/bin/env --split-string=${JSON.stringify(`git -C ${target.ws} push origin main`)}`
+  ]) {
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, true);
+    assert.equal(resolution.proven, false);
+  }
+});
+
+test("env split-string echo text stays a non-push", () => {
+  const outer = freshPushRepo();
+  for (const command of [
+    `env -S ${JSON.stringify("echo git push")}`,
+    `/usr/bin/env --split-string=${JSON.stringify("printf '%s\\n' 'git push'")}`
+  ]) {
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, false, command);
+  }
+});
+
+test("env -i/-u apply to inherited GIT_DIR in argv order", () => {
+  const outer = freshPushRepo();
+  const inherited = freshPushRepo();
+  const target = freshPushRepo();
+  const inheritedGitDir = path.join(inherited.ws, ".git");
+
+  for (const command of [
+    `env -u GIT_DIR git -C ${JSON.stringify(target.ws)} push origin main`,
+    `GIT_DIR=${JSON.stringify(inheritedGitDir)} env -i git -C ${JSON.stringify(target.ws)} push origin main`
+  ]) {
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: { GIT_DIR: inheritedGitDir } });
+    assert.equal(resolution.push, true, command);
+    assert.equal(resolution.proven, true, command);
+    assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(target.ws), command);
+  }
+
+  const restored = resolveNativePushTarget(
+    `env -i GIT_DIR=${JSON.stringify(inheritedGitDir)} git push origin main`,
+    outer.ws,
+    { env: { GIT_DIR: path.join(target.ws, ".git") } }
+  );
+  assert.equal(restored.push, true);
+  assert.equal(restored.proven, true);
+  assert.equal(fs.realpathSync.native(restored.cwd), fs.realpathSync.native(inherited.ws));
+});
+
+test("sudo -C close-from is not mistaken for a cwd change", () => {
+  const outer = freshPushRepo();
+  const resolution = resolveNativePushTarget("sudo -C 5 git push origin main", outer.ws, { env: {} });
+  assert.equal(resolution.push, true);
+  assert.equal(fs.realpathSync.native(resolution.cwd), fs.realpathSync.native(outer.ws));
+});
+
+test("quoted or unquoted tilde push targets fail closed instead of arming the wrong repo", () => {
+  const outer = freshPushRepo();
+  for (const command of ['git -C "~/repo" push origin main', "git -C ~/repo push origin main"]) {
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: { HOME: outer.ws } });
+    assert.equal(resolution.push, true);
+    assert.equal(resolution.proven, false);
+  }
+});
+
+test("production Bash hook fails closed when a dynamic push target cannot be proved", async () => {
+  const outer = freshPushRepo();
+  let ensureCalls = 0;
+  let stdout = "";
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+  try {
+    await runHookMain({
+      input: { cwd: outer.ws, tool_input: { command: 'cd "$TARGET_REPO" && git push origin main' } },
+      env: { TARGET_REPO: outer.ws },
+      ensureNativeHookImpl: () => { ensureCalls++; return { ok: true, installed: true }; }
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(ensureCalls, 0, "must not arm input.cwd when the target depends on shell expansion");
+  const decision = JSON.parse(stdout.trim());
+  assert.equal(decision.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(decision.hookSpecificOutput.permissionDecisionReason, /could not prove which repository/i);
+  assert.match(decision.hookSpecificOutput.permissionDecisionReason, /peerbench setup/i);
+  assert.match(decision.hookSpecificOutput.permissionDecisionReason, /BENCH_NATIVE_PUSH_BYPASS=1/);
+  assert.match(decision.hookSpecificOutput.permissionDecisionReason, /--no-verify skips all pre-push hooks/);
+});
+
+test("production Bash hook fails closed for ambiguous directory-control execution and scope", async () => {
+  const outer = freshPushRepo();
+  const target = freshPushRepo();
+  const quotedTarget = JSON.stringify(target.ws);
+  const commands = [
+    `true || cd ${quotedTarget}; git push origin main`,
+    `false && cd ${quotedTarget}; git push origin main`,
+    `cd ${quotedTarget} & git push origin main`,
+    `(cd ${quotedTarget}); git push origin main`,
+    "pushd +1 && git push origin main"
+  ];
+
+  for (const command of commands) {
+    const resolution = resolveNativePushTarget(command, outer.ws, { env: {} });
+    assert.equal(resolution.push, true, command);
+    assert.equal(resolution.proven, false, `must not guess a cwd for: ${command}`);
+    let ensureCalls = 0;
+    let stdout = "";
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+    try {
+      await runHookMain({
+        input: { cwd: outer.ws, tool_input: { command } },
+        env: {},
+        ensureNativeHookImpl: () => { ensureCalls++; return { ok: true, installed: true }; }
+      });
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    assert.equal(ensureCalls, 0, `must not install in a guessed repo for: ${command}`);
+    assert.equal(JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision, "deny", command);
+  }
+});
+
+test("production Bash hook fails closed when the authoritative native hook cannot be installed", async () => {
+  const { ws } = freshPushRepo();
+  let calls = 0;
+  let stdout = "";
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+  try {
+    await runHookMain({
+      input: { cwd: ws, tool_input: { command: "git push origin main" } },
+      env: { BENCH_PUSH_GATE_MODE: "blocking" },
+      ensureNativeHookImpl: () => ({ ok: false, installed: false, reason: "custom hook conflict" }),
+      pushReviewImpl: async (...args) => { calls++; return fakePushReview()(...args); },
+      resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW")],
+      writeTraceImpl: () => {}, isBenchDisabledImpl: () => false, exit: () => {}
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(calls, 0, "advisory legacy review must not silently replace the native boundary");
+  const decision = JSON.parse(stdout.trim());
+  assert.equal(decision.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(decision.hookSpecificOutput.permissionDecisionReason, /custom hook conflict/);
+});
+
+test("git push --no-verify remains the explicit all-hooks bypass", async () => {
+  const { ws } = freshPushRepo();
+  let ensureCalls = 0;
+  let stdout = "";
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+  try {
+    await runHookMain({
+      input: { cwd: ws, tool_input: { command: "git push --no-verify origin main" } },
+      env: {},
+      ensureNativeHookImpl: () => { ensureCalls++; return { ok: false, installed: false, reason: "conflict" }; }
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(ensureCalls, 0);
+  assert.equal(stdout, "", "explicit all-hooks Git bypass should be a silent allow");
+});
+
+for (const [label, command, env] of [
+  ["inline assignment", "BENCH_NATIVE_PUSH_BYPASS=1 git push origin main", {}],
+  ["hook environment", "git push origin main", { BENCH_NATIVE_PUSH_BYPASS: "1" }]
+]) {
+  test(`BENCH_NATIVE_PUSH_BYPASS=1 (${label}) is the peerBench-only bootstrap bypass`, async () => {
+    const { ws } = freshPushRepo();
+    let ensureCalls = 0;
+    let stdout = "";
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+    try {
+      await runHookMain({
+        input: { cwd: ws, tool_input: { command } },
+        env,
+        ensureNativeHookImpl: () => { ensureCalls++; return { ok: false, installed: false, reason: "conflict" }; }
+      });
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    assert.equal(ensureCalls, 0);
+    assert.equal(stdout, "", "peerBench bypass should be a silent allow at bootstrap");
+  });
+}
+
+test("explicit BENCH_LEGACY_PUSH_PREFLIGHT opt-in retains the legacy fallback", async () => {
+  const { ws } = freshPushRepo();
+  let calls = 0;
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    await runHookMain({
+      input: { cwd: ws, tool_input: { command: "git push origin main" } },
+      env: { BENCH_LEGACY_PUSH_PREFLIGHT: "1", BENCH_PUSH_GATE_MODE: "blocking" },
+      ensureNativeHookImpl: () => ({ ok: false, installed: false, reason: "custom hook conflict" }),
+      pushReviewImpl: async (...args) => { calls++; return fakePushReview()(...args); },
+      resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW")],
+      writeTraceImpl: () => {}, isBenchDisabledImpl: () => false, exit: () => {}
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(calls, 1);
 });
 
 // ===========================================================================

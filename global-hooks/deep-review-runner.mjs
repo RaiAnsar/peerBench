@@ -4,12 +4,15 @@
 // RELIABLY, even when it has gone idle after its turn (exit 2 wakes an idle agent per the docs).
 //
 // Each turn end: recover orphaned claims → re-deliver pending .blocked jobs (retire ONLY on
-// content-change; wake within WAKE_WINDOW, else non-waking advisory, file KEPT) → claim ≤ CLAIM_LIMIT
+// content-change; wake at most MAX_BLOCK_WAKES, else non-waking advisory, file KEPT) → claim ≤ MAX_BATCH
 // queued jobs → run them CONCURRENTLY (errors requeue) → CLEAN delete / BLOCK persist-then-wake.
-// Crash-safe with NO delivery counter (see the spec). Fails OPEN everywhere.
+// Delivery/follow-up counters are persisted before a wake so crashes can shorten, never extend, the
+// automatic loop. Fails OPEN for the turn while keeping durable jobs/findings visible.
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput } from "./config-store.mjs";
+import path from "node:path";
+import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput, workspaceStateDir } from "./config-store.mjs";
 import { shouldRewake, deepKey } from "./deep-review.mjs";
 import { runSpecReview as defaultRunSpecReview, runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 import {
@@ -25,13 +28,16 @@ export const RUNNER_BUDGET_MS = 12 * 60 * 1000; // MUST match the deep-runner St
                                                 // another one near the end of this window gets the runner KILLED mid-claim —
                                                 // and with no later Stop, the orphaned claims sit unprocessed indefinitely
                                                 // (recovery only runs at the NEXT invocation). The drain loop therefore only
-                                                // starts a new batch when a worst-case batch still fits; deferred surplus
-                                                // forces a rewake (exit 2) so a next Stop is GUARANTEED to process it.
+                                                // starts a new batch when a worst-case batch still fits. Deferred surplus
+                                                // gets at most three continuation wakes, then waits durably for a natural Stop.
 export const WAKE_WINDOW_MS = 30 * 60 * 1000;   // re-WAKE a .blocked within this; after, downgrade to advisory (file kept)
 export const MAX_REVIEW_ATTEMPTS = 3;           // bound retries of a QUEUED job whose review keeps failing (git/transient).
-                                                // Safe to cap: a queued job has no completed finding, so dropping it after
-                                                // the cap loses no review RESULT (unlike a delivered .blocked, which is
-                                                // retired ONLY on content-change and never by count).
+                                                // At the cap the runner stops the exit-2 wake loop, but persists an
+                                                // advisory-only unavailable record until the target changes. The absence
+                                                // of a completed review must never be silently discarded.
+export const MAX_BLOCK_WAKES = 3;                // completed finding: at most three automatic deliveries per unchanged target
+export const MAX_RUNNER_FOLLOWUP_WAKES = 3;      // every deep-runner exit-2 combined: at most three automatic Stops per task/session
+export const RUNNER_FOLLOWUP_WINDOW_MS = 2 * 60 * 60 * 1000; // stale-marker cleanup only; durable work never ages out
 
 function workspaceRoot(cwd) {
   try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
@@ -69,13 +75,246 @@ function reflogHeadAt(ws, atMs) {
 // away (`show <traceId>`) even if the inline text is truncated — no manual dig through the state dir.
 const traceHint = (id) => (id ? `\n↳ full findings: /bench:show ${id}` : "");
 
+function targetLabel(job) {
+  return job?.specPath || job?.range || job?.kind || "unknown target";
+}
+
+function persistBlockedUpdate(ws, job, overrides = {}) {
+  const { _path, _jobKey, ...payload } = job;
+  return markBlocked(ws, _jobKey, { ...payload, ...overrides });
+}
+
+const followupFile = (ws, sessionKey) => path.join(
+  workspaceStateDir(ws),
+  sessionKey ? `deep-runner-followup.${sessionKey}` : "deep-runner-followup"
+);
+
+const DEEP_RUNNER_LEASE_STALE_MS = 30 * 60 * 1000;
+const DEEP_RUNNER_HANDOFF_WAIT_MS = 250;
+const DEEP_RUNNER_HANDOFF_POLL_MS = 10;
+
+function runnerScope(sessionKey) {
+  return String(sessionKey || "session-unscoped").replace(/[^a-zA-Z0-9._-]+/g, "-");
+}
+
+function runnerLeaseDir(ws, sessionKey) {
+  return path.join(workspaceStateDir(ws), "deep-runner-leases", `${runnerScope(sessionKey)}.lock`);
+}
+
+function runnerContentionFile(ws, sessionKey) {
+  return path.join(workspaceStateDir(ws), "deep-runner-contention", `${runnerScope(sessionKey)}.json`);
+}
+
+function readRunnerContentionEpoch(ws, sessionKey) {
+  try {
+    const value = JSON.parse(fs.readFileSync(runnerContentionFile(ws, sessionKey), "utf8"));
+    return `${Math.max(0, Number(value?.epoch) || 0)}:${String(value?.nonce || "")}`;
+  } catch {
+    return "0:";
+  }
+}
+
+// A contender cannot simply return while the owner is quiescing: a producer may have enqueued work
+// after the owner's last empty queue read. Publish a durable epoch so the owner re-drains. The nonce
+// keeps concurrent same-process writers observable even if both read the same prior numeric epoch.
+function publishRunnerContention(ws, sessionKey, now = Date.now()) {
+  const file = runnerContentionFile(ws, sessionKey);
+  let prior = 0;
+  try { prior = Math.max(0, Number(JSON.parse(fs.readFileSync(file, "utf8"))?.epoch) || 0); }
+  catch { /* first contention or a recoverable corrupt marker */ }
+  const marker = {
+    schema: 1,
+    epoch: prior + 1,
+    nonce: `${process.pid}-${now}-${Math.random().toString(16).slice(2)}`,
+    ts: now
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp.${marker.nonce}`;
+  fs.writeFileSync(tmp, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return `${marker.epoch}:${marker.nonce}`;
+}
+
+const handoffDelay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForRunnerLease(ws, sessionKey, {
+  waitMs = DEEP_RUNNER_HANDOFF_WAIT_MS,
+  pollMs = DEEP_RUNNER_HANDOFF_POLL_MS
+} = {}) {
+  const deadline = Date.now() + Math.max(0, Number(waitMs) || 0);
+  while (Date.now() < deadline) {
+    await handoffDelay(Math.max(1, Number(pollMs) || DEEP_RUNNER_HANDOFF_POLL_MS));
+    const release = acquireRunnerLease(ws, sessionKey);
+    if (release) return release;
+  }
+  return null;
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error?.code === "EPERM"; }
+}
+
+// One runner owns one workspace/session at a time. Queue claims alone do not serialize the global
+// wake counter or per-block wakeCount updates; without this lease, parallel Stop hooks can each read
+// count N, both deliver, and both persist N+1. A contender records an epoch so the owner re-drains at
+// quiescence; it also briefly retries acquisition to cover the final epoch-check/lease-release gap.
+// Dead owners are recoverable immediately.
+function acquireRunnerLease(ws, sessionKey, now = Date.now()) {
+  const lock = runnerLeaseDir(ws, sessionKey);
+  const ownerFile = path.join(lock, "owner.json");
+  fs.mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const nonce = `${process.pid}-${now}-${Math.random().toString(16).slice(2)}`;
+    let created = false;
+    try {
+      fs.mkdirSync(lock, { mode: 0o700 });
+      created = true;
+      fs.writeFileSync(ownerFile, `${JSON.stringify({ schema: 1, pid: process.pid, nonce, ts: now })}\n`, { mode: 0o600 });
+      return () => {
+        try {
+          const owner = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+          if (owner?.nonce !== nonce) return;
+          fs.rmSync(lock, { recursive: true, force: true });
+        } catch { /* owner already released/replaced */ }
+      };
+    } catch (error) {
+      if (created) {
+        try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* failed lease never becomes authoritative */ }
+      }
+      if (error?.code !== "EEXIST") throw error;
+      let owner = null, age = 0;
+      try { owner = JSON.parse(fs.readFileSync(ownerFile, "utf8")); } catch { /* incomplete owner */ }
+      try { age = Math.max(0, now - fs.statSync(lock).mtimeMs); } catch { age = DEEP_RUNNER_LEASE_STALE_MS + 1; }
+      const dead = owner?.pid ? !processIsAlive(Number(owner.pid)) : false;
+      const stale = age > DEEP_RUNNER_LEASE_STALE_MS;
+      if (dead || stale) {
+        try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* another contender */ }
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function readFollowupCount(file, now, { durableWorkRemains = false } = {}) {
+  try {
+    const marker = JSON.parse(fs.readFileSync(file, "utf8"));
+    // TTL is only crash/stale-state cleanup after a cycle has actually drained. Letting elapsed time
+    // erase the counter while jobs/findings are still durable re-opens the exact unchanged wake loop
+    // this task/session ceiling exists to stop.
+    if (!durableWorkRemains && now - Number(marker.ts) >= RUNNER_FOLLOWUP_WINDOW_MS) {
+      try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+      return 0;
+    }
+    return Math.max(0, Number(marker.count) || 0);
+  } catch {
+    return 0;
+  }
+}
+
+function requestedResetNonce(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || ["0", "false", "no", "off"].includes(raw.toLowerCase())) return null;
+  // Store only a digest: callers can use any memorable/changing token without writing it back into
+  // shared state. Legacy BENCH_DEEP_CYCLE_RESET=1 remains valid, but is consumed exactly once.
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function consumeResetNonce(file, nonce, now) {
+  if (!nonce) return { applied: false, error: false };
+  try {
+    let prior = null;
+    try { prior = JSON.parse(fs.readFileSync(file, "utf8")); } catch { /* first use/corrupt marker */ }
+    if (prior?.nonce === nonce) return { applied: false, error: false };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, `${JSON.stringify({ nonce, ts: now })}\n`);
+    fs.renameSync(tmp, file);
+    return { applied: true, error: false };
+  } catch {
+    // Fail closed for automatic waking: never clear the ceiling unless one-shot consumption itself
+    // was persisted first. A reset-state write failure may shorten a cycle, but cannot unbound it.
+    return { applied: false, error: true };
+  }
+}
+
+function writeFollowupCount(file, count, now) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, `${JSON.stringify({ count, ts: now })}\n`);
+    fs.renameSync(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Synchronous stdin read (the runner reads the Stop hook JSON from fd 0).
 function readInputSync() {
   try { const raw = fs.readFileSync(0, "utf8").trim(); return raw ? JSON.parse(raw) : {}; }
   catch { return {}; }
 }
 
-export async function runMain({
+export async function runMain(options = {}) {
+  const {
+    input: inputOverride,
+    ws: wsOverride,
+    isBenchDisabledImpl = defaultIsBenchDisabled,
+    env = process.env,
+    exitImpl = (code) => process.exit(code),
+    contentionWaitMs = DEEP_RUNNER_HANDOFF_WAIT_MS,
+    contentionPollMs = DEEP_RUNNER_HANDOFF_POLL_MS,
+    onContentionRequest
+  } = options;
+  const input = inputOverride ?? readInputSync();
+  const runtimeEnv = env || process.env;
+  const cwd = (input && input.cwd) || runtimeEnv.CLAUDE_PROJECT_DIR || process.cwd();
+  const ws = wsOverride || workspaceRoot(cwd);
+  const sessionKey = sessionKeyFromInput(input, runtimeEnv);
+
+  if (isBenchDisabledImpl(ws)) return exitImpl(0);
+  let release = acquireRunnerLease(ws, sessionKey);
+  if (!release) {
+    let epoch = null;
+    try { epoch = publishRunnerContention(ws, sessionKey); }
+    catch { /* bounded takeover still covers an owner already in its final release window */ }
+    if (epoch && onContentionRequest) await onContentionRequest({ ws, sessionKey, epoch });
+    release = await waitForRunnerLease(ws, sessionKey, { waitMs: contentionWaitMs, pollMs: contentionPollMs });
+    if (!release) return exitImpl(0);
+  }
+  const observedContentionEpoch = readRunnerContentionEpoch(ws, sessionKey);
+  let released = false;
+  const releaseOnce = () => {
+    if (released) return;
+    released = true;
+    release();
+  };
+  try {
+    return await runMainUnlocked({
+      ...options,
+      input,
+      ws,
+      env: runtimeEnv,
+      runnerContention: {
+        observedEpoch: observedContentionEpoch,
+        readEpoch: () => readRunnerContentionEpoch(ws, sessionKey)
+      },
+      isBenchDisabledImpl: () => false,
+      exitImpl: (code) => {
+        releaseOnce();
+        return exitImpl(code);
+      }
+    });
+  } finally {
+    releaseOnce();
+  }
+}
+
+async function runMainUnlocked({
   input: inputOverride,
   ws: wsOverride,
   isBenchDisabledImpl = defaultIsBenchDisabled,
@@ -84,22 +323,47 @@ export async function runMain({
   now = Date.now(),
   clock = Date.now,                       // live clock for the drain deadline (`now` is a snapshot)
   env = process.env,
+  runnerContention = null,
+  onQueueQuiescent,
   exitImpl = (code) => process.exit(code),
   stderr = (s) => process.stderr.write(s),
   stdout = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`)
 } = {}) {
   const input = inputOverride ?? readInputSync();
-  const cwd = (input && input.cwd) || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const runtimeEnv = env || process.env;
+  const cwd = (input && input.cwd) || runtimeEnv.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = wsOverride || workspaceRoot(cwd);
-  const sessionKey = sessionKeyFromInput(input, process.env);
+  const sessionKey = sessionKeyFromInput(input, runtimeEnv);
 
   if (isBenchDisabledImpl(ws)) return exitImpl(0);
 
+  const runnerFollowupFile = followupFile(ws, sessionKey);
   // 1. Recover orphaned claims (killed/timed-out prior runner) → back to .json.
   try { recoverOrphans(ws, { now }); } catch (e) { stderr(`⛩ deep-runner: orphan recovery failed (${msg(e)}).\n`); }
 
+  // Compute durability before applying TTL cleanup. The fallback deliberately says "work remains":
+  // uncertainty must preserve the ceiling, never reopen an automatic loop.
+  const durableWorkAtStart = safe(
+    () => listBlocked(ws, { sessionKey }).length > 0 || listJobs(ws, { sessionKey }).length > 0,
+    true
+  );
+  const resetNonce = requestedResetNonce(runtimeEnv.BENCH_DEEP_CYCLE_RESET);
+  if (resetNonce) {
+    const reset = consumeResetNonce(`${runnerFollowupFile}.reset-nonce`, resetNonce, now);
+    if (reset.applied) {
+      try { fs.rmSync(runnerFollowupFile, { force: true }); }
+      catch { stderr("⛩ deep-runner: explicit cycle reset could not clear wake state; use a new reset nonce after fixing state permissions.\n"); }
+    } else if (reset.error) {
+      stderr("⛩ deep-runner: explicit cycle reset could not be consumed safely; the existing wake ceiling remains active.\n");
+    }
+  }
+  const priorFollowupWakes = readFollowupCount(runnerFollowupFile, now, {
+    durableWorkRemains: durableWorkAtStart
+  });
+
   const wake = [];       // findings to deliver via exit-2 wake
   const advisory = [];   // findings past WAKE_WINDOW → stdout note (non-waking), file kept
+  const unavailable = []; // queued reviews that must retry; consolidated into the one exit-2 delivery
 
   // 2. Re-deliver pending .blocked jobs (retire ONLY on content-change; never by time/count).
   for (const b of safe(() => listBlocked(ws, { sessionKey }), [])) {
@@ -123,11 +387,8 @@ export async function runMain({
           const baselineKey = rec.sha ? deepKey(`${b.kind}:${b.range}`, rec.sha) : null;
           if (baselineKey !== cur) { deleteJob(b._path); continue; }   // moved since block → addressed → retired
           try {
-            markBlocked(ws, b._jobKey, {
-              kind: b.kind, specPath: b.specPath, range: b.range, contentKey: cur,
-              sessionKey: b.sessionKey, findings: b.findings, traceId: b.traceId ?? null,
-              firstBlockedTs: b.firstBlockedTs
-            });
+            persistBlockedUpdate(ws, b, { contentKey: cur });
+            b.contentKey = cur; // subsequent wake-count persistence in this same pass must keep the healed key
           } catch { /* best-effort — deliver regardless; heal again next Stop */ }
         }
         // rec null (no usable reflog) or blockedTs missing → keep unstamped; deliver, retry next
@@ -142,8 +403,24 @@ export async function runMain({
       deleteJob(b._path); continue;   // gone or confirmed change → retired
     }
     const findings = (b.findings || b.summary || "(deep block)") + traceHint(b.traceId);
-    if ((now - (Number(b.firstBlockedTs) || 0)) < WAKE_WINDOW_MS) wake.push(findings);
-    else advisory.push(findings);   // KEEP the file — never deleted by elapsed time
+    // Exhausted review attempts are durable but advisory-only: keep the warning visible and keep
+    // enqueue dedupe intact for this exact target, without creating an infinite asyncRewake loop.
+    if (b.advisoryOnly) advisory.push(findings);
+    else {
+      // A completed block's initial persist+delivery counts as wake 1. Legacy records did not carry
+      // the field, so conservatively treat them as already delivered once. Persist the increment
+      // BEFORE exit 2: a crash can shorten the loop, never extend it past the hard ceiling.
+      const priorWakeCount = Number.isInteger(Number(b.wakeCount)) && Number(b.wakeCount) >= 0
+        ? Number(b.wakeCount)
+        : 1;
+      const withinWindow = (now - (Number(b.firstBlockedTs) || 0)) < WAKE_WINDOW_MS;
+      if (withinWindow && priorWakeCount < MAX_BLOCK_WAKES) {
+        persistBlockedUpdate(ws, b, { wakeCount: priorWakeCount + 1 });
+        wake.push(findings);
+      } else {
+        advisory.push(`${findings}\n(automatic deep-block wakes exhausted at ${Math.min(priorWakeCount, MAX_BLOCK_WAKES)}/${MAX_BLOCK_WAKES}; warning remains until the target changes)`);
+      }
+    }
   }
 
   // 3-5. Drain queued jobs in bounded concurrent batches. Older builds exited 2 after a clean
@@ -153,13 +430,30 @@ export async function runMain({
   //    a deadline-deferred surplus rewakes instead (rare: only after a slow batch), so it is never
   //    stranded waiting on a Stop that may not come.
   const startTs = clock();
-  const reviewBudgetMs = Number(env.BENCH_DEEP_REVIEW_BUDGET_MS) || 10 * 60 * 1000;
-  const runnerBudgetMs = Number(env.BENCH_DEEP_RUNNER_BUDGET_MS) || RUNNER_BUDGET_MS;
+  const reviewBudgetMs = Number(runtimeEnv.BENCH_DEEP_REVIEW_BUDGET_MS) || 10 * 60 * 1000;
+  const runnerBudgetMs = Number(runtimeEnv.BENCH_DEEP_RUNNER_BUDGET_MS) || RUNNER_BUDGET_MS;
   let deferred = 0;
+  let requeued = 0;
   const seenJobKeys = new Set();
+  let observedContentionEpoch = runnerContention?.observedEpoch || "0:";
+  let quiescenceChecks = 0;
   for (;;) {
     const queued = safe(() => listJobs(ws, { sessionKey }), []).filter((job) => !seenJobKeys.has(job._jobKey));
-    if (!queued.length) break;
+    if (!queued.length) {
+      // This is the owner's last empty read. Give a contender that found the lease occupied a
+      // durable handoff point: if its request epoch changed, re-read and drain before releasing.
+      // A request that lands just after this check is covered by the contender's bounded takeover.
+      if (onQueueQuiescent) {
+        await onQueueQuiescent({ ws, sessionKey, observedEpoch: observedContentionEpoch, check: quiescenceChecks });
+      }
+      quiescenceChecks++;
+      const currentEpoch = runnerContention?.readEpoch?.() || observedContentionEpoch;
+      if (currentEpoch !== observedContentionEpoch) {
+        observedContentionEpoch = currentEpoch;
+        continue;
+      }
+      break;
+    }
     // Every batch after the first must fit its worst case (per-review budget + margin) inside the
     // remaining hook budget, or the hook timeout kills the runner mid-claim.
     if (seenJobKeys.size && (clock() - startTs) + reviewBudgetMs + 30_000 > runnerBudgetMs) {
@@ -181,8 +475,8 @@ export async function runMain({
         // merge jobs review through the same range machinery as push (their range is SHA-pinned by
         // the pre-merge gate, so reviewing after the merge has advanced HEAD is still exact).
         const res = (job.kind === "push" || job.kind === "merge")
-          ? await runPushReviewImpl(job.range, ws, { sessionKey: job.sessionKey || sessionKey })
-          : await runSpecReviewImpl(job.specPath, ws, { sessionKey: job.sessionKey || sessionKey });
+          ? await runPushReviewImpl(job.range, ws, { sessionKey: job.sessionKey || sessionKey, env: runtimeEnv })
+          : await runSpecReviewImpl(job.specPath, ws, { sessionKey: job.sessionKey || sessionKey, env: runtimeEnv });
         return { job, claimedPath, res };
       } catch (e) {
         return { job, claimedPath, error: msg(e) };
@@ -193,14 +487,41 @@ export async function runMain({
     // job (bounded) — never deletes it (that would lose a queued review). CLEAN → delete claim;
     // BLOCK → .blocked (durable) + wake.
     for (const o of outcomes) {
-      const retryReason = o.error || (o.res && o.res.retry ? (o.res.reason || "retry") : null);
+      // `retry:true` is the normal contract from spec-review-run for git failures and panels with no
+      // valid verdict. Defensively recognize the latter shape here too so a future/alternate review
+      // implementation cannot turn an all-error or malformed panel into a clean delete by omission.
+      const noReviewerVerdict = Array.isArray(o.res?.reviewers)
+        && !o.res.reviewers.some((r) => !r?.error && ["ALLOW", "BLOCK"].includes(String(r?.verdict || "").toUpperCase()));
+      const retryReason = o.error
+        || (o.res && o.res.retry ? (o.res.reason || "retry") : null)
+        || (noReviewerVerdict ? "no reviewer verdicts" : null);
       if (retryReason) {
         const next = (Number(o.job.attempts) || 0) + 1;
         if (next >= MAX_REVIEW_ATTEMPTS) {
-          deleteJob(o.claimedPath);
-          stderr(`⛩ deep-runner: ${o.job.kind} review failed ${next}x (${retryReason}); giving up on this queued job.\n`);
+          let contentKey = o.job.contentKey;
+          if (o.job.kind === "merge") {
+            try { contentKey = currentContentKey(ws, o.job); } catch { contentKey = null; }
+            if (contentKey === GONE) contentKey = null;
+          }
+          const failure = `Deep ${o.job.kind} review for ${targetLabel(o.job)} remains UNREVIEWED after ${next} attempts: ${retryReason}. Automatic wake retries stopped to avoid a loop; change the target to enqueue a fresh review, or run /bench:review manually when providers recover.`;
+          markBlocked(ws, o.job._jobKey, {
+            kind: o.job.kind,
+            specPath: o.job.specPath,
+            range: o.job.range,
+            contentKey,
+            sessionKey: o.job.sessionKey || sessionKey || undefined,
+            findings: failure,
+            firstBlockedTs: clock(),
+            advisoryOnly: true,
+            reviewStatus: "unavailable",
+            wakeCount: 0
+          }, { claimedPath: o.claimedPath });
+          advisory.push(failure);
+          stderr(`⛩ deep-runner: ${o.job.kind} review failed ${next}x (${retryReason}); automatic retries stopped and a durable unreviewed advisory was saved.\n`);
         } else {
           requeueForRetry(ws, o.claimedPath, o.job, next, { now });
+          requeued++;
+          unavailable.push(`Deep ${o.job.kind} review unavailable for ${targetLabel(o.job)} (attempt ${next}/${MAX_REVIEW_ATTEMPTS}): ${retryReason}; the next Stop retries it`);
           stderr(`⛩ deep-runner: ${o.job.kind} review error (${retryReason}); requeued (attempt ${next}).\n`);
         }
         continue;
@@ -227,29 +548,64 @@ export async function runMain({
         markBlocked(ws, o.job._jobKey, {
           kind: o.job.kind, specPath: o.job.specPath, range: o.job.range,
           contentKey, sessionKey: o.job.sessionKey || sessionKey || undefined,
-          findings, traceId: o.res.traceId || null, firstBlockedTs: clock()
+          findings, traceId: o.res.traceId || null, firstBlockedTs: clock(), wakeCount: 1
         }, { claimedPath: o.claimedPath });
         wake.push(findings + traceHint(o.res.traceId));
       } else {
         deleteJob(o.claimedPath);   // clean — nothing to lose
       }
     }
-    if (wake.length) break;
+    // Do not stop at the first blocking batch. Continue through every eligible queued job that fits
+    // this invocation's budget, then deliver one consolidated wake. Drip-feeding later blockers over
+    // repeated no-action turns is exactly the failure mode this runner exists to prevent.
   }
 
-  // 6. Deliver. wake → stderr + exit 2 (wakes even idle); else advisory → stdout note; else quiet.
-  if (wake.length) {
-    stderr(`⛩ deep review found blocking issues — address them before continuing:\n\n${wake.join("\n\n")}\n`);
+  // 6. Deliver exactly one consolidated wake for every blocking/unavailable/deferred outcome from
+  // this pass. The ceiling is GLOBAL to this runner/session, not per target or merely per deferred
+  // batch: otherwise a long queue whose successive batches each find a new blocker can still create
+  // an unbounded no-action wake chain even though every individual block has its own counter.
+  const hasContinuation = requeued > 0 || deferred > 0;
+  const requestedWake = wake.length > 0 || hasContinuation;
+  let automaticWake = false;
+  if (requestedWake && priorFollowupWakes < MAX_RUNNER_FOLLOWUP_WAKES) {
+    automaticWake = writeFollowupCount(runnerFollowupFile, priorFollowupWakes + 1, clock());
+    if (!automaticWake) {
+      advisory.push("Deep review wake state could not be persisted; automatic waking stopped to avoid an unbounded loop. Durable findings/jobs will continue on the next natural Stop.");
+    }
+  } else if (requestedWake) {
+    advisory.push(
+      `Deep review automatic wake ceiling exhausted at ${MAX_RUNNER_FOLLOWUP_WAKES}/${MAX_RUNNER_FOLLOWUP_WAKES}; ` +
+      "new findings remain durable and queued work will continue only on natural Stops or after BENCH_DEEP_CYCLE_RESET=<new-nonce>."
+    );
+  }
+
+  if (automaticWake) {
+    const sections = [];
+    if (wake.length) sections.push(`Blocking findings (${wake.length}):\n\n${wake.join("\n\n")}`);
+    if (unavailable.length) sections.push(`Unavailable reviews (${unavailable.length}):\n${unavailable.map((note) => `- ${note}`).join("\n")}`);
+    if (advisory.length) sections.push(`Persistent non-waking advisories (${advisory.length}):\n${advisory.join("\n\n")}`);
+    if (deferred) sections.push(`${deferred} queued job(s) deferred (runner budget exhausted); the next automatic Stop will continue them.`);
+    stderr(`⛩ deep review pass requires follow-up — all in-budget outcomes were consolidated:\n\n${sections.join("\n\n")}\n`);
     return exitImpl(2);
   }
-  // Deadline-deferred surplus with nothing else waking: force the next Stop ourselves (exit 2) —
-  // queued jobs must never depend on a future Stop that may not come (idle session = stranded jobs).
+  if (wake.length) {
+    advisory.push(`Durable blocking findings (automatic wake suppressed):\n\n${wake.join("\n\n")}`);
+  }
+  if (unavailable.length) {
+    advisory.push(`Unavailable reviews:\n${unavailable.map((note) => `- ${note}`).join("\n")}`);
+  }
   if (deferred) {
-    stderr(`⛩ deep review: ${deferred} queued job(s) deferred (runner budget exhausted); ending turn so the next Stop runs them.\n`);
-    return exitImpl(2);
+    advisory.push(`${deferred} queued job(s) remain durable for the next natural Stop.`);
+  }
+  // Reset the task/session ceiling only after every durable target/job is gone. Clearing it merely
+  // because this pass did not request another wake would let an unchanged advisory block start a
+  // fresh three-wake loop on the next natural Stop.
+  const durableWorkRemains = safe(() => listBlocked(ws, { sessionKey }).length > 0 || listJobs(ws, { sessionKey }).length > 0, true);
+  if (!requestedWake && !durableWorkRemains) {
+    try { fs.rmSync(runnerFollowupFile, { force: true }); } catch { /* drained/reset best effort */ }
   }
   if (advisory.length) {
-    stdout({ systemMessage: `⛩ deep review (advisory, not blocking): ${advisory.join(" · ").slice(0, 400)}` });
+    stdout({ systemMessage: `⛩ deep review (advisory, not blocking; ${advisory.length} item(s)): ${advisory.join(" · ").slice(0, 2000)}` });
     return exitImpl(0);
   }
   return exitImpl(0);

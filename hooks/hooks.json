@@ -1,6 +1,18 @@
 {
   "description": "peerBench automatic review gates for Claude Code.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/native-session-start.mjs\"",
+            "timeout": 30,
+            "statusMessage": "⛩ bench: arming native push gate…"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "ExitPlanMode",
@@ -18,8 +30,8 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/pre-push-review.mjs\"",
-            "timeout": 1320,
-            "statusMessage": "⛩ bench: reviewing push…",
+            "timeout": 30,
+            "statusMessage": "⛩ bench: arming native push gate…",
             "if": "Bash(git *)"
           },
           {

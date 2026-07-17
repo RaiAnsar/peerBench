@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 // Isolate BENCH_ROOT before importing anything that uses config-store.
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "deep-root-"));
@@ -79,9 +80,21 @@ test("summarizeSpecReview produces the structured contract", () => {
     { name: "Kimi", verdict: "ALLOW", findingCount: 1, severity: "low" },
     { name: "MiMo", verdict: "BLOCK", findingCount: 2, severity: "high" }
   ]);
-  assert.deepEqual(s.reviewers, [{ name: "Kimi", verdict: "ALLOW", severity: "low" }, { name: "MiMo", verdict: "BLOCK", severity: "high" }]);
+  assert.deepEqual(s.reviewers, [
+    { name: "Kimi", verdict: "ALLOW", severity: "low", error: null },
+    { name: "MiMo", verdict: "BLOCK", severity: "high", error: null }
+  ]);
   assert.equal(s.findingCount, 3);
   assert.equal(s.maxSeverity, "high");
+});
+
+test("summarizeSpecReview preserves reviewer failures in the structured contract", () => {
+  const s = summarizeSpecReview([
+    { name: "Kimi", verdict: null, findingCount: 0, severity: "none", error: "timeout" }
+  ]);
+  assert.deepEqual(s.reviewers, [
+    { name: "Kimi", verdict: null, severity: "none", error: "timeout" }
+  ]);
 });
 
 test("shouldRewake fires at/above the rewake severity with findings, else not", () => {
@@ -154,13 +167,20 @@ test("runSpecReview writes a gate:'spec-review' trace and returns the structured
   assert.equal(readTrace(ws, latest.id).gate, "spec-review");
 });
 
-function gitStub({ commits = "abc123 add feature", diff = "+const x = 1;", head = "deadbeefcafef00d", logOk = true, diffOk = true } = {}) {
+function gitStub({ commits = "abc123 add feature", diff = "+const x = 1;", head = "d".repeat(40), base = "a".repeat(40), logOk = true, diffOk = true } = {}) {
   const calls = [];
   const impl = (args) => {
     calls.push(args);
-    if (args[0] === "log") return [commits, logOk];
+    if (args[0] === "log") return [args.includes("-p") ? diff : commits, logOk];
     if (args[0] === "diff") return [diff, diffOk];
-    if (args[0] === "rev-parse" && args[1] === "HEAD") return [head, true];
+    if (args[0] === "cat-file" && args[1] === "-t") return ["commit", true];
+    if (args[0] === "merge-base") return [base, true];
+    if (args[0] === "rev-parse") {
+      const spec = String(args.at(-1) || "");
+      if (spec.includes("HEAD")) return [head, true];
+      if (spec.includes("@{u}")) return [base, true];
+      if (/^[0-9a-f]{40}(?:[0-9a-f]{24})?\^\{(?:object|commit)\}$/i.test(spec)) return [spec.split("^")[0], true];
+    }
     return ["", true];
   };
   return { impl, calls };
@@ -185,6 +205,79 @@ test("runPushReview writes a gate:'push-review' trace and returns result + findi
   assert.match(result.findings, /cross-file regression/);
   const [latest] = listTraces(ws, 1);
   assert.equal(latest.gate, "push-review");
+});
+
+test("spec/push deep review panels receive the caller's explicit environment", async () => {
+  const ws = freshWs();
+  const file = path.join(ws, "spec.md");
+  fs.writeFileSync(file, "# Spec\n");
+  const explicitEnv = { BENCH_SUPPRESS_CODEX_REVIEWER: "1", BENCH_DEEP_REVIEW_BUDGET_MS: "1234" };
+  const seen = [];
+  const panelImpl = async ({ env }) => {
+    seen.push(env);
+    return [{ name: "Kimi", verdict: "ALLOW", findings: "ALLOW: clean", findingCount: 0, severity: "none" }];
+  };
+
+  await runSpecReview(file, ws, { panelImpl, writeTraceImpl: () => null, env: explicitEnv });
+  await runPushReview("@{u}..HEAD", ws, {
+    panelImpl,
+    writeTraceImpl: () => null,
+    gitImpl: gitStub().impl,
+    env: explicitEnv
+  });
+
+  assert.deepEqual(seen, [explicitEnv, explicitEnv]);
+});
+
+test("runSpecReview returns retry and preserves errors when no reviewer produced a verdict", async () => {
+  const ws = freshWs();
+  const file = path.join(ws, "spec.md");
+  fs.writeFileSync(file, "# Spec\n");
+  const result = await runSpecReview(file, ws, {
+    panelImpl: async () => [
+      { name: "Kimi", verdict: null, findings: "", findingCount: 0, severity: "none", error: "timeout" },
+      { name: "Grok", verdict: null, findings: "", findingCount: 0, severity: "none", error: "auth" }
+    ],
+    writeTraceImpl: () => null
+  });
+  assert.equal(result.retry, true);
+  assert.match(result.reason, /Kimi: timeout/);
+  assert.deepEqual(result.reviewers.map((r) => r.error), ["timeout", "auth"]);
+  assert.doesNotMatch(result.summary, /no blocking findings/);
+});
+
+test("runPushReview treats malformed no-verdict prose as retry, never a clean result", async () => {
+  const ws = freshWs();
+  const stub = gitStub();
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    gitImpl: stub.impl,
+    panelImpl: async () => [
+      { name: "Kimi", verdict: null, findings: "Looks fine but omitted the contract", findingCount: 0, severity: "none", error: null }
+    ],
+    writeTraceImpl: () => null
+  });
+  assert.equal(result.retry, true);
+  assert.match(result.reason, /unparseable verdict/);
+  assert.equal(result.reviewers[0].error, "unparseable verdict");
+  assert.equal(result.reviewers[0].verdict, null);
+  assert.equal(result.badge, "Kimi!");
+});
+
+test("a malformed reviewer is skipped when another reviewer has a valid verdict", async () => {
+  const ws = freshWs();
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    gitImpl: gitStub().impl,
+    panelImpl: async () => [
+      { name: "Kimi", verdict: "ALLOW", findings: "ALLOW: clean", findingCount: 0, severity: "none" },
+      { name: "Grok", verdict: null, findings: "narration only", findingCount: 2, severity: "high" }
+    ],
+    writeTraceImpl: () => null
+  });
+  assert.equal(result.retry, undefined, "one valid verdict is sufficient for the panel outcome");
+  assert.equal(result.reviewers[1].error, "unparseable verdict");
+  assert.equal(result.findingCount, 0, "malformed output cannot contribute blocking findings");
+  assert.equal(result.maxSeverity, "none", "malformed output cannot contribute severity");
+  assert.equal(result.badge, "Kimi✓ Grok!");
 });
 
 test("runPushReview seeds and traces previous assistant context as claims, not proof", async () => {
@@ -227,14 +320,72 @@ test("runPushReview signals retry when git log/diff report ok=false", async () =
   assert.equal(result.findings, "");
 });
 
-test("runPushReview caps the diff at ~200KB", async () => {
+test("runPushReview fully reviews a diff above the old 200KB sampling limit", async () => {
   const ws = freshWs();
   const stub = gitStub({ diff: "+x".repeat(300_000) });
   let captured = null;
   const panelImpl = async ({ content }) => { captured = content; return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }]; };
-  await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
-  assert.ok(captured.includes("diff truncated"));
-  assert.ok(captured.length < 220_000);
+  const result = await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
+  assert.equal(result.coverageBlocked, undefined);
+  assert.match(captured, /<per_commit_deltas[^>]+bytes="600000"[^>]+truncated="false"/);
+  assert.doesNotMatch(captured, /bytes omitted/);
+  assert.match(captured, /\+x\+x\+x\+x$/m, "the tail is present, not authenticated-but-omitted");
+});
+
+test("runPushReview caches a deterministic coverage BLOCK when evidence is too large for one bounded pass", async () => {
+  const ws = freshWs();
+  const stub = gitStub({ diff: "+x".repeat(550_000) });
+  let panelCalled = false;
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    panelImpl: async () => { panelCalled = true; return []; },
+    gitImpl: stub.impl
+  });
+  assert.equal(panelCalled, false, "omitted bytes must never reach an ALLOW-capable panel");
+  assert.equal(result.coverageBlocked, true);
+  assert.equal(result.maxSeverity, "high");
+  assert.match(result.reason, /no omitted or lossy-decoded bytes can produce an ALLOW/);
+  assert.match(result.hash, /^[0-9a-f]{16}$/);
+});
+
+test("runPushReview streams a text diff larger than 64 MiB into bounded evidence", { timeout: 30_000 }, async () => {
+  const ws = freshWs();
+  const git = (args) => {
+    const result = spawnSync("git", args, { cwd: ws, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return result.stdout.trim();
+  };
+  git(["init", "-q"]);
+  git(["config", "user.email", "test@example.com"]);
+  git(["config", "user.name", "Test"]);
+  fs.writeFileSync(path.join(ws, "large.txt"), "small\n");
+  git(["add", "large.txt"]);
+  git(["commit", "-q", "-m", "base"]);
+
+  const file = path.join(ws, "large.txt");
+  const fd = fs.openSync(file, "w");
+  const oneMiB = Buffer.alloc(1024 * 1024, 0x61);
+  try {
+    for (let i = 0; i < 65; i++) fs.writeSync(fd, oneMiB);
+    fs.writeSync(fd, Buffer.from("\n"));
+  } finally {
+    fs.closeSync(fd);
+  }
+  git(["add", "large.txt"]);
+  git(["commit", "-q", "-m", "large text"]);
+
+  let panelCalled = false;
+  const result = await runPushReview("HEAD^..HEAD", ws, {
+    env: process.env,
+    writeTraceImpl: () => null,
+    panelImpl: async () => {
+      panelCalled = true;
+      return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }];
+    }
+  });
+  assert.equal(panelCalled, false);
+  assert.equal(result.coverageBlocked, true);
+  assert.match(result.reason, /681\d{5,}|cannot be rendered exhaustively/);
+  assert.match(result.hash, /^[0-9a-f]{16}$/);
 });
 
 test("runPushReview throws on a missing range", async () => {

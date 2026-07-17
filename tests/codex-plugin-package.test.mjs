@@ -23,6 +23,7 @@ test("Codex marketplace entry resolves to a plugin with an explicit Codex hook f
 
   const hooks = readJson(path.join(pluginRoot, "hooks.json"));
   const commands = JSON.stringify(hooks);
+  assert.match(commands, /\$\{PLUGIN_ROOT\}\/global-hooks\/native-session-start\.mjs/);
   assert.match(commands, /\$\{PLUGIN_ROOT\}\/global-hooks\/codex-stop-review\.mjs/);
   assert.doesNotMatch(commands, /global-hooks\/stop-review\.mjs/);
   assert.doesNotMatch(commands, /global-hooks\/deep-review-runner\.mjs/);

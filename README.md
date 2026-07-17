@@ -5,7 +5,7 @@ A Claude Code + Codex helper that reviews your work with a **panel of AI reviewe
 CLI) as plan-billed agentic CLIs, plus API providers **Kimi** (Moonshot `k3`),
 **GLM** (z.ai `glm-5.2`), **Qwen** (Alibaba MaaS `qwen3.7-max`), **MiMo** (Xiaomi), and
 **MiniMax** (`MiniMax-M3`) — instead of a single reviewer. The panel runs automatically as
-**gates** (plans/specs, code turns, pushes) and on demand as a **bug hunt** that
+**gates** (plans/specs, protected-branch merges, code turns, pushes) and on demand as a **bug hunt** that
 scours the repo read-only. The API providers are cheap and the CLI reviewers ride
 existing subscription plans; the goal is frontier-grade review from several
 independent models at once, each swappable with one command.
@@ -25,12 +25,39 @@ gets the findings and fixes them); **ALLOW** shows a brief status line.
 | --- | --- | --- | --- |
 | Plan | `ExitPlanMode` | active panel | content-only plan review |
 | Plan / spec file | Writes to `**/plans/*.md` · `**/specs/*.md` | active panel | fast content-only save gate, then repo-aware deep review on ALLOW |
+| Merge | `git merge` into a protected branch | active panel | bounded content-only review, then repo-aware deep review |
 | Code turn (Stop) | end of a turn with committed, staged, unstaged, or untracked changes | active non-Codex reviewers | content-only diff review; direct Codex never asks Codex to review itself |
-| Push | `git push` | active panel | inline repo-aware full review of the about-to-be-pushed commit range |
+| Push | Git's native `pre-push` hook | active panel | authoritative repo-aware review of Git's exact ref updates; cached by immutable object IDs |
 
-The panel is **AND-pass**: any reviewer's blocking `BLOCK:` blocks; if a reviewer
-errors, the others decide. Plan/Stop gates fail open with a visible note only when
-all reviewers error; pre-push fails closed so commits never leave unreviewed.
+The panel is **AND-pass**: any reviewer's blocking `BLOCK:` blocks. Plan/Stop gates let
+healthy reviewers decide and fail open with a visible note only when all reviewers error.
+Native pre-push additionally requires a verdict quorum and fails closed, so a degraded
+one-reviewer run can never be presented as a clean push.
+
+Automatic repair loops are bounded. Stop review permits at most three blocked repair cycles across
+changed revisions in one task/session; unresolved counters never age into more automatic turns.
+After that it keeps a visible advisory without spawning more repairs. A clean/ALLOW transition, a
+new session, or a new one-shot `BENCH_STOP_CYCLE_RESET` nonce starts fresh. Plan and plan-file gates
+share the same three slots, so switching surfaces cannot buy extra cycles. Incomplete/oversized
+evidence is tracked separately as **UNREVIEWED** and is never written to reviewed markers.
+
+Transient deep-review jobs retry at most three times. Across completed blockers, deferred queue
+continuations, and changed targets, the deep runner may cause at most three automatic follow-up
+Stops total in one task/session; unresolved durable work never ages into more. It then remains a
+non-waking advisory and progresses only on natural Stops or a new explicit reset nonce.
+
+Protected-branch merge review follows the same anti-churn rule: one exhaustive pass must report all
+verified independent blockers, grouped by root cause, and at most three automatic BLOCK/repair cycles
+may run across changed merge targets in one task/session. Unresolved cycle records never age out into
+more automatic repairs. The fourth attempt is
+allowed locally with a durable **UNREVIEWED** warning (the native pre-push gate is still the hard
+boundary); use a new one-shot nonce such as `BENCH_MERGE_CYCLE_RESET=$(date +%s) git merge …` for one
+explicit fresh cycle. Leaving the same reset value exported does not repeatedly reset the ceiling. Exact ALLOWs are
+cached by the sorted immutable incoming range set plus reviewer/model/policy identity, so unchanged
+retries do not re-stream Git evidence or call reviewers. Every unique octopus target is peeled to
+its commit, deduplicated, and inspected. The fast gate streams and hashes complete Git output; if all
+evidence cannot fit its 200 KiB content-only budget, it records no clean verdict and visibly allows as
+**UNREVIEWED / coverage incomplete** while the queued deep review and native push gate enforce it.
 
 **Auto deep-review on spec save (capability G).** When the fast plan/spec file gate ALLOWs
 a `**/plans/*.md` · `**/specs/*.md` save, it **enqueues** a deep-review job to a crash-safe
@@ -40,22 +67,43 @@ real repository** (repo-aware, read-only) concurrently, and on a **high-severity
 the findings to stderr + **exits 2 — which wakes Claude immediately, even if the session has
 gone idle**. The job lifecycle is crash-safe:
 atomic-rename states (`.json` queued → `.claimed.<pid>` running → `.blocked` durable), a completed
-block is retired ONLY when its content changes (the agent addresses it) or the target is deleted —
-never lost on a crash, transient git error, or large file. Disabling the bench (`/bench:off`) skips
+block is retired ONLY when its content changes (the agent addresses it) or the target is deleted;
+exhausting its three automatic deliveries only downgrades it to an advisory. Findings are never
+lost on a crash, transient git error, or large file. Disabling the bench (`/bench:off`) skips
 the runner. Deep jobs are stamped with Claude's hook `session_id`, so two Claude chats in the same
 git checkout do not claim or wake each other's queued findings. (This replaced an earlier detached
 worker + `deep-result` + next-stop-surfacing design that could not wake an idle agent — see
 `docs/superpowers/specs/2026-06-22-deep-review-wake-delivery-design.md`.)
 
-**Inline full review before push (capability H).** The `Bash(git *)` pre-push hook reviews the
-exact ahead-of-remote commit range **before** the push is allowed. It runs the same repo-aware
-deep push review inline, blocks on high/critical findings, and also blocks if peerBench cannot
-resolve or inspect the commit range. Delete-only pushes and pushes with no commits ahead are
-allowed without running the reviewer. Use `/bench:off` only when you intentionally want to bypass
-the gate. The thorough inline review holds the session for the review's duration; if you'd
-rather trade depth for latency, `BENCH_PUSH_GATE_MODE=fast` switches the gate to a 90-second
-content-capped inline pass that fails open and enqueues the full repo-aware review to run
-asynchronously after the push (any other value, or unset, means blocking).
+**Authoritative native review before push (capability H).** Setup installs a chain-safe Git
+`pre-push` dispatcher (honoring `core.hooksPath` and running an existing hook first). Git supplies
+the exact `<local-ref> <local-object> <remote-ref> <remote-object>` updates, so peerBench never has
+to emulate Bash/Zsh quoting, redirects, wrappers, or compound-command timing. Multiple refs are
+reviewed individually; deletions and updates containing no new commits are instant. The lightweight
+Claude `Bash(git *)` hook only installs/refreshes this dispatcher and is not the trust boundary.
+
+The dispatcher must already be installed in a repository before Git can invoke it. Direct pushes
+with statically visible targets are armed automatically, including common `sudo`/`doas`/`env`/
+`timeout` wrappers and static `cd`, wrapper-chdir, `git -C`, or `GIT_DIR` paths. A push hidden inside
+an arbitrary script body (`bash release.sh`), shell alias/function, make task, or dynamically
+expanded `eval`/`sh -c` command or command substitution does not expose its eventual repository to
+a pre-execution shell hook. Run `/bench:setup` once inside every repository that such automation may
+push. After that one-time setup, the persistent native Git hook is authoritative regardless of how
+the push starts; peerBench does not claim universal interception of previously unseen repositories
+hidden in code.
+
+Clean and blocked results are cached by the immutable ref-update set plus reviewer panel. Retrying
+unchanged code is instant. A clean push requires two verdicts by default (and a Codex verdict when
+Codex is configured), so one surviving reviewer can no longer make a degraded run look green. Each
+panel is explicitly required to finish one exhaustive pass and report every verified independent
+blocker, grouping sibling manifestations without imposing a finding-count cap. After
+three distinct blocked revisions, automatic reviews pause permanently for that unresolved ref scope
+and replay the consolidated findings; use a new nonce such as
+`BENCH_PUSH_CYCLE_RESET=$(date +%s) git push …` for one fresh verification after fixing them.
+Leaving the same reset value exported cannot repeatedly reopen the loop.
+`BENCH_NATIVE_PUSH_BYPASS=1 git push …` bypasses peerBench once while still running an existing
+chained hook. `git push --no-verify` is the emergency all-hooks bypass; `/bench:off` disables all
+peerBench gates for the workspace.
 
 **2. Bug hunt (on demand).** `/bench:hunt [focus]` runs the panel **agentically** —
 each reviewer explores the repository read-only via tools (read_file, grep, glob,
@@ -170,8 +218,18 @@ when a task calls for finding or root-causing a bug. The rest are user-invoked.
   The CLI reviewers (`codex`, `grok`) need no keys — they use their own plan sign-ins.
 - `BENCH_ROOT` — override the shared dir (used for test isolation).
 - `BENCH_DEBUG=1` — verbose agentic diagnostics.
-- `BENCH_PUSH_GATE_MODE=fast` — opt the pre-push gate into the bounded fast pass
-  (default is the thorough blocking review).
+- `BENCH_STOP_CYCLE_RESET=<nonce>` — explicitly start one fresh Stop-review cycle; each value is consumed once per task/session.
+- `BENCH_PLAN_CYCLE_RESET=<nonce>` — explicitly start one fresh shared plan/plan-file cycle; each value is consumed once per task/session.
+- `BENCH_MERGE_CYCLE_RESET=<nonce>` — explicitly start one fresh protected-branch merge-review cycle; the same persistent value is consumed only once, so change the nonce for a later reset.
+- `BENCH_MERGE_REVIEW_REFRESH=1` — ignore an exact merge ALLOW cache entry and rerun the complete fast panel once.
+- `BENCH_DEEP_CYCLE_RESET=<nonce>` — explicitly resume automatic deep-review waking after its global three-wake task/session ceiling. Each value is consumed once per task/session (`1` works once); change the nonce for another deliberate reset, so an inherited environment value cannot disable the ceiling.
+- `BENCH_PUSH_REVIEW_QUORUM=<n>` — required native push verdict count (default: two, or all when fewer are configured).
+- `BENCH_PUSH_REQUIRE_CODEX=0` — do not require Codex specifically when it is in the active push panel.
+- `BENCH_PUSH_MAX_BLOCK_CYCLES=<n>` — choose a stricter automatic blocked-revision ceiling; values are hard-capped at three.
+- `BENCH_PUSH_CYCLE_RESET=<nonce>` — clear one ref-scope hold once and perform one fresh native verification; change the nonce for a later deliberate reset.
+- `BENCH_PUSH_REVIEW_REFRESH=1` — ignore an exact-result cache entry and rerun the reviewer panel once.
+- `BENCH_NATIVE_PUSH_BYPASS=1` — bypass peerBench for one push while preserving other pre-push hooks.
+- `BENCH_LEGACY_PUSH_PREFLIGHT=1` — explicitly re-enable the old shell-string preflight for diagnosis; it is not authoritative.
 
 State is keyed first by **workspace** (git top-level). Git facts that are truly
 workspace-wide, such as `/bench:off` and the stop gate's `reviewed-head` marker,
@@ -183,14 +241,15 @@ The provider config in `companion.json` is global/shared.
 When peerBench is installed for direct Codex work, the Codex Stop hook uses the
 same stop-review logic but always removes the `codex` reviewer before the panel
 runs. That means Codex work is reviewed by Grok/Kimi/GLM/Qwen/etc., never by
-Codex itself. Codex processes launched as Claude reviewers/delegates are skipped with
+Codex itself. The native push hook applies the same self-review suppression when it inherits a
+direct Codex `CODEX_THREAD_ID`. Codex processes launched as Claude reviewers/delegates are skipped with
 `BENCH_SUPPRESS_HOOKS` / `CODEX_COMPANION_SESSION_ID`, so `codex-plugin-cc`
 does not recursively trigger peerBench.
 
 ## Fallback (revert anytime)
 
 1. **Config toggle** — `/bench:reviewers kimi glm` (or any subset of
-   `kimi glm qwen mimo codex`) re-selects the active panel without redeploying.
+   `kimi glm qwen mimo minimax codex grok`) re-selects the active panel without redeploying.
 2. **Disable gates** — `/bench:off` disables this workspace; `/bench:off --global`
    disables everywhere. Use `/bench:on` to re-enable.
 3. **Rollback script** — `node scripts/rollback.mjs` restores the pre-install hook
@@ -307,8 +366,8 @@ The local installer is idempotent. It:
 - scrubs local secret files such as `.keys` from Claude's installed plugin cache
   after local marketplace installs;
 - copies review hooks into `~/.claude/hooks` and `~/.codex/hooks`;
-- registers Claude gates for `ExitPlanMode`, plan/spec file writes, Stop, deep
-  Stop review delivery, and `git push`;
+- registers Claude gates for `ExitPlanMode`, plan/spec file writes, Stop, and deep
+  Stop review delivery, plus installs Git's authoritative native `pre-push` dispatcher;
 - registers the direct Codex Stop hook, which removes `codex` from the reviewer
   panel so Codex never asks itself to review its own work;
 - installs Codex manual prompts into `~/.codex/prompts`;

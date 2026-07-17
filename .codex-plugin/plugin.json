@@ -1,6 +1,6 @@
 {
   "name": "bench",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "peerBench multi-reviewer gates and read-only bug hunts for Codex.",
   "author": {
     "name": "Rai Ansar",

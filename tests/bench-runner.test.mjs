@@ -105,6 +105,7 @@ test("D4: statusCommand(ws, []) lists traces (no id → list mode)", () => {
 
 // ── D2b: setup reports per-gate registration in ~/.claude/settings.json ──────
 const GATES = [
+  { event: "SessionStart", matcher: undefined, file: "native-session-start.mjs" },
   { event: "PreToolUse", matcher: "ExitPlanMode", file: "plan-review.mjs" },
   { event: "PostToolUse", matcher: "Write|Edit", file: "plan-file-review.mjs" },
   { event: "PreToolUse", matcher: "Bash", file: "pre-push-review.mjs" },
@@ -118,7 +119,7 @@ function writeSettings(obj) {
   return p;
 }
 
-test("D2b: setupStatus reports all four gates as missing when settings has no hooks", () => {
+test("D2b: setupStatus reports every automatic hook registration as missing when settings has no hooks", () => {
   const p = writeSettings({ hooks: {} });
   const out = setupStatus(p);
   for (const g of GATES) {
@@ -205,10 +206,13 @@ test("D2b: missing settings file → 'unable to check' (no crash)", () => {
 test("D2b: codexSetupStatus reports the direct-Codex stop wrapper", () => {
   const p = writeSettings({
     hooks: {
+      SessionStart: [{ hooks: [{ type: "command", command: 'node "/x/.codex/hooks/native-session-start.mjs"' }] }],
       Stop: [{ hooks: [{ type: "command", command: 'node "/x/.codex/hooks/codex-stop-review.mjs"' }] }]
     }
   });
   const out = codexSetupStatus(p);
+  const sessionLine = out.split("\n").find((line) => line.includes("native-session-start.mjs"));
+  assert.match(sessionLine || "", /registered/i);
   assert.match(out, /codex-stop-review\.mjs/);
   assert.match(out, /registered/i);
 });
@@ -218,10 +222,13 @@ test("D2b: codexSetupStatus reports plugin-managed direct-Codex stop wrapper", (
   const pluginHooksPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "br-codex-plugin-hooks-")), "hooks.json");
   fs.writeFileSync(pluginHooksPath, JSON.stringify({
     hooks: {
+      SessionStart: [{ hooks: [{ type: "command", command: 'node "${PLUGIN_ROOT}/global-hooks/native-session-start.mjs"' }] }],
       Stop: [{ hooks: [{ type: "command", command: 'node "${PLUGIN_ROOT}/global-hooks/codex-stop-review.mjs"' }] }]
     }
   }));
   const out = codexSetupStatus(settingsPath, { pluginHooksPath });
+  const sessionLine = out.split("\n").find((line) => line.includes("native-session-start.mjs"));
+  assert.match(sessionLine || "", /registered \(plugin\)/i);
   assert.match(out, /codex-stop-review\.mjs/);
   assert.match(out, /registered \(plugin\)/i);
 });
@@ -272,6 +279,23 @@ test("D2b: codexPromptStatus reports installed prompt commands", () => {
   assert.match(codexPromptStatus(dir), /10 registered/);
   fs.writeFileSync(path.join(dir, "bench-hunt.md"), "{{BENCH_RUNNER}}\n");
   assert.match(codexPromptStatus(dir), /MISSING.*bench-hunt\.md/);
+});
+
+test("setup installs the authoritative native pre-push hook in the current workspace", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "br-setup-native-ws-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "br-setup-native-home-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
+  const env = {
+    ...process.env,
+    HOME: home,
+    BENCH_ROOT: path.join(home, "bench-root"),
+    CLAUDE_CONFIG_DIR: path.join(home, ".claude")
+  };
+  const result = spawnSync(process.execPath, [RUNNER, "setup"], { cwd: ws, env, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const hook = fs.readFileSync(path.join(ws, ".git", "hooks", "pre-push"), "utf8");
+  assert.match(hook, /peerBench managed native pre-push dispatcher/);
+  assert.match(result.stdout, /Git native pre-push: installed \(authoritative exact-ref gate; refreshed\)/);
 });
 
 // ── F: review output leads with the verdict badge ───────────────────────────

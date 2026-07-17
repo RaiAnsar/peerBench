@@ -2,6 +2,7 @@
 // ~/.claude/hooks/panel-lib.mjs (canonical copy lives in the peerbench
 // repo — self-contained on purpose: no repo imports).
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,11 +16,9 @@ export function parseVerdict(rawOutput) {
   return { verdict: null, firstLine, raw };
 }
 
-// List untracked files and embed their (text) contents for content-only review. NUL-delimited
-// (handles newlines in names) and NEVER follows a symlink out of the workspace — an untracked
-// symlink to e.g. ~/.ssh/config must not leak into a reviewer prompt (found by the bench's own hunt).
-// Shared by stop-review and bench-runner so both stay consistent.
-export function untrackedBlock(ws, { maxFiles = 20, maxBytesEach = 20_000 } = {}) {
+// Legacy prompt-only helper used outside Stop review. It deliberately reads at most maxFiles and a
+// bounded prefix of each file, and never follows a symlink out of the workspace.
+function collectBoundedUntrackedBlock(ws, { maxFiles = 20, maxBytesEach = 20_000 } = {}) {
   let names = [];
   try {
     names = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: ws, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 })
@@ -28,26 +27,269 @@ export function untrackedBlock(ws, { maxFiles = 20, maxBytesEach = 20_000 } = {}
     return "";
   }
   let root; try { root = fs.realpathSync.native(ws); } catch { root = ws; }
+  const maxPromptFiles = Math.max(0, Number(maxFiles) || 0);
+  const maxPromptBytes = Math.max(0, Number(maxBytesEach) || 0);
   const parts = [];
-  for (const name of names.slice(0, maxFiles)) {
-    const abs = path.join(ws, name);
+  for (const name of names.slice(0, maxPromptFiles)) {
+    const abs = path.resolve(root, name);
+    if (abs !== root && !abs.startsWith(root + path.sep)) {
+      parts.push(`--- NEW UNTRACKED FILE (outside workspace, skipped): ${name} ---`);
+      continue;
+    }
+    let lst;
+    try { lst = fs.lstatSync(abs); }
+    catch {
+      parts.push(`--- NEW UNTRACKED FILE (unreadable): ${name} ---`);
+      continue;
+    }
+    if (lst.isSymbolicLink()) {
+      parts.push(`--- NEW UNTRACKED FILE (symlink skipped): ${name} ---`);
+      continue;
+    }
     let real;
     try {
-      if (fs.lstatSync(abs).isSymbolicLink()) { parts.push(`--- NEW UNTRACKED FILE (symlink skipped): ${name} ---`); continue; }
       real = fs.realpathSync.native(abs);
-      if (real !== root && !real.startsWith(root + path.sep)) { parts.push(`--- NEW UNTRACKED FILE (outside workspace, skipped): ${name} ---`); continue; }
+      if (real !== root && !real.startsWith(root + path.sep)) {
+        parts.push(`--- NEW UNTRACKED FILE (outside workspace, skipped): ${name} ---`);
+        continue;
+      }
     } catch {
-      parts.push(`--- NEW UNTRACKED FILE (unreadable): ${name} ---`); continue;
+      parts.push(`--- NEW UNTRACKED FILE (unreadable): ${name} ---`);
+      continue;
     }
+    let fd;
     try {
-      const body = fs.readFileSync(real, "utf8").slice(0, maxBytesEach);
-      parts.push(`--- NEW UNTRACKED FILE: ${name} ---\n${body}`);
+      fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) {
+        parts.push(`--- NEW UNTRACKED FILE (unreadable/binary): ${name} ---`);
+        continue;
+      }
+      const body = Buffer.alloc(Math.min(stat.size, maxPromptBytes));
+      const read = body.length ? fs.readSync(fd, body, 0, body.length, null) : 0;
+      parts.push(`--- NEW UNTRACKED FILE: ${name} ---\n${body.subarray(0, read).toString("utf8")}`);
     } catch {
       parts.push(`--- NEW UNTRACKED FILE (unreadable/binary): ${name} ---`);
+    } finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
     }
   }
-  if (names.length > maxFiles) parts.push(`(… ${names.length - maxFiles} more untracked files omitted)`);
+  if (names.length > maxPromptFiles) parts.push(`(… ${names.length - maxPromptFiles} more untracked files omitted)`);
   return parts.join("\n\n");
+}
+
+export function untrackedSnapshot(ws, options) {
+  return collectCompleteUntrackedSnapshot(ws, options);
+}
+
+// Shared prompt-only compatibility surface used by bench-runner and existing callers. It preserves
+// bounded I/O; only stop-review needs the full identity returned by untrackedSnapshot.
+export function untrackedBlock(ws, options) {
+  return collectBoundedUntrackedBlock(ws, options);
+}
+
+// Stop-review needs a stronger contract than the legacy single-block helper above: every byte that
+// can safely be read must either appear in one of a bounded number of review chunks, or the result
+// must explicitly say coverage is incomplete so the gate can block visibly. The same read pass also
+// builds the full-content fingerprint, avoiding a prompt/hash TOCTOU caused by reading files twice.
+function collectCompleteUntrackedSnapshot(ws, {
+  maxFiles = 20,
+  maxBytesEach = 20_000,
+  maxReviewChunks = 2
+} = {}) {
+  let names = [];
+  try {
+    names = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+      cwd: ws,
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024
+    }).split("\0").filter(Boolean);
+  } catch (error) {
+    return {
+      block: "",
+      reviewBlocks: [],
+      fingerprint: createHash("sha256").update("untracked-unavailable-v2").digest("hex"),
+      count: 0,
+      coverageComplete: false,
+      coverageReason: `could not enumerate untracked files (${error instanceof Error ? error.message : String(error)})`
+    };
+  }
+
+  let root;
+  try { root = fs.realpathSync.native(ws); } catch { root = path.resolve(ws); }
+  const segmentsPerBlock = Math.max(0, Number(maxFiles) || 0);
+  const bytesPerSegment = Math.max(0, Number(maxBytesEach) || 0);
+  const chunkLimit = Math.max(0, Number(maxReviewChunks) || 0);
+  const segmentLimit = segmentsPerBlock * chunkLimit;
+  const identity = createHash("sha256");
+  const reviewSegments = [];
+  const coverageProblems = [];
+  const problemSet = new Set();
+  const addIdentity = (label, value = "") => {
+    const data = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+    identity.update(`${label}\0${data.length}\0`);
+    identity.update(data);
+    identity.update("\0");
+  };
+  const markIncomplete = (reason) => {
+    if (!problemSet.has(reason)) {
+      problemSet.add(reason);
+      if (coverageProblems.length < 5) coverageProblems.push(reason);
+    }
+  };
+  const pushSegment = (segment, name) => {
+    if (reviewSegments.length >= segmentLimit) {
+      markIncomplete(`untracked review exceeds ${chunkLimit} bounded chunk(s); first omitted path: ${name}`);
+      return false;
+    }
+    reviewSegments.push(segment);
+    return true;
+  };
+  const renderBytes = (data) => {
+    // NUL-bearing or invalid UTF-8 data is rendered reversibly instead of losing bytes through
+    // replacement characters or injecting binary controls into a prompt.
+    if (!data.includes(0)) {
+      try { return new TextDecoder("utf-8", { fatal: true }).decode(data); } catch { /* base64 below */ }
+    }
+    return `[binary/non-UTF8 bytes; base64]\n${data.toString("base64")}`;
+  };
+
+  addIdentity("format", "peerbench-untracked-review-v3");
+  addIdentity("count", String(names.length));
+
+  for (const name of names) {
+    addIdentity("name", name);
+    const abs = path.resolve(root, name);
+    if (abs !== root && !abs.startsWith(root + path.sep)) {
+      addIdentity("kind", "outside-workspace");
+      markIncomplete(`outside-workspace untracked path could not be reviewed: ${name}`);
+      pushSegment(`--- NEW UNTRACKED FILE (outside workspace, not reviewed): ${name} ---`, name);
+      continue;
+    }
+
+    let lst;
+    try { lst = fs.lstatSync(abs); }
+    catch {
+      addIdentity("kind", "unreadable");
+      markIncomplete(`unreadable untracked path: ${name}`);
+      pushSegment(`--- NEW UNTRACKED FILE (unreadable, not reviewed): ${name} ---`, name);
+      continue;
+    }
+
+    if (lst.isSymbolicLink()) {
+      addIdentity("kind", "symlink");
+      let link = "";
+      try { link = fs.readlinkSync(abs); addIdentity("link", link); }
+      catch { addIdentity("link", "unreadable"); markIncomplete(`unreadable untracked symlink: ${name}`); }
+      // Review the link text itself, but never follow it or include target-file bytes.
+      pushSegment(`--- NEW UNTRACKED SYMLINK: ${name} ---\n<link-target>${link}</link-target>`, name);
+      continue;
+    }
+
+    let real;
+    try {
+      real = fs.realpathSync.native(abs);
+      if (real !== root && !real.startsWith(root + path.sep)) {
+        addIdentity("kind", "outside-workspace");
+        markIncomplete(`outside-workspace untracked path could not be reviewed: ${name}`);
+        pushSegment(`--- NEW UNTRACKED FILE (outside workspace, not reviewed): ${name} ---`, name);
+        continue;
+      }
+    } catch {
+      addIdentity("kind", "unreadable");
+      addIdentity("stat", `${lst.mode}:${lst.size}:${lst.mtimeMs}`);
+      markIncomplete(`unreadable untracked path: ${name}`);
+      pushSegment(`--- NEW UNTRACKED FILE (unreadable, not reviewed): ${name} ---`, name);
+      continue;
+    }
+
+    let fd;
+    try {
+      fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) {
+        addIdentity("kind", "non-regular");
+        addIdentity("stat", `${stat.mode}:${stat.size}:${stat.mtimeMs}`);
+        markIncomplete(`non-regular untracked path could not be reviewed: ${name}`);
+        pushSegment(`--- NEW UNTRACKED FILE (non-regular, not reviewed): ${name} ---`, name);
+        continue;
+      }
+
+      addIdentity("kind", "file");
+      addIdentity("mode", String(stat.mode & 0o777));
+      const fileHash = createHash("sha256");
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let fileOffset = 0;
+      let segmentStart = 0;
+      let segmentBytes = 0;
+      let segmentChunks = [];
+      let sawBytes = false;
+      let storing = bytesPerSegment > 0 && reviewSegments.length < segmentLimit;
+
+      const finishSegment = () => {
+        if (!segmentBytes) return;
+        const data = Buffer.concat(segmentChunks, segmentBytes);
+        pushSegment(
+          `--- NEW UNTRACKED FILE: ${name} (bytes ${segmentStart}-${segmentStart + segmentBytes - 1}) ---\n${renderBytes(data)}`,
+          name
+        );
+        segmentStart += segmentBytes;
+        segmentBytes = 0;
+        segmentChunks = [];
+        storing = bytesPerSegment > 0 && reviewSegments.length < segmentLimit;
+      };
+
+      for (;;) {
+        const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+        if (!read) break;
+        sawBytes = true;
+        const chunk = buffer.subarray(0, read);
+        fileHash.update(chunk);
+        fileOffset += read;
+
+        let cursor = 0;
+        while (cursor < read) {
+          if (!storing) {
+            markIncomplete(`untracked review exceeds ${chunkLimit} bounded chunk(s); first omitted path: ${name}`);
+            break;
+          }
+          const take = Math.min(read - cursor, bytesPerSegment - segmentBytes);
+          segmentChunks.push(Buffer.from(chunk.subarray(cursor, cursor + take)));
+          segmentBytes += take;
+          cursor += take;
+          if (segmentBytes >= bytesPerSegment) finishSegment();
+        }
+      }
+      finishSegment();
+      if (!sawBytes) pushSegment(`--- NEW UNTRACKED FILE: ${name} (empty file) ---`, name);
+      addIdentity("size", String(fileOffset));
+      addIdentity("content-sha256", fileHash.digest("hex"));
+    } catch {
+      addIdentity("read-error", `${lst.mode}:${lst.size}:${lst.mtimeMs}`);
+      markIncomplete(`unreadable untracked file content: ${name}`);
+      pushSegment(`--- NEW UNTRACKED FILE (unreadable content, not reviewed): ${name} ---`, name);
+    } finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+
+  const reviewBlocks = [];
+  if (segmentsPerBlock > 0) {
+    for (let i = 0; i < reviewSegments.length; i += segmentsPerBlock) {
+      reviewBlocks.push(reviewSegments.slice(i, i + segmentsPerBlock).join("\n\n"));
+    }
+  }
+  let block = reviewBlocks[0] || "";
+  if (reviewBlocks.length > 1) block += `\n\n(… ${reviewBlocks.length - 1} additional bounded untracked review chunk(s) follow)`;
+
+  return {
+    block,
+    reviewBlocks,
+    fingerprint: identity.digest("hex"),
+    count: names.length,
+    coverageComplete: coverageProblems.length === 0,
+    coverageReason: coverageProblems.join(" | ")
+  };
 }
 
 export function spawnCollect(cmd, args, { cwd, env, timeoutMs }) {

@@ -1,6 +1,6 @@
 {
   "name": "bench",
-  "description": "peerbench — a panel of AI reviewers (Codex + Kimi + GLM + Qwen + MiMo) for Claude Code: automatic gating reviews (plans, code turns, pushes), agentic read-only code review, and on-demand bug hunts. Commands are /bench:*.",
-  "version": "0.3.0",
+  "description": "peerbench — a panel of AI reviewers (Codex + Grok + Kimi + GLM + Qwen + MiMo + MiniMax) for Claude Code: automatic gating reviews (plans, code turns, pushes), agentic read-only code review, and on-demand bug hunts. Commands are /bench:*.",
+  "version": "0.3.1",
   "author": { "name": "Rai Ansar" }
 }

@@ -12,7 +12,8 @@ import { spawnSync } from "node:child_process";
 const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-root-"));
 process.env.BENCH_ROOT = TEMP_GCR;
 
-import { runMain, buildPrompt, PLAN_PATH_RE, createEmitter } from "../global-hooks/plan-file-review.mjs";
+import { runMain, buildPrompt, PLAN_PATH_RE, createEmitter, readPlanSnapshot } from "../global-hooks/plan-file-review.mjs";
+import { readPlanCycle, readPlanMarker } from "../global-hooks/plan-gate-state.mjs";
 
 // ---------------------------------------------------------------------------
 // P0 — make plan-file-review.mjs injectable: runMain is exported and accepts
@@ -418,7 +419,7 @@ test("enqueue dedupes — identical content re-save does not double-queue", asyn
   assert.equal(listJobs(ws).length, 1, "identical content must not double-queue (enqueue dedupes by contentKey)");
 });
 
-test("dedup-hit (content identical to last approved) → deep enqueue NOT reached", async () => {
+test("dedup-hit (content identical to last approved) still requests this session's deep review", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enq-deduphit-"));
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
@@ -431,10 +432,11 @@ test("dedup-hit (content identical to last approved) → deep enqueue NOT reache
     input: { cwd: ws, tool_input: { file_path: specFile } }
   };
   await runMain(opts);   // first ALLOW enqueues + sets the approval marker
-  // Second save, IDENTICAL content → hits the dedup-skip path (approvalKey matches) BEFORE enqueue.
+  // Second save, IDENTICAL content → fast review is cached, but the session-scoped deep job must
+  // still be requested. The old early return skipped this and could lose the only full review.
   let enqCalled = false;
   await runMain({ ...opts, enqueueDeepReviewImpl: () => { enqCalled = true; return true; } });
-  assert.equal(enqCalled, false, "a dedup-hit (approvalKey match) must return before the deep enqueue");
+  assert.equal(enqCalled, true, "a fast-cache hit must still request the full deep review");
 });
 
 test("enqueue failure does not break the gate (fail-open, ALLOW still emitted)", async () => {
@@ -460,6 +462,192 @@ test("enqueue failure does not break the gate (fail-open, ALLOW still emitted)",
   }
   const parsed = JSON.parse(lines.find((l) => l.trim()));
   assert.match(parsed.systemMessage || "", /ALLOW/, "ALLOW must still be emitted even if the deep enqueue throws");
+});
+
+test("full streamed identity catches tail-only changes beyond 64 KiB and never reports fast-clean coverage", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-tail-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "large.md");
+  const prefix = `# Large spec\n\n${"x".repeat(70 * 1024)}\n`;
+  fs.writeFileSync(specFile, `${prefix}TAIL_REVISION_A\n`);
+
+  const prompts = [];
+  let reviewerCalls = 0;
+  const deepKeys = [];
+  const emitted = [];
+  const opts = {
+    resolveReviewersImpl: () => [{
+      name: "Kimi",
+      reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1", thinking: null },
+      async run({ user }) {
+        reviewerCalls += 1;
+        prompts.push(user);
+        return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: sampled evidence clean", raw: "ALLOW: sampled evidence clean\nSEVERITY: none" };
+      }
+    }],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    enqueueDeepReviewImpl: (_ws, _path, _content, options) => {
+      deepKeys.push(options.contentKey);
+      return { ok: true, enqueued: true };
+    },
+    emitter: { emit(payload) { emitted.push(payload); return true; } },
+    input: { cwd: ws, session_id: "tail-session", tool_input: { file_path: specFile } }
+  };
+
+  await runMain(opts);
+  fs.writeFileSync(specFile, `${prefix}TAIL_REVISION_B\n`);
+  await runMain(opts);
+  await runMain(opts); // exact B resave: fast cache hit, but deep request still happens
+
+  assert.equal(reviewerCalls, 2, "a tail-only change must invalidate the fast marker; exact resave may reuse it");
+  assert.match(prompts[1], /TAIL_REVISION_B/, "bounded evidence includes the tail, not only the first 64 KiB");
+  assert.notEqual(deepKeys[0], deepKeys[1], "full deep content identity changes when only the tail changes");
+  assert.equal(deepKeys[1], deepKeys[2], "the exact cached revision still requests its same deep job");
+  assert.equal(deepKeys.length, 3, "both reviews and the exact-cache hit request deep coverage");
+  for (const payload of emitted) assert.match(payload.systemMessage, /UNREVIEWED \/ fast coverage incomplete/);
+
+  const snapshot = await readPlanSnapshot(specFile);
+  assert.equal(snapshot.deepContentKey, deepKey(specFile, fs.readFileSync(specFile, "utf8")), "streamed key exactly matches deep queue recomputation");
+});
+
+test("ALLOW cache invalidates when reviewer model, endpoint, or inference config changes", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-review-id-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "identity.md");
+  fs.writeFileSync(specFile, "# Plan\n\nStable bytes.\n");
+  let calls = 0;
+  let identity = { kind: "api", model: "model-a", baseURL: "https://a.test/v1", thinking: "disabled", temperature: 0 };
+  const opts = {
+    resolveReviewersImpl: () => [{
+      name: "Kimi",
+      reviewIdentity: { ...identity },
+      async run() {
+        calls += 1;
+        return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok\nSEVERITY: none" };
+      }
+    }],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    enqueueDeepReviewImpl: () => ({ ok: true, enqueued: false }),
+    emitter: { emit() { return true; } },
+    input: { cwd: ws, session_id: "review-id", tool_input: { file_path: specFile } }
+  };
+
+  await runMain(opts);
+  identity = { kind: "api", model: "model-b", baseURL: "https://b.test/v2", thinking: "enabled", temperature: 0.4 };
+  await runMain(opts);
+  await runMain(opts);
+  assert.equal(calls, 2, "changed reviewer config re-reviews; exact model/endpoint/config reuses the ALLOW");
+});
+
+test("plan-file automatic BLOCK wakes stop at three across changed revisions and reset in a new session", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-cycle-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "cycle.md");
+  let calls = 0;
+  let blocks = 0;
+  const deliveredCycles = [];
+  const emitted = [];
+  const opts = {
+    resolveReviewersImpl: () => [{
+      name: "Kimi",
+      reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1" },
+      async run() {
+        calls += 1;
+        return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: broken", raw: "BLOCK: broken\nSEVERITY: high\n- one complete finding set" };
+      }
+    }],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    emitter: { emit(payload) { emitted.push(payload); return true; } },
+    blockHandler: async ({ cycle }) => { blocks += 1; deliveredCycles.push(cycle); },
+    input: { cwd: ws, session_id: "cycle-A", tool_input: { file_path: specFile } }
+  };
+
+  for (let revision = 1; revision <= 4; revision++) {
+    fs.writeFileSync(specFile, `# Plan revision ${revision}\n\nStill broken.\n`);
+    await runMain(opts);
+  }
+  assert.equal(calls, 3, "changed content never resets the three-cycle ceiling");
+  assert.equal(blocks, 3, "only three automatic wakes are delivered");
+  assert.deepEqual(deliveredCycles, [1, 2, 3]);
+  assert.match(emitted.at(-1)?.systemMessage || "", /paused after 3 blocked repair cycles/);
+
+  fs.writeFileSync(specFile, "# Plan revision 5\n\nNew session.\n");
+  await runMain({ ...opts, input: { ...opts.input, session_id: "cycle-B" } });
+  assert.equal(calls, 4, "a new task/session starts a fresh cycle");
+  assert.deepEqual(deliveredCycles, [1, 2, 3, 1]);
+});
+
+test("a delayed ALLOW for revision A cannot clear or cache over revision B's newer BLOCK", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-delayed-allow-"));
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const specFile = path.join(specDir, "race.md");
+  const session = "delayed-allow-session";
+  const cycles = [];
+  const emitted = [];
+  let aCalls = 0;
+  let reviewerCalls = 0;
+  let signalDelayed;
+  let releaseDelayed;
+  const delayedEntered = new Promise((resolve) => { signalDelayed = resolve; });
+  const delayedRelease = new Promise((resolve) => { releaseDelayed = resolve; });
+
+  const reviewer = {
+    name: "Kimi",
+    reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1" },
+    async run({ user }) {
+      reviewerCalls += 1;
+      if (/REVISION_A/.test(user)) {
+        aCalls += 1;
+        if (aCalls === 2) {
+          signalDelayed();
+          await delayedRelease;
+          return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: old A", raw: "ALLOW: old A\nSEVERITY: none" };
+        }
+      }
+      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: current defect", raw: "BLOCK: current defect\nSEVERITY: high\n- exhaustive blocker" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    enqueueDeepReviewImpl: () => ({ ok: true, enqueued: false }),
+    emitter: { emit(payload) { emitted.push(payload); return true; } },
+    blockHandler: async ({ cycle }) => { cycles.push(cycle); },
+    input: { cwd: ws, session_id: session, tool_input: { file_path: specFile } }
+  };
+
+  fs.writeFileSync(specFile, "# Plan\n\nREVISION_A\n");
+  await runMain(opts);
+  assert.deepEqual(cycles, [1]);
+
+  const delayedA = runMain(opts);
+  await delayedEntered;
+  fs.writeFileSync(specFile, "# Plan\n\nREVISION_B\n");
+  await runMain(opts);
+  assert.deepEqual(cycles, [1, 2], "B claims the second shared slot before old A finishes");
+
+  releaseDelayed();
+  await delayedA;
+  assert.equal(readPlanCycle(ws, session).count, 2, "old A cannot resolve B's newer immutable block id");
+  assert.equal(readPlanMarker(ws, "plan-file-panel", specFile), null, "old A cannot leave an ALLOW cache after B blocked");
+  assert.match(emitted.at(-1)?.systemMessage || "", /superseded|UNREVIEWED/i);
+
+  fs.writeFileSync(specFile, "# Plan\n\nREVISION_C\n");
+  await runMain(opts);
+  fs.writeFileSync(specFile, "# Plan\n\nREVISION_D\n");
+  await runMain(opts);
+  assert.deepEqual(cycles, [1, 2, 3], "the next block gets slot 3 and the fourth gets only the durable advisory");
+  assert.equal(readPlanCycle(ws, session).count, 3);
+  assert.match(emitted.at(-1)?.systemMessage || "", /paused after 3 blocked repair cycles/);
+  assert.equal(reviewerCalls, 4, "the exhausted fourth revision never starts another panel");
 });
 
 // ===========================================================================

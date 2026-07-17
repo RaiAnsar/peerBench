@@ -10,6 +10,7 @@ process.env.BENCH_ROOT = PR_ROOT;
 
 import { buildPrompt, runMain, createEmitter } from "../global-hooks/plan-review.mjs";
 import { normalizeSessionId } from "../global-hooks/config-store.mjs";
+import { readPlanCycle, readPlanMarker } from "../global-hooks/plan-gate-state.mjs";
 
 /** Fake reviewer that always returns the given verdict. */
 function prReviewer(name, verdict) {
@@ -31,6 +32,9 @@ test("plan prompt is content-only (no repo-read claim)", () => {
   const { system, user } = buildPrompt("PLAN BODY");
   assert.doesNotMatch(system, /read access|verify.*against.*code|explore the/i);
   assert.match(system, /ALLOW:|BLOCK:/);
+  assert.match(system, /ONE exhaustive discovery pass/i);
+  assert.match(system, /never stop after the first blocker/i);
+  assert.match(system, /do not impose a finding-count cap/i);
   assert.match(user, /PLAN BODY/);
 });
 
@@ -238,4 +242,133 @@ test("D3: plan-review trace write failure emits a ⛩ note and still allows", as
   assert.match(stderrChunks.join(""), /⛩ .*trace write failed/i, "expected a ⛩ trace-write-failed note on stderr");
   const parsed = JSON.parse(stdoutLines.find((l) => l.trim()));
   assert.equal(parsed.hookSpecificOutput?.permissionDecision, "allow", "must still allow despite trace failure");
+});
+
+test("ExitPlanMode automatic denials stop at three across changed revisions with a durable advisory", async () => {
+  const ws = prRepo();
+  let calls = 0;
+  const payloads = [];
+  const reviewer = {
+    name: "Kimi",
+    reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1", thinking: null },
+    async run() {
+      calls += 1;
+      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: broken", raw: "BLOCK: broken\nSEVERITY: high\n- exhaustive finding" };
+    }
+  };
+
+  for (let revision = 1; revision <= 4; revision++) {
+    await runMain({
+      resolveReviewersImpl: () => [reviewer],
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      emitter: { emit(payload) { payloads.push(payload); return true; } },
+      input: { cwd: ws, session_id: "plan-cycle-A", tool_input: { plan: `revision ${revision}` } }
+    });
+  }
+
+  assert.equal(calls, 3, "changed plan text must not reset the repair-cycle count");
+  assert.deepEqual(payloads.slice(0, 3).map((p) => p.hookSpecificOutput.permissionDecision), ["deny", "deny", "deny"]);
+  assert.equal(payloads[3].hookSpecificOutput.permissionDecision, "allow", "the fourth invocation cannot auto-deny/wake");
+  assert.match(payloads[3].hookSpecificOutput.permissionDecisionReason, /UNREVIEWED.*paused after 3 blocked repair cycles/s);
+
+  await runMain({
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    emitter: { emit() { return true; } },
+    input: { cwd: ws, session_id: "plan-cycle-B", tool_input: { plan: "new session revision" } }
+  });
+  assert.equal(calls, 4, "a new task/session gets a fresh review cycle");
+});
+
+test("ExitPlanMode ALLOW cache includes the concrete reviewer model/endpoint/config identity", async () => {
+  const ws = prRepo();
+  let calls = 0;
+  let reviewIdentity = { kind: "api", model: "model-a", baseURL: "https://a.test/v1", thinking: "disabled", temperature: 0 };
+  const opts = () => ({
+    resolveReviewersImpl: () => [{
+      name: "Kimi",
+      reviewIdentity: { ...reviewIdentity },
+      async run() {
+        calls += 1;
+        return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok\nSEVERITY: none" };
+      }
+    }],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    emitter: { emit() { return true; } },
+    input: { cwd: ws, session_id: "plan-cache", tool_input: { plan: "identical plan bytes" } }
+  });
+
+  await runMain(opts());
+  await runMain(opts());
+  reviewIdentity = { kind: "api", model: "model-b", baseURL: "https://b.test/v2", thinking: "enabled", temperature: 0.5 };
+  await runMain(opts());
+  await runMain(opts());
+  assert.equal(calls, 2, "each exact reviewer configuration reviews once; names alone never reuse the cache");
+});
+
+test("same-revision concurrent ExitPlanMode calls single-flight and a BLOCK can never race a false ALLOW cache", async () => {
+  const ws = prRepo();
+  const session = "plan-concurrent-same-revision";
+  const payloads = [[], []];
+  let calls = 0;
+  let nextVerdict = "BLOCK";
+  let releaseFirst;
+  let signalFirst;
+  const firstEntered = new Promise((resolve) => { signalFirst = resolve; });
+  const firstRelease = new Promise((resolve) => { releaseFirst = resolve; });
+  const reviewer = {
+    name: "Kimi",
+    reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1" },
+    async run() {
+      calls += 1;
+      const verdict = nextVerdict;
+      if (calls === 1) {
+        signalFirst();
+        await firstRelease;
+      }
+      return {
+        name: "Kimi",
+        verdict,
+        firstLine: `${verdict}: deterministic race verdict`,
+        raw: `${verdict}: deterministic race verdict\nSEVERITY: ${verdict === "BLOCK" ? "high" : "none"}`
+      };
+    }
+  };
+  const invoke = (index) => runMain({
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    emitter: { emit(payload) { payloads[index].push(payload); return true; } },
+    input: { cwd: ws, session_id: session, tool_input: { plan: "one immutable plan revision" } }
+  });
+
+  const first = invoke(0);
+  await firstEntered;
+  // If a second panel is incorrectly launched it returns ALLOW, recreating the original race.
+  nextVerdict = "ALLOW";
+  const second = invoke(1);
+  releaseFirst();
+  await Promise.all([first, second]);
+
+  assert.equal(calls, 1, "the exact concurrent revision runs one reviewer panel");
+  assert.deepEqual(payloads.map((items) => items[0]?.hookSpecificOutput?.permissionDecision), ["deny", "deny"]);
+  assert.equal(readPlanCycle(ws, session).count, 1, "the shared result consumes exactly one BLOCK slot");
+  assert.equal(readPlanMarker(ws, "exit-plan-mode", "inline-plan"), null, "a BLOCK never leaves an exact ALLOW marker");
+
+  // A later, non-overlapping invocation is not skipped as ALLOW; it can safely re-review.
+  nextVerdict = "BLOCK";
+  const later = [];
+  await runMain({
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    emitter: { emit(payload) { later.push(payload); return true; } },
+    input: { cwd: ws, session_id: session, tool_input: { plan: "one immutable plan revision" } }
+  });
+  assert.equal(calls, 2, "no false ALLOW cache skips the later review");
+  assert.equal(later[0]?.hookSpecificOutput?.permissionDecision, "deny");
+  assert.equal(readPlanCycle(ws, session).count, 2);
 });
