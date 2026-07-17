@@ -25,9 +25,11 @@ const BACKOFF_CAP_MS = 16_000;
 // re-running a doomed call at every gate. A 429 only reaches this point after the retry loop
 // exhausted, so treating it as quota (not a transient blip) is correct here.
 export function classifyHttpErrorKind(status, body = "") {
+  // Body keywords FIRST: providers reuse auth-ish statuses for billing (Kimi K3 sends its
+  // "usage limit for this billing cycle" as HTTP 403), and "out of quota" is the honest message.
+  if (/quota|insufficient|credit|balance|usage.?limit|exceed/i.test(String(body))) return "quota";
   if (status === 401 || status === 403) return "auth";
   if (status === 402 || status === 429) return "quota";
-  if (/quota|insufficient|credit|balance|usage.?limit|exceed/i.test(String(body))) return "quota";
   return "http";
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

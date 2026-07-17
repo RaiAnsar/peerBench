@@ -281,3 +281,10 @@ test("quota keywords in a non-429 error body classify as quota", async () => {
   assert.equal(res.ok, false);
   assert.equal(res.error.kind, "quota");
 });
+
+test("HTTP 403 with a usage-limit body classifies as quota, not auth (Kimi K3 billing signal)", async () => {
+  const res = await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000,
+    fetchImpl: async () => ({ ok: false, status: 403, text: async () => '{"error":{"message":"You have reached your usage limit for this billing cycle."}}' }) });
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "quota");
+});
