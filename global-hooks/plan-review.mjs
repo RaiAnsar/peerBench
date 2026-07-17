@@ -29,6 +29,11 @@ function workspaceRoot(cwd) {
   catch { return cwd; }
 }
 
+function insideGitWorkTree(cwd) {
+  try { return execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8" }).trim() === "true"; }
+  catch { return false; }
+}
+
 // Invocation-scoped emit-once guard. Claude Code reads only the FIRST JSON line on stdout, so a
 // second emit (e.g. the top-level .catch firing after runMain already decided) is silently dropped.
 // MUST be created per runMain invocation — a module-level flag would suppress emits on later
@@ -102,6 +107,10 @@ export async function runMain({
   const cwd = input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd();
   const ws = workspaceRoot(cwd);              // git top-level — matches where /bench:off writes the marker + the stop/push gates
   if (isBenchDisabledImpl(ws)) return;         // bench layer disabled for this workspace
+  // Plans are gated only inside a git repository. peerBench's state model (markers, /bench:off
+  // scope, traces) is per-git-workspace; a home-dir or scratch chat must never be pulled into a
+  // review loop by ExitPlanMode. Silent return = allow.
+  if (!insideGitWorkTree(ws)) return;
 
   let reviewers;
   try { reviewers = resolveReviewersImpl({ env }); }
@@ -131,7 +140,11 @@ export async function runMain({
       return true;
     }
     if (outcome === "advisory") {
-      const advisory = planCycleAdvisory(readPlanCycle(ws, sessionKey));
+      // The completing review WAS validated and blocked — its findings claimed no ledger slot, so
+      // they must ride inside the advisory rather than be discarded (F1).
+      const advisory = planCycleAdvisory(readPlanCycle(ws, sessionKey), {
+        completedFindings: payload.detail || payload.summary || ""
+      });
       decision("allow", advisory, `⛩ bench plan-review: ${advisory.slice(0, 1800)}`);
       return true;
     }

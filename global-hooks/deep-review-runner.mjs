@@ -79,9 +79,9 @@ function targetLabel(job) {
   return job?.specPath || job?.range || job?.kind || "unknown target";
 }
 
-function persistBlockedUpdate(ws, job, overrides = {}) {
+function persistBlockedUpdate(ws, job, overrides = {}, opts = {}) {
   const { _path, _jobKey, ...payload } = job;
-  return markBlocked(ws, _jobKey, { ...payload, ...overrides });
+  return markBlocked(ws, _jobKey, { ...payload, ...overrides }, opts);
 }
 
 const followupFile = (ws, sessionKey) => path.join(
@@ -415,8 +415,18 @@ async function runMainUnlocked({
         : 1;
       const withinWindow = (now - (Number(b.firstBlockedTs) || 0)) < WAKE_WINDOW_MS;
       if (withinWindow && priorWakeCount < MAX_BLOCK_WAKES) {
-        persistBlockedUpdate(ws, b, { wakeCount: priorWakeCount + 1 });
-        wake.push(findings);
+        // Compare-and-rewrite on the stored wakeCount: a LEGACY (session-less) block is listed by
+        // every session's runner while the runner lease is per-session, so two sessions could
+        // otherwise read N, both persist N+1, and BOTH deliver — two deliveries spent, one counted,
+        // and a later pass exceeds MAX_BLOCK_WAKES. A refusal means a peer moved or retired the
+        // block between our list and this persist; it owns this delivery, so skip the duplicate.
+        const expectedWakeCount = Number.isInteger(Number(b.wakeCount)) && Number(b.wakeCount) >= 0
+          ? Number(b.wakeCount)
+          : null;
+        const persisted = persistBlockedUpdate(ws, b, { wakeCount: priorWakeCount + 1 }, { expectedWakeCount });
+        if (persisted) wake.push(findings);
+      } else if (!withinWindow) {
+        advisory.push(`${findings}\n(automatic deep-block wake window expired after ${Math.min(priorWakeCount, MAX_BLOCK_WAKES)}/${MAX_BLOCK_WAKES} deliveries; warning remains until the target changes)`);
       } else {
         advisory.push(`${findings}\n(automatic deep-block wakes exhausted at ${Math.min(priorWakeCount, MAX_BLOCK_WAKES)}/${MAX_BLOCK_WAKES}; warning remains until the target changes)`);
       }
@@ -430,8 +440,17 @@ async function runMainUnlocked({
   //    a deadline-deferred surplus rewakes instead (rare: only after a slow batch), so it is never
   //    stranded waiting on a Stop that may not come.
   const startTs = clock();
-  const reviewBudgetMs = Number(runtimeEnv.BENCH_DEEP_REVIEW_BUDGET_MS) || 10 * 60 * 1000;
-  const runnerBudgetMs = Number(runtimeEnv.BENCH_DEEP_RUNNER_BUDGET_MS) || RUNNER_BUDGET_MS;
+  // Mirror deepReviewBudgetMs (hunt.mjs): only a finite, positive override counts. A negative value
+  // survives Number(env) || default and corrupts the worst-case batch math below — a negative review
+  // budget makes every batch "fit", so the hook is killed mid-claim by the real timeout.
+  const configuredReviewBudgetMs = Number(runtimeEnv.BENCH_DEEP_REVIEW_BUDGET_MS);
+  const reviewBudgetMs = Number.isFinite(configuredReviewBudgetMs) && configuredReviewBudgetMs > 0
+    ? configuredReviewBudgetMs
+    : 10 * 60 * 1000;
+  const configuredRunnerBudgetMs = Number(runtimeEnv.BENCH_DEEP_RUNNER_BUDGET_MS);
+  const runnerBudgetMs = Number.isFinite(configuredRunnerBudgetMs) && configuredRunnerBudgetMs > 0
+    ? configuredRunnerBudgetMs
+    : RUNNER_BUDGET_MS;
   let deferred = 0;
   let requeued = 0;
   const seenJobKeys = new Set();
@@ -536,10 +555,19 @@ async function runMainUnlocked({
         // enqueue key, which a later healthy recompute would read as "changed" and retire (losing
         // the finding). An unstamped block is never retired; step 2 self-heals it at the first
         // successful recompute.
+        // A SPEC block's durable identity is the REVIEWED content: runSpecReview reads the file at
+        // review time and returns hash = deepKey(specPath, reviewedContent) — the same formula
+        // currentContentKey recomputes. An edit landed between enqueue and review is COVERED by the
+        // review, so keying the block on the stale enqueue key would read the reviewed content as
+        // "changed" at the next Stop and retire a HIGH block nothing addressed. (Push keeps its
+        // enqueue key: res.hash there is evidence-keyed, not the HEAD-seeded identity
+        // currentContentKey recomputes.)
         let contentKey = o.job.contentKey;
         if (o.job.kind === "merge") {
           try { contentKey = currentContentKey(ws, o.job); } catch { contentKey = null; }
           if (contentKey === GONE) contentKey = null;
+        } else if (o.job.kind !== "push" && o.res.hash) {
+          contentKey = o.res.hash;
         }
         // firstBlockedTs = the moment the block is PERSISTED/DELIVERED (live clock) — NOT the
         // invocation-start `now`: the review above can run ~10 min, and a commit landed DURING it

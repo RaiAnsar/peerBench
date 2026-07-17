@@ -68,6 +68,26 @@ function lineRangeFromText(text, offset, limit) {
   return String(text).split(/\r?\n/).slice(start, start + want).join("\n");
 }
 
+// git's DEFAULT pathspec semantics (what `git ls-files -- <pattern>` applies), for filtering
+// ls-tree output client-side: a wildcard-less pattern matches a file exactly or as a leading
+// directory; with wildcards the WHOLE path is wildmatched with `*`/`?` crossing `/` (no
+// FNM_PATHNAME) — `*.js` matches at any depth, `sub` matches everything under sub/.
+function gitPathspecMatcher(pattern) {
+  const pat = pattern.replace(/^\.\//, "");
+  if (pat === "" || pat === ".") return () => true;               // repo-root pathspec matches everything
+  if (!/[*?[]/.test(pat)) {
+    const prefix = pat.endsWith("/") ? pat : `${pat}/`;
+    return (file) => file === pat || file.startsWith(prefix);
+  }
+  const rx = new RegExp(`^${pat.split(/(\*+|\?|\[[^\]]*\])/).map((part) => {
+    if (/^\*+$/.test(part)) return ".*";                        // `*` and `**` alike: no FNM_PATHNAME
+    if (part === "?") return ".";
+    if (part.startsWith("[") && part.endsWith("]")) return part[1] === "!" ? `[^${part.slice(2, -1)}]` : part;
+    return part.replace(/[.*+?^${}()|\\]/g, "\\$&");
+  }).join("")}$`);
+  return (file) => rx.test(file);
+}
+
 export function createReviewTools(cwd, { execImpl = spawnSync, treeish = null } = {}) {
   if (treeish != null && !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(String(treeish))) {
     throw new Error("review treeish must be an immutable object id");
@@ -127,10 +147,15 @@ export function createReviewTools(cwd, { execImpl = spawnSync, treeish = null } 
     glob({ pattern }) {
       const requested = pattern || "*";
       if (treeish) safeGitPath(requested, { pathspec: true });
+      // ls-tree does NOT support fnmatch pathspecs: `-- "*"` silently lists NOTHING and `:(glob)`
+      // is fatal 128 — both surfaced as "(no files)", telling a push reviewer the pushed tree is
+      // empty. List the whole tree and filter client-side with the same semantics ls-files uses.
       const r = treeish
-        ? git(["ls-tree", "-r", "--name-only", treeish, "--", requested])
+        ? git(["ls-tree", "-r", "--name-only", treeish])
         : git(["ls-files", "--", requested]);
-      const files = String(r.stdout || "").split(/\r?\n/).filter(Boolean);
+      if (r.status !== 0) throw new Error(`could not list ${treeish ? "pushed-tip" : "repository"} files: ${String(r.stderr || "").trim().slice(0, 200)}`);
+      let files = String(r.stdout || "").split(/\r?\n/).filter(Boolean);
+      if (treeish) files = files.filter(gitPathspecMatcher(requested));
       const shown = files.slice(0, GLOB_MAX).join("\n");
       return files.length > GLOB_MAX ? `${shown}\n…[${files.length - GLOB_MAX} more files]` : (shown || "(no files)");
     },

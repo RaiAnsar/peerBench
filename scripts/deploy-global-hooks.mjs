@@ -900,18 +900,24 @@ export function syncCodexPrompts({
   return { promptsDir, copied, backedUp, states };
 }
 
-function gitOrNull(args, cwd) {
-  try { return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+function gitOrNull(args, cwd, { timeout = 0 } = {}) {
+  try {
+    return execFileSync("git", args, {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], ...(timeout > 0 ? { timeout } : {})
+    }).trim();
+  }
   catch { return null; }
 }
 
-export function compareLocalWithOrigin({ cwd, remote = "origin", branch } = {}) {
+export function compareLocalWithOrigin({ cwd, remote = "origin", branch, lsRemoteTimeoutMs = 15_000 } = {}) {
   const repo = gitOrNull(["rev-parse", "--show-toplevel"], cwd);
   if (!repo) return { ok: false, reason: "not a git repository" };
   const localHead = gitOrNull(["rev-parse", "HEAD"], repo);
   const currentBranch = branch || gitOrNull(["branch", "--show-current"], repo);
   if (!localHead || !currentBranch) return { ok: false, repo, reason: "could not resolve local branch/head" };
-  const remoteLine = gitOrNull(["ls-remote", "--heads", remote, currentBranch], repo);
+  // ls-remote touches the network and the installer runs this inside the install lock: keep it
+  // bounded so a blackholed origin degrades to a soft skip instead of stalling the install.
+  const remoteLine = gitOrNull(["ls-remote", "--heads", remote, currentBranch], repo, { timeout: lsRemoteTimeoutMs });
   if (!remoteLine) return { ok: false, repo, branch: currentBranch, localHead, reason: `could not resolve ${remote}/${currentBranch}` };
   const remoteHead = remoteLine.split(/\s+/)[0] || "";
   const status = gitOrNull(["status", "--short"], repo) || "";

@@ -1,5 +1,5 @@
 ---
-description: Deep multi-model investigation. The active peerBench panel (Codex/Kimi/GLM/Qwen/MiMo, depending on /bench:reviewers) scours the repo READ-ONLY with the deep budget to trace a hard, specific problem to its root cause. Use for a tough bug or a "why does X happen" question that a quick hunt will not crack. Slower and more thorough than the hunt skill; never edits files.
+description: Deep multi-model investigation. The active peerBench panel (Codex/Grok/Kimi/MiniMax, depending on /bench:reviewers) scours the repo READ-ONLY with the deep budget to trace a hard, specific problem to its root cause. Use for a tough bug or a "why does X happen" question that a quick hunt will not crack. Slower and more thorough than the hunt skill; never edits files.
 argument-hint: '[symptom/area/question]'
 allowed-tools: Bash(node:*)
 ---

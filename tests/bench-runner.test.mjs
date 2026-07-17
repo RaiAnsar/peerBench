@@ -435,3 +435,22 @@ test("healthCommand probes grok via the CLI (stub), reporting plan-billed health
   assert.equal(sick.ok, false);
   assert.match(sick.text, /✗ Grok.*not logged in/);
 });
+
+test("healthCommand redacts the submitted key and sk-* tokens from provider error bodies", async () => {
+  const { healthCommand } = await import("../scripts/bench-runner.mjs");
+  const cfg = {
+    reviewers: ["kimi"],
+    providers: { kimi: { apiKey: "kimi-secret-9f8e7d6c5b", baseURL: "https://x/v1", model: "m", headers: {} } }
+  };
+  // The provider reflects the submitted key back, plus an sk-*-shaped token of its own.
+  const echoFetch = async () => ({
+    ok: false,
+    status: 401,
+    text: async () => '{"error":"Invalid API key: kimi-secret-9f8e7d6c5b; upstream key sk-a1b2c3d4e5f6 rejected"}'
+  });
+  const r = await healthCommand({ cfg, fetchImpl: echoFetch });
+  assert.equal(r.ok, false);
+  assert.doesNotMatch(r.text, /kimi-secret-9f8e7d6c5b/, "the configured key must not leak into health output");
+  assert.doesNotMatch(r.text, /sk-a1b2c3d4e5f6/, "sk-*-shaped tokens must be masked");
+  assert.match(r.text, /✗ Kimi.*HTTP 401/);
+});

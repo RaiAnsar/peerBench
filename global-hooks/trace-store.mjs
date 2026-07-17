@@ -1,12 +1,14 @@
 // global-hooks/trace-store.mjs
 import { randomBytes } from "node:crypto";
 import fs from "node:fs"; import path from "node:path";
-import { normalizeSessionId, workspaceStateDir, wsKey } from "./config-store.mjs";
+import { normalizeSessionId, workspaceStateDir, wsKey, ensurePrivateDir, writePrivateFileAtomic } from "./config-store.mjs";
 const CAP = 64 * 1024;
 const cap = (s) => (typeof s === "string" ? s.slice(0, CAP) : s);
 export function writeTrace(ws, trace, { now = Date.now() } = {}) {
   const dir = path.join(workspaceStateDir(ws), "traces");
-  fs.mkdirSync(dir, { recursive: true });
+  // Traces carry full review prompts (source diffs, possibly in-code secrets): keep the whole
+  // state path owner-only, like the rest of the state layer.
+  ensurePrivateDir(workspaceStateDir(ws));
   const id = `${now}-${randomBytes(6).toString("hex")}`; // 48-bit random suffix: same-ms collision is negligible
   const sessionKey = normalizeSessionId(trace.sessionKey ?? trace.session_id ?? trace.sessionId);
   // Stamp the canonical owning workspace KEY into the record so a surfacing path can verify the
@@ -15,7 +17,7 @@ export function writeTrace(ws, trace, { now = Date.now() } = {}) {
   const record = { id, ts: new Date(now).toISOString(), gate: trace.gate, ws: trace.ws, wsKey: wsKey(ws), sessionKey: sessionKey || undefined, reviewers: trace.reviewers || [],
     systemPrompt: cap(trace.systemPrompt), userPrompt: cap(trace.userPrompt),
     rawResponses: Object.fromEntries(Object.entries(trace.rawResponses || {}).map(([k, v]) => [k, cap(v)])) };
-  fs.writeFileSync(path.join(dir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
+  writePrivateFileAtomic(path.join(dir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
   return id;
 }
 export function readTrace(ws, id) { try { return JSON.parse(fs.readFileSync(path.join(workspaceStateDir(ws), "traces", `${id}.json`), "utf8")); } catch { return null; } }

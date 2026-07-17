@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { rollback } from "../scripts/rollback.mjs";
 import { claudePluginInstallRoots, installPeerBench } from "../scripts/install.mjs";
 import { ensureNativePrePushHook, nativePrePushStatus } from "../global-hooks/native-git-hook.mjs";
-import { deploy, snapshot, snapshotPluginInstallRoot } from "../scripts/deploy-global-hooks.mjs";
+import { capturePathState, deploy, snapshot, snapshotPluginInstallRoot } from "../scripts/deploy-global-hooks.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -180,6 +180,41 @@ test("native rollback restores pre-existing managed bytes and mode, and removes 
     }
     assert.equal(rollback({ backupDir: installed.backupDir }).nativePrePush.changed, false, "native restore is idempotent");
   }
+});
+
+test("native rollback refuses to overwrite a pre-existing hook that was replaced after install", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pb-native-replaced-"));
+  const repo = path.join(root, "repo");
+  const home = path.join(root, "home");
+  gitInit(repo);
+  fs.cpSync(path.join(PROJECT_ROOT, "global-hooks"), path.join(repo, "global-hooks"), { recursive: true });
+  fs.cpSync(path.join(PROJECT_ROOT, "codex-prompts"), path.join(repo, "codex-prompts"), { recursive: true });
+  const hookPath = path.join(repo, ".git", "hooks", "pre-push");
+  // A managed hook existed BEFORE install (an older peerbench dispatcher).
+  const runtimeA = path.join(repo, "runtime-a.mjs");
+  fs.writeFileSync(runtimeA, "process.exit(0);\n");
+  assert.equal(ensureNativePrePushHook(repo, { runtimePath: runtimeA }).installed, true);
+
+  const installed = installPeerBench({
+    repoRoot: repo,
+    home,
+    claude: false,
+    codex: true,
+    now: () => 4747,
+    syncClaudePlugin: false
+  });
+  assert.equal(nativePrePushStatus(repo).installed, true);
+
+  // A post-install tool (e.g. husky reinstall) rewrote the hook: it differs from BOTH the
+  // pre-install original and the dispatcher install left behind.
+  const replacement = "#!/bin/sh\n# husky reinstall\nexit 0\n";
+  fs.writeFileSync(hookPath, replacement);
+  fs.chmodSync(hookPath, 0o755);
+
+  const result = rollback({ backupDir: installed.backupDir });
+  assert.equal(result.nativePrePush.ok, false);
+  assert.match(result.nativePrePush.reason, /replaced after install/);
+  assert.equal(fs.readFileSync(hookPath, "utf8"), replacement, "the post-install replacement is preserved");
 });
 
 test("native rollback restores a pre-existing pre-push symlink as a symlink", () => {
@@ -552,4 +587,55 @@ test("rollback aggregates ok:false restorers and the CLI exits nonzero", () => {
   const cli = spawnSync(process.execPath, [path.join(PROJECT_ROOT, "scripts", "rollback.mjs"), backupDir], { encoding: "utf8" });
   assert.equal(cli.status, 1);
   assert.match(cli.stdout, /"ok": false/, cli.stderr || "rollback CLI produced no JSON output");
+});
+
+test("fresh-machine plugin registry rollback honors expectedAfter instead of deleting a changed registry", () => {
+  for (const changed of [true, false]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `pb-registry-fresh-${changed ? "changed" : "pristine"}-`));
+    const backupDir = path.join(root, "backup");
+    const registryDir = path.join(root, "registry");
+    const installedPath = path.join(registryDir, "installed_plugins.json");
+    fs.mkdirSync(registryDir, { recursive: true });
+    const registryBackupDir = path.join(backupDir, "claude-plugin-registry");
+    fs.mkdirSync(registryBackupDir, { recursive: true });
+    // Install on a fresh machine created the registry (nothing pre-existed to back up); the
+    // transaction records the after-install state so rollback can tell later edits apart.
+    fs.writeFileSync(installedPath, `${JSON.stringify({ plugins: { "bench@aiwithrai": [{ scope: "user", installPath: "/x/bench" }] } })}\n`);
+    const expectedAfter = capturePathState(installedPath);
+    if (changed) {
+      // The user installed ANOTHER plugin after peerbench: the registry no longer matches the
+      // after-install state, so removing it would destroy the user's entry.
+      fs.writeFileSync(installedPath, `${JSON.stringify({ plugins: {
+        "bench@aiwithrai": [{ scope: "user", installPath: "/x/bench" }],
+        "other@other": [{ scope: "user", installPath: "/x/other" }]
+      } })}\n`);
+    }
+    fs.writeFileSync(path.join(backupDir, "install-metadata.json"), JSON.stringify({
+      schemaVersion: 1,
+      claude: {
+        pluginRegistryFiles: [{
+          target: installedPath,
+          backupPath: path.join(registryBackupDir, "installed_plugins.json"),
+          existed: false,
+          mode: null,
+          type: null,
+          linkTarget: null,
+          expectedAfter
+        }],
+        statuslineUpdated: false
+      },
+      codex: null,
+      nativePrePush: null
+    }));
+
+    const result = rollback({ backupDir });
+    if (changed) {
+      assert.equal(result.ok, false);
+      assert.match(result.failures.join("\n"), /changed after install/);
+      assert.ok(JSON.parse(fs.readFileSync(installedPath, "utf8")).plugins["other@other"], "the user's post-install plugin entry survives rollback");
+    } else {
+      assert.equal(result.ok, true);
+      assert.equal(fs.existsSync(installedPath), false, "an untouched fresh-machine registry is still removed");
+    }
+  }
 });

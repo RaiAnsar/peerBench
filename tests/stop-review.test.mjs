@@ -532,6 +532,62 @@ test("Stop transaction lock reclaims dead and stale owners", async () => {
   }
 });
 
+test("a mid-acquire orphan reclaim never yields two holders of the same gate", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-lock-toctou-"));
+  process.env.BENCH_ROOT = root;
+  const lockDir = path.join(workspaceStateDir(ws), "stop-review.lock");
+  const instanceOf = (dir) => {
+    const st = fs.statSync(dir);
+    return `${st.ino}:${st.birthtimeMs}`;
+  };
+  const createdByAcquirer = new Set();
+  const origMkdir = fs.mkdirSync;
+  const origWrite = fs.writeFileSync;
+  let reclaimed = false;
+  let simulating = false;
+  fs.mkdirSync = (target, options) => {
+    const result = origMkdir.call(fs, target, options);
+    if (!simulating && String(target) === lockDir) createdByAcquirer.add(instanceOf(lockDir));
+    return result;
+  };
+  fs.writeFileSync = (file, ...args) => {
+    if (!reclaimed && !simulating && String(file).startsWith(`${lockDir}${path.sep}`)) {
+      // The acquirer stalled past the orphan grace between its mkdir and this first owner write
+      // (SIGSTOP/laptop sleep): a waiter reclaims the ownerless dir and republishes its own lock
+      // at the same path before the stalled write lands.
+      reclaimed = true;
+      simulating = true;
+      try {
+        const quarantine = `${lockDir}.reclaim-sim`;
+        fs.renameSync(lockDir, quarantine);
+        fs.rmSync(quarantine, { recursive: true, force: true });
+        fs.mkdirSync(lockDir, { mode: 0o700 });
+        origWrite.call(fs, path.join(lockDir, "owner.json"),
+          `${JSON.stringify({ schema: 1, pid: 99_999_999, token: "waiter", startedAt: Date.now(), heartbeatAt: Date.now() })}\n`);
+      } finally {
+        simulating = false;
+      }
+    }
+    return origWrite.call(fs, file, ...args);
+  };
+
+  try {
+    const release = await acquireStopGateLock(ws, { pollMs: 1 });
+    assert.equal(reclaimed, true, "the simulated orphan reclaim actually fired mid-acquire");
+    const heldInstance = instanceOf(lockDir);
+    release();
+    assert.ok(
+      createdByAcquirer.has(heldInstance),
+      "the resolved acquisition must hold a lock dir it created, never the reclaimed-and-republished one"
+    );
+  } finally {
+    fs.mkdirSync = origMkdir;
+    fs.writeFileSync = origWrite;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Test: disabled workspace → no-op (exit 0)
 // ---------------------------------------------------------------------------
@@ -1261,6 +1317,25 @@ test("streamed tracked snapshot cannot mistake a >64MiB diff for clean", async (
   }
 });
 
+test("captureGitSnapshot kills a wedged git and fails the snapshot instead of hanging the gate", async () => {
+  const ws = freshRepo({ withChange: false });
+  // A git that never emits and never exits stands in for a dead NFS/sshfs mount.
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "sr-wedged-git-"));
+  fs.writeFileSync(path.join(shimDir, "git"), "#!/bin/sh\nexec sleep 10\n", { mode: 0o755 });
+  fs.chmodSync(path.join(shimDir, "git"), 0o755);
+  const origPath = process.env.PATH;
+  process.env.PATH = `${shimDir}${path.delimiter}${origPath ?? ""}`;
+  const startedAt = Date.now();
+  try {
+    const snapshot = await captureGitSnapshot(["status", "--short"], ws, { timeoutMs: 150 });
+    assert.equal(snapshot.ok, false, "a wedged git must surface as a failed snapshot, not a hang");
+    assert.match(snapshot.error, /timed out/, "the failure names the timeout");
+    assert.ok(Date.now() - startedAt < 5_000, "the capture returns promptly once the kill timer fires");
+  } finally {
+    process.env.PATH = origPath;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Task 7 — E2: visible stderr note on malformed stdin (mirrors pre-push E2)
 // ---------------------------------------------------------------------------
@@ -1482,9 +1557,10 @@ test("GAP FIX: the marker does NOT advance on fail-open (range is re-reviewed un
   assert.equal(readReviewedHead(ws), initial, "marker stays put on fail-open so the range is re-reviewed");
 });
 
-test("GAP FIX: a genuine no-op turn keeps the baseline current (sets marker to HEAD) and skips", async () => {
-  const ws = freshRepo({ withChange: false });   // clean tree, no marker
+test("GAP FIX: a genuine no-op turn keeps an existing baseline current and skips", async () => {
+  const ws = freshRepo({ withChange: false });   // clean tree
   const head = gitC(ws, "rev-parse", "HEAD").trim();
+  writeReviewedHead(ws, "ORPHANED-BASELINE");    // e.g. a rebase orphaned the marker
   let called = false;
   const { restore } = captureEmit(() => {});
   try {
@@ -1497,5 +1573,68 @@ test("GAP FIX: a genuine no-op turn keeps the baseline current (sets marker to H
     });
   } finally { restore(); }
   assert.equal(called, false, "no changes → no review");
-  assert.equal(readReviewedHead(ws), head, "baseline marker established at HEAD for the next committing turn");
+  assert.equal(readReviewedHead(ws), head, "an existing baseline is refreshed to HEAD for the next committing turn");
+});
+
+test("a clean committing turn with no baseline and no upstream does not certify unreviewed commits", async () => {
+  const ws = freshRepo({ withChange: false });   // upstream-less repo, no reviewed-head marker
+  // The /bench:on mid-session repro: the first observed turn COMMITS its work (clean tree), so
+  // resolveReviewBase falls back to HEAD and the snapshot has no reviewable evidence at all.
+  fs.writeFileSync(path.join(ws, "feature.js"), "export const committed = 1;\n");
+  gitC(ws, "add", "-A");
+  gitC(ws, "commit", "-qm", "feat: committed with bench freshly enabled");
+  let called = false;
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { called = true; return [fakeReviewer("Kimi", "ALLOW")]; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws }
+    });
+  } finally { restore(); }
+  assert.equal(called, false, "base == HEAD means this clean snapshot contains no reviewable evidence");
+  assert.equal(readReviewedHead(ws), null, "the no-op path must not certify commits no reviewer ever saw");
+});
+
+test("session-total budget: ALLOW/clean transitions reset the streak but never refund the total; the 9th block latches advisory-only", async () => {
+  const ws = freshRepo({ withChange: true });
+  let verdict = "BLOCK";
+  let calls = 0;
+  const reviewer = { name: "Kimi", async run() { calls += 1; return verdict === "BLOCK"
+    ? { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug" }
+    : { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: fixed", raw: "ALLOW: fixed" }; } };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: "total-budget" },
+    blockHandler: async () => {}
+  };
+
+  // Streaks of 2 blocks, each "healed" by an ALLOW on a changed revision BEFORE the streak
+  // ceiling latches — the exact alternation that used to run for 8 hours (every ALLOW refunded
+  // the streak, so the wakes never ended). Budget: 9 total blocks, then advisory-only.
+  for (let streak = 0; streak < 4; streak++) {
+    verdict = "BLOCK";
+    for (let i = 0; i < 2; i++) {
+      fs.appendFileSync(path.join(ws, "changed.js"), `export const s${streak}i${i} = 1;\n`);
+      await runMain(opts);
+    }
+    verdict = "ALLOW";
+    fs.appendFileSync(path.join(ws, "changed.js"), `export const heal${streak} = 1;\n`);
+    await runMain(opts);   // ALLOW resets the streak — but must not refund the total
+  }
+  verdict = "BLOCK";       // 9th total block
+  fs.appendFileSync(path.join(ws, "changed.js"), "export const ninth = 1;\n");
+  await runMain(opts);
+  const beforeExhausted = calls;
+  verdict = "BLOCK";
+  const emitted = [];
+  fs.appendFileSync(path.join(ws, "changed.js"), "export const again = 1;\n");
+  await runMain({ ...opts, emitter: { emit(payload) { emitted.push(payload); return true; } } });
+  assert.equal(calls, beforeExhausted, "after 9 total blocks the panel must not run again this session");
+  assert.match(emitted[0]?.systemMessage || "", /session-total automatic review budget exhausted/);
 });

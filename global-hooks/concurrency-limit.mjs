@@ -26,15 +26,26 @@ export async function withConcurrencyLimit(opts, fn) {
   const dir = path.join(root, "locks", name);
   try { fs.mkdirSync(dir, { recursive: true }); } catch { return fn(null); }  // can't make lock dir → fail open
   const deadline = now() + timeoutMs;
+  // Ownership token: a holder that outlives staleMs can have its slot stolen and re-acquired; the
+  // token lets the slow finisher's release tell "my slot" from the stealer's LIVE one.
+  const token = `${process.pid}:${now()}:${Math.random().toString(36).slice(2)}`;
+  const ownerFile = (slot) => path.join(slot, "owner");
   let held = null, heldIdx = null;
   while (!held) {
     for (let i = 0; i < slots; i++) {
       const slot = path.join(dir, `slot-${i}`);
-      try { fs.mkdirSync(slot); held = slot; heldIdx = i; break; }   // claimed a free slot
+      // Claim a free slot, then drop our token in it (a failed write fails open; the empty dir
+      // leaks until it goes stale and is stolen — same as a crashed holder).
+      try { fs.mkdirSync(slot); fs.writeFileSync(ownerFile(slot), token, { mode: 0o600 }); held = slot; heldIdx = i; break; }
       catch (e) {
         if (e?.code !== "EEXIST") { return fn(null); }        // unexpected fs error → fail open
         try {                                                 // occupied: steal only if stale (crashed holder)
-          if (now() - fs.statSync(slot).mtimeMs > staleMs) { fs.rmdirSync(slot); fs.mkdirSync(slot); held = slot; heldIdx = i; break; }
+          if (now() - fs.statSync(slot).mtimeMs > staleMs) {
+            fs.rmSync(slot, { recursive: true, force: true }); // recursive: the stale token file is inside
+            fs.mkdirSync(slot);
+            fs.writeFileSync(ownerFile(slot), token, { mode: 0o600 });
+            held = slot; heldIdx = i; break;
+          }
         } catch { /* lost the race or vanished — loop and retry */ }
       }
     }
@@ -43,7 +54,13 @@ export async function withConcurrencyLimit(opts, fn) {
     await sleepImpl(50 + Math.floor((now() % 150)));          // brief jittered wait for a slot to free
   }
   try { return await fn(heldIdx); }
-  finally { try { fs.rmdirSync(held); } catch { /* already stolen/removed */ } }
+  finally {
+    // Release ONLY if the slot is still ours: after a steal the path belongs to the live stealer,
+    // and a blind rmdir would delete it, letting a third process exceed the per-key cap.
+    try {
+      if (fs.readFileSync(ownerFile(held), "utf8") === token) { fs.unlinkSync(ownerFile(held)); fs.rmdirSync(held); }
+    } catch { /* already stolen/removed */ }
+  }
 }
 
 // Self-check: assert the limiter never lets more than `slots` run at once. Run: node concurrency-limit.mjs

@@ -384,6 +384,13 @@ async function main() {
 // revoked refresh token — seen live). Slow-ish on purpose: honest checks only.
 const HEALTH_API_TIMEOUT_MS = 30_000;
 const HEALTH_CODEX_TIMEOUT_MS = 180_000;
+// Health output is what users paste into issue reports: never echo the submitted key, and mask
+// sk-*-shaped tokens a provider error body might reflect back ("Invalid API key: sk-...").
+function redactHealthSecrets(text, apiKey) {
+  let out = String(text);
+  if (apiKey) out = out.split(String(apiKey)).join("[redacted]");
+  return out.replace(/sk-[A-Za-z0-9_-]{4,}/g, "sk-[redacted]");
+}
 export async function healthCommand({ all = false, env = process.env, fetchImpl, codexImpl, grokImpl, cfg: cfgOverride } = {}) {
   const cfg = cfgOverride || resolveConfig({ env });
   const doFetch = fetchImpl || globalThis.fetch;
@@ -406,7 +413,7 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
       }).finally(() => clearTimeout(timer));
       const ms = Date.now() - t0;
       if (r.ok) return { name, display: displayName(name), ok: true, note: `${p.model} · ${ms}ms` };
-      const body = (await r.text().catch(() => "")).slice(0, 120);
+      const body = redactHealthSecrets((await r.text().catch(() => "")).slice(0, 120), p.apiKey);
       return { name, display: displayName(name), ok: false, note: `HTTP ${r.status} in ${ms}ms — ${body}` };
     } catch (e) {
       const kind = e?.name === "AbortError" ? `timeout >${HEALTH_API_TIMEOUT_MS / 1000}s` : String(e?.message || e).slice(0, 100);
@@ -541,16 +548,17 @@ export function gateToggleCommand(ws, args, {
       : disableLegacyCodexWorkspaceImpl(ws);
     const legacyChanged = typeof legacy?.changed === "number" ? legacy.changed > 0 : Boolean(legacy?.changed);
     legacyNote = legacyChanged ? " Legacy Codex gate disabled." : "";
-  } else {
-    // Keep-both must actively RESTORE a gate that single-gate mode (or the pre-fix disable) turned
-    // off — merely skipping the disable left such workspaces silently Codex-less (caught by Grok).
-    const restored = scope === "global"
-      ? enableLegacyCodexGlobalImpl()
-      : enableLegacyCodexWorkspaceImpl(ws);
+  } else if (scope === "workspace") {
+    // Keep-both restores THIS workspace's Codex gate — a deliberate, user-initiated, repo-scoped
+    // act. It must never fan out globally: the old mass-restore flipped stopReviewGate:true in
+    // every state file (tmp dirs, non-git chats included), so one Codex outage wedged everything.
+    const restored = enableLegacyCodexWorkspaceImpl(ws);
     const n = typeof restored?.changed === "number" ? restored.changed : (restored?.changed ? 1 : 0);
     legacyNote = n > 0
-      ? ` Codex gate RESTORED (${n} workspace${n === 1 ? "" : "s"}) — runs alongside peerBench.`
+      ? " Codex gate RESTORED for this workspace — runs alongside peerBench."
       : " Codex gate kept — runs alongside peerBench.";
+  } else {
+    legacyNote = " Codex gate left as each workspace's own setting (enable per repo with /bench:on there).";
   }
   if (!stillDisabled) return `bench: enabled (${scope}).${legacyNote}`;
   // The cleared scope didn't fully re-enable — name the remaining source honestly.

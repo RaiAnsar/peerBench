@@ -1563,6 +1563,26 @@ test("git push --no-verify remains the explicit all-hooks bypass", async () => {
   assert.equal(stdout, "", "explicit all-hooks Git bypass should be a silent allow");
 });
 
+test("--no-verify on ANOTHER command in the compound does NOT skip the push gate", async () => {
+  const { ws } = freshPushRepo();
+  let ensureCalls = 0;
+  let stdout = "";
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+  try {
+    await runHookMain({
+      input: { cwd: ws, tool_input: { command: "git commit --no-verify -m wip; git push origin main" } },
+      env: {},
+      ensureNativeHookImpl: () => { ensureCalls++; return { ok: false, installed: false, reason: "conflict" }; }
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(ensureCalls, 1, "--no-verify scopes to the commit; Git still runs hooks for the unprefixed push");
+  const decision = JSON.parse(stdout.trim());
+  assert.equal(decision.hookSpecificOutput.permissionDecision, "deny");
+});
+
 for (const [label, command, env] of [
   ["inline assignment", "BENCH_NATIVE_PUSH_BYPASS=1 git push origin main", {}],
   ["hook environment", "git push origin main", { BENCH_NATIVE_PUSH_BYPASS: "1" }]
@@ -1586,6 +1606,50 @@ for (const [label, command, env] of [
     assert.equal(stdout, "", "peerBench bypass should be a silent allow at bootstrap");
   });
 }
+
+for (const [label, command] of [
+  ["assignment after the push runs", "git push origin main; BENCH_NATIVE_PUSH_BYPASS=1 git status"],
+  ["assignment scoped to a different command", "BENCH_NATIVE_PUSH_BYPASS=1 git fetch; git push origin main"]
+]) {
+  test(`BENCH_NATIVE_PUSH_BYPASS on another command does NOT skip the push gate (${label})`, async () => {
+    const { ws } = freshPushRepo();
+    let ensureCalls = 0;
+    let stdout = "";
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+    try {
+      await runHookMain({
+        input: { cwd: ws, tool_input: { command } },
+        env: {},
+        ensureNativeHookImpl: () => { ensureCalls++; return { ok: false, installed: false, reason: "conflict" }; }
+      });
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    assert.equal(ensureCalls, 1, "a NAME=value prefix scopes to its own command, so the unprefixed push still arms the gate");
+    const decision = JSON.parse(stdout.trim());
+    assert.equal(decision.hookSpecificOutput.permissionDecision, "deny");
+  });
+}
+
+test("BENCH_NATIVE_PUSH_BYPASS prefixing the push itself wins over a later segment's assignment", async () => {
+  const { ws } = freshPushRepo();
+  let ensureCalls = 0;
+  let stdout = "";
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
+  try {
+    await runHookMain({
+      input: { cwd: ws, tool_input: { command: "BENCH_NATIVE_PUSH_BYPASS=1 git push origin main; BENCH_NATIVE_PUSH_BYPASS=0 git status" } },
+      env: {},
+      ensureNativeHookImpl: () => { ensureCalls++; return { ok: false, installed: false, reason: "conflict" }; }
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(ensureCalls, 0, "the push command's own prefix scopes the bypass to the push");
+  assert.equal(stdout, "", "a bypassed push stays a silent allow at bootstrap");
+});
 
 test("explicit BENCH_LEGACY_PUSH_PREFLIGHT opt-in retains the legacy fallback", async () => {
   const { ws } = freshPushRepo();
@@ -1993,6 +2057,32 @@ test("H: launchPushReview never blocks the push — an enqueue/git throw is swal
   }
   assert.equal(ret, false, "an internal throw must be swallowed (returns false), never propagated to block the push");
   assert.match(stderrChunks.join(""), /⛩ pre-push: deep push-review enqueue failed/i, "must note the enqueue failure on stderr");
+});
+
+test("H: launchPushReview skips the enqueue when rev-parse HEAD fails (no empty-head job identity)", () => {
+  const { ws } = freshPushRepo();
+  const wsReal = fs.realpathSync(ws);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ppr-root-hhead-")));
+  process.env.BENCH_ROOT = root;
+
+  const stderrChunks = [];
+  const origErr = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
+  let ret;
+  let enqueues = 0;
+  try {
+    ret = launchPushReview(ws, "@{u}..HEAD", {
+      gitImpl: () => ["", false],
+      enqueueImpl: () => { enqueues++; return true; }
+    });
+  } finally {
+    process.stderr.write = origErr;
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+  assert.equal(ret, false, "a transient rev-parse HEAD failure must skip the deep enqueue (the fast gate still stands)");
+  assert.equal(enqueues, 0, "no deep job is stamped with an empty head — the runner would recompute a different key and delete the durable block");
+  assert.equal(listJobs(wsReal).length, 0, "no durable job left behind");
+  assert.match(stderrChunks.join(""), /rev-parse HEAD failed/i, "the skip is surfaced on stderr");
 });
 
 test("H: launchPushReview dedupes on the (push:range, headSha) content key — second enqueue is a no-op", () => {

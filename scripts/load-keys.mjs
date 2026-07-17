@@ -72,6 +72,11 @@ for (const name of PROVIDERS) {
     const headers = { ...(preserved.headers || {}), ...(p.headers || {}) };   // preserve custom headers, overlay .keys UA
     cur.providers[name] = { ...preserved, ...p, ...(Object.keys(headers).length ? { headers } : {}) };
     loaded.push(name);
+  } else if (cur.providers[name]) {
+    // Provider dropped from .keys entirely: strip the managed fields too, so a rotated-out or
+    // compromised key goes dead instead of staying live in companion.json. Unmanaged fields and
+    // custom headers are preserved, same as the reload path above.
+    for (const f of MANAGED_FIELDS) delete cur.providers[name][f];
   }
 }
 

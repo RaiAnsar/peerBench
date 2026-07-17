@@ -22,6 +22,7 @@ import {
   planApprovalIdentity,
   planCycleAdvisory,
   readPlanCycle,
+  readPlanMarker,
   truthy,
   waitForPlanReview
 } from "./plan-gate-state.mjs";
@@ -31,6 +32,11 @@ const HOOK_KIND = "plan-file-panel";
 function workspaceRoot(cwd) {
   try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
   catch { return cwd; }
+}
+
+function insideGitWorkTree(cwd) {
+  try { return execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8" }).trim() === "true"; }
+  catch { return false; }
 }
 
 // After a fast ALLOW, ENQUEUE a deep spec-review job for the asyncRewake Stop runner
@@ -208,6 +214,9 @@ export async function runMain({
   const filePath = path.isAbsolute(rawFilePath) ? rawFilePath : path.resolve(cwd, rawFilePath);
   const ws = workspaceRoot(cwd);              // git top-level — matches /bench:off marker + the other gates
   if (isBenchDisabledImpl(ws)) return;
+  // Plan/spec markdown is gated only inside a git repository — a home-dir or scratch chat
+  // writing a plans/*.md must never be pulled into a panel-review loop. Silent return = allow.
+  if (!insideGitWorkTree(ws)) return;
 
   let snapshot;
   try { snapshot = await readPlanSnapshot(filePath); }
@@ -266,10 +275,24 @@ export async function runMain({
       return true;
     }
     if (outcome === "advisory") {
-      emit({ systemMessage: `⛩ bench plan-file: ${planCycleAdvisory(readPlanCycle(ws, sessionKey)).slice(0, 3500)}` });
+      // The completing review WAS validated and blocked — its findings claimed no ledger slot, so
+      // they must ride inside the advisory rather than be discarded (F1).
+      const advisory = planCycleAdvisory(readPlanCycle(ws, sessionKey), {
+        completedFindings: payload.detail || payload.summary || ""
+      });
+      emit({ systemMessage: `⛩ bench plan-file: ${advisory.slice(0, 3500)}` });
       return true;
     }
     if (outcome === "superseded") {
+      // Cross-session same-identity race: the twin that won the shared head may have already
+      // committed the very ALLOW this review lost. Prefer that durable approval over claiming a
+      // revision change or cycle reset that never happened (F4).
+      const marker = readPlanMarker(ws, HOOK_KIND, filePath);
+      if (marker?.status === "allow" && marker.identity === approvalKey) {
+        const deep = requestDeepReview();
+        emit({ systemMessage: `⛩ plan gate: exact revision approved by the shared single-flight review; full deep review ${deep.ok ? "queued or already pending" : "could not be queued"}.` });
+        return true;
+      }
       emit({ systemMessage: "⛩ plan gate: UNREVIEWED — this review was superseded by a newer file revision or cycle reset; its ALLOW/BLOCK result was discarded and no cycle slot was changed." });
       return true;
     }

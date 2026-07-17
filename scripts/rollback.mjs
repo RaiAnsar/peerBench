@@ -214,7 +214,11 @@ function restoreRecordedFiles(entries, backupDir) {
       destination: path.resolve(entry.target),
       knownAbsent: entry.existed === false,
       mode: entry.mode,
-      snapshot: entry.type ? entry : null,
+      // Pass the entry as the snapshot whenever it is typed, and also for a file that did NOT
+      // exist pre-install (type null): restoreSnapshotEntry still honors expectedAfter there,
+      // instead of removing a target the user changed after install. Typeless legacy entries
+      // keep the backup-file fallback below.
+      snapshot: entry.type || entry.existed === false ? entry : null,
       expectedState: entry.expectedAfter || null,
       backupDir
     });
@@ -276,6 +280,14 @@ function restoreNativePrePushSnapshot(snapshot, backupDir) {
     return true;
   };
   if (snapshot.hook.existed) {
+    // The installed dispatcher legitimately differs from the pre-install original, so a mismatch
+    // against the original is expected. Refuse only when the hook ALSO differs from the recorded
+    // after-install state: something (e.g. a husky reinstall) replaced it after install.
+    if (snapshot.hookAfterState
+        && !capturedMatches(snapshot.hook, snapshot.hookPath)
+        && !pathStateMatches(snapshot.hookPath, snapshot.hookAfterState)) {
+      return { ok: false, changed: false, reason: "native pre-push hook was replaced after install; preserving it" };
+    }
     changed = restoreCaptured(snapshot.hook, snapshot.hookPath) || changed;
   } else if (pathEntryExists(snapshot.hookPath)) {
     let managed = false;

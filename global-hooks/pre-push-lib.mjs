@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveConfig, workspaceStateDir } from "./config-store.mjs";
+import { resolveConfig, workspaceStateDir, readReviewerCooldown } from "./config-store.mjs";
 import { shouldRewake } from "./deep-review.mjs";
 import { consumeCycleReset } from "./cycle-reset.mjs";
 import { runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
@@ -239,6 +239,31 @@ function cycleHold(ws, scope, { now, windowMs, maxCycles, reset, fsImpl }) {
   return state;
 }
 
+// FAST-FAIL before the (multi-minute) panel: if reviewer availability cooldowns make the policy
+// unsatisfiable — the trusted Codex verdict is required but Codex is out of quota, or too few
+// non-cooled reviewers remain to meet quorum — say so honestly and immediately. Without this,
+// every push retry re-ran the whole dying panel, burned its timeouts, and then blocked anyway
+// with an opaque "quorum not met".
+export function pushPolicyDoomedByCooldowns(intendedReviewers, policy, { now = Date.now() } = {}) {
+  const intended = [...new Set((intendedReviewers || []).map(normalizeReviewerName).filter(Boolean))];
+  const cooled = intended
+    .map((name) => ({ name, cooldown: readReviewerCooldown(name, { now }) }))
+    .filter((entry) => entry.cooldown);
+  if (!cooled.length) return null;
+  const describe = ({ name, cooldown }) => {
+    const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - now) / 60_000));
+    return `${name}: ${cooldown.kind === "auth" ? "auth failed (re-auth needed)" : "out of quota/credits"} — retry in ~${minutesLeft} min`;
+  };
+  const codexRequiredButCooled = policy.requireCodex && cooled.some((entry) => entry.name === "codex");
+  const availableCount = intended.length - cooled.length;
+  if (codexRequiredButCooled || availableCount < policy.quorum) {
+    return `push review cannot currently succeed — ${cooled.map(describe).join("; ")}. ` +
+      "Wait for the quota/cooldown to clear (or re-auth), then push again; " +
+      "BENCH_NATIVE_PUSH_BYPASS=1 git push is the explicit peerBench-only bypass.";
+  }
+  return null;
+}
+
 export function evaluatePushReview(review, intendedReviewers, env = process.env) {
   // Deterministic evidence-coverage failures are policy BLOCKs, not provider outages. They are
   // safe to cache by exact immutable range and participate in the same three-revision ceiling.
@@ -261,8 +286,11 @@ export function evaluatePushReview(review, intendedReviewers, env = process.env)
   }
   const valid = [...validByName.values()];
   const configuredQuorum = Number(env.BENCH_PUSH_REVIEW_QUORUM);
+  // A configured quorum larger than the panel can never be met and would block every push as
+  // unavailable; clamp to all configured reviewers (the documented "or all when fewer are
+  // configured" behavior).
   const quorum = Number.isInteger(configuredQuorum) && configuredQuorum > 0
-    ? configuredQuorum
+    ? Math.max(1, Math.min(configuredQuorum, intended.length || 1))
     : Math.max(1, Math.min(2, intended.length || sides.length || 1));
   const requireCodex = intended.includes("codex") && !["0", "false", "no", "off"].includes(String(env.BENCH_PUSH_REQUIRE_CODEX || "").toLowerCase());
   const unavailableReasons = [];
@@ -310,8 +338,10 @@ export function evaluatePushReview(review, intendedReviewers, env = process.env)
 function nativePushPolicy(config, env) {
   const intended = config.reviewers.map(normalizeReviewerName);
   const configuredQuorum = Number(env.BENCH_PUSH_REVIEW_QUORUM);
+  // Same clamp as evaluatePushReview: an over-large configured quorum means "all reviewers",
+  // never an unreachable bar (and it keeps the policy fingerprint identical for equivalent values).
   const quorum = Number.isInteger(configuredQuorum) && configuredQuorum > 0
-    ? configuredQuorum
+    ? Math.max(1, Math.min(configuredQuorum, intended.length || 1))
     : Math.max(1, Math.min(2, intended.length || 1));
   const requireCodex = intended.includes("codex") && !["0", "false", "no", "off"].includes(String(env.BENCH_PUSH_REQUIRE_CODEX || "").toLowerCase());
   const configuredReviewers = intended.map((name) => {
@@ -370,26 +400,41 @@ async function acquireNativePushLock(cwd, remoteName, remoteUrl, fsImpl = fs, wa
   for (;;) {
     try {
       fsImpl.mkdirSync(lock, { mode: 0o700 });
+      const nonce = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       try {
         fsImpl.writeFileSync(ownerFile, `${JSON.stringify({
           pid: process.pid,
-          nonce: `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          nonce,
           createdAt: Date.now()
         })}\n`, { mode: 0o600 });
       } catch (error) {
         try { fsImpl.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
         throw error;
       }
-      return () => { try { fsImpl.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ } };
+      // The lease may be legitimately replaced while we still hold it (a contender reclaimed it
+      // after we looked dead). Only remove the lock while the owner record is still OURS, or an
+      // evicted owner's release would delete the new owner's lease (the deep-review runner's
+      // lease release checks the same nonce).
+      return () => {
+        try {
+          const owner = JSON.parse(fsImpl.readFileSync(ownerFile, "utf8"));
+          if (owner?.nonce !== nonce) return;
+          fsImpl.rmSync(lock, { recursive: true, force: true });
+        } catch { /* owner already released/replaced */ }
+      };
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       let owner = null;
       let ageMs = 0;
       try { owner = JSON.parse(fsImpl.readFileSync(ownerFile, "utf8")); } catch { /* creator may be writing it */ }
       try { ageMs = Date.now() - fsImpl.statSync(lock).mtimeMs; } catch { ageMs = Infinity; }
-      const deadOwner = owner && !ownerAlive(Number(owner.pid));
+      const liveOwner = owner && ownerAlive(Number(owner.pid));
+      const deadOwner = owner && !liveOwner;
       const abandonedWithoutOwner = !owner && ageMs > 2_000;
-      const impossiblyOldLease = ageMs > 30 * 60 * 1000;
+      // A legitimate multi-range review can exceed any fixed age ceiling (each range may run up to
+      // the deep-review budget), so age alone never evicts a LIVE owner — only a dead owner's or
+      // an unreadable owner record's lease is reclaimable by age.
+      const impossiblyOldLease = !liveOwner && ageMs > 30 * 60 * 1000;
       if (deadOwner || abandonedWithoutOwner || impossiblyOldLease) {
         try { fsImpl.rmSync(lock, { recursive: true, force: true }); } catch { /* another process won */ }
         continue;
@@ -445,6 +490,11 @@ async function reviewNativePushLocked({
       summary: `automatic review ceiling reached after ${hold.count} blocked revisions`,
       findings: `${consolidated}\n\nFix the consolidated findings, then run the push once with a new BENCH_PUSH_CYCLE_RESET nonce to authorize a fresh verification. BENCH_NATIVE_PUSH_BYPASS=1 git push bypasses peerBench only; git push --no-verify bypasses every pre-push hook.`.trim()
     };
+  }
+
+  const doomed = pushPolicyDoomedByCooldowns(intendedReviewers, policy, { now });
+  if (doomed) {
+    return { decision: "unavailable", kind: "reviewer-cooldown", identity, reason: doomed };
   }
 
   const traceIds = [];

@@ -54,6 +54,31 @@ test("glob lists tracked files", async () => {
   const out = await execute("glob", { pattern: "*.js" });
   assert.match(out, /a\.js/);
 });
+test("glob on a treeish lists pushed-tip files (default '*')", async () => {
+  const d = tmpRepo();
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: d, encoding: "utf8" }).trim();
+  const { execute } = createReviewTools(d, { treeish: head });
+  for (const out of [await execute("glob", {}), await execute("glob", { pattern: "*" })]) {
+    assert.match(out, /a\.js/);
+    assert.match(out, /sub\/b\.js/);
+  }
+});
+test("glob on a treeish filters with the same semantics as git ls-files", async () => {
+  const d = tmpRepo();
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: d, encoding: "utf8" }).trim();
+  const { execute } = createReviewTools(d, { treeish: head });
+  const js = await execute("glob", { pattern: "*.js" });
+  assert.match(js, /a\.js/);
+  assert.match(js, /sub\/b\.js/);
+  assert.equal(await execute("glob", { pattern: "sub" }), "sub/b.js");
+  assert.equal(await execute("glob", { pattern: "*.md" }), "(no files)");
+  assert.match(await execute("glob", { pattern: "." }), /sub\/b\.js/, "a '.' pathspec is the repo root — matches everything, as in git ls-files");
+});
+test("glob on a treeish surfaces a git failure as an error, not '(no files)'", async () => {
+  const d = tmpRepo();
+  const { execute } = createReviewTools(d, { treeish: "0".repeat(40) });
+  await assert.rejects(() => execute("glob", { pattern: "*" }), /could not list pushed-tip files/);
+});
 test("list_dir lists entries; rejects escape", async () => {
   const d = tmpRepo();
   const { execute } = createReviewTools(d);

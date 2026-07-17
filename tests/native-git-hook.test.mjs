@@ -325,6 +325,111 @@ test("real git push supplies exact post-commit tuples, chains identical stdin, a
   assert.equal(run("git", ["rev-parse", "refs/heads/main"], remote), bypassSha);
 });
 
+test("concurrent installs never rename the dispatcher over an existing pre-push chain", () => {
+  const ws = repo();
+  const hooks = path.join(ws, ".git", "hooks");
+  const hookPath = path.join(hooks, "pre-push");
+  const localPath = path.join(hooks, "pre-push.local");
+  const original = "#!/bin/sh\nexit 0\n";
+  fs.writeFileSync(hookPath, original);
+  fs.chmodSync(hookPath, 0o755);
+  const runtime = fakeRuntime(ws);
+
+  // Interleave a full competing install between this install's status read and its hook rename —
+  // exactly the window two simultaneous installers hit. Match on basenames because git may report
+  // the hooks dir through a different symlink prefix than os.tmpdir().
+  let interleaved = false;
+  let competitor = null;
+  const racingFs = Object.create(fs);
+  racingFs.renameSync = (from, to) => {
+    if (!interleaved && path.basename(from) === "pre-push" && path.basename(to) === "pre-push.local") {
+      interleaved = true;
+      competitor = ensureNativePrePushHook(ws, { runtimePath: runtime, lock: { attempts: 3, sleepMs: 1 } });
+    }
+    return fs.renameSync(from, to);
+  };
+  const installed = ensureNativePrePushHook(ws, { runtimePath: runtime, fsImpl: racingFs });
+  assert.equal(interleaved, true);
+  assert.equal(competitor.ok, false);
+  assert.match(competitor.reason, /busy/);
+  assert.equal(installed.ok, true);
+  assert.equal(installed.chained, true);
+  assert.equal(fs.readFileSync(localPath, "utf8"), original, "the user's hook must survive the race");
+  assert.match(fs.readFileSync(hookPath, "utf8"), /peerBench managed/);
+  assert.doesNotMatch(fs.readFileSync(localPath, "utf8"), /peerBench managed/, "the dispatcher must not chain itself");
+});
+
+test("install refuses to run while another installer holds the lock", () => {
+  const ws = repo();
+  const hooks = path.join(ws, ".git", "hooks");
+  const hookPath = path.join(hooks, "pre-push");
+  const original = "#!/bin/sh\nexit 0\n";
+  fs.writeFileSync(hookPath, original);
+  fs.chmodSync(hookPath, 0o755);
+  fs.mkdirSync(path.join(hooks, "pre-push.peerbench-install.lock"));
+
+  const result = ensureNativePrePushHook(ws, { runtimePath: fakeRuntime(ws), lock: { attempts: 3, sleepMs: 1 } });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /busy/);
+  assert.equal(fs.readFileSync(hookPath, "utf8"), original, "a busy install must not touch the hooks");
+  assert.equal(fs.existsSync(path.join(hooks, "pre-push.local")), false);
+  fs.rmdirSync(path.join(hooks, "pre-push.peerbench-install.lock"));
+});
+
+test("install steals a stale install lock left by a crashed installer", () => {
+  const ws = repo();
+  const hooks = path.join(ws, ".git", "hooks");
+  const lockDir = path.join(hooks, "pre-push.peerbench-install.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  const crashed = new Date(Date.now() - 120_000);
+  fs.utimesSync(lockDir, crashed, crashed);
+
+  const result = ensureNativePrePushHook(ws, { runtimePath: fakeRuntime(ws), lock: { staleMs: 30_000, attempts: 5, sleepMs: 1 } });
+  assert.equal(result.ok, true);
+  assert.equal(result.installed, true);
+  assert.equal(fs.existsSync(lockDir), false, "the lock is released after install");
+});
+
+test("dispatcher restores the caller's umask before running a chained hook", () => {
+  const ws = repo();
+  const hooks = path.join(ws, ".git", "hooks");
+  const capture = path.join(ws, "umask-capture");
+  fs.writeFileSync(path.join(hooks, "pre-push"), "#!/bin/sh\numask > \"$UMASK_CAPTURE\"\ncat >/dev/null\n");
+  fs.chmodSync(path.join(hooks, "pre-push"), 0o755);
+  assert.equal(ensureNativePrePushHook(ws, { runtimePath: fakeRuntime(ws) }).ok, true);
+
+  const invoked = spawnSync("/bin/sh", ["-c", "umask 022; exec \"$0\" origin file:///remote", path.join(hooks, "pre-push")], {
+    cwd: ws,
+    input: "",
+    encoding: "utf8",
+    env: { ...process.env, CAPTURE: path.join(ws, "runtime-capture"), UMASK_CAPTURE: capture }
+  });
+  assert.equal(invoked.status, 0, invoked.stderr);
+  assert.equal(Number.parseInt(fs.readFileSync(capture, "utf8").trim(), 8), 0o022);
+});
+
+test("dispatcher preserves $0 for chained zsh hooks", (t) => {
+  if (spawnSync("/bin/zsh", ["-c", "true"]).status !== 0) return t.skip("zsh is not available");
+  const ws = repo();
+  const hooks = path.join(ws, ".git", "hooks");
+  const capture = path.join(ws, "zsh-basename");
+  const runtime = fakeRuntime(ws);
+  assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime }).ok, true);
+
+  for (const shebang of ["#!/bin/zsh", "#!/usr/bin/env zsh"]) {
+    fs.writeFileSync(path.join(hooks, "pre-push.local"), `${shebang}\nprintf 'zsh-basename:%s\\n' "$(basename "$0")" > "$ZSH_CAPTURE"\ncat >/dev/null\n`);
+    fs.chmodSync(path.join(hooks, "pre-push.local"), 0o755);
+    const invoked = spawnSync(path.join(hooks, "pre-push"), ["origin", "file:///remote"], {
+      cwd: ws,
+      input: "",
+      encoding: "utf8",
+      env: { ...process.env, CAPTURE: path.join(ws, "runtime-capture"), ZSH_CAPTURE: capture }
+    });
+    assert.equal(invoked.status, 0, invoked.stderr);
+    assert.match(fs.readFileSync(capture, "utf8"), /^zsh-basename:pre-push$/m);
+  }
+});
+
 test("install-prepush --status exits nonzero until the dispatcher is installed", () => {
   const ws = repo();
   const script = path.resolve("scripts/install-prepush.mjs");

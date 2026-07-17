@@ -14,7 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { normalizeSessionId, workspaceStateDir } from "./config-store.mjs";
+import { normalizeSessionId, workspaceStateDir, ensurePrivateDir, writePrivateFileAtomic } from "./config-store.mjs";
 import { deepKey } from "./deep-review.mjs";
 
 const queueDir = (ws) => path.join(workspaceStateDir(ws), "deep-queue");
@@ -45,17 +45,33 @@ export function enqueue(ws, { kind, specPath = null, range = null, contentKey, s
   const ownerSessionKey = normalizeSessionId(sessionKey ?? jobSessionKey);
   const jobKey = jobKeyFor(contentKey, ownerSessionKey);
   const dir = queueDir(ws);
-  fs.mkdirSync(dir, { recursive: true });
+  // Jobs name spec paths and push ranges: keep the whole state path owner-only, like the
+  // rest of the state layer.
+  ensurePrivateDir(workspaceStateDir(ws));
   let existing = [];
   try {
     existing = fs.readdirSync(dir).filter((f) =>
       f === `${jobKey}.json` || f === `${jobKey}.blocked` || f.startsWith(`${jobKey}.claimed.`));
   } catch { /* dir just created */ }
   if (existing.length) return false;
+  // SUPERSEDE: a newer revision of the same spec target replaces any still-QUEUED older revision —
+  // across sessions, because the file's current bytes are global truth (claimed/blocked entries are
+  // untouched: one is in flight, the other is a delivered finding). Without this, every save of an
+  // actively-edited plan/spec accumulated one more queued deep job per revision, so the runner
+  // always had stale work and kept waking sessions to review dead bytes.
+  if (kind === "spec" && specPath) {
+    let stale = [];
+    try {
+      stale = fs.readdirSync(dir).filter((f) => f.endsWith(".json") && !f.includes(".tmp."))
+        .map((f) => readJob(path.join(dir, f), /\.json$/))
+        .filter((job) => job && job.kind === "spec" && job.specPath === specPath && job.contentKey !== contentKey);
+    } catch { /* dir just created */ }
+    for (const job of stale) {
+      try { fs.rmSync(job._path, { force: true }); } catch { /* claimed meanwhile — the runner owns it now */ }
+    }
+  }
   const file = path.join(dir, `${jobKey}.json`);
-  const tmp = TMP(file);
-  fs.writeFileSync(tmp, `${JSON.stringify({ kind, specPath, range, contentKey, sessionKey: ownerSessionKey || undefined, ts: now }, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  writePrivateFileAtomic(file, `${JSON.stringify({ kind, specPath, range, contentKey, sessionKey: ownerSessionKey || undefined, ts: now }, null, 2)}\n`);
   return true;
 }
 
@@ -132,12 +148,61 @@ export function recoverOrphans(ws, { now = Date.now(), staleMs = 25 * 60 * 1000 
   return recovered;
 }
 
+const BLOCK_WAKE_LOCK_STALE_MS = 60 * 1000;  // the CAS critical section is three file ops; older ⇒ the holder crashed
+
+// mkdir mutex (the runner-lease primitive) serializing a wake-count compare-and-rewrite ACROSS
+// sessions: the runner lease is per-session, but a legacy session-less .blocked is listed by every
+// session's runner. Returns a release function, or null when a LIVE peer holds it (the peer owns the
+// in-flight delivery — deferring shortens the loop, never extends it). A stale lock is a crashed
+// holder's and is recovered.
+function acquireBlockWakeLock(dir, jobKey, now = Date.now()) {
+  const lock = path.join(dir, `${jobKey}.blocked.wake-lock`);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.mkdirSync(lock);
+      return () => { try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* recovered by a contender */ } };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let stale = true;
+      try { stale = now - fs.statSync(lock).mtimeMs > BLOCK_WAKE_LOCK_STALE_MS; } catch { stale = true; }
+      if (!stale) return null;
+      try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* a contender recovered it first */ }
+    }
+  }
+  return null;
+}
+
 // Persist a BLOCK result durably (rename claim → <jobKey>.blocked) BEFORE any wake, then drop the
 // claim. payload: { kind, specPath?, range?, contentKey, findings, firstBlockedTs }.
-export function markBlocked(ws, jobKey, payload, { claimedPath } = {}) {
+// With expectedWakeCount this is a COMPARE-AND-REWRITE of the stored wakeCount under the wake-lock:
+// the persist lands only when the stored count still equals what the caller based its delivery on
+// (a legacy session-less block is visible to every session's runner, so two sessions could
+// otherwise read N, both persist N+1, and both deliver — pushing an unchanged target past its wake
+// ceiling). Returns null — the caller must NOT deliver that duplicate wake — on a count mismatch,
+// a retired/corrupt record, or a live peer's lock.
+export function markBlocked(ws, jobKey, payload, { claimedPath, expectedWakeCount } = {}) {
   const dir = queueDir(ws);
   fs.mkdirSync(dir, { recursive: true });
   const to = path.join(dir, `${jobKey}.blocked`);
+  if (expectedWakeCount !== undefined) {
+    const release = acquireBlockWakeLock(dir, jobKey);
+    if (!release) return null;
+    try {
+      let stored = null;
+      try { stored = JSON.parse(fs.readFileSync(to, "utf8")); } catch { stored = null; }
+      if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;   // retired/corrupt since the caller's list
+      const storedWakeCount = Number.isInteger(Number(stored.wakeCount)) && Number(stored.wakeCount) >= 0
+        ? Number(stored.wakeCount)
+        : null;
+      if (storedWakeCount !== expectedWakeCount) return null;
+      const tmp = TMP(to);
+      fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`);
+      fs.renameSync(tmp, to);
+      return to;
+    } finally {
+      release();
+    }
+  }
   const tmp = TMP(to);
   fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`);
   fs.renameSync(tmp, to);

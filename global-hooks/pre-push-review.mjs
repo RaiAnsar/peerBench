@@ -23,7 +23,15 @@ const MAX_PUSH_DIFF_BYTES = 200_000;
 // runs in the BACKGROUND (delivered by the deep-review-runner rewake) instead of freezing the push.
 export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now(), sessionKey = null, enqueueImpl = defaultEnqueue } = {}) {
   try {
-    const [headSha] = gitImpl(["rev-parse", "HEAD"], ws);
+    const [headSha, headOk] = gitImpl(["rev-parse", "HEAD"], ws);
+    // A transient git failure must not stamp the deep job/block identity with an EMPTY head: the
+    // runner later recomputes the key with healthy git, sees a different key, and DELETES the
+    // durable block with no content change and no wake. Skip the enqueue; the fast gate stands
+    // (same guard as the merge producer's !refOk || !refSha skip).
+    if (!headOk || !headSha) {
+      process.stderr.write(`⛩ pre-push: deep push-review enqueue skipped (git rev-parse HEAD failed); fast review stands.\n`);
+      return false;
+    }
     let reviewRange = range;
     const dd = range.indexOf("..");
     if (dd > 0) {
@@ -1226,8 +1234,14 @@ export async function runHookMain({
   const bypassEnabled = (value) => ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
   let nativeBypass = env.BENCH_NATIVE_PUSH_BYPASS;
   const hasPotentialPush = !!pushSeg || target.push;
-  const pushTexts = [command, target.segmentText].filter((value, index, all) => value && all.indexOf(value) === index);
-  for (const text of pushTexts) {
+  // A `NAME=value` prefix applies only to the ONE command it introduces, so the bypass scan is
+  // restricted to the segment(s) actually containing the push. Scanning every segment honored
+  // `git push; BENCH_NATIVE_PUSH_BYPASS=1 git status` and `BENCH_NATIVE_PUSH_BYPASS=1 git fetch;
+  // git push`, skipping the gate for an unprefixed push. Within the push segment the LAST
+  // assignment before the git token wins, exactly as the shell scopes it; the exported-environment
+  // value above is unaffected.
+  const bypassTexts = [pushSeg?.text, target.segmentText].filter((value, index, all) => value && all.indexOf(value) === index);
+  for (const text of bypassTexts) {
     for (const segment of shellSegments(text)) {
       const tokens = shellTokenize(segment.text).filter(Boolean);
       const analysis = scanGitCommand(tokens);
@@ -1244,8 +1258,10 @@ export async function runHookMain({
   if (hasPotentialPush && bypassEnabled(nativeBypass)) return;
   // Git itself skips pre-push hooks for this explicit flag. Treat it as the documented deliberate
   // all-hooks bypass here too; otherwise our repair message would recommend a flag that the
-  // bootstrap hook immediately denied before Git could honor it.
-  if (hasPotentialPush && pushTexts.some((text) => shellTokenize(text).includes("--no-verify"))) return;
+  // bootstrap hook immediately denied before Git could honor it. Scoped to the push segment(s):
+  // `--no-verify` on ANOTHER command in the compound (e.g. `git commit --no-verify; git push`)
+  // does not make Git skip the push's hooks, so the gate must still arm.
+  if (hasPotentialPush && bypassTexts.some((text) => shellTokenize(text).includes("--no-verify"))) return;
   if (target.push && !target.proven) {
     emitter.emit(decisionPayload(
       "deny",

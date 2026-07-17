@@ -10,7 +10,7 @@ process.env.BENCH_ROOT = PR_ROOT;
 
 import { buildPrompt, runMain, createEmitter } from "../global-hooks/plan-review.mjs";
 import { normalizeSessionId } from "../global-hooks/config-store.mjs";
-import { readPlanCycle, readPlanMarker } from "../global-hooks/plan-gate-state.mjs";
+import { readPlanCycle, readPlanMarker, recordPlanBlock } from "../global-hooks/plan-gate-state.mjs";
 
 /** Fake reviewer that always returns the given verdict. */
 function prReviewer(name, verdict) {
@@ -371,4 +371,71 @@ test("same-revision concurrent ExitPlanMode calls single-flight and a BLOCK can 
   assert.equal(calls, 2, "no false ALLOW cache skips the later review");
   assert.equal(later[0]?.hookSpecificOutput?.permissionDecision, "deny");
   assert.equal(readPlanCycle(ws, session).count, 2);
+});
+
+test("advisory emit includes the completing review's findings when the ledger fills mid-review", async () => {
+  // F1: a leader that begins below the ceiling but completes after the third slot filled gets the
+  // `advisory` outcome — its revision WAS validated and blocked, so the findings must appear in
+  // the message (they claim no ledger slot) instead of being silently discarded.
+  const ws = prRepo();
+  const session = "plan-advisory-midfill";
+  const emitted = [];
+  let signalSlow;
+  let releaseSlow;
+  const slowEntered = new Promise((resolve) => { signalSlow = resolve; });
+  const slowRelease = new Promise((resolve) => { releaseSlow = resolve; });
+  const reviewer = {
+    name: "Kimi",
+    reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1" },
+    async run({ user }) {
+      if (/revision 3/.test(user)) {
+        signalSlow();
+        await slowRelease;
+        return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: r3 blocker", raw: "BLOCK: r3 blocker\nSEVERITY: high\n- REVISION_THREE_UNIQUE_FINDING" };
+      }
+      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: broken", raw: "BLOCK: broken\nSEVERITY: high\n- standard finding" };
+    }
+  };
+  const invoke = (plan) => runMain({
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    emitter: { emit(payload) { emitted.push(payload); return true; } },
+    input: { cwd: ws, session_id: session, tool_input: { plan } }
+  });
+
+  await invoke("revision 1");
+  await invoke("revision 2");
+  const slow = invoke("revision 3");
+  await slowEntered;
+  // A same-session plan-file BLOCK claims the last shared slot while revision 3 is mid-panel
+  // (a different scope, so revision 3 keeps its head and is not superseded).
+  recordPlanBlock(ws, session, { target: "plans/other.md", revision: "other", findings: "OTHER_FILE_FINDING" });
+  releaseSlow();
+  await slow;
+
+  assert.equal(readPlanCycle(ws, session).count, 3);
+  const advisory = emitted.at(-1);
+  assert.equal(advisory.hookSpecificOutput.permissionDecision, "allow");
+  assert.match(advisory.hookSpecificOutput.permissionDecisionReason, /paused after 3 blocked repair cycles/);
+  assert.match(advisory.hookSpecificOutput.permissionDecisionReason, /REVISION_THREE_UNIQUE_FINDING/, "the completing review's findings must not be discarded");
+  assert.doesNotMatch(advisory.hookSpecificOutput.permissionDecisionReason, /was not re-validated/, "a validated-and-blocked revision must not be described as unvalidated");
+});
+
+test("non-git workspace: ExitPlanMode gate skips silently (no panel, no decision emit)", async () => {
+  const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plan-review-nongit-")));   // NOT a git repo
+  let reviewersCalled = false;
+  const stdoutLines = [];
+  const origOut = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) stdoutLines.push(chunk.trim()); return origOut(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { reviewersCalled = true; return []; },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { plan: "do a thing" } }
+    });
+  } finally { process.stdout.write = origOut; }
+  assert.equal(reviewersCalled, false, "no panel outside a git repo");
+  assert.equal(stdoutLines.length, 0, "silent skip — ExitPlanMode proceeds without gate noise");
 });

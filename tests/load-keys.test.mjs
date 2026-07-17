@@ -56,3 +56,25 @@ test("load-keys REPLACES managed fields (drops a removed override) but PRESERVES
   assert.equal(fs.statSync(root).mode & 0o777, 0o700);
   assert.equal(fs.statSync(path.join(root, "companion.json")).mode & 0o777, 0o600);
 });
+
+test("load-keys strips a provider dropped from .keys so its rotated-out key goes dead", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "load-keys-root-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "load-keys-src-"));
+  const keys = path.join(dir, ".keys");
+  fs.writeFileSync(keys, ["KIMI_API_KEY=k1", "GLM_API_KEY=g1", "GLM_MODEL=glm-old", ""].join("\n"));
+  execFileSync(process.execPath, [LOAD_KEYS, keys], { encoding: "utf8", env: { ...process.env, BENCH_ROOT: root } });
+  // Give glm an unmanaged field that must survive the strip.
+  const file = path.join(root, "companion.json");
+  const seeded = JSON.parse(fs.readFileSync(file, "utf8"));
+  seeded.providers.glm.timeoutMs = 123000;
+  fs.writeFileSync(file, JSON.stringify(seeded));
+
+  // GLM is dropped from .keys: its managed fields (apiKey/model/...) must NOT stay live.
+  fs.writeFileSync(keys, ["KIMI_API_KEY=k2", ""].join("\n"));
+  execFileSync(process.execPath, [LOAD_KEYS, keys], { encoding: "utf8", env: { ...process.env, BENCH_ROOT: root } });
+  const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(saved.providers.kimi.apiKey, "k2");
+  assert.equal("apiKey" in saved.providers.glm, false, "a dropped provider's apiKey must be stripped");
+  assert.equal("model" in saved.providers.glm, false, "a dropped provider's model must be stripped");
+  assert.equal(saved.providers.glm.timeoutMs, 123000, "unmanaged companion fields are preserved");
+});

@@ -224,6 +224,29 @@ test("quorum counts unique configured reviewers only", () => {
   assert.equal(evaluatePushReview(exact, ["kimi", "glm"], {}).decision, "allow");
 });
 
+test("a configured quorum above the panel size clamps to all configured reviewers", () => {
+  const env = { BENCH_PUSH_REVIEW_QUORUM: "4" };
+  assert.equal(evaluatePushReview(allowReview(), ["grok", "kimi"], env).decision, "allow",
+    "quorum=4 on a two-reviewer panel must require all reviewers, not block every push forever");
+  const oneValid = { ...allowReview(), reviewers: [allowReview().reviewers[0]] };
+  assert.equal(evaluatePushReview(oneValid, ["grok", "kimi"], env).decision, "unavailable",
+    "the clamped quorum still requires the whole configured panel");
+});
+
+test("an over-large configured quorum no longer permanently blocks the native push gate", async () => {
+  const { ws, shas, root } = history(2);
+  process.env.BENCH_ROOT = root;
+  let calls = 0;
+  const result = await reviewNativePush({
+    cwd: ws, remoteName: "origin", remoteUrl: "file:///quorum-clamp",
+    updates: [update(shas[1], shas[0])],
+    env: { BENCH_PUSH_REVIEW_QUORUM: "4" },
+    runPushReviewImpl: async () => { calls++; return allowReview(); }
+  });
+  assert.equal(result.decision, "allow");
+  assert.equal(calls, 1);
+});
+
 test("an explicit valid BLOCK is strict even when the reviewer labels it medium severity", () => {
   const review = {
     reviewers: [
@@ -412,6 +435,65 @@ test("a live native push lease fails closed with a prompt, explicit contention e
     /another native push review is active.*retry after it finishes/
   );
   assert.ok(Date.now() - started < 500);
+  fs.rmSync(lock, { recursive: true, force: true });
+});
+
+test("an old native push lease with a LIVE owner is never reclaimed by age alone", async () => {
+  const { ws, shas, root } = history(2);
+  process.env.BENCH_ROOT = root;
+  const remoteUrl = "file:///old-live-owner-lock";
+  const lockId = createHash("sha256").update(remoteUrl).digest("hex");
+  const lock = path.join(workspaceStateDir(ws), "native-push-locks", `${lockId}.lock`);
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, "owner.json"), `${JSON.stringify({ pid: process.pid, nonce: "old-live", createdAt: Date.now() - 60 * 60 * 1000 })}\n`);
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  fs.utimesSync(lock, old, old);
+  let calls = 0;
+  await assert.rejects(
+    () => reviewNativePush({
+      cwd: ws,
+      remoteName: "origin",
+      remoteUrl,
+      updates: [update(shas[1], shas[0])],
+      env: {},
+      nativeLockWaitMs: 50,
+      runPushReviewImpl: async () => { calls++; return allowReview(); }
+    }),
+    /another native push review is active.*retry after it finishes/
+  );
+  assert.equal(calls, 0, "a live owner's long multi-range review must not be evicted by the age ceiling");
+  assert.equal(fs.existsSync(lock), true, "the live owner's lease survives");
+  fs.rmSync(lock, { recursive: true, force: true });
+});
+
+test("a released native push lease never removes a replacement owner's lock", async () => {
+  const { ws, shas, root } = history(2);
+  process.env.BENCH_ROOT = root;
+  const remoteUrl = "file:///release-nonce";
+  const lockId = createHash("sha256").update(remoteUrl).digest("hex");
+  const lock = path.join(workspaceStateDir(ws), "native-push-locks", `${lockId}.lock`);
+  let reviewStarted;
+  const started = new Promise((resolve) => { reviewStarted = resolve; });
+  let finishReview;
+  const reviewMayFinish = new Promise((resolve) => { finishReview = resolve; });
+  const first = reviewNativePush({
+    cwd: ws,
+    remoteName: "origin",
+    remoteUrl,
+    updates: [update(shas[1], shas[0])],
+    env: {},
+    runPushReviewImpl: async () => { reviewStarted(); await reviewMayFinish; return allowReview(); }
+  });
+  await started;
+  // The lease is legitimately replaced while the first review is still finishing (e.g. its owner
+  // looked dead to a contender): the evicted owner's release must not delete the NEW owner's lock.
+  fs.rmSync(lock, { recursive: true, force: true });
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, "owner.json"), `${JSON.stringify({ pid: process.pid, nonce: "replacement-owner", createdAt: Date.now() })}\n`);
+  finishReview();
+  const result = await first;
+  assert.equal(result.decision, "allow");
+  assert.equal(fs.existsSync(lock), true, "the evicted owner's release leaves the replacement lease in place");
   fs.rmSync(lock, { recursive: true, force: true });
 });
 
@@ -735,4 +817,29 @@ test("native hook suppresses Codex self-review for a direct Codex push", async (
   assert.equal(code, 0);
   assert.equal(seenEnv.BENCH_SUPPRESS_CODEX_REVIEWER, "1");
   assert.equal(seenEnv.CODEX_THREAD_ID, "thread-123");
+});
+
+test("pushPolicyDoomedByCooldowns: required Codex on quota cooldown fails fast with an honest message", async () => {
+  const { pushPolicyDoomedByCooldowns } = await import("../global-hooks/pre-push-lib.mjs");
+  const { recordReviewerCooldown, clearReviewerCooldowns } = await import("../global-hooks/config-store.mjs");
+  clearReviewerCooldowns();
+  const t0 = Date.now();
+  recordReviewerCooldown("codex", "quota", "usage limit reached", { now: t0 });
+  const reason = pushPolicyDoomedByCooldowns(["codex", "grok", "kimi"], { quorum: 2, requireCodex: true }, { now: t0 + 1000 });
+  assert.match(reason, /codex: out of quota\/credits/);
+  assert.match(reason, /BENCH_NATIVE_PUSH_BYPASS/);
+  // Without the Codex requirement, two healthy reviewers still meet quorum → no fast-fail.
+  assert.equal(pushPolicyDoomedByCooldowns(["codex", "grok", "kimi"], { quorum: 2, requireCodex: false }, { now: t0 + 1000 }), null);
+  clearReviewerCooldowns();
+});
+test("pushPolicyDoomedByCooldowns: quorum unreachable through cooldowns fails fast; healthy panel passes", async () => {
+  const { pushPolicyDoomedByCooldowns } = await import("../global-hooks/pre-push-lib.mjs");
+  const { recordReviewerCooldown, clearReviewerCooldowns } = await import("../global-hooks/config-store.mjs");
+  clearReviewerCooldowns();
+  const t0 = Date.now();
+  assert.equal(pushPolicyDoomedByCooldowns(["grok", "kimi"], { quorum: 2, requireCodex: false }, { now: t0 }), null, "no cooldowns → run the panel");
+  recordReviewerCooldown("kimi", "quota", "HTTP 429", { now: t0 });
+  const reason = pushPolicyDoomedByCooldowns(["grok", "kimi"], { quorum: 2, requireCodex: false }, { now: t0 + 1000 });
+  assert.match(reason, /kimi: out of quota\/credits/);
+  clearReviewerCooldowns();
 });

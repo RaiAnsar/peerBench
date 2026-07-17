@@ -8,6 +8,7 @@ process.env.BENCH_MERGE_GATE_BUDGET_MS = "300";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pmg-root-"));
 
 import { buildMergePrompt, captureGitBounded, parseMergeSegment, findMergeSegment, runMain } from "../global-hooks/pre-merge-review.mjs";
+import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 // ── detection ──────────────────────────────────────────────────────────────
 test("findMergeSegment detects a real git merge and its ref", () => {
@@ -55,6 +56,19 @@ test("findMergeSegment ignores --abort/--continue/--quit and non-merge git comma
   assert.equal(findMergeSegment("git merge --quit"), null);
   assert.equal(findMergeSegment("git status"), null);
   assert.equal(findMergeSegment("git commit -m 'merge stuff'"), null);
+});
+
+test("findMergeSegment collects EVERY merge segment of a compound command (a later merge cannot bypass the gate)", () => {
+  assert.deepEqual(findMergeSegment("git merge feature-a && git merge feature-b")?.refs, ["feature-a", "feature-b"]);
+  assert.deepEqual(findMergeSegment("git status; git merge a || git merge b")?.refs, ["a", "b"]);
+  assert.deepEqual(findMergeSegment("git merge --abort; git merge feature")?.refs, ["feature"]);
+  // a ref-less segment merges the upstream — dropping it would leave that merge ungated
+  assert.deepEqual(findMergeSegment("git merge && git merge branch")?.refs, ["@{u}", "branch"]);
+});
+
+test("parseMergeSegment treats --cleanup's value as a flag argument, not a ref", () => {
+  assert.deepEqual(parseMergeSegment("git merge --cleanup whitespace feature")?.refs, ["feature"]);
+  assert.deepEqual(parseMergeSegment("git merge --cleanup=whitespace feature")?.refs, ["feature"]);
 });
 
 // ── runMain on a real repo ───────────────────────────────────────────────────
@@ -657,4 +671,120 @@ test("runMain: identical concurrent reviews are single-flight and BLOCK permanen
   assert.equal(future.hookSpecificOutput.permissionDecision, "deny");
   assert.equal(blockCalls, 2, "the post-BLOCK ALLOW was never reusable as a false-clean exact cache hit");
   assert.doesNotMatch(future.hookSpecificOutput.permissionDecisionReason, /cached exact ALLOW/);
+});
+
+test("runMain: EVERY merge in a compound command is gated — `merge a && merge b` reviews/enqueues both and denies on a blocker", async () => {
+  const ws = repoWithIncoming();
+  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  g("checkout", "-q", "-b", "feature-b", "main");
+  fs.writeFileSync(path.join(ws, "g.js"), "export const y = 2;\n");
+  g("add", "-A"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "feat: add y");
+  g("checkout", "-q", "main");
+  const sha = (ref) => execFileSync("git", ["rev-parse", ref], { cwd: ws, encoding: "utf8" }).trim();
+  const cap = capture();
+  const enqueued = [];
+  let userPrompt = "";
+  await runMain({
+    input: { cwd: ws, tool_input: { command: "git merge staging && git merge feature-b" } },
+    resolveReviewersImpl: () => [{ name: "MiMo", async run({ user }) { userPrompt = user; return { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bad", raw: "BLOCK: bad\nSEVERITY: high\n- g.js:1 defect" }; } }],
+    enqueueImpl: (_ws, job) => { enqueued.push(job); return true; },
+    writeTraceImpl: () => {}, isBenchDisabledImpl: () => false,
+    emitter: cap.emitter, exit: () => {}
+  });
+  assert.equal(cap.payload.hookSpecificOutput.permissionDecision, "deny", "a blocker in ANY merge of the compound denies the command");
+  assert.equal(enqueued.length, 2, "the second merge's range gets its own deep review too (was silently skipped)");
+  assert.deepEqual(enqueued.map((j) => j.range).sort(), [`${sha("HEAD")}..${sha("feature-b")}`, `${sha("HEAD")}..${sha("staging")}`].sort());
+  assert.match(userPrompt, /add x/, "the first merge's commits are in the fast review");
+  assert.match(userPrompt, /add y/, "the second merge's commits are in the fast review too");
+});
+
+test("runMain: a merge redirected by --git-dir/GIT_DIR is visibly UNREVIEWED — never reviewed against the wrong repo", async () => {
+  const ws = repoWithIncoming();
+  const other = repoWithIncoming();   // the repo the merge ACTUALLY targets
+  const gitDir = path.join(other, ".git");
+  for (const command of [
+    `git --git-dir=${gitDir} merge staging`,
+    `git --git-dir ${gitDir} merge staging`,
+    `GIT_DIR=${gitDir} git merge staging`
+  ]) {
+    const cap = capture();
+    let panelResolved = false;
+    await runMain({
+      input: { cwd: ws, tool_input: { command } },
+      resolveReviewersImpl: () => { panelResolved = true; return [stubReviewer("ALLOW", "ALLOW: clean\nSEVERITY: none")]; },
+      enqueueImpl: () => true, writeTraceImpl: () => {}, isBenchDisabledImpl: () => false,
+      emitter: cap.emitter, exit: () => {}
+    });
+    assert.equal(cap.payload.hookSpecificOutput.permissionDecision, "allow", "repo redirection fails OPEN");
+    assert.match(cap.payload.hookSpecificOutput.permissionDecisionReason, /UNREVIEWED/);
+    assert.match(cap.payload.hookSpecificOutput.permissionDecisionReason, /--git-dir\/GIT_DIR/, command);
+    assert.match(cap.payload.systemMessage, /UNREVIEWED/);
+    assert.equal(panelResolved, false, `the panel never runs against the wrong repository (${command})`);
+  }
+});
+
+test("runMain: the cycle-exhausted UNREVIEWED path still enqueues the deep reviews", async () => {
+  const ws = repoWithIncoming();
+  const g = (...args) => execFileSync("git", args, { cwd: ws });
+  let calls = 0;
+  const enqueued = [];
+  const resolveReviewersImpl = () => [{
+    name: "MiMo", reviewIdentity: { kind: "api", model: "mimo" },
+    async run() {
+      calls++;
+      return { name: "MiMo", verdict: "BLOCK", raw: `BLOCK: defect ${calls}\nSEVERITY: high\n- f.js:1 broken revision ${calls}` };
+    }
+  }];
+  const captureGitImpl = async (args) => {
+    const text = args.includes("-p") ? "diff --git a/f.js b/f.js\n+broken" : "abc changed target";
+    return { ok: true, complete: true, text, totalBytes: Buffer.byteLength(text), sha256: "d".repeat(64) };
+  };
+  const invoke = async () => {
+    const cap = capture();
+    await runMain({
+      input: { cwd: ws, session_id: "cycle-enqueue-session", tool_input: { command: "git merge staging" } },
+      resolveReviewersImpl, captureGitImpl,
+      enqueueImpl: (_ws, job) => { enqueued.push(job); return true; },
+      writeTraceImpl: () => {}, isBenchDisabledImpl: () => false, emitter: cap.emitter, exit: () => {}
+    });
+    return cap.payload;
+  };
+  const advanceTarget = (index) => {
+    g("checkout", "-q", "staging");
+    fs.appendFileSync(path.join(ws, "f.js"), `export const repair${index} = ${index};\n`);
+    g("add", "-A");
+    g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", `repair ${index}`);
+    g("checkout", "-q", "main");
+  };
+
+  for (let cycle = 1; cycle <= 3; cycle++) {
+    assert.equal((await invoke()).hookSpecificOutput.permissionDecision, "deny");
+    advanceTarget(cycle);
+  }
+  assert.equal(enqueued.length, 3, "each blocked attempt queued its deep review");
+  const held = await invoke();
+  assert.equal(held.hookSpecificOutput.permissionDecision, "allow", "the ceiling stays non-waking/fail-open for the local merge");
+  assert.match(held.hookSpecificOutput.permissionDecisionReason, /paused after 3 blocked repair cycles/);
+  assert.equal(calls, 3, "the exhausted path never reruns the panel");
+  assert.equal(enqueued.length, 4, "the exhausted path still queues the thorough async pass (was zero async coverage)");
+  assert.equal(enqueued[3].kind, "merge");
+});
+
+test("runMain: a failed ALLOW-cache write is reported as a write failure, not a prior BLOCK", async () => {
+  const ws = repoWithIncoming();
+  // Force writeMergeAllow to throw: allow-cache as a regular file makes the atomic tmp+rename fail.
+  const mergeGate = path.join(workspaceStateDir(ws), "merge-gate");
+  fs.mkdirSync(mergeGate, { recursive: true });
+  fs.writeFileSync(path.join(mergeGate, "allow-cache"), "not a directory\n");
+  const cap = capture();
+  await runMain({
+    input: { cwd: ws, session_id: "cache-failure-session", tool_input: { command: "git merge staging" } },
+    resolveReviewersImpl: () => [stubReviewer("ALLOW", "ALLOW: clean\nSEVERITY: none")],
+    enqueueImpl: () => true, writeTraceImpl: () => {}, isBenchDisabledImpl: () => false,
+    emitter: cap.emitter, exit: () => {}
+  });
+  assert.equal(cap.payload.hookSpecificOutput.permissionDecision, "allow", "the current review still allows");
+  assert.match(cap.payload.hookSpecificOutput.permissionDecisionReason, /cache write failed/);
+  assert.doesNotMatch(cap.payload.hookSpecificOutput.permissionDecisionReason, /previously blocked/,
+    "an infrastructure failure must not be attributed to a prior BLOCK");
 });

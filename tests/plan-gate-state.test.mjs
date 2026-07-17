@@ -8,6 +8,7 @@ process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "plan-state-root-
 
 import {
   PLAN_CYCLE_WINDOW_MS,
+  PLAN_REVIEW_LEASE_MS,
   beginPlanReview,
   clearPlanCycleForTarget,
   completePlanReview,
@@ -15,6 +16,7 @@ import {
   readPlanMarker,
   recordPlanBlock
 } from "../global-hooks/plan-gate-state.mjs";
+import { resolveConfig } from "../global-hooks/config-store.mjs";
 
 test("unresolved unscoped sessions remain capped after the old cycle window", () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "plan-state-expire-"));
@@ -140,4 +142,60 @@ test("a reset nonce is consumed once inside the cycle transaction", () => {
     findings: "B"
   }).outcome, "block");
   assert.equal(readPlanCycle(ws, session).count, 2, "the reused nonce does not erase work committed after its first use");
+});
+
+test("the default review lease outlives the slowest configured reviewer timeout", () => {
+  // A leader whose lease expires mid-panel is reclaimed by a duplicate same-identity leader that
+  // pays for a second panel while the original completion is discarded as superseded (F3). The
+  // issued default lease must exceed the slowest reviewer timeoutMs (config-store DEFAULTS: Kimi).
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "plan-state-lease-ms-"));
+  const slowest = Math.max(...Object.values(resolveConfig({ env: {} }).providers).map((p) => Number(p.timeoutMs) || 0));
+  const started = beginPlanReview(ws, "lease-ms", {
+    hookKind: "exit-plan-mode",
+    target: "inline-plan",
+    identity: "slow-panel",
+    now: 5_000
+  });
+  assert.equal(started.role, "leader");
+  const lease = started.ticket.leaseExpiresAt - started.ticket.startedAt;
+  assert.equal(lease, PLAN_REVIEW_LEASE_MS, "no explicit leaseMs issues the default lease");
+  assert.ok(lease > slowest, `default lease ${lease}ms must exceed the slowest reviewer timeout ${slowest}ms`);
+});
+
+test("session-total budget: full cycle resolutions never refund the total; the 9th block latches exhausted", async () => {
+  const { recordPlanBlock, clearPlanCycleForTarget, readPlanCycle, MAX_PLAN_TOTAL_BLOCKS } = await import("../global-hooks/plan-gate-state.mjs");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pgs-total-"));
+  const session = "session-total-budget";
+  // 4 rounds of (2 blocks + full resolution) = 8 total; resolution wipes the slot ledger each time.
+  for (let round = 0; round < 4; round++) {
+    recordPlanBlock(ws, session, { target: "plans/a.md", revision: `r${round}a` });
+    recordPlanBlock(ws, session, { target: "plans/b.md", revision: `r${round}b` });
+    clearPlanCycleForTarget(ws, session, "plans/a.md", { approvalRevision: `r${round}a-fix` });
+    clearPlanCycleForTarget(ws, session, "plans/b.md", { approvalRevision: `r${round}b-fix` });
+    const state = readPlanCycle(ws, session);
+    assert.equal(state.count, 0, `round ${round}: resolution wipes the slot ledger`);
+    assert.equal(state.total, (round + 1) * 2, `round ${round}: the session total survives the wipe`);
+  }
+  assert.equal(readPlanCycle(ws, session).exhausted, false, "8/9 — one block left in the budget");
+  recordPlanBlock(ws, session, { target: "plans/a.md", revision: "r-final" });   // 9th
+  const latched = readPlanCycle(ws, session);
+  assert.equal(latched.total, MAX_PLAN_TOTAL_BLOCKS);
+  assert.equal(latched.exhausted, true, "the 9th total block latches exhausted even with free slots");
+});
+test("explicit resetPlanCycle refunds the session-total budget", async () => {
+  const { recordPlanBlock, clearPlanCycleForTarget, resetPlanCycle, readPlanCycle } = await import("../global-hooks/plan-gate-state.mjs");
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pgs-total-reset-"));
+  const session = "session-total-reset";
+  for (let round = 0; round < 4; round++) {
+    recordPlanBlock(ws, session, { target: "plans/a.md", revision: `r${round}a` });
+    recordPlanBlock(ws, session, { target: "plans/b.md", revision: `r${round}b` });
+    clearPlanCycleForTarget(ws, session, "plans/a.md", { approvalRevision: `r${round}a-fix` });
+    clearPlanCycleForTarget(ws, session, "plans/b.md", { approvalRevision: `r${round}b-fix` });
+  }
+  recordPlanBlock(ws, session, { target: "plans/a.md", revision: "r-final" });   // 9th — latches
+  assert.equal(readPlanCycle(ws, session).exhausted, true);
+  resetPlanCycle(ws, session);
+  const state = readPlanCycle(ws, session);
+  assert.equal(state.total, 0, "explicit reset refunds the total");
+  assert.equal(state.exhausted, false);
 });

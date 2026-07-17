@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   compareLocalWithOrigin,
@@ -165,19 +165,20 @@ function latestInstalledPluginPath({
   return typeof latest?.installPath === "string" ? latest.installPath : null;
 }
 
-function legacyPluginCachePath({ home, marketplace, pluginName }) {
-  return path.join(home, ".claude", "plugins", "cache", marketplace, pluginName);
+function legacyPluginCachePath({ claudeDir, marketplace, pluginName }) {
+  return path.join(claudeDir, "plugins", "cache", marketplace, pluginName);
 }
 
 export function claudePluginInstallRoots({
   home = os.homedir(),
+  claudeDir = path.join(home, ".claude"),
   repoRoot = ROOT,
   marketplaceName = DEFAULT_CLAUDE_MARKETPLACE,
   pluginName = CLAUDE_PLUGIN_NAME,
   legacyMarketplaces = LEGACY_CLAUDE_MARKETPLACES
 } = {}) {
-  const known = readJson(path.join(home, ".claude", "plugins", "known_marketplaces.json"));
-  const installed = readJson(path.join(home, ".claude", "plugins", "installed_plugins.json"));
+  const known = readJson(path.join(claudeDir, "plugins", "known_marketplaces.json"));
+  const installed = readJson(path.join(claudeDir, "plugins", "installed_plugins.json"));
   const marketplaces = [marketplaceName];
   for (const legacy of legacyMarketplaces) {
     const entry = known[legacy];
@@ -202,13 +203,14 @@ export function claudePluginInstallRoots({
 
 function allClaudeBenchCacheRoots({
   home,
+  claudeDir = path.join(home, ".claude"),
   marketplaceName,
   pluginName = CLAUDE_PLUGIN_NAME,
   legacyMarketplaces = LEGACY_CLAUDE_MARKETPLACES
 }) {
   const roots = new Set();
   const marketplaces = [...new Set([marketplaceName, ...legacyMarketplaces].filter(Boolean))];
-  const installed = readJson(path.join(home, ".claude", "plugins", "installed_plugins.json"));
+  const installed = readJson(path.join(claudeDir, "plugins", "installed_plugins.json"));
   for (const marketplace of marketplaces) {
     const entries = installed?.plugins?.[`${pluginName}@${marketplace}`];
     if (Array.isArray(entries)) {
@@ -218,7 +220,7 @@ function allClaudeBenchCacheRoots({
         if (fs.existsSync(candidate)) roots.add(candidate);
       }
     }
-    const cacheRoot = path.join(home, ".claude", "plugins", "cache", marketplace, pluginName);
+    const cacheRoot = path.join(claudeDir, "plugins", "cache", marketplace, pluginName);
     let versions = [];
     try { versions = fs.readdirSync(cacheRoot, { withFileTypes: true }); } catch { versions = []; }
     for (const version of versions) {
@@ -242,6 +244,7 @@ function runCommand(runner, command, args, opts = {}) {
 export function syncClaudePluginRegistry({
   repoRoot = ROOT,
   home = os.homedir(),
+  claudeDir = path.join(home, ".claude"),
   marketplaceName = DEFAULT_CLAUDE_MARKETPLACE,
   pluginName = CLAUDE_PLUGIN_NAME,
   legacyMarketplaces = LEGACY_CLAUDE_MARKETPLACES,
@@ -251,8 +254,8 @@ export function syncClaudePluginRegistry({
   skipCli = false,
   onBeforeMutation = () => {}
 } = {}) {
-  const knownPath = path.join(home, ".claude", "plugins", "known_marketplaces.json");
-  const installedPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
+  const knownPath = path.join(claudeDir, "plugins", "known_marketplaces.json");
+  const installedPath = path.join(claudeDir, "plugins", "installed_plugins.json");
   const known = readJson(knownPath);
   const nextKnown = { ...known };
   const removedLegacy = [];
@@ -356,7 +359,7 @@ export function syncClaudePluginRegistry({
   result.installPath = latestInstalledPluginPath({ installedPath, pluginId: result.pluginId, scope: "user" });
   if (result.installPath) result.scrubbed = scrubSensitivePluginCacheFiles(result.installPath);
   for (const legacy of removedLegacy) {
-    result.scrubbed.push(...scrubSensitivePluginCacheFiles(legacyPluginCachePath({ home, marketplace: legacy, pluginName })));
+    result.scrubbed.push(...scrubSensitivePluginCacheFiles(legacyPluginCachePath({ claudeDir, marketplace: legacy, pluginName })));
   }
   return result;
 }
@@ -414,7 +417,9 @@ export function parseInstallArgs(argv = []) {
     loadKeys: false,
     keysPath: null,
     marketplaceName: DEFAULT_CLAUDE_MARKETPLACE,
-    help: false
+    help: false,
+    allowDirty: false,
+    skipTests: false
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -428,10 +433,55 @@ export function parseInstallArgs(argv = []) {
     if (arg === "--load-keys") { opts.loadKeys = true; continue; }
     if (arg === "--keys" && i + 1 < argv.length) { opts.keysPath = argv[++i]; continue; }
     if (arg === "--marketplace" && i + 1 < argv.length) { opts.marketplaceName = argv[++i]; continue; }
+    if (arg === "--allow-dirty") { opts.allowDirty = true; continue; }
+    if (arg === "--skip-tests") { opts.skipTests = true; continue; }
     throw new Error(`unknown install option: ${arg}`);
   }
   if (!opts.claude && !opts.codex) throw new Error("nothing to install: both Claude and Codex are disabled");
   return opts;
+}
+
+// Deploys must come from a COMMITTED, TESTED tree. A dirty mid-rewrite working tree once shipped
+// into every live gate (the Jul 17 07:38 deploy) and degraded the whole review system for days.
+// When the source root is a git checkout: refuse a dirty tree unless --allow-dirty (or
+// BENCH_ALLOW_DIRTY_DEPLOY=1), and run the test suite unless --skip-tests (or
+// BENCH_SKIP_TEST_GATE=1). Non-git roots (packaged marketplace/plugin-cache installs) skip both —
+// their content is a committed release by construction.
+export function assertDeployableSource(root, {
+  allowDirty = false,
+  skipTests = false,
+  env = process.env,
+  execImpl = execFileSync,
+  spawnImpl = spawnSync
+} = {}) {
+  let inside = "";
+  try { inside = execImpl("git", ["rev-parse", "--is-inside-work-tree"], { cwd: root, encoding: "utf8" }).trim(); }
+  catch { inside = ""; }
+  if (inside !== "true") return { checked: false, reason: "not a git checkout (packaged install)" };
+
+  const dirtyOk = allowDirty || env.BENCH_ALLOW_DIRTY_DEPLOY === "1" || env.BENCH_ALLOW_DIRTY_DEPLOY === "true";
+  const porcelain = String(execImpl("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }) || "").trim();
+  if (porcelain && !dirtyOk) {
+    const files = porcelain.split("\n").length;
+    throw new Error(
+      `deploy blocked: the working tree has ${files} uncommitted change(s). ` +
+      "Deploying a mid-development snapshot is how the gates broke — commit (and test) first, " +
+      "or pass --allow-dirty to override deliberately."
+    );
+  }
+
+  const testsOk = skipTests || env.BENCH_SKIP_TEST_GATE === "1" || env.BENCH_SKIP_TEST_GATE === "true";
+  if (!testsOk) {
+    const run = spawnImpl("npm", ["test", "--silent"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    if (run.status !== 0) {
+      const tail = String(run.stdout || "").split("\n").slice(-15).join("\n");
+      throw new Error(
+        `deploy blocked: the test suite failed (exit ${run.status}). A deploy never ships untested gates; ` +
+        `fix the suite or pass --skip-tests to override deliberately.\n${tail}`
+      );
+    }
+  }
+  return { checked: true, dirty: Boolean(porcelain), dirtyOverridden: Boolean(porcelain && dirtyOk), testsRun: !testsOk };
 }
 
 const LEGACY_CLAUDE_HOOK_FILES = ["codex-plan-review.mjs", "codex-plan-file-review.mjs"];
@@ -528,9 +578,13 @@ export function installPeerBench({
   const codexPluginRootAtStart = codex ? latestCodexBenchPluginRoot({ home }) : null;
   if (codexPluginRootAtStart) assertPluginCacheVersionMatch({ repoRoot: resolvedRepo, pluginRoot: codexPluginRootAtStart, platform: "codex" });
 
-  const claudeSettingsPath = path.join(home, ".claude", "settings.json");
-  const knownPath = path.join(home, ".claude", "plugins", "known_marketplaces.json");
-  const installedPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
+  // Claude's own config tree (settings, hooks, plugin registry/cache) follows CLAUDE_CONFIG_DIR
+  // the way `bench-runner setup` resolves it; peerBench's own state (bench-shared, install lock)
+  // stays home-based, matching config-store's sharedRoot().
+  const claudeDir = env.CLAUDE_CONFIG_DIR || path.join(home, ".claude");
+  const claudeSettingsPath = path.join(claudeDir, "settings.json");
+  const knownPath = path.join(claudeDir, "plugins", "known_marketplaces.json");
+  const installedPath = path.join(claudeDir, "plugins", "installed_plugins.json");
   const codexHooksPath = path.join(home, ".codex", "hooks.json");
   // Distinguish missing configuration (fresh install) from malformed, unreadable, or symlinked
   // configuration before any platform mutation occurs.
@@ -574,8 +628,8 @@ export function installPeerBench({
 
     let claudeContext = null;
     if (claude) {
-      const hooksDir = path.join(home, ".claude", "hooks");
-      const statuslinePath = path.join(home, ".claude", "statusline-command.sh");
+      const hooksDir = path.join(claudeDir, "hooks");
+      const statuslinePath = path.join(claudeDir, "statusline-command.sh");
       const restoreNames = [...new Set([...plannedHookNames, ...LEGACY_CLAUDE_HOOK_FILES])];
       const snap = snapshot({
         hooksDir,
@@ -588,12 +642,12 @@ export function installPeerBench({
         snapshotRollbackFile({ target: knownPath, backupDir: path.join(backupDir, "claude-plugin-registry"), name: "known_marketplaces.json" }),
         snapshotRollbackFile({ target: installedPath, backupDir: path.join(backupDir, "claude-plugin-registry"), name: "installed_plugins.json" })
       ];
-      const pluginRootsBefore = claudePluginInstallRoots({ home, repoRoot: resolvedRepo, marketplaceName });
+      const pluginRootsBefore = claudePluginInstallRoots({ home, claudeDir, repoRoot: resolvedRepo, marketplaceName });
       let pluginInstallSnapshots = pluginRootsBefore.map((pluginRoot, index) => snapshotPluginInstallRoot({
         pluginRoot,
         backupDir: path.join(backupDir, "plugin-installs", `claude-before-${index}`)
       })).filter(Boolean);
-      const cacheRootsBefore = new Set(allClaudeBenchCacheRoots({ home, marketplaceName }).map((value) => path.resolve(value)));
+      const cacheRootsBefore = new Set(allClaudeBenchCacheRoots({ home, claudeDir, marketplaceName }).map((value) => path.resolve(value)));
       const transactionClaude = {
         hooksDir,
         settingsPath: claudeSettingsPath,
@@ -618,7 +672,7 @@ export function installPeerBench({
       transactionMetadata.claude = transactionClaude;
       captureCreatedPluginRoots = () => {
         const recorded = new Set(pluginInstallSnapshots.map((entry) => path.resolve(entry.pluginRoot)));
-        for (const candidate of allClaudeBenchCacheRoots({ home, marketplaceName })) {
+        for (const candidate of allClaudeBenchCacheRoots({ home, claudeDir, marketplaceName })) {
           const root = path.resolve(candidate);
           if (cacheRootsBefore.has(root) || recorded.has(root)) continue;
           const entry = snapshotPluginInstallRoot({
@@ -691,6 +745,7 @@ export function installPeerBench({
       const pluginRegistry = syncClaudePluginRegistry({
         repoRoot: resolvedRepo,
         home,
+        claudeDir,
         marketplaceName,
         env,
         runner: claudeRunner,
@@ -704,7 +759,7 @@ export function installPeerBench({
       if (pluginRegistry.cli.attempted) {
         captureCreatedPluginRoots();
         if (!pluginRegistry.installPath) throw new Error(`Claude reported a successful install of ${pluginRegistry.pluginId}, but no installed plugin root was registered`);
-        const expectedCacheBase = path.resolve(home, ".claude", "plugins", "cache", marketplaceName, CLAUDE_PLUGIN_NAME);
+        const expectedCacheBase = path.resolve(claudeDir, "plugins", "cache", marketplaceName, CLAUDE_PLUGIN_NAME);
         const installedRoot = path.resolve(expandHome(pluginRegistry.installPath, home));
         if (!installedRoot.startsWith(`${expectedCacheBase}${path.sep}`)) {
           throw new Error(`Claude reported an unexpected plugin root for ${pluginRegistry.pluginId}: ${installedRoot}`);
@@ -725,10 +780,15 @@ export function installPeerBench({
         : removeClaudeSettingsPeerBenchHooks({ settingsPath: claudeSettingsPath });
       transactionClaude.settingsAfterState = capturePathState(claudeSettingsPath);
       persistTransaction();
-      const codexPluginData = path.join(home, ".claude", "plugins", "data", "codex-openai-codex");
+      const codexPluginData = path.join(claudeDir, "plugins", "data", "codex-openai-codex");
+      // NEVER mass-enable the Codex plugin gate here. The old blanket enable flipped
+      // stopReviewGate:true in EVERY workspace state file (47 at last count) — including tmp dirs
+      // and non-git home chats — so a Codex outage wedged every session everywhere. Enabling is a
+      // per-workspace, user-initiated act (/bench:on in that repo, or /codex:setup). Explicit
+      // single-gate mode may still mass-DISABLE (a safe direction).
       const legacyCodexGate = (env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true")
         ? disableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData })
-        : { ...enableLegacyCodexStopGateStates({ pluginDataDir: codexPluginData }), kept: true };
+        : { changed: 0, kept: true, skipped: "per-workspace setting left untouched" };
       const statusline = syncStatuslineSessionArg({ statuslinePath });
       transactionClaude.statuslineUpdated = statusline.updated;
       transactionClaude.statuslineAfterState = statusline.updated ? capturePathState(statuslinePath) : null;
@@ -766,6 +826,12 @@ export function installPeerBench({
     persistTransaction();
     if (!result.nativePrePush?.ok || !result.nativePrePush?.installed) {
       throw new Error(`native Git pre-push hook installation failed: ${result.nativePrePush?.reason || "hook was not installed"}`);
+    }
+    if (transactionMetadata.nativePrePush.snapshot?.captured) {
+      // Record the dispatcher's after-state so a later rollback can distinguish "still what install
+      // left" from "replaced after install" (mirroring hookAfterStates) and refuse on conflict.
+      transactionMetadata.nativePrePush.snapshot.hookAfterState = capturePathState(transactionMetadata.nativePrePush.snapshot.hookPath);
+      persistTransaction();
     }
 
     if (loadKeys) {
@@ -887,6 +953,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     if (opts.help) {
       process.stdout.write(usage());
       process.exit(0);
+    }
+    const source = assertDeployableSource(ROOT, { allowDirty: opts.allowDirty, skipTests: opts.skipTests });
+    if (source.checked) {
+      process.stdout.write(`Deploy source: ${source.dirtyOverridden ? "DIRTY (explicit --allow-dirty override)" : "clean"}${source.testsRun ? ", test suite passed" : ", tests skipped"}\n`);
     }
     const result = installPeerBench({
       claude: opts.claude,

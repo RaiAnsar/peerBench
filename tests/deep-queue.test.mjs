@@ -176,3 +176,71 @@ test("recoverOrphans: a stale .claimed whose .blocked already exists is DROPPED,
   assert.equal(listJobs(ws).length, 0, "NOT requeued as .json → no duplicate review");
   assert.equal(listBlocked(ws).length, 1, "the durable .blocked is untouched");
 });
+
+
+// ── compare-and-rewrite wake-count persist (legacy cross-session lost update) ─────────────────────
+// A legacy (session-less) .blocked is listed by EVERY session's runner, but the runner lease is
+// per-session: two sessions can each read wakeCount N, both persist N+1, and BOTH deliver — two
+// deliveries spent, one counted, and a later pass exceeds MAX_BLOCK_WAKES. markBlocked with
+// expectedWakeCount refuses a persist based on a stale read; the runner must not deliver on refusal.
+
+test("markBlocked compare-and-rewrite: a persist based on a STALE wakeCount read is refused", () => {
+  const ws = freshWs();
+  const payload = (wakeCount) => ({ kind: "spec", specPath: "/x/s.md", contentKey: "k", findings: "x", firstBlockedTs: 5, wakeCount });
+  markBlocked(ws, "k", payload(1));   // legacy block at wakeCount 1, listed by two concurrent session runners
+  const first = markBlocked(ws, "k", payload(2), { expectedWakeCount: 1 });
+  assert.ok(first, "the persist matching the stored count lands");
+  const stale = markBlocked(ws, "k", payload(2), { expectedWakeCount: 1 });
+  assert.equal(stale, null, "the peer already moved the counter — a second N→N+1 persist is a lost update (both would deliver)");
+  assert.equal(listBlocked(ws)[0].wakeCount, 2, "exactly one delivery is counted");
+});
+
+test("markBlocked compare-and-rewrite: a retired (missing/corrupt) block is refused, never resurrected", () => {
+  const ws = freshWs();
+  assert.equal(markBlocked(ws, "gone", { kind: "spec", contentKey: "gone", findings: "x", wakeCount: 2 }, { expectedWakeCount: 1 }), null,
+    "retired between the runner's list and its persist → the write must not recreate it");
+  assert.equal(listBlocked(ws).length, 0, "no record was resurrected");
+  markBlocked(ws, "k", { kind: "spec", specPath: "/x/s.md", contentKey: "k", findings: "x", firstBlockedTs: 5, wakeCount: 1 });
+  fs.writeFileSync(path.join(qdir(ws), "k.blocked"), "not json");
+  assert.equal(markBlocked(ws, "k", { kind: "spec", specPath: "/x/s.md", contentKey: "k", findings: "x", firstBlockedTs: 5, wakeCount: 2 }, { expectedWakeCount: 1 }), null,
+    "corrupt since the list → refuse (uncertainty shortens the loop, never extends it)");
+});
+
+test("markBlocked compare-and-rewrite: a live peer wake-lock defers; a crashed peer's lock is recovered", () => {
+  const ws = freshWs();
+  const payload = (wakeCount) => ({ kind: "spec", specPath: "/x/s.md", contentKey: "k", findings: "x", firstBlockedTs: 5, wakeCount });
+  markBlocked(ws, "k", payload(1));
+  const lock = path.join(qdir(ws), "k.blocked.wake-lock");
+  fs.mkdirSync(lock);   // a peer session is mid-delivery (holding its compare-and-rewrite)
+  assert.equal(markBlocked(ws, "k", payload(2), { expectedWakeCount: 1 }), null, "a fresh peer lock owns the in-flight delivery");
+  assert.equal(listBlocked(ws)[0].wakeCount, 1, "the peer's in-flight persist is not overwritten");
+
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(lock, old, old);   // the holder crashed — the lock is older than the stale threshold
+  const recovered = markBlocked(ws, "k", payload(2), { expectedWakeCount: 1 });
+  assert.ok(recovered, "a crashed peer's lock must not veto a durable finding forever");
+  assert.equal(listBlocked(ws)[0].wakeCount, 2);
+  assert.equal(fs.existsSync(lock), false, "the lock is released after the persist");
+});
+
+test("enqueue supersedes still-queued older revisions of the same spec path (across sessions)", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "dq-supersede-"));
+  assert.equal(enqueue(ws, { kind: "spec", specPath: "plans/a.md", contentKey: "rev1" }, { sessionKey: "chat-old" }), true);
+  assert.equal(enqueue(ws, { kind: "spec", specPath: "plans/a.md", contentKey: "rev2" }, { sessionKey: "chat-new" }), true);
+  const jobs = listJobs(ws);
+  assert.equal(jobs.length, 1, "only the newest revision stays queued");
+  assert.equal(jobs[0].contentKey, "rev2");
+  // A different spec path is never touched.
+  assert.equal(enqueue(ws, { kind: "spec", specPath: "plans/b.md", contentKey: "rev9" }, { sessionKey: "chat-new" }), true);
+  assert.equal(listJobs(ws).length, 2);
+});
+test("supersede leaves claimed and blocked entries of the same path untouched", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "dq-supersede-claimed-"));
+  enqueue(ws, { kind: "spec", specPath: "plans/a.md", contentKey: "rev1" }, { sessionKey: "chat-x" });
+  const key = listJobs(ws)[0]._jobKey;
+  const claimed = claim(ws, key);
+  assert.ok(claimed, "claimed the rev1 job");
+  enqueue(ws, { kind: "spec", specPath: "plans/a.md", contentKey: "rev2" }, { sessionKey: "chat-x" });
+  assert.ok(fs.existsSync(claimed), "in-flight claim survives a supersede");
+  assert.equal(listJobs(ws).length, 1);
+});

@@ -750,3 +750,115 @@ test("firstBlockedTs is stamped when the block PERSISTS (markBlocked), not at in
   const [blocked] = listBlocked(ws);
   assert.ok(blocked.firstBlockedTs >= before, `stamped at persist time (got ${blocked.firstBlockedTs}, invocation now=12345)`);
 });
+
+
+// ── audited regressions: spec review-time stamp (D1), wake-window message (D2), budget clamp (D3) ──
+
+test("SPEC block: the durable key is the REVIEWED content (res.hash), not the stale enqueue key", async () => {
+  // Save v1 → ALLOW+enqueue; edit to v2 BEFORE the runner reviews: runSpecReview reads the file at
+  // review time and returns hash = deepKey(filePath, v2) — the same formula currentContentKey
+  // recomputes. Keying the block on the v1 enqueue key makes the next Stop read the reviewed v2 as
+  // "changed" and retire a HIGH block that nothing addressed (live-verified audit finding).
+  const ws = freshWs();
+  const { file, contentKey } = planSpecJob(ws, "spec v1");
+  fs.writeFileSync(file, "spec v2");   // edited after enqueue, before the review runs
+  const reviewedHash = deepKey(file, "spec v2");
+  const { exit } = await runRunner(ws, {
+    runSpecReviewImpl: async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: v2 finding", hash: reviewedHash })
+  });
+  assert.equal(exit, 2);
+  const [blocked] = listBlocked(ws);
+  assert.equal(blocked.contentKey, reviewedHash, "the block is keyed on what the review actually covered");
+  assert.notEqual(blocked.contentKey, contentKey, "the superseded v1 enqueue key is not the durable identity");
+
+  // Next Stop, spec untouched since the review: nothing changed AFTER the review → keep + re-deliver.
+  const second = await runRunner(ws, { runSpecReviewImpl: async () => { throw new Error("no re-review"); } });
+  assert.equal(second.exit, 2, "unchanged since the review → re-delivered, never retired as 'changed'");
+  assert.equal(listBlocked(ws).length, 1, "the durable HIGH block survives");
+});
+
+test("SPEC block: a review result without a hash falls back to the enqueue-time key", async () => {
+  const ws = freshWs();
+  const { contentKey } = planSpecJob(ws, "spec body");
+  const { exit } = await runRunner(ws, {
+    runSpecReviewImpl: async () => ({ maxSeverity: "high", findingCount: 1, findings: "BLOCK: no hash field" })
+  });
+  assert.equal(exit, 2);
+  assert.equal(listBlocked(ws)[0].contentKey, contentKey, "absent res.hash → enqueue key (legacy/alternate review impls)");
+});
+
+test("WAKE WINDOW expiry is reported as window expiry, not as wake-count exhaustion", async () => {
+  const now = Date.now();
+  const ws = freshWs();
+  const file = path.join(ws, "s.md");
+  fs.writeFileSync(file, "spec body");
+  const contentKey = deepKey(file, "spec body");
+  markBlocked(ws, contentKey, { kind: "spec", specPath: file, contentKey, findings: "- window block", wakeCount: 1, firstBlockedTs: now - WAKE_WINDOW_MS - 1000 });
+  const { exit, out } = await runRunner(ws, { now });
+  assert.equal(exit, 0);
+  const msg = out[0]?.systemMessage || "";
+  assert.match(msg, /wake window expired after 1\/3 deliveries/, "one delivery + expired window is NOT 'wakes exhausted at 1/3'");
+  assert.doesNotMatch(msg, /wakes exhausted/);
+
+  // Count exhaustion inside the window keeps the existing message.
+  const ws2 = freshWs();
+  const file2 = path.join(ws2, "s.md");
+  fs.writeFileSync(file2, "spec body");
+  const key2 = deepKey(file2, "spec body");
+  markBlocked(ws2, key2, { kind: "spec", specPath: file2, contentKey: key2, findings: "- count block", wakeCount: MAX_BLOCK_WAKES, firstBlockedTs: now });
+  const second = await runRunner(ws2, { now });
+  assert.equal(second.exit, 0);
+  assert.match(second.out[0]?.systemMessage || "", new RegExp(`wakes exhausted at ${MAX_BLOCK_WAKES}/${MAX_BLOCK_WAKES}`));
+});
+
+test("DRAIN DEADLINE: a NEGATIVE review budget env is clamped to the default (no unbounded batch start)", async () => {
+  const ws = freshWs();
+  for (let n = 0; n < MAX_BATCH + 1; n++) {
+    const f = path.join(ws, `neg-${n}.md`);
+    fs.writeFileSync(f, `body ${n}`);
+    enqueue(ws, { kind: "spec", specPath: f, contentKey: deepKey(f, `body ${n}`) });
+  }
+  let runCount = 0;
+  const { exit } = await runRunner(ws, {
+    runSpecReviewImpl: async () => { runCount++; return { maxSeverity: "none", findingCount: 0, findings: "" }; },
+    env: { BENCH_DEEP_REVIEW_BUDGET_MS: "-600000", BENCH_DEEP_RUNNER_BUDGET_MS: "1" }
+  });
+  // Number("-600000") || default keeps the negative: the worst-case batch math goes NEGATIVE, so a
+  // second batch "fits" a 1ms runner budget — the hook would be killed mid-claim by the real timeout.
+  assert.equal(runCount, MAX_BATCH, "only the first batch runs — the surplus cannot fit the runner budget");
+  assert.equal(exit, 2, "the deferred surplus forces the next Stop");
+  assert.equal(listJobs(ws).length, 1, "the surplus job stays durably queued");
+});
+
+test("DRAIN DEADLINE: a NEGATIVE runner budget env is clamped to the default (surplus still drains)", async () => {
+  const ws = freshWs();
+  for (let n = 0; n < MAX_BATCH + 1; n++) {
+    const f = path.join(ws, `negr-${n}.md`);
+    fs.writeFileSync(f, `body ${n}`);
+    enqueue(ws, { kind: "spec", specPath: f, contentKey: deepKey(f, `body ${n}`) });
+  }
+  const { exit } = await runRunner(ws, {
+    runSpecReviewImpl: CLEAN,
+    env: { BENCH_DEEP_REVIEW_BUDGET_MS: "1000", BENCH_DEEP_RUNNER_BUDGET_MS: "-600000" }
+  });
+  assert.equal(exit, 0, "the default runner budget fits every batch — a negative env must not force deferral");
+  assert.equal(listJobs(ws).length, 0, "the whole surplus drains in one invocation");
+});
+
+
+test("LEGACY block: a peer session's in-flight delivery suppresses the duplicate wake (compare-and-rewrite)", async () => {
+  // Legacy (session-less) blocks are listed by EVERY session's runner while the runner lease is
+  // per-session: without a conditional persist, both sessions read wakeCount N, persist N+1, and
+  // BOTH deliver — a later pass then exceeds MAX_BLOCK_WAKES. The wake-lock marks the peer's
+  // in-flight compare-and-rewrite; this runner must defer, not double-deliver.
+  const ws = freshWs();
+  const file = path.join(ws, "s.md");
+  fs.writeFileSync(file, "spec body");
+  const contentKey = deepKey(file, "spec body");
+  markBlocked(ws, contentKey, { kind: "spec", specPath: file, contentKey, findings: "- legacy block", firstBlockedTs: Date.now(), wakeCount: 1 });
+  fs.mkdirSync(path.join(workspaceStateDir(ws), "deep-queue", `${contentKey}.blocked.wake-lock`), { recursive: true });
+  const { exit, err } = await runRunner(ws, { input: { cwd: ws, session_id: "chat-B" } });
+  assert.equal(exit, 0, "the peer owns this delivery — a duplicate wake spends two deliveries for one counted wake");
+  assert.doesNotMatch(err, /legacy block/);
+  assert.equal(listBlocked(ws)[0].wakeCount, 1, "the counter is not double-incremented");
+});

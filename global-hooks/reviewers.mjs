@@ -1,11 +1,53 @@
 // global-hooks/reviewers.mjs
 import { parseVerdict, runCodexReview, runGrokReview } from "./panel-lib.mjs";
-import { resolveConfig, displayName } from "./config-store.mjs";
+import { resolveConfig, displayName, readReviewerCooldown, recordReviewerCooldown } from "./config-store.mjs";
 import { review as defaultReview } from "./review-client.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// --- reviewer availability -----------------------------------------------------------------
+// A reviewer that is out of quota/credits or auth-broken must FAIL FAST AND SAY SO — never make
+// every gate re-run the same doomed call (each one burning its retry backoff + timeout) until the
+// plan resets. On a classified quota/auth failure we record a short global cooldown
+// (config-store); while it lasts, the reviewer is skipped instantly with an explicit note.
+const COOLDOWN_KINDS = new Set(["quota", "auth"]);
+
+const unavailableLabel = (kind) => (kind === "auth" ? "auth failed (re-auth needed)" : "out of quota/credits");
+
+// CLI reviewers (codex/grok) fail with free-text spawn errors, not HTTP statuses. Sniff those
+// into the same quota/auth taxonomy — conservative word-boundary matches only.
+export function classifyReviewerFailureText(text) {
+  const s = String(text || "");
+  if (/\b(quota|usage limit|rate.?limit|insufficient credits?|out of credits|plan limit|credit balance)\b/i.test(s)) return "quota";
+  if (/\b(401|unauthorized|invalid_grant|not logged in|logged out|sign-?in required|login required|re-?authenticate)\b/i.test(s)) return "auth";
+  return null;
+}
+
+function withAvailability(name, display, runImpl, { now = Date.now } = {}) {
+  return async (args) => {
+    const cooldown = readReviewerCooldown(name, { now: now() });
+    if (cooldown) {
+      const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - now()) / 60_000));
+      return {
+        name: display,
+        error: `${unavailableLabel(cooldown.kind)} — skipped without retry (cooldown ${minutesLeft} min left; ${cooldown.detail})`,
+        errorKind: cooldown.kind,
+        skipped: "cooldown"
+      };
+    }
+    const result = await runImpl(args);
+    if (result?.error) {
+      const kind = result.errorKind || classifyReviewerFailureText(result.error);
+      if (COOLDOWN_KINDS.has(kind)) {
+        recordReviewerCooldown(name, kind, result.error, { now: now() });
+        return { ...result, error: `${unavailableLabel(kind)} — ${result.error}`, errorKind: kind };
+      }
+    }
+    return result;
+  };
+}
 
 const STRICT = "\n\nIMPORTANT: respond with ONLY a first line of `ALLOW: <reason>` or `BLOCK: <reason>`. No preamble, no code fences.";
 
@@ -19,8 +61,8 @@ export function latestCodexRoot() {
   return latest ? path.join(PLUGIN_CACHE, latest) : null;
 }
 
-function codexAdapter() {
-  return { name: "codex", reviewIdentity: { kind: "codex-cli" }, async run({ system, user, cwd, env = process.env }) {
+function codexAdapter(env = process.env) {
+  return { name: "codex", reviewIdentity: { kind: "codex-cli", model: readCodexCliModel(env) }, async run({ system, user, cwd, env = process.env }) {
     const codexRoot = latestCodexRoot();
     if (!codexRoot) return { name: "Codex", error: "codex plugin not found" };
     const codexEnv = { ...env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA || CODEX_DATA };
@@ -28,10 +70,33 @@ function codexAdapter() {
   } };
 }
 
+// CLI reviewers have no API model/baseURL to key a cached ALLOW on, but the reviewer still changes
+// underneath the cache. Track it with PLAIN FILE READS ONLY — never a spawn on the gate hot path:
+//  • codex: the companion inherits the gate's CODEX_HOME, so the review model is the top-level
+//    `model = "…"` in $CODEX_HOME/config.toml.
+//  • grok: reviews run with GROK_HOME redirected to an ephemeral tmpdir (no config file applies),
+//    so the review model is the CLI build's built-in default — the installed build's version.json
+//    is the cheap proxy; a model change rides along with a build change.
+// The signal rides in `model` so every consumer invalidates on it (plan gates hash the whole
+// reviewIdentity; the stop gate fingerprints .model). "" when nothing is cheaply readable.
+function readCodexCliModel(env) {
+  try {
+    const toml = fs.readFileSync(path.join(env.CODEX_HOME || path.join(os.homedir(), ".codex"), "config.toml"), "utf8");
+    return (toml.match(/^model\s*=\s*"([^"]+)"/m) || [])[1] || "";
+  } catch { return ""; }
+}
+
+function readGrokCliVersion(env) {
+  try {
+    const v = JSON.parse(fs.readFileSync(path.join(env.GROK_HOME || path.join(os.homedir(), ".grok"), "version.json"), "utf8"))?.version;
+    return typeof v === "string" && v ? `grok-cli@${v}` : "";
+  } catch { return ""; }
+}
+
 // Grok Build CLI (local x.ai harness, plan-billed — no API key). Same shape as codexAdapter:
 // spawn headless, read-only (plan mode), parse the ALLOW/BLOCK verdict from stdout.
-function grokAdapter() {
-  return { name: "grok", reviewIdentity: { kind: "grok-cli" }, async run({ system, user, cwd, env = process.env }) {
+function grokAdapter(env = process.env) {
+  return { name: "grok", reviewIdentity: { kind: "grok-cli", model: readGrokCliVersion(env) }, async run({ system, user, cwd, env = process.env }) {
     return runGrokReview({ prompt: `${system}\n\n${user}`, cwd, env });
   } };
 }
@@ -55,14 +120,20 @@ export function extractVerdict(text) {
 }
 
 // NOTE (v1 limitation): parallel provider calls fail-fast on rate limits; no backoff/retry beyond the one verdict-format retry below.
-export function resolveReviewers({ env = process.env, reviewImpl = defaultReview, reviewers } = {}) {
+export function resolveReviewers({ env = process.env, reviewImpl = defaultReview, reviewers, now } = {}) {
   const cfg = resolveConfig({ env, reviewers });
+  // Every adapter (API and CLI) goes through the availability wrapper: cooldown pre-check first
+  // (instant skip with a clear out-of-quota/auth note), classified-failure recording after.
+  const wrap = (adapter) => ({
+    ...adapter,
+    run: withAvailability(adapter.name, displayName(adapter.name), adapter.run, now ? { now } : {})
+  });
   return cfg.reviewers.map((name) => {
-    if (name === "codex") return codexAdapter();
-    if (name === "grok") return grokAdapter();
+    if (name === "codex") return wrap(codexAdapter(env));
+    if (name === "grok") return wrap(grokAdapter(env));
     const p = cfg.providers[name];
     const display = displayName(name);
-    return {
+    return wrap({
       name,
       // Non-secret cache identity for gates that remember an ALLOW. A reviewer name alone is not
       // enough: changing the model or endpoint must invalidate an earlier decision for unchanged
@@ -89,16 +160,16 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
           }
         );
         let r = await call(user);
-        if (!r.ok) return { name: display, error: `${r.error.kind}: ${r.error.detail}` };
+        if (!r.ok) return { name: display, error: `${r.error.kind}: ${r.error.detail}`, errorKind: r.error.kind };
         let v = extractVerdict(r.text), raw = r.text, usage = r.usage;
         if (!v) {
           const r2 = await call(user + STRICT);
-          if (!r2.ok) return { name: display, error: `${r2.error.kind}: ${r2.error.detail}` };
+          if (!r2.ok) return { name: display, error: `${r2.error.kind}: ${r2.error.detail}`, errorKind: r2.error.kind };
           v = extractVerdict(r2.text); raw = r2.text; usage = r2.usage;   // bill the retry, not the first call
         }
         if (!v) return { name: display, error: "unparseable verdict", raw };
         return { name: display, verdict: v.verdict, firstLine: v.firstLine, raw, model: p.model, usage: usage ?? null };
       }
-    };
+    });
   });
 }

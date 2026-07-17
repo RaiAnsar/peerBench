@@ -57,3 +57,30 @@ test("fails open (runs anyway) if no slot frees before timeout", async () => {
   assert.equal(ran, true);                            // never blocks a review forever
   assert.ok(Date.now() - t >= 150);
 });
+
+test("a slow holder's release does NOT delete a stolen-and-reacquired live slot", async () => {
+  const root = tmpRoot();
+  const slot = path.join(root, "locks", "g", "slot-0");
+  const waitFor = async (cond) => {
+    const t0 = Date.now();
+    while (!cond() && Date.now() - t0 < 2000) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(cond(), "timed out waiting for the limiter");
+  };
+  // A acquires the only slot and runs "too long" (outlives the stealer's staleMs).
+  let aHolding = false, finishA;
+  const aDone = withConcurrencyLimit({ name: "g", slots: 1, root, staleMs: 60_000, timeoutMs: 2000 },
+    () => new Promise((r) => { aHolding = true; finishA = r; }));
+  await waitFor(() => aHolding);
+  // B steals the (by its clock, stale) slot and keeps holding it.
+  let bHolding = false, finishB;
+  const bDone = withConcurrencyLimit({ name: "g", slots: 1, root, staleMs: 0, timeoutMs: 2000 },
+    () => new Promise((r) => { bHolding = true; finishB = r; }));
+  await waitFor(() => bHolding);
+  // The slow finisher's release must not rmdir the slot the stealer now owns (that would let a
+  // third process mkdir the same slot and exceed the per-key cap).
+  finishA(); await aDone;
+  assert.ok(fs.existsSync(slot), "stale holder's release deleted the live stolen slot");
+  finishB(); await bDone;
+  assert.ok(!fs.existsSync(slot), "the rightful owner's release still frees the slot");
+  fs.rmSync(root, { recursive: true, force: true });
+});

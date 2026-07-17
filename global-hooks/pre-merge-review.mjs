@@ -46,10 +46,13 @@ function protectedBranches(env) {
 const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"]);
 // `git merge` options that take a SEPARATE value token — so `-m "msg" staging` yields ref "staging",
 // not "msg". Only DEFINITE value-flags (optional-arg flags like -S are left alone to avoid eating a ref).
-const MERGE_VALUE_FLAGS = new Set(["-m", "--message", "-F", "--file", "-s", "--strategy", "-X", "--strategy-option", "--into-name"]);
+const MERGE_VALUE_FLAGS = new Set(["-m", "--message", "-F", "--file", "-s", "--strategy", "-X", "--strategy-option", "--into-name", "--cleanup"]);
 
 // Detect `git merge <ref...>` in a shell segment (allow leading env assignments + git global opts).
-// Excludes --abort/--continue/--quit (not a NEW merge) and --help. Returns { refs } or null.
+// Excludes --abort/--continue/--quit (not a NEW merge) and --help. Returns { refs, redirected } or null.
+// `redirected` marks repo redirection (`GIT_DIR=/x git merge y`, `git --git-dir=/x merge y`): the gate
+// resolves the workspace from the command cwd, so such a merge would be reviewed against the WRONG
+// repository — the caller must say UNREVIEWED instead of silently gating the wrong repo.
 export function parseMergeSegment(text) {
   const toks = shellTokenize(text).filter(Boolean);
   // COMMAND-position git only (shared rule): `echo git merge x` is not a merge — with escape
@@ -57,8 +60,15 @@ export function parseMergeSegment(text) {
   // the next segment and fail the gate open through the unresolvable ref (a stop-gate catch).
   let i = gitCommandIndex(toks);
   if (i < 0) return null;
+  const envRedirect = toks.slice(0, i).some((t) => /^GIT_DIR=/.test(t));
   i++;
-  while (i < toks.length && toks[i].startsWith("-")) { const t = toks[i]; i++; if (GIT_VALUE_OPTS.has(t)) i++; }
+  let optRedirect = false;
+  while (i < toks.length && toks[i].startsWith("-")) {
+    const t = toks[i];
+    if (t === "--git-dir" || t.startsWith("--git-dir=")) optRedirect = true;
+    i++;
+    if (GIT_VALUE_OPTS.has(t)) i++;
+  }
   if (toks[i] !== "merge") return null;
   const rest = toks.slice(i + 1);
   if (rest.some((t) => ["--help", "-h", "--abort", "--continue", "--quit"].includes(t))) return null;
@@ -71,18 +81,27 @@ export function parseMergeSegment(text) {
     if (t.startsWith("-")) { if (MERGE_VALUE_FLAGS.has(t)) j++; continue; }   // skip a value-flag's value token
     refs.push(t);
   }
-  return { refs };
+  return { refs, redirected: envRedirect || optRedirect };
 }
 
-// The first segment that is a real git merge, or null. Also handles a subshell-wrapped `(git merge x)`.
+// EVERY real git merge segment of the compound command, combined into one ref set: gating only the
+// FIRST match let `git merge innocent && git merge blocked-branch` skip the second merge's fast
+// review AND its deep-review enqueue — a deterministic bypass of an active deny. A ref-less segment
+// merges the upstream (@{u}). Also handles a subshell-wrapped `(git merge x)`.
 export function findMergeSegment(command) {
+  let refs = null;
+  let redirected = false;
   for (const s of shellSegments(command)) {
-    const m = parseMergeSegment(s.text);
-    if (m) return m;
-    const stripped = s.text.replace(/^\(\s*/, "").replace(/\s*\)$/, "");
-    if (stripped !== s.text) { const m2 = parseMergeSegment(stripped); if (m2) return m2; }
+    let m = parseMergeSegment(s.text);
+    if (!m) {
+      const stripped = s.text.replace(/^\(\s*/, "").replace(/\s*\)$/, "");
+      if (stripped !== s.text) m = parseMergeSegment(stripped);
+    }
+    if (!m) continue;
+    refs = (refs || []).concat(m.refs.length ? m.refs : ["@{u}"]);
+    redirected = redirected || m.redirected;
   }
-  return null;
+  return refs ? { refs, redirected } : null;
 }
 
 function readInput() {
@@ -475,6 +494,18 @@ export async function runMain({
   const ws = workspaceRoot(commandCwd(command, input.cwd || env.CLAUDE_PROJECT_DIR || process.cwd()), env);
   if (isBenchDisabledImpl(ws)) return exit(0);
 
+  // A merge whose repository is redirected away from the command cwd (`git --git-dir=/x merge y`,
+  // `GIT_DIR=/x git merge y`) cannot be gated from here: every gate Git op and the state dir would
+  // target the WRONG repo. Say UNREVIEWED visibly instead of silently reviewing the wrong repository.
+  if (merge.redirected) {
+    decision(
+      "allow",
+      "UNREVIEWED — pre-merge gate cannot review a merge whose repository is redirected by --git-dir/GIT_DIR; merge allowed locally and the native pre-push gate remains authoritative.",
+      "⛩ bench merge: UNREVIEWED — repository redirected via --git-dir/GIT_DIR; native push gate remains authoritative."
+    );
+    return;
+  }
+
   // 2. Only gate merges INTO a protected branch (the "releasing into main" moment).
   const [branch, branchOk] = immutableGitTry(["rev-parse", "--abbrev-ref", "HEAD"], ws, env);
   if (!branchOk || !branch) {
@@ -486,11 +517,12 @@ export async function runMain({
   const sessionKey = sessionKeyFromInput(input, env);
 
   // 3. Incoming commits per ref. `git merge` with no ref merges the upstream (@{u}); an octopus
-  // merge (`git merge a b`) lists several refs — EVERY ref's commits are incoming, so every ref is
-  // gathered (reviewing only refs[0] let the rest bypass the gate — a push-gate catch). Ranges are
+  // merge (`git merge a b`) — and EVERY merge segment of a compound command — lists several refs, so
+  // EVERY ref's commits are incoming and every ref is gathered (reviewing only refs[0] let the rest
+  // bypass the gate — a push-gate catch). Ranges are
   // pinned to SHAs (`<headSha>..<refSha>`), never symbolic `HEAD..ref`: the queued deep review runs
   // AFTER the merge advances HEAD, where a symbolic range is empty (ff) or wrong (non-ff).
-  const refNames = [...new Set(merge.refs.length ? merge.refs : ["@{u}"])];
+  const refNames = [...new Set(merge.refs)];
   const refsLabel = refNames.join(", ");
   const [headSha, headOk] = immutableGitTry(["rev-parse", "--verify", "HEAD^{commit}"], ws, env);
   if (!headOk || !headSha) {
@@ -572,17 +604,11 @@ export async function runMain({
     return;
   }
 
-  // A completed immutable ALLOW above is always safe to replay without spending another cycle. For
-  // every not-yet-approved target, however, the task/session ceiling is absolute and non-waking.
-  if (cycle.exhausted) {
-    const advisory = mergeCycleAdvisory(cycle);
-    decision("allow", advisory, `⛩ bench merge: ${advisory.slice(0, 1800)}`);
-    return;
-  }
-
   // 4. Enqueue the DEEP async reviews FIRST (best-effort), one per UNIQUE immutable range — delivered by the
   // deep-review-runner via the visible rewake, non-blocking, so the thorough repo-aware pass happens
-  // even if the fast gate below times out or crashes. kind:"merge" (not "push"): the runner reviews
+  // even if the fast gate below times out or crashes, and even when the repair-cycle ceiling pauses
+  // the fast gate (an exhausted cycle must not leave a changed target with zero async coverage).
+  // kind:"merge" (not "push"): the runner reviews
   // it through the same range machinery, but its durable-block identity is recomputed as
   // `merge:<range>` (deep-queue currentContentKey) — reusing kind:"push" made every recompute
   // `push:<range>`-keyed, so a durable merge block was always "changed" and retired at the next Stop.
@@ -592,6 +618,14 @@ export async function runMain({
     } catch (e) {
       process.stderr.write(`⛩ pre-merge: deep review enqueue failed for ${i.refs.join(", ")} (${e instanceof Error ? e.message : String(e)}); fast gate stands.\n`);
     }
+  }
+
+  // A completed immutable ALLOW above is always safe to replay without spending another cycle. For
+  // every not-yet-approved target, however, the task/session ceiling is absolute and non-waking.
+  if (cycle.exhausted) {
+    const advisory = mergeCycleAdvisory(cycle);
+    decision("allow", advisory, `⛩ bench merge: ${advisory.slice(0, 1800)}`);
+    return;
   }
 
   if (reviewerResolveError) {
@@ -792,6 +826,7 @@ export async function runMain({
   }
 
   let cacheWritten = false;
+  let cacheWriteFailed = false;
   try {
     cacheWritten = writeMergeAllow(ws, approvalIdentity, {
       badge: panel.badge,
@@ -799,11 +834,15 @@ export async function runMain({
       advisories: panel.advisories || []
     });
   } catch (error) {
+    cacheWriteFailed = true;
     process.stderr.write(`⛩ pre-merge: exact ALLOW cache write failed (${error instanceof Error ? error.message : String(error)}); current review still allows.\n`);
   }
+  const cacheNote = cacheWritten ? "exact clean result cached"
+    : cacheWriteFailed ? "not cached because the exact ALLOW cache write failed"
+    : "not cached because this immutable identity was previously blocked";
   decision(
     "allow",
-    `⛩ bench merge: exact ALLOW [${panel.badge}] — ${panel.summary} (complete evidence; ${cacheWritten ? "exact clean result cached" : "not cached because this immutable identity was previously blocked"}; a deep review is queued for the thorough pass)`,
+    `⛩ bench merge: exact ALLOW [${panel.badge}] — ${panel.summary} (complete evidence; ${cacheNote}; a deep review is queued for the thorough pass)`,
     `⛩ bench merge: ALLOW [${panel.badge}] — ${(panel.summary || "merge review passed").slice(0, 180)}`
   );
   } finally {

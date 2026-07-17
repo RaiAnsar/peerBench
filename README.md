@@ -166,7 +166,7 @@ produce output:
 - **Per-round watchdog** — an exploration round that runs too long (default 90s) is
   cut and the model is forced to conclude; the final synthesis round gets the full
   remaining budget.
-- **Conclude budget** — past ~150 KB of gathered context the model is told to stop
+- **Conclude budget** — past ~120 KB of gathered context the model is told to stop
   reading and write its findings (prevents endless exploration).
 - **Network retry** + **wall-clock timeout** + per-tool try/catch.
 - **Budgets** — hunt/debug get a 12-minute wall clock; investigate stays deep
@@ -208,6 +208,35 @@ param IS a live toggle (GLM, Qwen) still flip on for deep reviews automatically.
 `hunt`, `debug`, and `investigate` are **model-invokable** — Claude can reach for them on its own
 when a task calls for finding or root-causing a bug. The rest are user-invoked.
 
+## Reliability contract (anti-loop + honest failures)
+
+The gates are wrapped in hard reliability rules so a degraded panel can never wedge a session:
+
+- **Out-of-quota/auth failures say so and skip.** HTTP 402/exhausted-429 (and quota-keyword
+  bodies) classify as `quota`, 401/403 as `auth` — for API *and* CLI reviewers. A classified
+  failure records a short global cooldown (quota ≈ 5 min, auth ≈ 10 min in
+  `~/.claude/plugins/data/bench-shared/reviewer-cooldowns.json`); while it lasts, every gate skips
+  that reviewer **instantly** with a `"<name> out of quota/credits — skipped"` note instead of
+  re-burning retries and timeouts on every stop/push.
+- **Session-total wake budgets.** The consecutive-block streak (3) still resets on ALLOW/clean —
+  but the **session total does not** (stop gate: 9, plan gate: 9 with a 2 h inactivity refund).
+  A BLOCK→fix→ALLOW→BLOCK alternation can no longer wake a session forever; after the budget the
+  gate downgrades to a visible, non-waking advisory. `BENCH_STOP_CYCLE_RESET` / plan-cycle reset
+  nonces are the explicit refunds.
+- **Git-scoped gates.** Stop, plan (ExitPlanMode), and plan/spec-file gates run only inside a git
+  work tree — non-git chats are never gated.
+- **Push gate fails fast and honestly.** If cooldowns make the policy unsatisfiable (required
+  Codex out of quota, or quorum unreachable), the push blocks immediately with the exact reason
+  and the explicit bypass — no multi-minute doomed panel run.
+- **Queued deep reviews supersede by path.** A newer saved revision of a plan/spec retires any
+  still-queued older revision, so the deep runner never wakes a session to review dead bytes.
+- **Deploys must be committed + tested.** `scripts/install.mjs` refuses a dirty working tree and
+  runs the test suite first (`--allow-dirty` / `--skip-tests` are the explicit overrides) — a
+  mid-development snapshot can no longer ship into the live gates.
+- **No blanket Codex-gate enabling.** Installing peerBench (and `/bench:on --global`) no longer
+  flips the official codex plugin's `stopReviewGate` on across every workspace; enabling it is a
+  per-repo act (`/bench:on` in that repo).
+
 ## Configuration
 
 - **`companion.json`** (shared, env-independent path under
@@ -223,7 +252,7 @@ when a task calls for finding or root-causing a bug. The rest are user-invoked.
 - `BENCH_MERGE_CYCLE_RESET=<nonce>` — explicitly start one fresh protected-branch merge-review cycle; the same persistent value is consumed only once, so change the nonce for a later reset.
 - `BENCH_MERGE_REVIEW_REFRESH=1` — ignore an exact merge ALLOW cache entry and rerun the complete fast panel once.
 - `BENCH_DEEP_CYCLE_RESET=<nonce>` — explicitly resume automatic deep-review waking after its global three-wake task/session ceiling. Each value is consumed once per task/session (`1` works once); change the nonce for another deliberate reset, so an inherited environment value cannot disable the ceiling.
-- `BENCH_PUSH_REVIEW_QUORUM=<n>` — required native push verdict count (default: two, or all when fewer are configured).
+- `BENCH_PUSH_REVIEW_QUORUM=<n>` — required native push verdict count (default: two, or all when fewer are configured; values above the configured panel clamp to all reviewers).
 - `BENCH_PUSH_REQUIRE_CODEX=0` — do not require Codex specifically when it is in the active push panel.
 - `BENCH_PUSH_MAX_BLOCK_CYCLES=<n>` — choose a stricter automatic blocked-revision ceiling; values are hard-capped at three.
 - `BENCH_PUSH_CYCLE_RESET=<nonce>` — clear one ref-scope hold once and perform one fresh native verification; change the nonce for a later deliberate reset.
@@ -276,7 +305,7 @@ segment falls back to workspace-level trace selection for compatibility.
   `GROK_HOME=~/.grok-headless grok -p OK` for the gate's dedicated auth) only if
   you enable the `grok` reviewer.
 - At least one provider key in `.keys` / `companion.json` if no CLI reviewer is
-  set up. Fallback defaults are `kimi` + `glm`.
+  set up. Fallback defaults are `kimi` + `minimax` (the keyed API reviewers of the current panel; CLI reviewers are never part of the key-only fallback).
 
 ## Install
 

@@ -24,6 +24,10 @@ import { summarizeSpecReview, deepKey, DEEP_REWAKE_SEVERITY, aggregateFindings, 
 const MAX_PUSH_DIFF_BYTES = 1_000_000;
 const MAX_PUSH_LOG_BYTES = 128_000;
 const MAX_PUSH_STDERR_BYTES = 8_000;
+// A wedged git (dead NFS/fuse) never settles, and the native pre-push path has no outer budget and
+// no Git hook timeout — the push would hang indefinitely. Kill the child well below the deep
+// runner's per-review budget (default 10 min) so the existing retry/defer handling engages instead.
+const GIT_EVIDENCE_TIMEOUT_MS = 5 * 60 * 1000;
 
 const VALID_VERDICTS = new Set(["ALLOW", "BLOCK"]);
 
@@ -130,7 +134,7 @@ function boundedEvidenceFromBuffer(buffer, maxBytes) {
 // Stream arbitrarily large Git output through a full SHA-256 while retaining only bounded head and
 // tail evidence for the prompt. This avoids execFileSync's maxBuffer false-block on large text diffs
 // and still detects the child exit status exactly.
-export function streamGitEvidence(args, cwd, { maxBytes = MAX_PUSH_DIFF_BYTES, env = process.env } = {}) {
+export function streamGitEvidence(args, cwd, { maxBytes = MAX_PUSH_DIFF_BYTES, timeoutMs = GIT_EVIDENCE_TIMEOUT_MS, env = process.env } = {}) {
   return new Promise((resolve) => {
     const hash = createHash("sha256");
     const headLimit = Math.ceil(maxBytes / 2);
@@ -140,11 +144,24 @@ export function streamGitEvidence(args, cwd, { maxBytes = MAX_PUSH_DIFF_BYTES, e
     let completeChunks = [];
     let stderr = Buffer.alloc(0);
     let settled = false;
+    let timer = null;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(value);
+    };
     const child = spawn("git", ["-c", "advice.graftFileDeprecated=false", "--no-replace-objects", ...args], {
       cwd,
       env: { ...env, GIT_NO_REPLACE_OBJECTS: "1", GIT_GRAFT_FILE: os.devNull },
       stdio: ["ignore", "pipe", "pipe"]
     });
+    if (Number(timeoutMs) > 0) {
+      timer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* already dead */ }
+        finish({ ok: false, text: "", bytes, sha256: null, truncated: false, stderr: `git evidence timed out after ${Number(timeoutMs)} ms` });
+      }, Number(timeoutMs));
+    }
 
     child.stdout.on("data", (raw) => {
       const chunk = Buffer.from(raw);
@@ -175,13 +192,10 @@ export function streamGitEvidence(args, cwd, { maxBytes = MAX_PUSH_DIFF_BYTES, e
       stderr = Buffer.concat([stderr, Buffer.from(raw).subarray(0, MAX_PUSH_STDERR_BYTES - stderr.length)]);
     });
     child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      resolve({ ok: false, text: "", bytes, sha256: null, truncated: false, stderr: error.message });
+      finish({ ok: false, text: "", bytes, sha256: null, truncated: false, stderr: error.message });
     });
     child.on("close", (code, signal) => {
       if (settled) return;
-      settled = true;
       const sha256 = hash.digest("hex");
       const truncated = bytes > maxBytes;
       let text;
@@ -197,7 +211,7 @@ export function streamGitEvidence(args, cwd, { maxBytes = MAX_PUSH_DIFF_BYTES, e
         const marker = `\n\n[... ${bytes - maxBytes} bytes omitted; full_sha256=${sha256} ...]\n\n`;
         text = `${Buffer.concat(headChunks).toString("utf8")}${marker}${Buffer.concat(tailChunks).toString("utf8")}`.trim();
       }
-      resolve({
+      finish({
         ok: code === 0,
         text,
         bytes,

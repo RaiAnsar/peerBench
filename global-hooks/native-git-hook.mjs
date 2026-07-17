@@ -52,26 +52,30 @@ export function nativeHookScript(runtimePath, nodePath = process.execPath) {
 ${NATIVE_HOOK_MARKER}
 # Git gives pre-push update tuples on stdin. Spool the exact bytes once so an existing user hook
 # and peerBench receive identical input, including a truly empty stream and trailing newlines.
+# mktemp already creates the spool 0600; restore the caller's umask so chained hooks keep their own.
+prev_umask=$(umask)
 umask 077
 input_file=$(mktemp "\${TMPDIR:-/tmp}/peerbench-pre-push.XXXXXX") || {
   echo "peerBench: could not create a secure pre-push input buffer; push blocked." >&2
   exit 1
 }
+umask "$prev_umask"
 trap 'rm -f "$input_file"' 0 1 2 3 15
 cat > "$input_file" || exit $?
 local_hook="$(dirname "$0")/${LOCAL_HOOK_NAME}"
 if [ -x "$local_hook" ]; then
   # For common shell hooks, source the renamed file in a fresh matching shell while keeping $0 as
   # .../pre-push. That preserves dirname/basename dispatch used by hook managers. Opaque executable
-  # hooks still run directly with the same args, stdin, environment, and exit status.
+  # hooks still run directly with the same args, stdin, environment, and exit status. zsh resets $0
+  # to the sourced file (FUNCTION_ARGZERO), so only the zsh branches unset that option first.
   hook_header=$(head -n 1 "$local_hook" 2>/dev/null || true)
   case "$hook_header" in
     '#!/bin/sh') /bin/sh -c 'script=$1; shift; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
     '#!/usr/bin/env sh') /usr/bin/env sh -c 'script=$1; shift; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
     '#!/bin/bash') /bin/bash -c 'script=$1; shift; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
     '#!/usr/bin/env bash') /usr/bin/env bash -c 'script=$1; shift; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
-    '#!/bin/zsh') /bin/zsh -c 'script=$1; shift; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
-    '#!/usr/bin/env zsh') /usr/bin/env zsh -c 'script=$1; shift; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
+    '#!/bin/zsh') /bin/zsh -c 'script=$1; shift; setopt NO_FUNCTION_ARGZERO; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
+    '#!/usr/bin/env zsh') /usr/bin/env zsh -c 'script=$1; shift; setopt NO_FUNCTION_ARGZERO; . "$script"' "$0" "$local_hook" "$@" < "$input_file" || exit $? ;;
     *) "$local_hook" "$@" < "$input_file" || exit $? ;;
   esac
 fi
@@ -137,48 +141,90 @@ export function nativePrePushStatus(cwd, { fsImpl = fs, gitImpl = git } = {}) {
   };
 }
 
+const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
+
+// Serialize the status→rename→write sequence across peerBench processes (same mkdir-lock idiom as
+// withDirectoryLock in plan-gate-state.mjs). Without it, two concurrent installers both read
+// "occupied, no pre-push.local"; the second installer's rename then moves the first installer's new
+// dispatcher onto pre-push.local, destroying the user's hook and self-chaining the dispatcher.
+function withInstallLock(hooksDir, operation, { fsImpl = fs, staleMs = 30_000, attempts = 400, sleepMs = 5 } = {}) {
+  const lock = path.join(hooksDir, "pre-push.peerbench-install.lock");
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let acquired = false;
+    try {
+      fsImpl.mkdirSync(lock, { mode: 0o700 });
+      acquired = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let stale = false;
+      try { stale = Date.now() - fsImpl.statSync(lock).mtimeMs > staleMs; } catch { stale = true; }
+      if (stale) {
+        try { fsImpl.rmSync(lock, { recursive: true, force: true }); } catch { /* another process owns it */ }
+        continue;
+      }
+      Atomics.wait(sleepBuffer, 0, 0, sleepMs);
+    }
+    if (acquired) {
+      try { return operation(); }
+      finally { try { fsImpl.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ } }
+    }
+  }
+  throw new Error("native pre-push install is busy");
+}
+
 export function ensureNativePrePushHook(cwd, {
   runtimePath = nativeRuntimePath(),
   nodePath = process.execPath,
   fsImpl = fs,
-  gitImpl = git
+  gitImpl = git,
+  lock = {}
 } = {}) {
-  const status = nativePrePushStatus(cwd, { fsImpl, gitImpl });
-  if (!status.ok) return status;
-  const { hooksDir, hookPath, localPath } = status;
+  const initial = nativePrePushStatus(cwd, { fsImpl, gitImpl });
+  if (!initial.ok) return initial;
+  const { hooksDir, hookPath, localPath } = initial;
   try {
     fsImpl.mkdirSync(hooksDir, { recursive: true });
     const desired = nativeHookScript(runtimePath, nodePath);
-    if (status.installed) {
-      const current = fsImpl.readFileSync(hookPath, "utf8");
-      if (current !== desired) atomicWriteExecutable(hookPath, desired, { fsImpl });
-      else fsImpl.chmodSync(hookPath, 0o755);
-      return { ...status, installed: true, executable: true, changed: current !== desired, reason: undefined, runtimePath: path.resolve(runtimePath) };
-    }
+    return withInstallLock(hooksDir, () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        // Re-read under the install lock: a concurrent installer may have chained or installed the
+        // dispatcher between the first status read and lock acquisition.
+        const status = nativePrePushStatus(cwd, { fsImpl, gitImpl });
+        if (!status.ok) return status;
+        if (status.installed) {
+          const current = fsImpl.readFileSync(hookPath, "utf8");
+          if (current !== desired) atomicWriteExecutable(hookPath, desired, { fsImpl });
+          else fsImpl.chmodSync(hookPath, 0o755);
+          return { ...status, installed: true, executable: true, changed: current !== desired, reason: undefined, runtimePath: path.resolve(runtimePath) };
+        }
 
-    if (!status.managed && status.localOccupied) {
-      if (!status.occupied) {
-        return { ...status, ok: false, installed: false, reason: `${localPath} already exists; refusing to activate a hook peerBench did not chain` };
+        if (!status.managed && status.localOccupied) {
+          if (!status.occupied) {
+            return { ...status, ok: false, installed: false, reason: `${localPath} already exists; refusing to activate a hook peerBench did not chain` };
+          }
+          return { ...status, ok: false, installed: false, reason: `${localPath} already exists; refusing to overwrite either user hook` };
+        }
+        if (status.occupied) {
+          // Never rename onto an existing pre-push.local. One appearing since the status read came
+          // from a writer that ignored the lock; abort and decide again from fresh status.
+          if (pathEntryExists(localPath, fsImpl)) continue;
+          fsImpl.renameSync(hookPath, localPath);
+        }
+        try {
+          atomicWriteExecutable(hookPath, desired, { fsImpl });
+        } catch (error) {
+          // Restore an existing user hook if dispatcher creation failed after the move.
+          if (status.occupied && pathEntryExists(localPath, fsImpl) && !pathEntryExists(hookPath, fsImpl)) {
+            try { fsImpl.renameSync(localPath, hookPath); } catch { /* surface original error */ }
+          }
+          throw error;
+        }
+        return { ...status, ok: true, installed: true, executable: true, changed: true, chained: status.occupied, reason: undefined, runtimePath: path.resolve(runtimePath) };
       }
-      if (status.occupied) {
-        return { ...status, ok: false, installed: false, reason: `${localPath} already exists; refusing to overwrite either user hook` };
-      }
-    }
-    if (status.occupied) {
-      fsImpl.renameSync(hookPath, localPath);
-    }
-    try {
-      atomicWriteExecutable(hookPath, desired, { fsImpl });
-    } catch (error) {
-      // Restore an existing user hook if dispatcher creation failed after the move.
-      if (status.occupied && pathEntryExists(localPath, fsImpl) && !pathEntryExists(hookPath, fsImpl)) {
-        try { fsImpl.renameSync(localPath, hookPath); } catch { /* surface original error */ }
-      }
-      throw error;
-    }
-    return { ...status, ok: true, installed: true, executable: true, changed: true, chained: status.occupied, reason: undefined, runtimePath: path.resolve(runtimePath) };
+      return { ...nativePrePushStatus(cwd, { fsImpl, gitImpl }), ok: false, installed: false, reason: `${localPath} changed while installing; refusing to overwrite it` };
+    }, { fsImpl, ...lock });
   } catch (error) {
-    return { ...status, ok: false, installed: false, reason: error instanceof Error ? error.message : String(error) };
+    return { ...initial, ok: false, installed: false, reason: error instanceof Error ? error.message : String(error) };
   }
 }
 

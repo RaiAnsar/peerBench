@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "push-evidence-state-"));
 
 import { resolveNativeUpdateRange } from "../global-hooks/pre-push-lib.mjs";
-import { runPushReview } from "../global-hooks/spec-review-run.mjs";
+import { runPushReview, streamGitEvidence } from "../global-hooks/spec-review-run.mjs";
 import { materializeImmutableCommit, pushReviewPanel } from "../global-hooks/hunt.mjs";
 import { createReviewTools } from "../global-hooks/review-tools.mjs";
 
@@ -301,4 +301,29 @@ test("push review hash depends on immutable base/tip evidence, never current HEA
   assert.equal(first.result.hash, second.result.hash);
   assert.equal(first.seen.range, `${base}..${feature}`);
   assert.equal(second.seen.targetCommit, feature);
+});
+
+test("a wedged git child is killed on a timer and fails into the retry path instead of hanging", async () => {
+  // F2: streamGitEvidence must settle even when the spawned git never exits (dead NFS/fuse). The
+  // native pre-push path has no outer budget and Git applies no hook timeout, so without a kill
+  // timer `git push` hangs indefinitely. A fake `git` that sleeps stands in for the wedge.
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "push-evidence-hung-bin-"));
+  const hangGit = path.join(binDir, "git");
+  fs.writeFileSync(hangGit, "#!/bin/sh\nexec sleep 30\n");
+  fs.chmodSync(hangGit, 0o755);
+
+  let bark;
+  const watchdog = new Promise((resolve) => { bark = resolve; });
+  const watchdogTimer = setTimeout(() => bark({ ok: "watchdog" }), 10_000);
+  const result = await Promise.race([
+    streamGitEvidence(["log", "--format=%H", "HEAD"], os.tmpdir(), {
+      timeoutMs: 250,
+      env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}` }
+    }),
+    watchdog
+  ]);
+  clearTimeout(watchdogTimer);
+  assert.notEqual(result.ok, "watchdog", "streamGitEvidence must settle on its own kill timer");
+  assert.equal(result.ok, false, "a timed-out git fails so the caller's retry/defer handling engages");
+  assert.match(String(result.stderr || ""), /timed out/i);
 });

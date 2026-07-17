@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
+import net from "node:net";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin, removeClaudeSettingsPeerBenchHooks, removeCodexSettingsPeerBenchHooks, deployPluginRuntime, latestClaudeBenchPluginRoot, latestCodexBenchPluginRoot } from "../scripts/deploy-global-hooks.mjs";
@@ -343,6 +344,33 @@ test("compareLocalWithOrigin reports same, dirty, and differing states", () => {
   assert.equal(differs.ok, true);
   assert.equal(differs.status, "differs-from-origin");
   assert.notEqual(differs.localHead, differs.remoteHead);
+});
+
+test("compareLocalWithOrigin bounds ls-remote so a blackholed origin is a soft skip, not a stall", async () => {
+  // Accepts connections but never responds: git ls-remote hangs without a timeout.
+  const server = net.createServer(() => {});
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "origin-blackhole-local-"));
+    const git = (args) => execFileSync("git", args, { cwd: local, encoding: "utf8" });
+    git(["init", "-q", "-b", "main"]);
+    git(["config", "user.email", "t@t.t"]);
+    git(["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(local, "a.txt"), "one\n");
+    git(["add", "-A"]);
+    git(["commit", "-qm", "one"]);
+    git(["remote", "add", "origin", `http://127.0.0.1:${server.address().port}/repo.git`]);
+
+    const started = Date.now();
+    const result = compareLocalWithOrigin({ cwd: local, lsRemoteTimeoutMs: 500 });
+    const elapsed = Date.now() - started;
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /could not resolve/);
+    assert.ok(elapsed < 10_000, `ls-remote must be bounded, took ${elapsed}ms`);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("syncSettings removes only matching legacy commands, drops empty entries, registers absolute plan-* paths, preserves unrelated hooks", () => {

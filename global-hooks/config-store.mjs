@@ -58,7 +58,11 @@ export const PROVIDER_NAMES = Object.keys(DEFAULTS);                 // API-back
 export const KNOWN_REVIEWERS = [...PROVIDER_NAMES, CODEX, GROK];
 const DISPLAY = { ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => [k, v.displayName || k])), [CODEX]: "Codex", [GROK]: "Grok" };
 export function displayName(name) { return DISPLAY[name] || name; }
-const DEFAULT_REVIEWERS = ["kimi", "glm"];   // fallback only (mimo disabled); the active set lives in companion.json
+// Fallback only — the active set lives in companion.json (currently codex+grok+kimi). The fallback
+// stays API-key-only (CLI reviewers need their own installed/authed harness) and must track the
+// panel Rai actually runs: GLM was retired for Grok, so a lost companion.json degrades to the two
+// keyed API reviewers, never to a retired provider.
+const DEFAULT_REVIEWERS = ["kimi", "minimax"];
 export function sharedRoot() {
   return process.env.BENCH_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
@@ -163,6 +167,47 @@ export function setReviewers(list, { root = sharedRoot() } = {}) {
 }
 const GLOBAL_DISABLE = (root) => path.join(root || sharedRoot(), "disabled-global");
 const WS_DISABLE = (ws) => path.join(workspaceStateDir(ws), "disabled");
+
+// --- reviewer availability cooldowns -----------------------------------------------------------
+// When a reviewer fails with a QUOTA (402/429-exhausted/credit keywords) or AUTH (401/403) error,
+// every gate in every session would otherwise re-run the same doomed call — burning its full retry
+// backoff and timeout per gate, per stop, until the plan resets. Record a short global cooldown so
+// later gates skip the reviewer INSTANTLY with a clear "out of quota — skipped" note instead.
+// TTLs are deliberately short: quota state is re-probed within minutes of a plan reset/top-up, and
+// a mis-classified transient (e.g. a saturated concurrency cap) costs at most one quiet window.
+const COOLDOWN_TTL_MS = { quota: 5 * 60_000, auth: 10 * 60_000 };
+const COOLDOWNS = (root) => path.join(root || sharedRoot(), "reviewer-cooldowns.json");
+
+function readCooldownMap(root) {
+  try { return JSON.parse(fs.readFileSync(COOLDOWNS(root), "utf8")) || {}; } catch { return {}; }
+}
+
+export function readReviewerCooldown(name, { root, now = Date.now() } = {}) {
+  const entry = readCooldownMap(root)[name];
+  return entry && Number(entry.until) > now ? entry : null;
+}
+
+export function recordReviewerCooldown(name, kind, detail, { root, now = Date.now(), ttlMs } = {}) {
+  const ttl = Number(ttlMs) || COOLDOWN_TTL_MS[kind] || COOLDOWN_TTL_MS.quota;
+  const map = readCooldownMap(root);
+  map[name] = { kind, detail: String(detail || "").slice(0, 200), until: now + ttl, ts: now };
+  for (const [key, value] of Object.entries(map)) {
+    if (!(Number(value?.until) > now)) delete map[key];
+  }
+  try { writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`); } catch { /* best-effort cache */ }
+  return map[name];
+}
+
+export function clearReviewerCooldowns({ root, name } = {}) {
+  if (!name) {
+    try { fs.rmSync(COOLDOWNS(root), { force: true }); } catch { /* best-effort */ }
+    return;
+  }
+  const map = readCooldownMap(root);
+  if (!(name in map)) return;
+  delete map[name];
+  try { writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`); } catch { /* best-effort */ }
+}
 
 // reviewed-head marker: the last HEAD the stop gate reviewed up to. Shared by the stop gate
 // (advances it on a clean ALLOW; diffs HEAD against it) AND the pre-push gate (bootstraps it on

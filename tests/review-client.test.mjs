@@ -163,7 +163,7 @@ test("HTTP 429 overload retries with jittered backoff then succeeds (no '!')", a
   assert.equal(waits.length, 1);
   assert.ok(waits[0] >= 1000 && waits[0] < 2000, `first backoff ~1s+jitter, got ${waits[0]}`);
 });
-test("HTTP 429 that never clears exhausts all retries and maps to http error", async () => {
+test("HTTP 429 that never clears exhausts all retries and maps to quota error", async () => {
   let calls = 0;
   const res = await review({
     baseURL: "https://x/v1", apiKey: "k", model: "glm-5.2", system: "s", user: "u", timeoutMs: 60000,
@@ -171,7 +171,9 @@ test("HTTP 429 that never clears exhausts all retries and maps to http error", a
     fetchImpl: async () => { calls++; return { ok: false, status: 429, headers: { get: () => null }, text: async () => "overloaded" }; }
   });
   assert.equal(res.ok, false);
-  assert.equal(res.error.kind, "http");
+  // Post-retry 429 is a quota/limit condition — gates use this to cooldown-skip the reviewer
+  // with a clear "out of quota" note instead of re-burning the backoff at every gate.
+  assert.equal(res.error.kind, "quota");
   assert.equal(calls, 6); // 1 initial + 5 retries
 });
 test("Retry-After header is honored over default backoff", async () => {
@@ -187,6 +189,37 @@ test("Retry-After header is honored over default backoff", async () => {
     }
   });
   assert.deepEqual(waits, [2000]);
+});
+test("Retry-After is CAPPED at 30s (a 429 + Retry-After: 3600 must not park the gate for an hour)", async () => {
+  let calls = 0;
+  const waits = [];
+  await review({
+    baseURL: "https://x/v1", apiKey: "k", model: "glm-5.2", system: "s", user: "u", timeoutMs: 60000,
+    sleepImpl: async (ms) => { waits.push(ms); },
+    fetchImpl: async () => {
+      calls++;
+      if (calls === 1) return { ok: false, status: 429, headers: { get: (h) => h.toLowerCase() === "retry-after" ? "3600" : null }, text: async () => "capped" };
+      return ok({ choices: [{ message: { content: "ALLOW: ok" } }] });
+    }
+  });
+  assert.deepEqual(waits, [30000]);
+});
+test("the overall timeout aborts a long overload sleep instead of waiting it out", async () => {
+  let calls = 0;
+  const t = Date.now();
+  const res = await review({
+    baseURL: "https://x/v1", apiKey: "k", model: "glm-5.2", system: "s", user: "u", timeoutMs: 50,
+    sleepImpl: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 2000))), // bounded fake sleep — the abort must cut it short, not the timer
+    fetchImpl: async () => {
+      calls++;
+      return { ok: false, status: 429, headers: { get: (h) => h.toLowerCase() === "retry-after" ? "3600" : null }, text: async () => "capped" };
+    }
+  });
+  const elapsed = Date.now() - t;
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "timeout");
+  assert.equal(calls, 1, "no second request once the timeout fired mid-sleep");
+  assert.ok(elapsed < 2000, `returned in ${elapsed}ms, not after the 30s capped sleep`);
 });
 test("thinking:disabled includes thinking:{type:disabled} in body", async () => {
   const cap = {};
@@ -225,4 +258,26 @@ test("temperature null → OMITTED from the request body (K3 fixes sampling serv
     fetchImpl: (url, opts) => { cap.body = JSON.parse(opts.body); return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }) }); } });
   assert.equal("temperature" in cap.body, false, "K3 rejects sampling overrides — the field must be ABSENT, not null");
   assert.equal("thinking" in cap.body, false, "K2.x thinking param is unsupported on K3");
+});
+
+test("maps HTTP 402 (insufficient credits) to quota error", async () => {
+  const res = await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000,
+    fetchImpl: async () => ({ ok: false, status: 402, text: async () => "insufficient balance" }) });
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "quota");
+});
+test("maps an exhausted 429 retry loop to quota error (not generic http)", async () => {
+  let calls = 0;
+  const res = await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000,
+    sleepImpl: async () => {},
+    fetchImpl: async () => { calls++; return { ok: false, status: 429, text: async () => "rate limit reached", headers: { get: () => null } }; } });
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "quota");
+  assert.ok(calls >= 6, `429 retries exhausted before classification (calls=${calls})`);
+});
+test("quota keywords in a non-429 error body classify as quota", async () => {
+  const res = await review({ baseURL: "https://x/v1", apiKey: "k", model: "m", system: "s", user: "u", timeoutMs: 5000,
+    fetchImpl: async () => ({ ok: false, status: 400, text: async () => "monthly quota exceeded for this plan" }) });
+  assert.equal(res.ok, false);
+  assert.equal(res.error.kind, "quota");
 });

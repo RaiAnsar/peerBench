@@ -29,6 +29,7 @@ test("disabled short-circuit: runMain returns without throwing", async () => {
   // the isBenchDisabled check; with isBenchDisabledImpl: () => true it must
   // short-circuit and return without throwing (no reviewers, no trace).
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-ws-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const planDir = path.join(ws, "plans");
   fs.mkdirSync(planDir, { recursive: true });
   const planFile = path.join(planDir, "p.md");
@@ -82,6 +83,7 @@ test("relative file_path is resolved against input.cwd before read", async () =>
   // The reviewer must receive the file's actual content (proving the read
   // happened against the resolved absolute path, not the hook process cwd).
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-rel-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const planDir = path.join(ws, "plans");
   fs.mkdirSync(planDir, { recursive: true });
   const planContent = "# Relative Plan\n\nUnique marker ABC123 content.\n";
@@ -115,6 +117,7 @@ test("relative file_path is resolved against input.cwd before read", async () =>
 
 test("F: plan-file ALLOW systemMessage leads with the badge", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-badge-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const planDir = path.join(ws, "plans");
   fs.mkdirSync(planDir, { recursive: true });
   fs.writeFileSync(path.join(planDir, "p.md"), "# Plan\n\nbody\n");
@@ -187,6 +190,7 @@ test("emit-once: createEmitter is exported and invocation-scoped", () => {
 test("emit-once: a second emit within one plan-file runMain writes no second stdout line", async () => {
   // ALLOW path emits the badge systemMessage exactly once.
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-emitonce-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const planDir = path.join(ws, "plans");
   fs.mkdirSync(planDir, { recursive: true });
   fs.writeFileSync(path.join(planDir, "p.md"), "# Plan\n\nbody emit-once\n");
@@ -226,6 +230,7 @@ test("emit-once: entrypoint .catch routes a post-emit error to stderr (no 2nd st
 
 test("D3: plan-file trace write failure emits a ⛩ note and still allows", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-d3-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const planDir = path.join(ws, "plans");
   fs.mkdirSync(planDir, { recursive: true });
   fs.writeFileSync(path.join(planDir, "p.md"), "# Plan\n\nbody d3 trace\n");
@@ -258,6 +263,7 @@ test("D3: plan-file trace write failure emits a ⛩ note and still allows", asyn
 
 test("severity-gate: a MEDIUM-severity BLOCK does NOT block the save (allows with advisory note)", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-sev-med-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const planDir = path.join(ws, "specs");
   fs.mkdirSync(planDir, { recursive: true });
   fs.writeFileSync(path.join(planDir, "s.md"), "# Spec\n\nmedium severity body.\n");
@@ -305,6 +311,7 @@ test("severity-gate: a MEDIUM-severity BLOCK does NOT block the save (allows wit
 
 test("severity-gate: a HIGH-severity BLOCK still blocks (rewake, exit 2)", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-sev-high-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const planDir = path.join(ws, "specs");
   fs.mkdirSync(planDir, { recursive: true });
   fs.writeFileSync(path.join(planDir, "s.md"), "# Spec\n\nhigh severity body.\n");
@@ -352,6 +359,7 @@ function allowReviewers() {
 
 test("fast ALLOW ENQUEUES a kind:'spec' job keyed by (path,content) — no spawn, no inline review", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enq-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
@@ -374,6 +382,7 @@ test("fast ALLOW ENQUEUES a kind:'spec' job keyed by (path,content) — no spawn
 
 test("fast ALLOW stamps trace and deep job with the originating Claude session", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-session-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
@@ -396,6 +405,7 @@ test("fast ALLOW stamps trace and deep job with the originating Claude session",
 
 test("enqueue dedupes — identical content re-save does not double-queue", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enqdedup-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
@@ -421,6 +431,7 @@ test("enqueue dedupes — identical content re-save does not double-queue", asyn
 
 test("dedup-hit (content identical to last approved) still requests this session's deep review", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enq-deduphit-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
@@ -441,6 +452,7 @@ test("dedup-hit (content identical to last approved) still requests this session
 
 test("enqueue failure does not break the gate (fail-open, ALLOW still emitted)", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-enqerr-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "s.md");
@@ -466,6 +478,7 @@ test("enqueue failure does not break the gate (fail-open, ALLOW still emitted)",
 
 test("full streamed identity catches tail-only changes beyond 64 KiB and never reports fast-clean coverage", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-tail-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "large.md");
@@ -514,6 +527,7 @@ test("full streamed identity catches tail-only changes beyond 64 KiB and never r
 
 test("ALLOW cache invalidates when reviewer model, endpoint, or inference config changes", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-review-id-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "identity.md");
@@ -545,6 +559,7 @@ test("ALLOW cache invalidates when reviewer model, endpoint, or inference config
 
 test("plan-file automatic BLOCK wakes stop at three across changed revisions and reset in a new session", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-cycle-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "cycle.md");
@@ -585,6 +600,7 @@ test("plan-file automatic BLOCK wakes stop at three across changed revisions and
 
 test("a delayed ALLOW for revision A cannot clear or cache over revision B's newer BLOCK", async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-delayed-allow-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const specDir = path.join(ws, "specs");
   fs.mkdirSync(specDir, { recursive: true });
   const specFile = path.join(specDir, "race.md");
@@ -650,6 +666,115 @@ test("a delayed ALLOW for revision A cannot clear or cache over revision B's new
   assert.equal(reviewerCalls, 4, "the exhausted fourth revision never starts another panel");
 });
 
+test("plan-file advisory emit includes the completing review's findings when the ledger fills mid-save", async () => {
+  // F1: the cycle ledger is shared across plan files in one session. A leader whose file review
+  // completes after the third slot was claimed by OTHER files gets the `advisory` outcome — its
+  // validated BLOCK findings must appear in the message (they claim no ledger slot).
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-advisory-midfill-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
+  const specDir = path.join(ws, "specs");
+  fs.mkdirSync(specDir, { recursive: true });
+  const session = "pfr-advisory-midfill";
+  const emitted = [];
+  const cycles = [];
+  let signalSlow;
+  let releaseSlow;
+  const slowEntered = new Promise((resolve) => { signalSlow = resolve; });
+  const slowRelease = new Promise((resolve) => { releaseSlow = resolve; });
+  const reviewer = {
+    name: "Kimi",
+    reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1" },
+    async run({ user }) {
+      if (/C_UNIQUE_CONTENT/.test(user)) {
+        signalSlow();
+        await slowRelease;
+        return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: c blocker", raw: "BLOCK: c blocker\nSEVERITY: high\n- C_UNIQUE_FINDING" };
+      }
+      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: broken", raw: "BLOCK: broken\nSEVERITY: high\n- standard finding" };
+    }
+  };
+  const opts = (specFile) => ({
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    emitter: { emit(payload) { emitted.push(payload); return true; } },
+    blockHandler: async ({ cycle }) => { cycles.push(cycle); },
+    input: { cwd: ws, session_id: session, tool_input: { file_path: specFile } }
+  });
+  const write = (name, marker) => {
+    const specFile = path.join(specDir, name);
+    fs.writeFileSync(specFile, `# Plan\n\n${marker}\n`);
+    return specFile;
+  };
+
+  await runMain(opts(write("a.md", "A_CONTENT")));
+  await runMain(opts(write("b.md", "B_CONTENT")));
+  const slow = runMain(opts(write("c.md", "C_UNIQUE_CONTENT")));
+  await slowEntered;
+  await runMain(opts(write("d.md", "D_CONTENT")));   // claims the last shared slot mid-panel
+  releaseSlow();
+  await slow;
+
+  assert.deepEqual(cycles, [1, 2, 3]);
+  assert.equal(readPlanCycle(ws, session).count, 3);
+  const advisory = emitted.at(-1)?.systemMessage || "";
+  assert.match(advisory, /paused after 3 blocked repair cycles/);
+  assert.match(advisory, /C_UNIQUE_FINDING/, "the completing review's findings must not be discarded");
+  assert.doesNotMatch(advisory, /was not re-validated/, "a validated-and-blocked revision must not be described as unvalidated");
+});
+
+test("a same-identity cross-session supersede prefers the winner's approval marker over a misleading reset claim", async () => {
+  // F4: two sessions saving identical bytes share the plan-file head. The twin whose completion
+  // loses the head must not claim a revision change/reset when the winner's ALLOW marker already
+  // approves that exact identity.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-twin-allow-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
+  const planDir = path.join(ws, "plans");
+  fs.mkdirSync(planDir, { recursive: true });
+  const planFile = path.join(planDir, "twin.md");
+  fs.writeFileSync(planFile, "# Plan\n\nTWIN_IDENTICAL_BYTES\n");
+
+  let calls = 0;
+  let signalFirst;
+  let releaseFirst;
+  const firstEntered = new Promise((resolve) => { signalFirst = resolve; });
+  const firstRelease = new Promise((resolve) => { releaseFirst = resolve; });
+  const reviewer = {
+    name: "Kimi",
+    reviewIdentity: { kind: "api", model: "k3", baseURL: "https://review.test/v1" },
+    async run() {
+      calls += 1;
+      if (calls === 1) {
+        signalFirst();
+        await firstRelease;
+      }
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: clean", raw: "ALLOW: clean\nSEVERITY: none" };
+    }
+  };
+  const emittedA = [];
+  const emittedB = [];
+  const opts = (session, emitted) => ({
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    enqueueDeepReviewImpl: () => ({ ok: true, enqueued: false }),
+    emitter: { emit(payload) { emitted.push(payload); return true; } },
+    input: { cwd: ws, session_id: session, tool_input: { file_path: planFile } }
+  });
+
+  const twinA = runMain(opts("twin-session-A", emittedA));
+  await firstEntered;
+  await runMain(opts("twin-session-B", emittedB));   // wins the shared head and commits the ALLOW
+  releaseFirst();
+  await twinA;
+
+  assert.equal(calls, 2, "each session's leader ran its own panel (separate flight records)");
+  assert.match(emittedB.at(-1)?.systemMessage || "", /ALLOW/, "the winning session approves the exact revision");
+  const loser = emittedA.at(-1)?.systemMessage || "";
+  assert.match(loser, /approved/i, "the losing twin must surface the committed approval");
+  assert.doesNotMatch(loser, /superseded|UNREVIEWED/i, "no false revision-change/reset claim");
+});
+
 // ===========================================================================
 // FIX 1 — deploy-parity: the deep spec-review worker must resolve its imports in
 // the DEPLOYED FLAT layout (~/.claude/hooks/), where ONLY global-hooks/*.mjs are
@@ -675,6 +800,7 @@ test("FIX 1: spec-review-run.mjs is present and resolves all imports in a FLAT d
   // (b) running the worker in the flat layout must NOT fail with a module-resolution error.
   const benchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flat-root-"));
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flat-ws-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
   const someFile = path.join(ws, "specs", "s.md");
   fs.mkdirSync(path.dirname(someFile), { recursive: true });
   fs.writeFileSync(someFile, "# Spec\n\nflat layout deploy-parity check.\n");
@@ -711,6 +837,7 @@ test("H: spec-review-run.mjs --push <range> resolves all imports in a FLAT deplo
 
   const benchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flatpush-root-"));
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-flatpush-ws-"));
+  spawnSync("git", ["init", "-q"], { cwd: ws });
 
   const result = spawnSync(process.execPath, [worker, "--push", "@{u}..HEAD", "--ws", ws], {
     encoding: "utf8",
@@ -721,4 +848,26 @@ test("H: spec-review-run.mjs --push <range> resolves all imports in a FLAT deplo
   assert.doesNotMatch(result.stderr || "", /Cannot find module/, `push worker must not have an unresolved import in a flat layout; stderr: ${result.stderr}`);
   // Fail-open: missing reviewers / no real repo is fine; the process must exit 0, not crash on a bad import.
   assert.equal(result.status, 0, `push worker fails open (exit 0); got ${result.status}, stderr: ${result.stderr}`);
+});
+
+test("non-git workspace: plan-file gate skips silently (no panel, no trace, no emit)", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "pfr-nongit-"));   // deliberately NOT a git repo
+  const planDir = path.join(ws, "plans");
+  fs.mkdirSync(planDir, { recursive: true });
+  fs.writeFileSync(path.join(planDir, "p.md"), "# Plan\n\nnon-git chat plan\n");
+  let reviewersCalled = false, traceWritten = false;
+  const stdoutLines = [];
+  const origOut = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => { if (typeof chunk === "string" && chunk.trim()) stdoutLines.push(chunk.trim()); return origOut(chunk, ...rest); };
+  try {
+    await runMain({
+      resolveReviewersImpl: () => { reviewersCalled = true; return []; },
+      writeTraceImpl: () => { traceWritten = true; },
+      isBenchDisabledImpl: () => false,
+      input: { cwd: ws, tool_input: { file_path: "plans/p.md" } }
+    });
+  } finally { process.stdout.write = origOut; }
+  assert.equal(reviewersCalled, false, "no panel outside a git repo");
+  assert.equal(traceWritten, false);
+  assert.equal(stdoutLines.length, 0, "silent skip — no noise in non-git chats");
 });

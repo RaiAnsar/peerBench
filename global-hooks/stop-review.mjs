@@ -16,8 +16,16 @@ import { consumeCycleReset } from "./cycle-reset.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
 const MAX_SYNTHESIS_PROMPT_BYTES = 120_000;
-const MAX_STOP_LOOPS = 3;                  // hard cap on automatic BLOCK repair cycles in one task/session
-export const STOP_REVIEW_POLICY_VERSION = "stop-review-v3-exhaustive-cycle3";
+const GIT_SNAPSHOT_TIMEOUT_MS = 60_000;    // a wedged git (dead NFS/sshfs) must not hang the gate forever
+const MAX_STOP_LOOPS = 3;                  // hard cap on CONSECUTIVE automatic BLOCK repair cycles
+// SESSION-TOTAL budget on automatic block-wakes. The streak above resets on any ALLOW or clean
+// snapshot (deliberate, tested) — but that reset is exactly what powered the multi-hour
+// BLOCK→fix→ALLOW→BLOCK loops: every intervening ALLOW bought three more wakes, forever. The
+// total never resets within a task/session (only a new session or an explicit
+// BENCH_STOP_CYCLE_RESET nonce), so a session can burn at most three full repair streaks before
+// the gate downgrades to a non-waking advisory.
+export const MAX_STOP_TOTAL_BLOCKS = 9;
+export const STOP_REVIEW_POLICY_VERSION = "stop-review-v4-total-budget";
 const STOP_LOCK_STALE_MS = 10 * 60 * 1000;
 const STOP_LOCK_ORPHAN_GRACE_MS = 1_000;
 const STOP_LOCK_POLL_MS = 25;
@@ -77,7 +85,9 @@ function tryReclaimLock(lockDir, token) {
 // capture inside the lock is intentional: a delayed ALLOW can never commit after a concurrent
 // BLOCK that it did not observe. Atomic mkdir supplies ownership; dead owners are reclaimed
 // immediately, ownerless create-crashes after a short grace, and a heartbeat plus stale cutoff
-// prevents abandoned/PID-reused locks from wedging Stop indefinitely.
+// prevents abandoned/PID-reused locks from wedging Stop indefinitely. The acquirer re-validates
+// its dir instance around the owner publish so a mid-publish orphan reclaim (a stalled acquirer
+// whose ownerless dir was renamed away and re-won by a waiter) can never yield two holders.
 export async function acquireStopGateLock(ws, {
   staleMs = STOP_LOCK_STALE_MS,
   orphanGraceMs = STOP_LOCK_ORPHAN_GRACE_MS,
@@ -89,11 +99,42 @@ export async function acquireStopGateLock(ws, {
   const token = randomUUID();
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 
+  // Identity of the lock dir INSTANCE. Orphan reclaim renames the dir away and a waiter wins the
+  // same path again; inode + creation time always change across that, so comparing identity
+  // around the owner publish proves our owner record lands in the dir we actually created.
+  const lockInstance = () => {
+    try {
+      const st = fs.statSync(lockDir);
+      return `${st.ino}:${st.birthtimeMs}`;
+    } catch {
+      return null;
+    }
+  };
+
   while (true) {
     try {
       fs.mkdirSync(lockDir, { mode: 0o700 });
+      const acquired = lockInstance();
       const owner = { schema: 1, pid: process.pid, token, startedAt: now(), heartbeatAt: now() };
-      writeLockOwner(lockDir, owner);
+      // Publish via tmp+rename, but only while our dir instance is intact: if we stalled past
+      // the orphan grace after the mkdir (SIGSTOP/laptop sleep), a waiter may already own the
+      // path, and an unchecked publish would clobber the NEW owner's owner.json while both sides
+      // believed they held the gate.
+      const temporary = path.join(lockDir, `.owner-${token}.tmp`);
+      let published = false;
+      try {
+        fs.writeFileSync(temporary, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+        if (lockInstance() === acquired) {
+          fs.renameSync(temporary, path.join(lockDir, "owner.json"));
+          published = true;
+        }
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;   // reclaimed mid-publish: treated as lost below
+      }
+      if (!published || lockInstance() !== acquired) {
+        try { fs.rmSync(temporary, { force: true }); } catch { /* moved away with the quarantine */ }
+        continue;   // lost the dir mid-acquire; retry as an ordinary waiter
+      }
       let released = false;
       const heartbeat = setInterval(() => {
         if (released) return;
@@ -187,7 +228,7 @@ function emptyGitSnapshot() {
 // Stream git output so snapshot identity covers arbitrarily large diffs without retaining them in
 // memory. Only a bounded prefix enters reviewer prompts; a truncated/error result is explicit and is
 // handled as a visible coverage block below, never as an empty/clean diff.
-export function captureGitSnapshot(args, cwd, { maxPromptBytes = MAX_DIFF_BYTES } = {}) {
+export function captureGitSnapshot(args, cwd, { maxPromptBytes = MAX_DIFF_BYTES, timeoutMs = GIT_SNAPSHOT_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     const hash = createHash("sha256");
     const chunks = [];
@@ -195,9 +236,11 @@ export function captureGitSnapshot(args, cwd, { maxPromptBytes = MAX_DIFF_BYTES 
     let totalBytes = 0;
     let stderr = "";
     let settled = false;
+    let timer = null;
     const finish = (ok, error = "") => {
       if (settled) return;
       settled = true;
+      if (timer) clearTimeout(timer);
       resolve({
         ok,
         text: Buffer.concat(chunks, captured).toString("utf8"),
@@ -211,6 +254,14 @@ export function captureGitSnapshot(args, cwd, { maxPromptBytes = MAX_DIFF_BYTES 
     let child;
     try { child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (error) { finish(false, error instanceof Error ? error.message : String(error)); return; }
+
+    // A wedged git (dead NFS/sshfs) never emits and never exits; the lock heartbeat would keep
+    // firing, so nothing ever goes stale and the gate hangs forever. Kill it like spawnCollect
+    // does — the failed snapshot then surfaces through the normal coverage/fail-closed path.
+    timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      finish(false, `timed out after ${timeoutMs}ms`);
+    }, timeoutMs);
 
     child.stdout.on("data", (data) => {
       if (settled) return;
@@ -553,6 +604,21 @@ export async function reviewPromptChunks(reviewers, prompts, { cwd, env } = {}) 
 
 const STOP_BLOCK_EXIT = Symbol("stop-block-exit");
 
+// Reset the consecutive-block STREAK while preserving the session-TOTAL budget. An ALLOW or a
+// clean snapshot legitimately ends a repair streak, but must never refund the session's automatic
+// wake budget — that refund is what made the BLOCK→fix→ALLOW→BLOCK loop unbounded.
+function resetStreakPreservingTotal(loopFile) {
+  let total = 0;
+  try { total = Math.max(0, Number(JSON.parse(fs.readFileSync(loopFile, "utf8")).total) || 0); } catch { /* no marker */ }
+  if (total > 0) {
+    try {
+      writeStateJsonAtomic(loopFile, { count: 0, total, ts: Date.now(), generation: randomUUID(), status: "streak-reset" });
+    } catch { /* best-effort marker */ }
+  } else {
+    try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
+  }
+}
+
 async function runMainLocked({
   resolveReviewersImpl = defaultResolveReviewers,
   writeTraceImpl = defaultWriteTrace,
@@ -639,12 +705,16 @@ async function runMainLocked({
   const hasWorkingTree = diffSnapshot.totalBytes > 0;
   const hasStaged = stagedSnapshot.totalBytes > 0;
   if (!coverageProblems.length && !hasCommitted && !hasWorkingTree && !hasStaged && untrackedCount === 0) {
-    // Nothing changed since the last review (status/report-only) — keep the baseline current so
-    // the NEXT committing turn diffs from here, then skip. Reaching a clean snapshot also breaks
-    // any prior block streak: restoring the old bytes later is a new edit cycle, never an auto-skip.
-    try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
+    // Nothing changed since the last review (status/report-only) — keep an EXISTING baseline
+    // current so the NEXT committing turn diffs from here, then skip. Never CREATE the baseline
+    // here: with no marker and no upstream, resolveReviewBase fell back to HEAD, so this clean
+    // snapshot covers no committed range — writing HEAD would certify commits no reviewer ever
+    // saw (e.g. the first stop after /bench:on mid-session on an upstream-less repo). Reaching a
+    // clean snapshot also breaks any prior block STREAK (the session-total budget survives):
+    // restoring the old bytes later is a new edit cycle, never an auto-skip.
+    resetStreakPreservingTotal(loopFile);
     try { fs.rmSync(coverageFile, { force: true }); } catch { /* noop */ }
-    writeReviewedHead(ws, curHead);
+    if (readReviewedHead(ws)) writeReviewedHead(ws, curHead);
     clearReviewedWorktree(ws, sessionKey);
     return;
   }
@@ -689,17 +759,20 @@ async function runMainLocked({
     policy: "stop-coverage-v1"
   });
   let priorBlocks = 0;
+  let priorTotalBlocks = 0;
   let priorBlockMarker = null;
   let priorCoverageBlocks = 0;
   // One task/session cycle counter spans changed revisions. Counting only an identical snapshot is
   // not a repair-cycle ceiling: an agent that edits after every finding could otherwise be woken
-  // forever. A new session, a clean/ALLOW transition, or a one-shot reset nonce starts fresh.
+  // forever. A new session, a clean/ALLOW transition, or a one-shot reset nonce starts the STREAK
+  // fresh; the session TOTAL survives those transitions (see MAX_STOP_TOTAL_BLOCKS).
   try {
     const marker = JSON.parse(fs.readFileSync(loopFile, "utf8"));
-    const count = Number(marker.count) || 0;
-    priorBlocks = count;
+    priorBlocks = Number(marker.count) || 0;
+    priorTotalBlocks = Math.max(Number(marker.total) || 0, priorBlocks);
     priorBlockMarker = marker;
   } catch { /* no active task/session cycle */ }
+  const totalBudgetExhausted = priorTotalBlocks >= MAX_STOP_TOTAL_BLOCKS;
   if (coverageProblems.length) {
     // Coverage failures are NOT reviewer decisions. Keep a distinct persistent marker so they can
     // obey the same three-wake UX ceiling without ever being mistaken for reviewed/clean work.
@@ -708,7 +781,7 @@ async function runMainLocked({
       if (marker.snapshot === coverageSnapshotFingerprint) priorCoverageBlocks = Number(marker.count) || 0;
       else fs.rmSync(coverageFile, { force: true });
     } catch { /* no valid same-snapshot coverage marker */ }
-    if (priorBlocks >= MAX_STOP_LOOPS || priorCoverageBlocks >= MAX_STOP_LOOPS) {
+    if (priorBlocks >= MAX_STOP_LOOPS || priorCoverageBlocks >= MAX_STOP_LOOPS || totalBudgetExhausted) {
       const detail = coverageProblems.join(" | ").slice(0, 500);
       emit({
         systemMessage:
@@ -721,8 +794,10 @@ async function runMainLocked({
   } else {
     // A reviewable or clean snapshot supersedes any prior incomplete-coverage state.
     try { fs.rmSync(coverageFile, { force: true }); } catch { /* noop */ }
-    if (priorBlocks >= MAX_STOP_LOOPS) {
-      emit({ systemMessage: `⛩ bench stop: automatic review ceiling reached after ${MAX_STOP_LOOPS} blocked repair cycles in this task/session. The current snapshot was not re-validated automatically. Address remaining findings manually, start a new task, or use a new BENCH_STOP_CYCLE_RESET nonce for an explicit retry; /bench:off is the explicit bypass.` });
+    if (priorBlocks >= MAX_STOP_LOOPS || totalBudgetExhausted) {
+      emit({ systemMessage: totalBudgetExhausted
+        ? `⛩ bench stop: session-total automatic review budget exhausted (${MAX_STOP_TOTAL_BLOCKS} blocked repair cycles this task/session — the streak resets on ALLOW/clean, the total does not). Remaining findings are advisory-only; address them manually, start a new session, or use a new BENCH_STOP_CYCLE_RESET nonce for an explicit retry; /bench:off is the explicit bypass.`
+        : `⛩ bench stop: automatic review ceiling reached after ${MAX_STOP_LOOPS} blocked repair cycles in this task/session. The current snapshot was not re-validated automatically. Address remaining findings manually, start a new task, or use a new BENCH_STOP_CYCLE_RESET nonce for an explicit retry; /bench:off is the explicit bypass.` });
       return;
     }
   }
@@ -829,7 +904,8 @@ async function runMainLocked({
     try {
       writeStateJsonAtomic(loopFile, {
         count: nextCount,
-        exhausted: nextCount >= MAX_STOP_LOOPS,
+        total: priorTotalBlocks + 1,
+        exhausted: nextCount >= MAX_STOP_LOOPS || priorTotalBlocks + 1 >= MAX_STOP_TOTAL_BLOCKS,
         ts: Date.now(),
         generation: randomUUID(),
         snapshot: reviewSnapshotFingerprint,
@@ -879,7 +955,7 @@ async function runMainLocked({
     });
     return;
   }
-  try { fs.rmSync(loopFile, { force: true }); } catch { /* noop */ }
+  resetStreakPreservingTotal(loopFile);
   writeReviewedHead(ws, curHead);
   writeReviewedWorktree(ws, worktreeFingerprint, sessionKey);
   emit({ systemMessage: `⛩ bench stop: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });

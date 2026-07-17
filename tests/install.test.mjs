@@ -86,11 +86,15 @@ test("parseInstallArgs defaults to Claude+Codex and supports focused installs", 
     loadKeys: false,
     keysPath: null,
     marketplaceName: "aiwithrai",
-    help: false
+    help: false,
+    allowDirty: false,
+    skipTests: false
   });
   assert.equal(parseInstallArgs(["--codex-only"]).claude, false);
   assert.equal(parseInstallArgs(["--claude-only"]).codex, false);
   assert.equal(parseInstallArgs(["--load-keys", "--keys", "/tmp/.keys"]).keysPath, "/tmp/.keys");
+  assert.equal(parseInstallArgs(["--allow-dirty"]).allowDirty, true);
+  assert.equal(parseInstallArgs(["--skip-tests"]).skipTests, true);
 });
 
 test("installPeerBench refuses a stale Codex cache before creating transaction state", () => {
@@ -468,4 +472,75 @@ test("install lock rejects overlap and backup allocation never reuses an existin
   });
   assert.notEqual(result.backupDir, existing);
   assert.equal(fs.readFileSync(path.join(existing, "sentinel"), "utf8"), "keep");
+});
+
+test("installPeerBench honors CLAUDE_CONFIG_DIR for Claude settings, hooks, and the plugin registry", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-claude-config-home-"));
+  const claudeDir = path.join(home, "custom-claude");
+  const repo = copyInstallRepo();
+  const result = installPeerBench({
+    repoRoot: repo,
+    home,
+    claude: true,
+    codex: false,
+    syncClaudePlugin: false,
+    now: () => 7006,
+    env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
+    nativeStatus: () => fakeNativeStatus(repo),
+    ensureNativeHook: () => ({ ok: true, installed: true, changed: false })
+  });
+
+  const settingsPath = path.join(claudeDir, "settings.json");
+  assert.equal(result.claude.settingsPath, settingsPath);
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert.equal(settings.enabledPlugins["bench@aiwithrai"], true);
+  assert.ok(
+    settings.hooks.Stop.flatMap((b) => b.hooks || []).some((h) => h.command.includes("stop-review.mjs")),
+    "gates are registered in the settings Claude actually reads"
+  );
+  assert.ok(fs.existsSync(path.join(claudeDir, "hooks", "stop-review.mjs")), "hooks deploy into CLAUDE_CONFIG_DIR");
+  const known = JSON.parse(fs.readFileSync(path.join(claudeDir, "plugins", "known_marketplaces.json"), "utf8"));
+  assert.equal(known.aiwithrai.source.path, path.resolve(repo));
+
+  // Nothing of Claude's config tree leaks into the default ~/.claude location (peerBench's own
+  // state under ~/.claude/plugins/data is intentionally home-based).
+  assert.equal(fs.existsSync(path.join(home, ".claude", "settings.json")), false);
+  assert.equal(fs.existsSync(path.join(home, ".claude", "hooks")), false);
+  assert.equal(fs.existsSync(path.join(home, ".claude", "plugins", "known_marketplaces.json")), false);
+});
+
+test("assertDeployableSource blocks a dirty checkout unless --allow-dirty", async () => {
+  const { assertDeployableSource } = await import("../scripts/install.mjs");
+  const calls = [];
+  const execImpl = (cmd, args) => {
+    calls.push(args[0] === "rev-parse" ? "rev-parse" : "status");
+    return args[0] === "rev-parse" ? "true\n" : " M global-hooks/stop-review.mjs\n?? junk.txt\n";
+  };
+  assert.throws(
+    () => assertDeployableSource("/repo", { execImpl, skipTests: true, env: {} }),
+    /deploy blocked: the working tree has 2 uncommitted change/
+  );
+  const overridden = assertDeployableSource("/repo", { execImpl, allowDirty: true, skipTests: true, env: {} });
+  assert.equal(overridden.checked, true);
+  assert.equal(overridden.dirtyOverridden, true);
+});
+test("assertDeployableSource blocks when the test suite fails, passes when green", async () => {
+  const { assertDeployableSource } = await import("../scripts/install.mjs");
+  const execImpl = (cmd, args) => (args[0] === "rev-parse" ? "true\n" : "");
+  assert.throws(
+    () => assertDeployableSource("/repo", { execImpl, env: {}, spawnImpl: () => ({ status: 1, stdout: "1 failing" }) }),
+    /deploy blocked: the test suite failed/
+  );
+  const ok = assertDeployableSource("/repo", { execImpl, env: {}, spawnImpl: () => ({ status: 0, stdout: "" }) });
+  assert.equal(ok.testsRun, true);
+});
+test("assertDeployableSource skips checks for a non-git (packaged) source root", async () => {
+  const { assertDeployableSource } = await import("../scripts/install.mjs");
+  const res = assertDeployableSource("/packaged", { execImpl: () => { throw new Error("not a repo"); }, env: {} });
+  assert.equal(res.checked, false);
+});
+test("install no longer mass-enables the Codex plugin gate (per-workspace setting untouched)", async () => {
+  const src = fs.readFileSync(path.join(PROJECT_ROOT, "scripts", "install.mjs"), "utf8");
+  const defaultBranch = src.split("BENCH_SINGLE_GATE")[2] || "";
+  assert.ok(!/enableLegacyCodexStopGateStates\(/.test(defaultBranch), "default install branch must not call the mass-enable");
 });

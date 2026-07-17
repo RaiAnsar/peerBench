@@ -1,6 +1,6 @@
 import { extractVerdict } from "./reviewers.mjs";
 import { allowedTemperatureFromError, isContentInspectionFailure, sanitizeForProviderInspection } from "./provider-compat.mjs";
-import { DEFAULT_USER_AGENT } from "./review-client.mjs";
+import { DEFAULT_USER_AGENT, classifyHttpErrorKind } from "./review-client.mjs";
 export { sanitizeForProviderInspection };
 
 // Parse an OpenAI-compatible SSE chat stream into one assembled message.
@@ -240,13 +240,13 @@ export async function agenticReview({
             const b2 = await resp.text().catch(() => "");
             dlog(`step ${step}: HTTP ${resp.status} after redacted retry reqKB=${(lastReqBytes / 1024) | 0}`);
             rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}`, retry: "redacted-data-inspection" });
-            return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${b2.slice(0, 200)}` }, diag: diag() };
+            return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, b2), detail: `HTTP ${resp.status}: ${b2.slice(0, 200)}` }, diag: diag() };
           }
         }
         if (!resp.ok) {
           dlog(`step ${step}: HTTP ${resp.status} reqKB=${(lastReqBytes / 1024) | 0}`);
           rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}` });
-          return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${b.slice(0, 200)}` }, diag: diag() };
+          return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, b), detail: `HTTP ${resp.status}: ${b.slice(0, 200)}` }, diag: diag() };
         }
       }
       const msg = parsed.message;

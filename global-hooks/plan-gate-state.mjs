@@ -14,10 +14,19 @@ import path from "node:path";
 import { normalizeSessionId, workspaceStateDir } from "./config-store.mjs";
 
 export const MAX_PLAN_BLOCK_CYCLES = 3;
+// SESSION-TOTAL budget on plan-gate blocks. The 3-slot cycle ledger is deliberately wiped when
+// every blocked target resolves — but that wipe is what powered the multi-hour plans/*.md
+// BLOCK→edit→ALLOW→BLOCK loops: every full resolution refunded all three slots, forever. The
+// total lives in a sibling file the resolution wipe never touches; it expires only after
+// PLAN_CYCLE_WINDOW_MS of no new blocks (a genuinely new work phase) or an explicit reset.
+export const MAX_PLAN_TOTAL_BLOCKS = 9;
 export const PLAN_CYCLE_WINDOW_MS = 2 * 60 * 60 * 1000;
 export const PLAN_REVIEW_POLICY_VERSION = "plan-review-v5-exhaustive-cycle3-epoch";
 export const PLAN_FILE_REVIEW_POLICY_VERSION = "plan-file-review-v5-full-identity-epoch";
-export const PLAN_REVIEW_LEASE_MS = 5 * 60 * 1000;
+// Must exceed the slowest configured reviewer timeoutMs (config-store DEFAULTS: Kimi 420s), or a
+// legitimately slow leader's lease expires mid-panel and a concurrent same-identity invocation
+// becomes a duplicate leader — billing a second panel whose completion supersedes the original's.
+export const PLAN_REVIEW_LEASE_MS = 8 * 60 * 1000;
 const PLAN_REVIEW_RESULT_TTL_MS = 60 * 1000;
 
 function stableJson(value) {
@@ -215,13 +224,36 @@ function expireCycleIn(dir, { now = Date.now(), windowMs = PLAN_CYCLE_WINDOW_MS 
   } catch { return false; }
 }
 
+const cycleTotalPath = (dir) => `${dir}.total.json`;
+
+function readCycleTotal(dir, { now = Date.now(), windowMs = PLAN_CYCLE_WINDOW_MS } = {}) {
+  try {
+    const record = JSON.parse(fs.readFileSync(cycleTotalPath(dir), "utf8"));
+    if (now - Number(record.ts) >= windowMs) {
+      try { fs.rmSync(cycleTotalPath(dir), { force: true }); } catch { /* best effort */ }
+      return 0;
+    }
+    return Math.max(0, Number(record.total) || 0);
+  } catch {
+    return 0;
+  }
+}
+
+function bumpCycleTotal(dir, { now = Date.now() } = {}) {
+  const total = readCycleTotal(dir, { now }) + 1;
+  writeJsonAtomic(cycleTotalPath(dir), { schema: 1, total, ts: now });
+  return total;
+}
+
 function stateIn(dir) {
   const slots = cycleSlotsIn(dir);
   const records = slots.map(normalizedBlock).filter(Boolean);
   const resolved = resolvedRecordsIn(dir);
+  const total = readCycleTotal(dir);
   return {
     count: slots.length,
-    exhausted: slots.length >= MAX_PLAN_BLOCK_CYCLES,
+    total,
+    exhausted: slots.length >= MAX_PLAN_BLOCK_CYCLES || total >= MAX_PLAN_TOTAL_BLOCKS,
     records,
     resolvedTargets: resolved.map((record) => record.target).filter(Boolean)
   };
@@ -297,7 +329,8 @@ function recordBlockIn(dir, { target, revision, badge = "", findings = "", revie
     const file = path.join(dir, `block-${index}.json`);
     try {
       fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      return { stale: false, slot: { index, exhausted: index >= MAX_PLAN_BLOCK_CYCLES, record } };
+      const total = bumpCycleTotal(dir, { now });
+      return { stale: false, slot: { index, exhausted: index >= MAX_PLAN_BLOCK_CYCLES || total >= MAX_PLAN_TOTAL_BLOCKS, record } };
     } catch (error) {
       if (error?.code === "EEXIST") continue;
       throw error;
@@ -317,6 +350,7 @@ export function resetPlanCycle(ws, sessionKey) {
   return withCycleLock(ws, sessionKey, (dir) => {
     const meta = readCycleMeta(dir);
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { fs.rmSync(cycleTotalPath(dir), { force: true }); } catch { /* explicit reset refunds the session total */ }
     writeJsonAtomic(cycleMetaPath(dir), {
       schema: 1,
       resetEpoch: meta.resetEpoch + 1,
@@ -343,16 +377,22 @@ export function recordPlanBlock(ws, sessionKey, block = {}, options = {}) {
   });
 }
 
-export function planCycleAdvisory(state) {
+export function planCycleAdvisory(state, { completedFindings = "" } = {}) {
   const records = Array.isArray(state?.records) ? state.records : [];
   const previous = records.map((record, index) => {
     const detail = String(record.findings || "blocking finding recorded").trim().slice(0, 1200);
     return `Cycle ${index + 1}${record.badge ? ` [${record.badge}]` : ""}: ${detail}`;
   }).join("\n\n");
+  // A leader that completes after the ceiling filled WAS validated and blocked; its findings claim
+  // no ledger slot, so they ride inside the advisory instead of being silently discarded.
+  const completed = String(completedFindings || "").trim().slice(0, 1200);
   return (
     `UNREVIEWED — automatic plan review paused after ${MAX_PLAN_BLOCK_CYCLES} blocked repair cycles in this task/session. ` +
-    "The current revision was not re-validated and no further automatic plan wake will run in this session. " +
+    (completed
+      ? "The current revision was validated and blocked, but it completed after the cycle ceiling filled, so no slot remains and no further automatic plan wake will run in this session. "
+      : "The current revision was not re-validated and no further automatic plan wake will run in this session. ") +
     "Start a new task/session or set BENCH_PLAN_CYCLE_RESET to a new one-shot nonce for one explicit fresh cycle." +
+    (completed ? `\n\nLatest completed review findings (validated and blocked; no slot remained):\n${completed}` : "") +
     (previous ? `\n\nPrior unresolved findings:\n${previous}` : "")
   );
 }

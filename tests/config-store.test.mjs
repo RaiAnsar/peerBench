@@ -31,11 +31,13 @@ test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => 
   assert.match(a.providers.kimi.headers["User-Agent"], /claude-cli/);
   assert.equal(a.providers.mimo.apiKey, "xk");
   assert.equal(a.providers.mimo.temperature, 0);
-  // glm provider is defined and now part of the default fallback set
+  // glm provider stays defined/selectable, but it was retired from the panel (Grok replaced it),
+  // so the fallback set must not silently revive it.
   assert.equal(a.providers.glm.baseURL, "https://api.z.ai/api/coding/paas/v4");
   assert.equal(a.providers.glm.model, "glm-5.2");
-  // Default fallback is kimi+glm (mimo disabled — quota-exhausted — but still wired/selectable).
-  assert.deepEqual(a.reviewers, ["kimi", "glm"]);
+  // Default fallback is the two keyed API reviewers of the current panel (CLI reviewers need
+  // their own installed/authed harness, so they are never part of the key-only fallback).
+  assert.deepEqual(a.reviewers, ["kimi", "minimax"]);
   assert.deepEqual(a, b);
 });
 test("mimo is selectable (KNOWN, integration retained) but NOT in the default set", () => {
@@ -99,7 +101,7 @@ test("resolveConfig can suppress the Codex reviewer for direct Codex prompt sess
   const mixed = resolveConfig({ env: { BENCH_SUPPRESS_CODEX_REVIEWER: "1" }, reviewers: ["codex", "kimi", "glm"] });
   assert.deepEqual(mixed.reviewers, ["kimi", "glm"]);
   const codexOnly = resolveConfig({ env: { BENCH_SUPPRESS_CODEX_REVIEWER: "1" }, reviewers: ["codex"] });
-  assert.deepEqual(codexOnly.reviewers, ["kimi", "glm"]);
+  assert.deepEqual(codexOnly.reviewers, ["kimi", "minimax"], "suppressed-codex fallback = current keyed API panel, never retired GLM");
 });
 test("unknown reviewer names are filtered out", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["kimi", "bogus"] });
@@ -178,4 +180,31 @@ test("C2: isBenchDisabled stays fail-open (false) AND warns on existsSync error"
   assert.match(warned, /⛩/, "must emit a ⛩ stderr warning");
   assert.match(warned, /bench/i, "warning should mention bench");
   assert.match(warned, /EIO|boom/, "warning should name the error");
+});
+
+test("reviewer cooldowns: record → read → expire → clear round-trip", async () => {
+  const { recordReviewerCooldown, readReviewerCooldown, clearReviewerCooldowns } = await import("../global-hooks/config-store.mjs");
+  clearReviewerCooldowns();
+  const t0 = 1_800_000_000_000;
+  recordReviewerCooldown("kimi", "quota", "HTTP 429: cap", { now: t0 });
+  const live = readReviewerCooldown("kimi", { now: t0 + 60_000 });
+  assert.equal(live.kind, "quota");
+  assert.match(live.detail, /HTTP 429/);
+  assert.equal(readReviewerCooldown("kimi", { now: t0 + 6 * 60_000 }), null, "quota cooldown expires after 5 min");
+  recordReviewerCooldown("grok", "auth", "invalid_grant", { now: t0 });
+  assert.ok(readReviewerCooldown("grok", { now: t0 + 9 * 60_000 }), "auth cooldown lasts 10 min");
+  assert.equal(readReviewerCooldown("grok", { now: t0 + 11 * 60_000 }), null);
+  clearReviewerCooldowns({ name: "grok" });
+  assert.equal(readReviewerCooldown("grok", { now: t0 + 60_000 }), null);
+  clearReviewerCooldowns();
+});
+test("recording a cooldown prunes expired entries from the map", async () => {
+  const { recordReviewerCooldown, readReviewerCooldown, clearReviewerCooldowns } = await import("../global-hooks/config-store.mjs");
+  clearReviewerCooldowns();
+  const t0 = 1_800_000_000_000;
+  recordReviewerCooldown("kimi", "quota", "old", { now: t0 });
+  recordReviewerCooldown("minimax", "quota", "new", { now: t0 + 30 * 60_000 });
+  assert.equal(readReviewerCooldown("kimi", { now: t0 + 30 * 60_000 }), null);
+  assert.ok(readReviewerCooldown("minimax", { now: t0 + 31 * 60_000 }));
+  clearReviewerCooldowns();
 });

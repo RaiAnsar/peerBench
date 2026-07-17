@@ -53,7 +53,9 @@ test("RC-1: gives up cleanly after exhausting 429 retries (1 + 5)", async () => 
   const fetchImpl = async () => { calls++; return r429(); };
   const res = await agenticReview({ ...baseArgs, mode: "report", tools, fetchImpl, sleepImpl: async () => {}, rng: () => 0.5 });
   assert.equal(res.ok, false);
-  assert.equal(res.error.kind, "http");
+  // Post-retry 429 is a quota/limit condition — the gates cooldown-skip the reviewer with a clear
+  // "out of quota" note instead of re-burning the backoff at every gate.
+  assert.equal(res.error.kind, "quota");
   assert.match(res.error.detail, /429/);
   assert.equal(calls, 6, `expected 1 initial + 5 overload retries = 6 fetches (got ${calls})`);
 });

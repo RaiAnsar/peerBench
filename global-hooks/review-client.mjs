@@ -19,10 +19,23 @@ export const DEFAULT_USER_AGENT = "claude-cli/1.0.83 (external, cli)";
 const RETRYABLE_STATUS = new Set([429, 503]);
 const MAX_OVERLOAD_RETRIES = 5;
 const BACKOFF_CAP_MS = 16_000;
+
+// Classify the FINAL (post-retry) HTTP failure so gates can tell "this reviewer is out of
+// quota/credits" apart from a generic server error and skip it with a clear note instead of
+// re-running a doomed call at every gate. A 429 only reaches this point after the retry loop
+// exhausted, so treating it as quota (not a transient blip) is correct here.
+export function classifyHttpErrorKind(status, body = "") {
+  if (status === 401 || status === 403) return "auth";
+  if (status === 402 || status === 429) return "quota";
+  if (/quota|insufficient|credit|balance|usage.?limit|exceed/i.test(String(body))) return "quota";
+  return "http";
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // attempt 0→~1s, 1→~2s … capped at ~16s, plus 0–1s jitter (skipped when Retry-After is explicit).
+// Retry-After is CAPPED at 30s (same as the agentic path): an uncapped `Retry-After: 3600` parks a
+// fast gate in a one-hour sleep the abort timer cannot interrupt on its own.
 function overloadBackoffMs(attempt, retryAfterSec, jitter = Math.random()) {
-  if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) return retryAfterSec * 1000;
+  if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) return Math.min(retryAfterSec * 1000, 30_000);
   return Math.min(BACKOFF_CAP_MS, 1000 * 2 ** attempt) + Math.floor(jitter * 1000);
 }
 export async function review({ baseURL, apiKey, apiKeys, model, system, user, timeoutMs = DEFAULT_TIMEOUT_MS, temperature = 0, headers = {}, thinking, fetchImpl, sleepImpl = sleep, keyPick = Math.random }) {
@@ -52,11 +65,20 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
   });
   // Retry a 429/503: rotate to the next key (overflow), then jittered backoff if it still caps out, so
   // a capped call lands a free slot instead of becoming an error. Stops early if the overall timeout fires.
+  // The backoff sleep is RACED against the abort signal: the wall-clock timeout must interrupt a long
+  // sleep (rejecting as AbortError → "timeout" below), not wait for the sleep promise to settle.
+  const sleepOrAbort = (ms) => new Promise((resolve, reject) => {
+    if (controller.signal.aborted) { reject(new DOMException("Aborted", "AbortError")); return; }
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(sleepImpl(ms)).then(resolve, reject)
+      .finally(() => controller.signal.removeEventListener("abort", onAbort));
+  });
   const request = async (body) => {
     let r = await rawRequest(body);
     for (let attempt = 0; !r.ok && RETRYABLE_STATUS.has(r.status) && attempt < MAX_OVERLOAD_RETRIES && !controller.signal.aborted; attempt++) {
       keyIdx++;
-      await sleepImpl(overloadBackoffMs(attempt, Number(r.headers?.get?.("retry-after"))));
+      await sleepOrAbort(overloadBackoffMs(attempt, Number(r.headers?.get?.("retry-after"))));
       r = await rawRequest(body);
     }
     return r;
@@ -95,11 +117,11 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
       if (!resp.ok) {
         const body2 = await resp.text().catch(() => "");
         clearTimeout(timer);
-        return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${body2.slice(0, 200)}` } };
+        return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, body2), detail: `HTTP ${resp.status}: ${body2.slice(0, 200)}` } };
       }
     } else {
       clearTimeout(timer);
-      return { ok: false, error: { kind: resp.status === 401 || resp.status === 403 ? "auth" : "http", detail: `HTTP ${resp.status}: ${errorBody.slice(0, 200)}` } };
+      return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, errorBody), detail: `HTTP ${resp.status}: ${errorBody.slice(0, 200)}` } };
     }
   }
   clearTimeout(timer);
