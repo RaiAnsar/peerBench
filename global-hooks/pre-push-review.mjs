@@ -44,6 +44,17 @@ export function launchPushReview(ws, range, { gitImpl = gitTry, now = Date.now()
 
 // Git global options that take a SEPARATE value token (so we skip the value when scanning for `push`).
 const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"]);
+// `git push` options that take a SEPARATE value token — skip the value so it isn't mistaken for the
+// remote/refspec (e.g. `git push -o ci.skip origin br` must yield remote=origin, not remote=ci.skip).
+// NOT here: `--repo <repo>` — its value IS the remote, so it must fall through as the `remote`
+// positional (skipping it would make `git push --repo upstream main` resolve remote=main and review
+// the wrong commits). `--force-with-lease`/`--force-if-includes` attach their value with `=` and are
+// bare otherwise, so skipping a token would eat the remote.
+const PUSH_VALUE_FLAGS = new Set(["-o", "--push-option", "--receive-pack", "--exec"]);
+// git's canonical empty tree — a universal base when a branch has no ancestor on the remote (a first
+// push / root commit). Verified: both `git log --oneline <empty>..HEAD` and `git diff <empty>..HEAD`
+// accept it and yield the full branch history.
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 // Split a compound command into segments on top-level shell operators (; && || | &),
 // honoring single/double quotes so operators inside strings don't split. Each segment carries
@@ -115,7 +126,7 @@ export function parsePushCommand(text) {
       i++;
       for (; i < toks.length; i++) {
         const t = toks[i];
-        if (t.startsWith("-")) flags.push(t);
+        if (t.startsWith("-")) { flags.push(t); if (PUSH_VALUE_FLAGS.has(t)) i++; }   // skip a value-flag's separate value token
         else positionals.push(t);
       }
     }
@@ -307,13 +318,15 @@ export function resolvePushRange(cwd, parsed) {
   }
 
   // Cases where an EXACT push range can't be scoped — multiple refspecs (`git push beta main develop`,
-  // a common deploy form) or whole-ref flags (--all/--tags/--mirror). Previously these SKIPPED review
-  // entirely, which left real deploy pushes unreviewed. Instead fall back to reviewing the current
-  // branch's ahead-commits — always review SOMETHING; only truly skip if even that can't resolve.
-  const wholeRefFlag = ["--all", "--tags", "--mirror"].find((f) => flags.includes(f));
+  // a common deploy form) or whole-ref flags (--all/--tags/--mirror). Best-effort: review the current
+  // branch's ahead-commits IF a cheap base exists — but stay FAIL-CLOSED (block) otherwise. These
+  // pushes carry commits on refs OTHER than HEAD, so the robust HEAD-scoped remote-ahead tier would
+  // silently UNDER-review (e.g. `push beta main develop` with no beta refs would review only main and
+  // skip develop's commits — a push-gate catch). currentBranchBaseRange has no such always-ok tier.
+  const wholeRefFlag = ["--all", "--branches", "--tags", "--mirror"].find((f) => flags.includes(f));   // --branches = git 2.50 alias for --all
   if (wholeRefFlag || refspecs.length > 1) {
     const why = wholeRefFlag ? `${wholeRefFlag} pushes multiple refs` : `${refspecs.length} refspecs`;
-    const fb = fallbackRange(cwd, remote);
+    const fb = currentBranchBaseRange(cwd, remote);
     if (fb.ok) return { ...fb, note: `⛩ pre-push: ${why} — reviewing current-branch commits (${fb.range}); exact push set not range-resolved.` };
     return { range: "", ok: false, note: `⛩ pre-push: ${why} and no branch base resolved; push blocked until peerBench can review a commit range.` };
   }
@@ -328,12 +341,13 @@ export function resolvePushRange(cwd, parsed) {
       const source = src === "HEAD" ? "HEAD" : src;
       const baseRef = `${remote}/${dst}`;
       if (refExists(baseRef, cwd)) return { range: `${baseRef}..${source}`, ok: true };
-      // No remote-tracking ref for the dst — keep the explicit source against a guessed base, else fall back.
+      // No remote-tracking ref for the dst — keep the explicit source against a guessed base, else
+      // scope the fallback to THAT SOURCE (never HEAD — HEAD may be a different branch → wrong commits).
       const chain = baseChain(cwd, remote);
       if (chain) return { range: `${chain}..${source}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
-      const fb = fallbackRange(cwd, remote);
-      return fb.ok
-        ? { ...fb, note: `⛩ pre-push: could not resolve a base for ${spec} — reviewing current-branch commits (${fb.range}).` }
+      const ahead = remoteAheadRange(cwd, remote, source);
+      return ahead.ok
+        ? { ...ahead, note: `⛩ pre-push: no remote base for ${spec} — reviewing ${source}'s commits not on ${remote} (${ahead.range}).` }
         : { range: "", ok: false, note: `⛩ pre-push: could not resolve a base for ${spec}; push blocked until peerBench can review a commit range.` };
     }
     // bare <ref> → src = dst = <ref>
@@ -341,27 +355,51 @@ export function resolvePushRange(cwd, parsed) {
     if (refExists(baseRef, cwd)) return { range: `${baseRef}..${spec}`, ok: true };
     const chain = baseChain(cwd, remote);
     if (chain) return { range: `${chain}..${spec}`, ok: true, note: `pre-push: guessed base ${chain} for ${spec}` };
-    const fb = fallbackRange(cwd, remote);
-    return fb.ok
-      ? { ...fb, note: `⛩ pre-push: no remote-tracking ref for ${spec} — reviewing current-branch commits (${fb.range}).` }
+    // Scope to <spec> (the pushed ref), NOT HEAD — the push may not be of the current branch.
+    const ahead = remoteAheadRange(cwd, remote, spec);
+    return ahead.ok
+      ? { ...ahead, note: `⛩ pre-push: no remote-tracking ref for ${spec} — reviewing its commits not on ${remote} (${ahead.range}).` }
       : { range: "", ok: false, note: `⛩ pre-push: no remote-tracking ref for ${spec}; push blocked until peerBench can review a commit range.` };
   }
 
-  // No explicit refspec → review the current branch's ahead-commits.
-  const fb = fallbackRange(cwd, remote);
-  return fb.ok ? fb : { range: "", ok: false, note: "⛩ pre-push: no upstream to diff against; push blocked until peerBench can review a commit range." };
+  // No explicit refspec (`git push`) → the current branch's ahead-commits from a CHEAP base. This
+  // stays FAIL-CLOSED (no always-ok remote-ahead tier) because a bare push is NOT guaranteed HEAD-only:
+  // `push.default=matching` or a `remote.<remote>.push` refspec can transmit other branches, which a
+  // HEAD-scoped range would silently skip (a push-gate catch). The new-branch fix lives on the EXPLICIT
+  // refspec path (`git push -u origin <branch>`), which scopes to the named source — the common form,
+  // and the one actually reported. A bare push that can't resolve a base blocks with a clear note
+  // (use the explicit `git push origin <branch>` form, or set an upstream).
+  const fb = currentBranchBaseRange(cwd, remote);
+  return fb.ok ? fb : { range: "", ok: false, note: "⛩ pre-push: no upstream to diff against; push blocked until peerBench can review a commit range (push an explicit `<remote> <branch>` so the range can be scoped)." };
 }
 
-// Current branch's ahead-commits: @{u}..HEAD, else <remote>/<branch|HEAD|main|master>..HEAD.
-// The always-available best-effort review range when an EXACT push range can't be scoped — these
-// are the committed-but-unpushed commits a push will transmit (NOT uncommitted work, which a push
-// never carries and which the stop gate already reviews).
-function fallbackRange(cwd, remote) {
+// The CURRENT branch's ahead-commits from a CHEAP base only: @{u}, else a guessed <remote>/<branch|
+// HEAD|main|master>. ok:false when neither exists. Used where scoping to HEAD is the RIGHT best-effort
+// but an always-success tier would UNDER-review (multi-ref / --all / bare pushes can carry commits on
+// refs OTHER than HEAD, so a HEAD-only fallback would silently skip them → fail-closed instead).
+function currentBranchBaseRange(cwd, remote) {
   const [upstreamFull, upOk] = gitTry(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
   if (upOk && upstreamFull) return { range: "@{u}..HEAD", ok: true };
   const chain = baseChain(cwd, remote);
   if (chain) return { range: `${chain}..HEAD`, ok: true, note: `pre-push: guessed base ${chain} (no @{u})` };
   return { range: "", ok: false };
+}
+
+// Commits on <source> (default HEAD) that NO tracking ref of <remote> contains = exactly what a push
+// of that source would send, regardless of branch naming or which refs are fetched. Base = the oldest
+// such commit's parent (the divergence point, which IS on the remote); a root commit (empty remote /
+// first push ever) has none, so git's empty tree is the base and the whole history is reviewed.
+// The <source> MUST be the ref actually being pushed — passing HEAD for an explicit non-HEAD refspec
+// would review the wrong commits (a push-gate catch). Returns { range, ok }; ok:false only when
+// git itself can't enumerate (source doesn't resolve / rev-list errors) → caller fail-closes.
+function remoteAheadRange(cwd, remote, source = "HEAD") {
+  const [list, ok] = gitTry(["rev-list", "--reverse", "--topo-order", source, "--not", `--remotes=${remote}`], cwd);
+  if (!ok) return { range: "", ok: false };
+  const commits = list.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (!commits.length) return { range: `${source}..${source}`, ok: true };   // nothing ahead → empty range → clean allow downstream
+  const [base, hasBase] = gitTry(["rev-parse", "--verify", "--quiet", `${commits[0]}^`], cwd);
+  const baseRef = (hasBase && base) ? base : EMPTY_TREE;
+  return { range: `${baseRef}..${source}`, ok: true, note: `pre-push: reviewing ${commits.length} commit(s) on ${source} not on any ${remote} ref (no upstream)` };
 }
 
 // Base-ref precedence for a named remote with no explicit refspec / no @{u}:

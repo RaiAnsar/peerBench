@@ -447,39 +447,38 @@ test("disabled workspace → allow no-op on git push (bench disabled)", () => {
 // Test: no upstream / nothing to push
 // ---------------------------------------------------------------------------
 
-test("no upstream → deny so commits are not pushed unreviewed", async () => {
-  // Repo with no remote configured → resolvePushRange fails gracefully.
+test("new branch, EXPLICIT refspec, no upstream → REVIEWED (not an unrecoverable block)", async () => {
+  // The reported scenario: `git push -u origin <branch>` on a brand-new branch with no @{u} and no
+  // main/master tracking ref used to HARD-BLOCK ("set an upstream" — impossible before the first
+  // push, an unrecoverable loop). The explicit-refspec path must now scope to the named source
+  // (rev-list <source> --not --remotes) and REVIEW it.
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-noremote-"));
   execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
   execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t",
     "commit", "--allow-empty", "-qm", "init"], { cwd: ws });
 
   let reviewersCalled = false;
-  const emittedLines = [];
-  const origWrite = process.stdout.write.bind(process.stdout);
-  process.stdout.write = (chunk, ...rest) => {
-    if (typeof chunk === "string" && chunk.trim()) emittedLines.push(chunk.trim());
-    return origWrite(chunk, ...rest);
-  };
+  await callRunMain({
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    pushReviewImpl: fakePushReview({ onCall: () => { reviewersCalled = true; } }),
+    env: process.env,
+    input: { cwd: ws, tool_input: { command: "git push -u origin main" } }
+  });
 
-  try {
-    await callRunMain({
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      pushReviewImpl: fakePushReview({ onCall: () => { reviewersCalled = true; } }),
-      env: process.env,
-      input: { cwd: ws, tool_input: { command: "git push" } }
-    });
-  } finally {
-    process.stdout.write = origWrite;
-  }
+  assert.equal(reviewersCalled, true, "an explicit new-branch push must be REVIEWED (commits scoped to the named source), never blocked forever");
+});
 
-  assert.equal(reviewersCalled, false, "reviewers must NOT be called when no upstream");
-  assert.ok(emittedLines.length > 0, "no upstream must emit a deny decision");
-  const parsed = parseLines(emittedLines);
-  assert.equal(parsed[0].hookSpecificOutput.permissionDecision, "deny",
-    "no upstream should block the push instead of allowing an unreviewed push");
-  assert.match(parsed[0].hookSpecificOutput.permissionDecisionReason, /no upstream|review a commit range|blocked/i);
+test("bare `git push` with no resolvable base stays FAIL-CLOSED (a bare push is not guaranteed HEAD-only)", () => {
+  // push.default=matching / remote.push can transmit non-HEAD branches, so a bare push without a cheap
+  // base must BLOCK rather than review HEAD-only (a push-gate catch). The explicit-refspec form is the
+  // supported new-branch path.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-bare-noref-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "init"], { cwd: ws });
+  const r = resolvePushRange(ws, parsePushCommand("git push"));
+  assert.equal(r.ok, false, "bare push, no @{u}, no remote ref → block (not HEAD-only review)");
+  assert.match(r.note, /explicit|blocked/i, "note points to the explicit-refspec form");
 });
 
 test("git log failure for a resolved push range → deny so commits are not pushed unreviewed", async () => {
@@ -873,13 +872,79 @@ test("A2: resolvePushRange — multiple refspecs (deploy push) are REVIEWED, not
   assert.ok(r.note && /2 refspecs/.test(r.note), "note explains the multi-refspec fallback");
 });
 
-test("A2: resolvePushRange — multiple refspecs with NO resolvable base → unresolved note", () => {
+test("A2: resolvePushRange — multi-refspec push with NO cheap base stays FAIL-CLOSED (never under-reviews to HEAD-only)", () => {
+  // A multi-ref push carries commits on refs OTHER than HEAD, so the robust HEAD-scoped remote-ahead
+  // tier must NOT apply here: `git push beta main develop` with no beta refs would review only main's
+  // ahead-set and skip develop's commits. Fail closed (block) instead — the safe pre-fix behavior.
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-norefs-"));
   execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
   execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base"], { cwd: ws });
   const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
-  assert.equal(r.ok, false, "no @{u} and no remote-tracking ref anywhere → cannot review");
+  assert.equal(r.ok, false, "multi-ref with no @{u} and no beta/* ref must BLOCK, not review HEAD-only");
   assert.ok(r.note && /blocked/.test(r.note), "carries a visible strict-gate note");
+});
+
+test("A2: resolvePushRange — multi-refspec WITH a cheap base reviews current-branch commits (best effort)", () => {
+  const { ws } = repoWithRemoteRefs("beta", ["main"], "main");
+  const r = resolvePushRange(ws, parsePushCommand("git push beta main develop"));
+  assert.equal(r.ok, true, "a resolvable base (beta/main) → best-effort current-branch review");
+  assert.match(r.range, /\.\.HEAD$/);
+  assert.ok(r.note && /2 refspecs/.test(r.note), "note explains the multi-ref best-effort fallback");
+});
+
+test("A2: resolvePushRange — NEW BRANCH off a non-standard remote default (no main/master, no @{u}) → tight base..HEAD", () => {
+  // The exact live-reported bug: remote default is `trunk` (not main/master), a fresh feature branch
+  // has no upstream, so baseChain's main/master/HEAD guesses all miss. Must resolve the real
+  // divergence base, not block.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-newbr-"));
+  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  g("init", "-q", "-b", "trunk");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base on trunk");
+  const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ws, encoding: "utf8" }).trim();
+  g("update-ref", "refs/remotes/origin/trunk", base);   // remote has ONLY trunk
+  g("checkout", "-q", "-b", "feature/x");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "feat 1");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "feat 2");
+  const r = resolvePushRange(ws, parsePushCommand("git push -u origin feature/x"));
+  assert.equal(r.ok, true, "new branch off a non-standard default must resolve, not block");
+  // Range is scoped to the pushed ref (feature/x — which is HEAD here); base = the divergence point
+  // on the remote (trunk tip), so exactly the 2 feature commits are reviewed.
+  assert.equal(r.range, `${base}..feature/x`, "base = trunk tip, tip = the pushed ref");
+  const log = execFileSync("git", ["log", "--oneline", r.range], { cwd: ws, encoding: "utf8" }).trim().split("\n");
+  assert.equal(log.length, 2, "git log accepts the resolved range and lists the 2 new commits");
+});
+
+test("A2: parsePushCommand skips a value-flag's value token (`-o ci.skip origin br` → remote origin, not ci.skip)", () => {
+  assert.deepEqual(parsePushCommand("git push -o ci.skip origin feature/x"),
+    { remote: "origin", refspecs: ["feature/x"], flags: ["-o"] });
+  // --force-with-lease attaches its value with `=` (or is bare) → must NOT eat the remote token.
+  assert.deepEqual(parsePushCommand("git push --force-with-lease origin main"),
+    { remote: "origin", refspecs: ["main"], flags: ["--force-with-lease"] });
+  // --repo's value IS the remote → must NOT be skipped (it falls through as the `remote` positional).
+  assert.deepEqual(parsePushCommand("git push --repo upstream main"),
+    { remote: "upstream", refspecs: ["main"], flags: ["--repo"] });
+});
+
+test("A2: resolvePushRange — an EXPLICIT non-HEAD refspec is scoped to THAT ref, never HEAD (fail-open guard)", () => {
+  // Grok push-gate catch: `git push origin feature` while `main` is checked out must review FEATURE's
+  // commits, not the current branch's. The always-ok remote-ahead fallback must use the pushed source.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-nonhead-"));
+  const g = (...a) => execFileSync("git", a, { cwd: ws });
+  g("init", "-q", "-b", "trunk");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base");
+  g("update-ref", "refs/remotes/origin/trunk", execFileSync("git", ["rev-parse", "HEAD"], { cwd: ws, encoding: "utf8" }).trim());
+  g("checkout", "-q", "-b", "feature");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "FEATURE only");
+  const featTip = execFileSync("git", ["rev-parse", "feature"], { cwd: ws, encoding: "utf8" }).trim();
+  g("checkout", "-q", "-b", "main", "trunk");   // HEAD is now main, NOT feature
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "MAIN only");
+  const r = resolvePushRange(ws, parsePushCommand("git push origin feature"));
+  assert.equal(r.ok, true);
+  assert.match(r.range, /\.\.feature$/, "range tip must be the pushed ref (feature), not HEAD/main");
+  const commits = execFileSync("git", ["log", "--format=%s", r.range], { cwd: ws, encoding: "utf8" }).trim().split("\n");
+  assert.ok(commits.includes("FEATURE only"), "feature's unique commit is reviewed");
+  assert.ok(!commits.includes("MAIN only"), "the current branch's commit must NOT be what's reviewed");
+  assert.equal(execFileSync("git", ["rev-parse", r.range.split("..")[1]], { cwd: ws, encoding: "utf8" }).trim(), featTip);
 });
 
 // ===========================================================================
@@ -1580,4 +1645,15 @@ test("an unrecognized BENCH_PUSH_GATE_MODE falls through to BLOCKING (fail towar
     });
   } finally { process.stdout.write = origWrite; process.env.BENCH_ROOT = TEMP_GCR; }
   assert.ok(inlineRan, "only exact 'fast' opts out; anything else → blocking");
+});
+
+test("A2: resolvePushRange — `--branches` (git 2.50 --all alias) is treated as a whole-ref push", () => {
+  // Must NOT reach the single/HEAD path: --branches pushes every branch, so with no cheap base it
+  // fail-closes (like --all), never reviews one branch and allows the rest unreviewed.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ppr-a2-branches-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base"], { cwd: ws });
+  const r = resolvePushRange(ws, parsePushCommand("git push --branches origin"));
+  assert.equal(r.ok, false, "--branches with no cheap base must block, not HEAD-only review");
+  assert.match(r.note, /pushes multiple refs|blocked/);
 });
