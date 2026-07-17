@@ -39,6 +39,14 @@ test("parseMergeSegment sees the argv the SHELL passes to git (redirects lexed o
   assert.deepEqual(parseMergeSegment('git merge "feature>old"')?.refs, ["feature>old"]);
   // a heredoc delimiter is NOT a second ref (stop-gate catch: `EOF` as a ref failed open)
   assert.deepEqual(parseMergeSegment("git merge feature << EOF")?.refs, ["feature"]);
+  // input-FD duplication between octopus refs (stop-gate catch: the segment splitter kept only
+  // `>`-adjacent &, so `3<&0` split its segment and dropped feature-b from review)
+  assert.deepEqual(findMergeSegment("git merge feature-a 3<&0 feature-b")?.refs, ["feature-a", "feature-b"]);
+  // only COMMAND-position `git` counts (stop-gate catch): a fake `echo g\it merge bad-ref` segment
+  // must not shadow the REAL octopus merge — the fake's unresolvable ref failed the gate OPEN
+  assert.deepEqual(findMergeSegment("echo g\\it merge does-not-exist & git merge feature-a feature-b")?.refs,
+    ["feature-a", "feature-b"]);
+  assert.equal(findMergeSegment("echo git merge x"), null);
 });
 
 test("findMergeSegment ignores --abort/--continue/--quit and non-merge git commands", () => {

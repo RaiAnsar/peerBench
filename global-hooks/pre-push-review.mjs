@@ -60,21 +60,37 @@ const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 // honoring single/double quotes so operators inside strings don't split. Each segment carries
 // the `joiner` operator that PRECEDED it ("" for the first) — needed to reason about control flow.
 export function shellSegments(command) {
-  const segs = []; let cur = "", quote = null, joiner = "";
+  const segs = []; let cur = "", quote = null, joiner = "", esc = false;   // esc: cur ends in a \-escaped literal
   const cmd = String(command ?? "");
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i], next = cmd[i + 1];
-    if (quote) { cur += c; if (c === quote) quote = null; continue; }
-    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
-    if ((c === "&" && next === "&") || (c === "|" && next === "|")) { segs.push({ text: cur, joiner }); joiner = c + next; cur = ""; i++; continue; }
-    // An & or | that is part of a REDIRECT is not a command separator: `2>&1`/`>&2` (& right after >),
-    // `&>`/`&>>` (& right before >), `>|` (clobber). Splitting inside `2>&1` tore the push segment apart
-    // BEFORE arg parsing ever ran — `git push origin main 2>&1 develop` lost `develop` to the next
-    // segment and bypassed the multi-ref block (a stop-gate catch).
-    if ((c === "&" || c === "|") && cur.endsWith(">")) { cur += c; continue; }
-    if (c === "&" && next === ">") { cur += c; continue; }
-    if (c === ";" || c === "|" || c === "&" || c === "\n") { segs.push({ text: cur, joiner }); joiner = c; cur = ""; continue; }
-    cur += c;
+    if (quote) {
+      // inside "…" a backslash keeps \" \\ literal — without this the string "closed" at an escaped
+      // quote and a later REAL separator was treated as inside-string (a missed command split).
+      // \<newline> is a line continuation even inside "…" (both chars vanish).
+      if (quote === '"' && c === "\\" && next === "\n") { i++; continue; }
+      if (quote === '"' && c === "\\" && next != null) { cur += c + next; i++; continue; }
+      cur += c; if (c === quote) quote = null; continue;
+    }
+    if (c === "\\") {
+      // \x is a LITERAL char, never an operator — `true \<& git push …` is a literal `<` word, a REAL
+      // background &, then an unrelated push (a stop-gate catch: treating the & as `<&` kept one
+      // segment and the push went entirely unreviewed). \<newline> is a line continuation (both vanish).
+      if (next === "\n") { i++; continue; }
+      if (next != null) { cur += c + next; i++; esc = true; continue; }
+      cur += c; esc = false; continue;
+    }
+    if (c === '"' || c === "'") { quote = c; cur += c; esc = false; continue; }
+    if ((c === "&" && next === "&") || (c === "|" && next === "|")) { segs.push({ text: cur, joiner }); joiner = c + next; cur = ""; esc = false; i++; continue; }
+    // An & or | that is part of a REDIRECT is not a command separator: `2>&1`/`>&2` and `<&0`/`3<&0`
+    // (& right after an UNESCAPED > or <), `&>`/`&>>` (& right before >), `>|` (clobber). Splitting
+    // inside `2>&1` tore the push segment apart BEFORE arg parsing ever ran — `git push origin main
+    // 2>&1 develop` lost `develop` to the next segment and bypassed the multi-ref block (a stop-gate
+    // catch; the input-FD `<&` form was a second catch).
+    if (c === "&" && ((!esc && (cur.endsWith(">") || cur.endsWith("<"))) || next === ">")) { cur += c; esc = false; continue; }
+    if (c === "|" && !esc && cur.endsWith(">")) { cur += c; esc = false; continue; }
+    if (c === ";" || c === "|" || c === "&" || c === "\n") { segs.push({ text: cur, joiner }); joiner = c; cur = ""; esc = false; continue; }
+    cur += c; esc = false;
   }
   segs.push({ text: cur, joiner });
   return segs.map((s) => ({ text: s.text.trim(), joiner: s.joiner })).filter((s) => s.text);
@@ -99,7 +115,24 @@ export function lexShellTokens(text) {
   const flushWord = () => { if (started) { out.push({ text: cur, op: false }); cur = ""; started = false; curQuoted = false; } };
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (quote) { if (c === quote) quote = null; else cur += c; continue; }
+    if (quote) {
+      if (quote === '"' && c === "\\") {                // inside "…": \" \\ \$ \` are the escapable chars
+        const n = s[i + 1];
+        if (n === "\n") { i++; continue; }              // \<newline> is a line continuation INSIDE "…" too:
+        if (n === '"' || n === "\\" || n === "$" || n === "`") { cur += n; i++; continue; }   // `git "pu\␤sh"` runs git push (a stop-gate catch)
+        cur += c; continue;
+      }
+      if (c === quote) quote = null; else cur += c;
+      continue;
+    }
+    if (c === "\\") {
+      // \x is a LITERAL word char, never an operator (`ma\<in` is one word) — and it counts as
+      // QUOTED, so a \-escaped digit is not an fd number (`echo \2>x` passes the arg "2", not fd 2)
+      const n = s[i + 1];
+      if (n === "\n") { i++; continue; }                // line continuation
+      if (n != null) { cur += n; i++; started = true; curQuoted = true; continue; }
+      cur += c; started = true; continue;
+    }
     if (c === '"' || c === "'") { quote = c; started = true; curQuoted = true; continue; }
     if (c === " " || c === "\t" || c === "\r") { flushWord(); continue; }
     if (c === "\n" || c === ";") { flushWord(); out.push({ text: ";", op: true }); continue; }
@@ -167,11 +200,32 @@ export function shellTokenize(text) {
   return words;
 }
 
+// Locate `git` at COMMAND position in a word list, or -1. `git` as an ARGUMENT is not a command:
+// `echo git push` prints, it doesn't push — and with escape normalization `echo g\it push` could
+// SHADOW a real push in a LATER segment (findPushSegment returns the first match), reviewing the
+// wrong command entirely (a stop-gate catch; the merge path failed OPEN through the fake ref).
+// Skipped on the way to `git`: leading NAME=value assignments, exec-style wrappers that run their
+// argv (`sudo git push`, `env -i git push`, `timeout 30 git push`), a wrapper's -flags and bare
+// numeric args. A wrapper flag with a non-numeric value (`sudo -u root git push`) is not understood —
+// the scan stops at `root` and the segment simply isn't treated as git (the stop gate still reviews).
+const EXEC_WRAPPERS = new Set(["sudo", "doas", "command", "env", "exec", "nohup", "nice", "ionice", "time", "timeout", "stdbuf", "chronic"]);
+export function gitCommandIndex(toks) {
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === "git") return i;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue;   // env-assignment prefix
+    if (EXEC_WRAPPERS.has(t)) continue;
+    if (t.startsWith("-") || /^\d+(\.\d+)?[smhd]?$/.test(t)) continue;   // a wrapper's flag / numeric arg
+    return -1;                                          // a real command that isn't git
+  }
+  return -1;
+}
+
 // True if a single segment is a real `git push` (allowing leading env assignments and git
 // global options before the `push` subcommand). Excludes `--help`/`-h` and `--dry-run`/`-n`.
 export function isGitPushSegment(text) {
   const toks = shellTokenize(text).filter(Boolean);
-  let i = toks.indexOf("git");
+  let i = gitCommandIndex(toks);
   if (i < 0) return false;
   i++;
   while (i < toks.length && toks[i].startsWith("-")) { const t = toks[i]; i++; if (GIT_VALUE_OPTS.has(t)) i++; }
@@ -186,7 +240,7 @@ export function isGitPushSegment(text) {
 // Used by resolvePushRange (A2) to compute the correct <base>..<source> range.
 export function parsePushCommand(text) {
   const toks = shellTokenize(text).filter(Boolean);
-  let i = toks.indexOf("git");
+  let i = gitCommandIndex(toks);
   const flags = [];
   const positionals = [];
   if (i >= 0) {
@@ -212,7 +266,7 @@ export function parsePushCommand(text) {
 // Extract -C target directories (in order) from a push segment, for review-cwd resolution (A1).
 function dashCTargets(text) {
   const toks = shellTokenize(text).filter(Boolean);
-  let i = toks.indexOf("git");
+  let i = gitCommandIndex(toks);
   const targets = [];
   if (i < 0) return targets;
   i++;
@@ -269,11 +323,9 @@ export function commandCwd(command, fallbackCwd) {
   let cwd = fallbackCwd;
   for (let k = 0; k < segs.length; k++) {
     const toks = shellTokenize(segs[k].text).filter(Boolean);
-    // Skip leading `NAME=value` env-assignment prefixes so `FOO=bar git …` is still recognized as a
-    // git invocation (matches how isGitPushSegment/dashCTargets locate git via indexOf).
-    let g = 0;
-    while (g < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[g])) g++;
-    if (toks[g] === "git") {
+    // Same command-position rule as isGitPushSegment/dashCTargets: env prefixes and exec wrappers
+    // are skipped, but `git` as an ARGUMENT (`echo git …`) is not a git invocation.
+    if (gitCommandIndex(toks) >= 0) {
       for (const target of dashCTargets(segs[k].text)) cwd = path.isAbsolute(target) ? target : path.resolve(cwd, target);
       return cwd;                                  // resolve to the first git segment (where work lands)
     }

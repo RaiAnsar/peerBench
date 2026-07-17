@@ -846,8 +846,39 @@ test("A2b: the SEGMENT splitter keeps `2>&1` whole — refspecs after it are sti
   assert.deepEqual(parsePushCommand(findPushSegment("git push origin main &> log").text).refspecs, ["main"]);
   assert.deepEqual(parsePushCommand(findPushSegment("git push origin main >&2").text).refspecs, ["main"]);
   assert.deepEqual(parsePushCommand(findPushSegment("git push origin main >| out.txt").text).refspecs, ["main"]);
+  // input-FD duplication (`<&`) must not split either (stop-gate catch: only `>`-adjacent & was kept,
+  // so `3<&0` split at its & and `develop` again bypassed the multi-ref block)
+  assert.deepEqual(parsePushCommand(findPushSegment("git push origin main 3<&0 develop").text).refspecs, ["main", "develop"]);
+  assert.deepEqual(parsePushCommand(findPushSegment("git push origin main <&0").text).refspecs, ["main"]);
   // a REAL background `&` still splits (the next command is not part of the push)
   assert.deepEqual(parsePushCommand(findPushSegment("git push origin main & echo bg").text).refspecs, ["main"]);
+  // an ESCAPED `<` is a literal word char, so the & after it is a REAL background separator and the
+  // push in the NEXT command must still be found (stop-gate catch: `true \<& git push …` kept one
+  // segment, the lexer ate `git` as a redirect target, and the push went entirely UNREVIEWED)
+  assert.deepEqual(parsePushCommand(findPushSegment("true \\<& git push origin main").text).refspecs, ["main"]);
+  // a \" inside a double-quoted string does NOT close the string — the later real & still splits
+  assert.deepEqual(parsePushCommand(findPushSegment('echo "a\\"b" & git push origin main').text).refspecs, ["main"]);
+  // an escaped `<` inside a refspec is a literal char, not a redirect
+  assert.deepEqual(parsePushCommand("git push origin ma\\<in").refspecs, ["ma<in"]);
+});
+
+test("A2c: only COMMAND-position `git` counts — a fake `echo git push` can't shadow the real push", () => {
+  // Escape normalization turns `g\it` into the word `git`; if `git` were matched ANYWHERE (old
+  // indexOf), the echo segment would be selected as the push and the REAL two-ref push in the next
+  // segment would be reviewed as a bare push instead of hitting the multi-ref block (stop-gate catch).
+  const seg = findPushSegment("echo g\\it push & git push origin main develop");
+  assert.ok(seg, "the REAL push segment is found");
+  assert.deepEqual(parsePushCommand(seg.text).refspecs, ["main", "develop"]);
+  assert.equal(findPushSegment("echo git push"), null, "git as an echo ARGUMENT is not a command");
+  // exec-style wrappers and env prefixes still put git at command position
+  assert.ok(isGitPushSegment("sudo git push origin main"));
+  assert.ok(isGitPushSegment("env -i git push origin main"));
+  assert.ok(isGitPushSegment("timeout 30 git push origin main"));
+  assert.ok(isGitPushSegment("FOO=1 git push origin main"));
+  // \<newline> is a line continuation even INSIDE double quotes — `git "pu\␤sh"` runs git push
+  // (stop-gate catch: the retained backslash+newline hid the `push` word entirely)
+  assert.ok(isGitPushSegment('git "pu\\\nsh" origin main'));
+  assert.deepEqual(parsePushCommand('git "pu\\\nsh" origin main').refspecs, ["main"]);
 });
 
 test("A2: resolvePushRange — explicit HEAD:<dst> → <remote>/<dst>..HEAD", () => {

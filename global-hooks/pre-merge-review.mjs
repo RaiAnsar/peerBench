@@ -20,7 +20,7 @@ import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput } from "
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { combinePanel } from "./panel-lib.mjs";
-import { buildPrompt, shellSegments, shellTokenize, commandCwd, createEmitter, assistantContextFromInput } from "./pre-push-review.mjs";
+import { buildPrompt, shellSegments, shellTokenize, gitCommandIndex, commandCwd, createEmitter, assistantContextFromInput } from "./pre-push-review.mjs";
 import { deepKey } from "./deep-review.mjs";
 import { enqueue as defaultEnqueue } from "./deep-queue.mjs";
 
@@ -40,7 +40,10 @@ const MERGE_VALUE_FLAGS = new Set(["-m", "--message", "-F", "--file", "-s", "--s
 // Excludes --abort/--continue/--quit (not a NEW merge) and --help. Returns { refs } or null.
 export function parseMergeSegment(text) {
   const toks = shellTokenize(text).filter(Boolean);
-  let i = toks.indexOf("git");
+  // COMMAND-position git only (shared rule): `echo git merge x` is not a merge — with escape
+  // normalization a fake `echo g\it merge bad-ref` segment could shadow the REAL octopus merge in
+  // the next segment and fail the gate open through the unresolvable ref (a stop-gate catch).
+  let i = gitCommandIndex(toks);
   if (i < 0) return null;
   i++;
   while (i < toks.length && toks[i].startsWith("-")) { const t = toks[i]; i++; if (GIT_VALUE_OPTS.has(t)) i++; }
