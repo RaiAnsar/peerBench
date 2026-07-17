@@ -809,17 +809,45 @@ test("A2: parsePushCommand extracts remote, refspecs, flags (origin default)", (
   assert.ok(tags.flags.includes("--tags"));
 });
 
-test("A2: parsePushCommand stops at shell redirects/operators — a `2>&1` never counts as a refspec", () => {
+test("A2: parsePushCommand sees the argv the SHELL passes to git (redirects lexed out, control ops end the command)", () => {
   // Agentic pushes append `2>&1` / pipes; the stray token used to count as a 2nd refspec, mis-routing
   // a single-branch push onto the multi-ref path (a spurious '2 refspecs' block — the likely real
-  // trigger of the reported new-branch failure). Redirects/pipes must be dropped entirely.
+  // trigger of the reported new-branch failure). Redirects are STRIPPED (anywhere, incl. between args).
   assert.deepEqual(parsePushCommand("git push origin main 2>&1"), { remote: "origin", refspecs: ["main"], flags: [] });
   assert.deepEqual(parsePushCommand("git push -u origin feature 2>&1"), { remote: "origin", refspecs: ["feature"], flags: ["-u"] });
   assert.deepEqual(parsePushCommand("git push origin main 2>&1 | tail -25"), { remote: "origin", refspecs: ["main"], flags: [] });
   assert.deepEqual(parsePushCommand("git push origin main 2>/dev/null"), { remote: "origin", refspecs: ["main"], flags: [] });
   assert.deepEqual(parsePushCommand("git push origin main > log.txt"), { remote: "origin", refspecs: ["main"], flags: [] });
-  // a GENUINE 2-branch push is still detected (the redirect strip must not over-eat real refspecs)
+  // A redirect BETWEEN args must not drop the LATER refspecs — both branches are still seen (→ multi-ref block).
+  assert.deepEqual(parsePushCommand("git push origin main 2>/dev/null develop"), { remote: "origin", refspecs: ["main", "develop"], flags: [] });
+  assert.deepEqual(parsePushCommand("git push origin main >out.txt develop"), { remote: "origin", refspecs: ["main", "develop"], flags: [] });
+  // A genuine 2-branch push is still detected (the strip must not over-eat real refspecs).
   assert.deepEqual(parsePushCommand("git push origin main develop 2>&1"), { remote: "origin", refspecs: ["main", "develop"], flags: [] });
+  // An UNQUOTED redirect starts MID-WORD (stop-gate catch): the shell hands git the refspec `main`
+  // and truncates the file `log` — `main>log` must NOT survive as one token (rev-parse would fail
+  // and the gate fail open). A QUOTED `>` is literal, so a deliberate `>`-in-ref still works.
+  assert.deepEqual(parsePushCommand("git push origin main>log"), { remote: "origin", refspecs: ["main"], flags: [] });
+  assert.deepEqual(parsePushCommand('git push origin "feature>old"'), { remote: "origin", refspecs: ["feature>old"], flags: [] });
+  // A heredoc/herestring target is a delimiter/word for the SHELL, never a refspec (stop-gate catch:
+  // `<<` classified as an attached redirect made `EOF` a 2nd refspec).
+  assert.deepEqual(parsePushCommand("git push origin main << EOF"), { remote: "origin", refspecs: ["main"], flags: [] });
+  assert.deepEqual(parsePushCommand("git push origin main <<< input"), { remote: "origin", refspecs: ["main"], flags: [] });
+});
+
+test("A2b: the SEGMENT splitter keeps `2>&1` whole — refspecs after it are still seen (stop-gate catch)", () => {
+  // shellSegments used to split at the `&` inside `2>&1`, tearing the push segment apart BEFORE arg
+  // parsing: `git push origin main 2>&1 develop` parsed only [main] while the shell passed git BOTH
+  // refs — `develop` bypassed the multi-ref block entirely.
+  const seg = findPushSegment("git push origin main 2>&1 develop");
+  assert.ok(seg, "one intact push segment");
+  assert.deepEqual(parsePushCommand(seg.text).refspecs, ["main", "develop"]);
+  // `&&` after a redirect still separates commands; `&>` / `>&2` / `>|` never split their segment.
+  assert.deepEqual(parsePushCommand(findPushSegment("git push origin main 2>&1 && echo ok").text).refspecs, ["main"]);
+  assert.deepEqual(parsePushCommand(findPushSegment("git push origin main &> log").text).refspecs, ["main"]);
+  assert.deepEqual(parsePushCommand(findPushSegment("git push origin main >&2").text).refspecs, ["main"]);
+  assert.deepEqual(parsePushCommand(findPushSegment("git push origin main >| out.txt").text).refspecs, ["main"]);
+  // a REAL background `&` still splits (the next command is not part of the push)
+  assert.deepEqual(parsePushCommand(findPushSegment("git push origin main & echo bg").text).refspecs, ["main"]);
 });
 
 test("A2: resolvePushRange — explicit HEAD:<dst> → <remote>/<dst>..HEAD", () => {

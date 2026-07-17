@@ -24,12 +24,21 @@ test("parseMergeSegment skips value-flag values so refs[0] is the branch, not th
   assert.deepEqual(parseMergeSegment("git merge --no-ff -m msg -s recursive staging")?.refs, ["staging"]);
 });
 
-test("parseMergeSegment stops at shell redirects/operators — `2>&1` never becomes a 2nd (octopus) ref", () => {
+test("parseMergeSegment sees the argv the SHELL passes to git (redirects lexed out, control ops end the command)", () => {
   assert.deepEqual(parseMergeSegment("git merge feature 2>&1")?.refs, ["feature"]);
   assert.deepEqual(parseMergeSegment("git merge --no-ff release 2>&1")?.refs, ["release"]);
   assert.deepEqual(parseMergeSegment("git merge feature 2>&1 | tee log")?.refs, ["feature"]);
   // a GENUINE octopus merge is still parsed with both refs
   assert.deepEqual(parseMergeSegment("git merge feature-a feature-b 2>&1")?.refs, ["feature-a", "feature-b"]);
+  // a redirect BETWEEN the octopus refs must not drop the second ref
+  assert.deepEqual(parseMergeSegment("git merge feature-a 2>/dev/null feature-b")?.refs, ["feature-a", "feature-b"]);
+  // an UNQUOTED mid-word redirect (stop-gate catch): the shell hands git the ref `feature` —
+  // keeping `feature>/dev/null` whole made rev-parse fail and the merge gate fail OPEN
+  assert.deepEqual(parseMergeSegment("git merge feature>/dev/null")?.refs, ["feature"]);
+  // a QUOTED `>` is literal — a deliberate `>`-in-ref survives intact
+  assert.deepEqual(parseMergeSegment('git merge "feature>old"')?.refs, ["feature>old"]);
+  // a heredoc delimiter is NOT a second ref (stop-gate catch: `EOF` as a ref failed open)
+  assert.deepEqual(parseMergeSegment("git merge feature << EOF")?.refs, ["feature"]);
 });
 
 test("findMergeSegment ignores --abort/--continue/--quit and non-merge git commands", () => {

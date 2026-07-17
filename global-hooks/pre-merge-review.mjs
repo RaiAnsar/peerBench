@@ -47,13 +47,12 @@ export function parseMergeSegment(text) {
   if (toks[i] !== "merge") return null;
   const rest = toks.slice(i + 1);
   if (rest.some((t) => ["--help", "-h", "--abort", "--continue", "--quit"].includes(t))) return null;
+  // Redirects and control operators are already stripped by shellTokenize (the lexer removes them
+  // exactly as the shell does — `git merge a 2>/dev/null b` → [a, b]; `feature>/dev/null` → the
+  // ref `feature`), so every remaining token is a real git argv word.
   const refs = [];
   for (let j = 0; j < rest.length; j++) {
     const t = rest[j];
-    // STOP at a shell redirect / control operator — `git merge feature 2>&1` must yield refs
-    // [feature], not [feature, "2>&1"] (the stray token would trip the octopus-merge path). Git refs
-    // never contain < > | & ; so this can't drop a real ref.
-    if (/[<>]/.test(t) || /^(\|\|?|&&?|;|\|&)$/.test(t)) break;
     if (t.startsWith("-")) { if (MERGE_VALUE_FLAGS.has(t)) j++; continue; }   // skip a value-flag's value token
     refs.push(t);
   }

@@ -67,6 +67,12 @@ export function shellSegments(command) {
     if (quote) { cur += c; if (c === quote) quote = null; continue; }
     if (c === '"' || c === "'") { quote = c; cur += c; continue; }
     if ((c === "&" && next === "&") || (c === "|" && next === "|")) { segs.push({ text: cur, joiner }); joiner = c + next; cur = ""; i++; continue; }
+    // An & or | that is part of a REDIRECT is not a command separator: `2>&1`/`>&2` (& right after >),
+    // `&>`/`&>>` (& right before >), `>|` (clobber). Splitting inside `2>&1` tore the push segment apart
+    // BEFORE arg parsing ever ran — `git push origin main 2>&1 develop` lost `develop` to the next
+    // segment and bypassed the multi-ref block (a stop-gate catch).
+    if ((c === "&" || c === "|") && cur.endsWith(">")) { cur += c; continue; }
+    if (c === "&" && next === ">") { cur += c; continue; }
     if (c === ";" || c === "|" || c === "&" || c === "\n") { segs.push({ text: cur, joiner }); joiner = c; cur = ""; continue; }
     cur += c;
   }
@@ -74,26 +80,91 @@ export function shellSegments(command) {
   return segs.map((s) => ({ text: s.text.trim(), joiner: s.joiner })).filter((s) => s.text);
 }
 
-// Tokenize a single shell segment honoring single/double quotes and STRIPPING the quote chars,
-// splitting on unquoted whitespace. `git -C "/a b/r" push` → ["git","-C","/a b/r","push"]. A
-// split(/\s+/) would break a quoted path with spaces in two, derailing the `-C` value-skip so it
-// never sees `push` (A1 — found by the bench's own hunt). Strips quotes so values are clean.
-export function shellTokenize(text) {
+// ── POSIX-style lexer ────────────────────────────────────────────────────────
+// Lex a command line into WORD and OPERATOR tokens the way a shell does, so arg parsing sees
+// exactly the argv git receives. The stop gate caught three divergences a regex classifier
+// could not close:
+//   • a redirect starts MID-WORD: `git merge feature>/dev/null` hands git the ref `feature`
+//     (`>` ends the word even without whitespace) — keeping `feature>/dev/null` whole made
+//     rev-parse fail and the merge gate fail OPEN
+//   • `2>` is one redirect (a word that is ONLY digits right before >/< is its fd number),
+//     while `foo2>bar` is the word `foo2` plus `>bar`
+//   • `<<`/`<<-` are heredocs (the delimiter word is consumed, never an arg), `<<<` a herestring
+// Quoting defeats all of it: a deliberate `git merge "feature>old"` stays one WORD (a legal ref).
+// Returns [{ text, op }]; op tokens are control operators (; & | && || |&) or redirects.
+export function lexShellTokens(text) {
   const s = String(text ?? "");
-  const toks = [];
-  let cur = "", quote = null, started = false;
+  const out = [];
+  let cur = "", started = false, quote = null, curQuoted = false;
+  const flushWord = () => { if (started) { out.push({ text: cur, op: false }); cur = ""; started = false; curQuoted = false; } };
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (quote) { if (c === quote) quote = null; else cur += c; started = true; continue; }
-    if (c === '"' || c === "'") { quote = c; started = true; continue; }
-    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
-      if (started) { toks.push(cur); cur = ""; started = false; }
+    if (quote) { if (c === quote) quote = null; else cur += c; continue; }
+    if (c === '"' || c === "'") { quote = c; started = true; curQuoted = true; continue; }
+    if (c === " " || c === "\t" || c === "\r") { flushWord(); continue; }
+    if (c === "\n" || c === ";") { flushWord(); out.push({ text: ";", op: true }); continue; }
+    if (c === "&" || c === "|") {
+      if (c === "&" && s[i + 1] === ">") {                          // &> / &>> (stdout+stderr to file)
+        flushWord();
+        let op = "&>"; i++;
+        if (s[i + 1] === ">") { op = "&>>"; i++; }
+        out.push({ text: op, op: true });
+        continue;
+      }
+      flushWord();
+      let op = c;
+      if (s[i + 1] === c) { op = c + c; i++; }                      // && ||
+      else if (c === "|" && s[i + 1] === "&") { op = "|&"; i++; }   // |&
+      out.push({ text: op, op: true });
+      continue;
+    }
+    if (c === ">" || c === "<") {
+      let fd = "";
+      if (started && !curQuoted && /^\d+$/.test(cur)) { fd = cur; cur = ""; started = false; }
+      else flushWord();
+      let op = c;
+      if (c === ">") {
+        if (s[i + 1] === ">") { op = ">>"; i++; }
+        else if (s[i + 1] === "|") { op = ">|"; i++; }
+      } else if (s[i + 1] === "<") {
+        op = "<<"; i++;
+        if (s[i + 1] === "<") { op = "<<<"; i++; }
+        else if (s[i + 1] === "-") { op = "<<-"; i++; }
+      } else if (s[i + 1] === ">") { op = "<>"; i++; }
+      if ((op === ">" || op === "<") && s[i + 1] === "&") {         // >& / <& fd duplication
+        op += "&"; i++;
+        const dup = /^(\d+|-)(?=$|[\s;|&<>])/.exec(s.slice(i + 1)); // 2>&1, >&2, 2>&- — self-contained
+        if (dup) { op += dup[1]; i += dup[1].length; }
+      }
+      out.push({ text: fd + op, op: true });
       continue;
     }
     cur += c; started = true;
   }
-  if (started) toks.push(cur);
-  return toks;
+  flushWord();
+  return out;
+}
+
+const CONTROL_OPS = new Set([";", "&", "|", "&&", "||", "|&"]);
+// A redirect consumes the NEXT word (its file/heredoc-delimiter/herestring) unless it already
+// carries an fd-duplication target (`2>&1`, `>&2`, `2>&-` — nothing follows).
+const redirectTakesWord = (op) => !/&(\d+|-)$/.test(op);
+
+// The argv WORDS of the first command in `text` — redirect operators and their target words are
+// removed exactly as the shell removes them, and the scan stops at the first control operator
+// (a NEW command starts there). Quotes are honored and stripped: `git -C "/a b/r" push` →
+// ["git","-C","/a b/r","push"] (A1 — a split(/\s+/) broke spaced paths in two). Every git-command
+// parser (push, merge, -C scanning) builds on this ONE view, so parsing can't diverge per caller.
+export function shellTokenize(text) {
+  const words = [];
+  const toks = lexShellTokens(text);
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (!t.op) { words.push(t.text); continue; }
+    if (CONTROL_OPS.has(t.text)) break;
+    if (redirectTakesWord(t.text)) i++;   // the redirect's file/delimiter word is not an arg
+  }
+  return words;
 }
 
 // True if a single segment is a real `git push` (allowing leading env assignments and git
@@ -124,14 +195,10 @@ export function parsePushCommand(text) {
     while (i < toks.length && toks[i].startsWith("-")) { const t = toks[i]; i++; if (GIT_VALUE_OPTS.has(t)) i++; }
     if (toks[i] === "push") {
       i++;
+      // Redirects and control operators are already handled by shellTokenize (the lexer strips
+      // them exactly as the shell does), so every remaining token is a real git argv word.
       for (; i < toks.length; i++) {
         const t = toks[i];
-        // STOP at a shell redirect / control operator — everything after belongs to the shell, not
-        // the push. `git push origin main 2>&1` must yield refspecs [main], NOT [main, "2>&1"]: the
-        // stray token counted as a 2nd refspec and pushed the command onto the multi-ref path (the
-        // likely real trigger of a spurious "2 refspecs" block, since agentic pushes append 2>&1).
-        // Git remotes/refspecs never contain < > | & ; so this can't drop a real arg.
-        if (/[<>]/.test(t) || /^(\|\|?|&&?|;|\|&)$/.test(t)) break;
         if (t.startsWith("-")) { flags.push(t); if (PUSH_VALUE_FLAGS.has(t)) i++; }   // skip a value-flag's separate value token
         else positionals.push(t);
       }
