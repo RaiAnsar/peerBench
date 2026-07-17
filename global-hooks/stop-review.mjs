@@ -200,7 +200,7 @@ function readInput() {
 
 function workspaceRoot(cwd) {
   try {
-    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   } catch {
     return cwd;
   }
@@ -208,7 +208,7 @@ function workspaceRoot(cwd) {
 
 function git(args, cwd) {
   try {
-    return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
   } catch {
     return "";
   }

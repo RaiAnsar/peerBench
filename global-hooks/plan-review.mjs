@@ -25,12 +25,12 @@ const HOOK_KIND = "exit-plan-mode";
 const PLAN_TARGET = "inline-plan";
 
 function workspaceRoot(cwd) {
-  try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
+  try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
   catch { return cwd; }
 }
 
 function insideGitWorkTree(cwd) {
-  try { return execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8" }).trim() === "true"; }
+  try { return execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() === "true"; }
   catch { return false; }
 }
 
