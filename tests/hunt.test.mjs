@@ -112,3 +112,28 @@ test("FIX 2: an ALLOW with no bullets stays findingCount 0 (no spurious rewake)"
   assert.equal(parsed.verdict, "ALLOW");
   assert.equal(parsed.findingCount, 0, "an ALLOW must NOT be counted as a finding");
 });
+
+test("deep spec/push panels require a schema-constrained grok verdict; hunt stays free-form", async () => {
+  const { specReviewPanel, pushReviewPanel, huntPanel } = await import("../global-hooks/hunt.mjs");
+  const { GROK_DEEP_REVIEW_SCHEMA } = await import("../global-hooks/panel-lib.mjs");
+  const seen = [];
+  const huntPanelImpl = async (opts) => { seen.push(opts.grokRequireVerdict); return []; };
+  await specReviewPanel({ cwd: "/tmp", filePath: "plans/x.md", content: "# p", huntPanelImpl });
+  await pushReviewPanel({ cwd: "/tmp", range: "a..b", content: "diff", huntPanelImpl });
+  assert.deepEqual(seen, [true, true], "spec + push panels must set grokRequireVerdict");
+
+  // huntPanel itself: grok gets the schema only when a verdict is required. Pin a grok-only
+  // roster through the test BENCH_ROOT companion.json (huntPanel reads the active config).
+  const { setReviewers } = await import("../global-hooks/config-store.mjs");
+  const priorReviewers = (() => { try { return JSON.parse(fs.readFileSync(path.join(process.env.BENCH_ROOT, "companion.json"), "utf8")).reviewers; } catch { return null; } })();
+  setReviewers(["grok"]);
+  try {
+    const grokCalls = [];
+    const grokImpl = async (opts) => { grokCalls.push(opts.jsonSchema || null); return { name: "Grok", raw: "findings" }; };
+    await huntPanel({ cwd: "/tmp", env: {}, grokImpl, seed: "s", grokRequireVerdict: true });
+    await huntPanel({ cwd: "/tmp", env: {}, grokImpl, seed: "s" });
+    assert.deepEqual(grokCalls, [GROK_DEEP_REVIEW_SCHEMA, null], "schema only on verdict-required runs");
+  } finally {
+    if (priorReviewers) setReviewers(priorReviewers);
+  }
+});

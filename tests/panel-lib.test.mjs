@@ -593,3 +593,20 @@ test("runGrokTask fail-closes when grok reports its sandbox could not be applied
   const r = await runGrokTask({ prompt: "x", cwd: dir, env: { BENCH_GROK_UNSANDBOXED: "1" }, bin: fake, platform: "linux" });
   assert.match(r.error, /sandbox could not be applied/, "an unsandboxed run must be REFUSED, not accepted");
 });
+
+test("grokStructuredDeepReview reconstitutes canonical parseable review text", async () => {
+  const { grokStructuredDeepReview } = await import("../global-hooks/panel-lib.mjs");
+  const stdout = JSON.stringify({ structuredOutput: {
+    verdict: "ALLOW", severity: "low",
+    findings: "- src/a.mjs:12 — minor naming nit\n- src/b.mjs:40 — dead import"
+  } });
+  const text = grokStructuredDeepReview(stdout);
+  assert.match(text, /^ALLOW: src\/a\.mjs:12/);
+  assert.match(text, /\nSEVERITY: low\n/);
+  assert.match(text, /- src\/b\.mjs:40/);
+  // Downstream contract: spec-review parsing extracts the verdict from the reconstituted text.
+  const { extractVerdict } = await import("../global-hooks/reviewers.mjs");
+  assert.equal(extractVerdict(text)?.verdict, "ALLOW");
+  assert.equal(grokStructuredDeepReview(JSON.stringify({ structuredOutput: { verdict: "MAYBE" } })), null);
+  assert.equal(grokStructuredDeepReview("narration.ALLOW: glued free text"), null);
+});

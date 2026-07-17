@@ -363,6 +363,42 @@ export const GROK_VERDICT_SCHEMA = JSON.stringify({
   required: ["verdict", "reason"],
 });
 
+// Schema for the DEEP REVIEW paths (push/spec): those runs need BOTH a machine-parseable verdict
+// AND the full findings prose. Free-form task output proved unreliable here — grok glues its
+// narration directly onto the verdict ("…read-only tools.ALLOW: …"), and the line-start verdict
+// parser rightly refuses mid-line matches (echoed/injected text must never fake a verdict), so a
+// correct review kept degrading to "unparseable verdict". Hunt/investigate stay schema-free.
+export const GROK_DEEP_REVIEW_SCHEMA = JSON.stringify({
+  type: "object",
+  properties: {
+    verdict: { type: "string", enum: ["ALLOW", "BLOCK"] },
+    severity: { type: "string", enum: ["none", "low", "medium", "high", "critical"] },
+    findings: { type: "string", description: "complete findings as markdown bullets (- file:line — issue); empty string when clean" }
+  },
+  required: ["verdict", "severity", "findings"],
+});
+
+const DEEP_SEVERITIES = new Set(["none", "low", "medium", "high", "critical"]);
+
+// Reconstitute the canonical review text (`VERDICT: …\nSEVERITY: …\n\n<findings>`) from a
+// --json-schema deep-review run, so the downstream text parsers (extractVerdict/parseSeverity/
+// bullet counting) work unchanged. Null on absent/malformed structuredOutput — the caller falls
+// back to the free-text output, degrading instead of breaking on a CLI shape change.
+export function grokStructuredDeepReview(stdout) {
+  try {
+    const so = JSON.parse(String(stdout ?? "").trim())?.structuredOutput;
+    if ((so?.verdict === "ALLOW" || so?.verdict === "BLOCK")
+      && DEEP_SEVERITIES.has(so?.severity)
+      && typeof so?.findings === "string") {
+      const findings = so.findings.trim();
+      const summary = (findings.split(/\r?\n/, 1)[0] || "").replace(/^[-*\s]+/, "").slice(0, 200)
+        || (so.verdict === "ALLOW" ? "no blocking findings" : "blocking findings below");
+      return `${so.verdict}: ${summary}\nSEVERITY: ${so.severity}${findings ? `\n\n${findings}` : ""}`;
+    }
+  } catch { /* not json */ }
+  return null;
+}
+
 // Seatbelt profile (last-match-wins). grok's ENTIRE writable state is redirected into the per-run
 // ephemeral tmpdir via GROK_HOME (see grokChildEnv), so this profile grants writes ONLY to that
 // tmpdir + /dev and denies everything else — ALL of ~/.grok is READ-ONLY. That closes every ~/.grok
@@ -578,8 +614,10 @@ export async function runGrokReview({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, 
   return { name: "Grok", ...v };
 }
 
-// Grok open-ended TASK → raw output (for hunt/deep gates; findings kept, no verdict parsing).
-export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home }) {
+// Grok open-ended TASK → raw output (for hunt/deep gates; findings kept). When `jsonSchema` is
+// supplied (the deep push/spec review paths), the run is schema-constrained and the canonical
+// review text is reconstituted from .structuredOutput, with free-text fallback.
+export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bin = "grok", platform, home, jsonSchema }) {
   const refusal = grokPlatformRefusal(env, platform);
   if (refusal) return { name: "Grok", error: refusal };
   const tmpDir = makeGrokTmpDir();
@@ -587,12 +625,12 @@ export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bi
   if (!tmpDir) return { name: "Grok", error: "grok sandbox tmpdir could not be created — refusing unsandboxed review" };
   const auth = grokAuthPath(env, home);
   const childEnv = grokChildEnv(env, tmpDir, home);
-  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
+  const spec = grokSpawnSpec(prompt, { bin, tmpDir, ...(jsonSchema ? { jsonSchema } : {}), ...(platform ? { platform } : {}), ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
   const r = await spawnCollect(spec.cmd, spec.args, { cwd, env: childEnv, timeoutMs }).finally(() => cleanupTmpDir(tmpDir));
   if (r.status === 127) return { name: "Grok", error: "grok CLI not found (install: curl -fsSL https://x.ai/cli/install.sh | bash)" };
   if (r.status !== 0) return { name: "Grok", error: grokFailureMessage(r, auth, platform) };
   if (grokSandboxFailedOpen(r.stderr)) return { name: "Grok", error: "grok sandbox could not be applied — refusing unsandboxed review" };
-  const raw = grokText(r.stdout);
+  const raw = (jsonSchema ? grokStructuredDeepReview(r.stdout) : null) ?? grokText(r.stdout);
   return raw ? { name: "Grok", raw } : { name: "Grok", error: "grok returned empty output" };
 }
 

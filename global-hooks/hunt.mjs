@@ -2,7 +2,7 @@ import { resolveConfig, displayName } from "./config-store.mjs";
 import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
-import { runCodexTask, runGrokTask } from "./panel-lib.mjs";
+import { runCodexTask, runGrokTask, GROK_DEEP_REVIEW_SCHEMA } from "./panel-lib.mjs";
 import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
 import { parseSeverity, stripThink } from "./deep-review.mjs";
 import fs from "node:fs";
@@ -174,7 +174,8 @@ export async function specReviewPanel({
   const results = await huntPanelImpl({
     cwd, env, deep, budgetMs,
     system: SPEC_REVIEW_SYSTEM,
-    user: buildSpecReviewUser(filePath, content)
+    user: buildSpecReviewUser(filePath, content),
+    grokRequireVerdict: true
   });
   return results.map((r) => {
     const parsed = parseSpecFindings(r.findings);
@@ -237,7 +238,8 @@ export async function pushReviewPanel({
     results = await huntPanelImpl({
       cwd, cliCwd: cliCwd || cwd, cliSnapshotError, treeish: targetCommit || null, env, deep, budgetMs,
       system: PUSH_REVIEW_SYSTEM,
-      user: buildPushReviewUser(range, content, { assistantContext })
+      user: buildPushReviewUser(range, content, { assistantContext }),
+      grokRequireVerdict: true
     });
   } finally {
     if (cliCwd) fs.rmSync(cliCwd, { recursive: true, force: true });
@@ -278,7 +280,7 @@ export function deepReviewBudgetMs(env = process.env) {
   return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_DEEP_REVIEW_BUDGET_MS;
 }
 
-export async function huntPanel({ cwd, cliCwd = cwd, cliSnapshotError = null, treeish = null, seed, env = process.env, reviewImpl, codexImpl, grokImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user }) {
+export async function huntPanel({ cwd, cliCwd = cwd, cliSnapshotError = null, treeish = null, seed, env = process.env, reviewImpl, codexImpl, grokImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user, grokRequireVerdict = false }) {
   const cfg = resolveConfig({ env });
   const userMsg = user || buildHuntUser(seed);
   const debug = !!env.BENCH_DEBUG;
@@ -300,7 +302,7 @@ export async function huntPanel({ cwd, cliCwd = cwd, cliSnapshotError = null, tr
       if (name === "grok") {
         if (cliSnapshotError) return { name: "Grok", findings: "", error: `immutable pushed-tip snapshot unavailable: ${cliSnapshotError}` };
         // Grok Build CLI — its own agentic harness explores the repo read-only (plan mode), plan-billed.
-        const r = await (grokImpl || runGrokTask)({ prompt: `${system}\n\n${userMsg}`, cwd: cliCwd, env, ...(budgetMs ? { timeoutMs: budgetMs } : {}) });
+        const r = await (grokImpl || runGrokTask)({ prompt: `${system}\n\n${userMsg}`, cwd: cliCwd, env, ...(grokRequireVerdict ? { jsonSchema: GROK_DEEP_REVIEW_SCHEMA } : {}), ...(budgetMs ? { timeoutMs: budgetMs } : {}) });
         if (debug) console.error(`[hunt grok] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
         return { name: "Grok", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
       }
