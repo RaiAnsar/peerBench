@@ -440,7 +440,17 @@ async function acquireNativePushLock(cwd, remoteName, remoteUrl, fsImpl = fs, wa
         continue;
       }
       if (Date.now() >= deadline) {
-        throw new Error(`another native push review is active for ${remoteUrl || remoteName || "this remote"}; retry after it finishes`);
+        // A LIVE holder is not a crash and not a wedge: a review deliberately survives its push
+        // command being timed-out/killed (its verdict is cached on completion), so the retry must
+        // be told exactly what is happening and that waiting resolves it — not a generic "active".
+        const busy = new Error(
+          `another native push review for ${remoteUrl || remoteName || "this remote"} is already running` +
+          `${owner?.pid ? ` (pid ${owner.pid}, ~${Math.max(1, Math.round(ageMs / 60_000))} min in)` : ""}`
+        );
+        busy.code = "BENCH_PUSH_REVIEW_IN_FLIGHT";
+        busy.ownerPid = owner?.pid ?? null;
+        busy.ageMs = ageMs;
+        throw busy;
       }
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -627,9 +637,31 @@ async function reviewNativePushLocked({
 // different ref-set scopes, so only a remote-wide transaction prevents stale ALLOW overwrites and
 // lost block-cycle increments.
 export async function reviewNativePush(options = {}) {
-  const { cwd, remoteName = "", remoteUrl = "", fsImpl = fs, nativeLockWaitMs = 5_000 } = options;
+  const { cwd, remoteName = "", remoteUrl = "", updates, env = process.env, fsImpl = fs, nativeLockWaitMs = 5_000, now = Date.now(), cacheTtlMs = DEFAULT_CACHE_TTL_MS } = options;
   if (!cwd) throw new Error("reviewNativePush: missing cwd");
-  const release = await acquireNativePushLock(cwd, remoteName, remoteUrl, fsImpl, nativeLockWaitMs);
+  let release;
+  try {
+    release = await acquireNativePushLock(cwd, remoteName, remoteUrl, fsImpl, nativeLockWaitMs);
+  } catch (error) {
+    if (error?.code !== "BENCH_PUSH_REVIEW_IN_FLIGHT") throw error;
+    // The in-flight review may have JUST finished (or an identical push was already decided) —
+    // its decision cache is readable without the lock, so a retry can complete instantly.
+    try {
+      const config = resolveConfig({ env });
+      const policy = nativePushPolicy(config, env);
+      const identity = nativePushIdentity({ remoteName, remoteUrl, updates, reviewers: config.reviewers, policy });
+      const cached = readCache(cwd, identity, { now, ttlMs: cacheTtlMs, fsImpl });
+      if (cached) return { ...cached, cached: true };
+    } catch { /* fall through to the honest in-flight report */ }
+    return {
+      decision: "unavailable",
+      kind: "review-in-flight",
+      reason:
+        `${error.message}. That review keeps working even if the push command that started it timed out, and its ` +
+        "verdict is CACHED when it finishes — wait a minute, then retry the push (give the command a 5–10 min timeout " +
+        "so the inline review can complete). BENCH_NATIVE_PUSH_BYPASS=1 git push is the explicit peerBench-only bypass."
+    };
+  }
   try {
     return await reviewNativePushLocked(options);
   } finally {

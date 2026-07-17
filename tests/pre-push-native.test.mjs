@@ -422,18 +422,20 @@ test("a live native push lease fails closed with a prompt, explicit contention e
   fs.mkdirSync(lock, { recursive: true });
   fs.writeFileSync(path.join(lock, "owner.json"), `${JSON.stringify({ pid: process.pid, nonce: "live", createdAt: Date.now() })}\n`);
   const started = Date.now();
-  await assert.rejects(
-    () => reviewNativePush({
-      cwd: ws,
-      remoteName: "origin",
-      remoteUrl,
-      updates: [update(shas[1], shas[0])],
-      env: {},
-      nativeLockWaitMs: 25,
-      runPushReviewImpl: async () => allowReview()
-    }),
-    /another native push review is active.*retry after it finishes/
-  );
+  const res = await reviewNativePush({
+    cwd: ws,
+    remoteName: "origin",
+    remoteUrl,
+    updates: [update(shas[1], shas[0])],
+    env: {},
+    nativeLockWaitMs: 25,
+    runPushReviewImpl: async () => allowReview()
+  });
+  // No longer a thrown "crash": a live concurrent review reports itself honestly as in-flight
+  // (still fail-closed at the hook — decision "unavailable" blocks the push with the real story).
+  assert.equal(res.decision, "unavailable");
+  assert.equal(res.kind, "review-in-flight");
+  assert.match(res.reason, /already running/);
   assert.ok(Date.now() - started < 500);
   fs.rmSync(lock, { recursive: true, force: true });
 });
@@ -449,18 +451,17 @@ test("an old native push lease with a LIVE owner is never reclaimed by age alone
   const old = new Date(Date.now() - 60 * 60 * 1000);
   fs.utimesSync(lock, old, old);
   let calls = 0;
-  await assert.rejects(
-    () => reviewNativePush({
-      cwd: ws,
-      remoteName: "origin",
-      remoteUrl,
-      updates: [update(shas[1], shas[0])],
-      env: {},
-      nativeLockWaitMs: 50,
-      runPushReviewImpl: async () => { calls++; return allowReview(); }
-    }),
-    /another native push review is active.*retry after it finishes/
-  );
+  const res = await reviewNativePush({
+    cwd: ws,
+    remoteName: "origin",
+    remoteUrl,
+    updates: [update(shas[1], shas[0])],
+    env: {},
+    nativeLockWaitMs: 50,
+    runPushReviewImpl: async () => { calls++; return allowReview(); }
+  });
+  assert.equal(res.decision, "unavailable");
+  assert.equal(res.kind, "review-in-flight");
   assert.equal(calls, 0, "a live owner's long multi-range review must not be evicted by the age ceiling");
   assert.equal(fs.existsSync(lock), true, "the live owner's lease survives");
   fs.rmSync(lock, { recursive: true, force: true });
@@ -842,4 +843,43 @@ test("pushPolicyDoomedByCooldowns: quorum unreachable through cooldowns fails fa
   const reason = pushPolicyDoomedByCooldowns(["grok", "kimi"], { quorum: 2, requireCodex: false }, { now: t0 + 1000 });
   assert.match(reason, /kimi: out of quota\/credits/);
   clearReviewerCooldowns();
+});
+
+test("in-flight lock: a LIVE concurrent review yields an honest 'review-in-flight' unavailable, never a crash", async () => {
+  const { reviewNativePush } = await import("../global-hooks/pre-push-lib.mjs");
+  const { workspaceStateDir } = await import("../global-hooks/config-store.mjs");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "npl-inflight-"));
+  const lockRoot = path.join(workspaceStateDir(cwd), "native-push-locks");
+  fs.mkdirSync(lockRoot, { recursive: true });
+  const crypto = await import("node:crypto");
+  const lockId = crypto.createHash("sha256").update("https://x/r.git").digest("hex");
+  const lock = path.join(lockRoot, `${lockId}.lock`);
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, nonce: "n", createdAt: Date.now() - 90_000 }));
+  const res = await reviewNativePush({ cwd, remoteName: "origin", remoteUrl: "https://x/r.git", updates: [], env: {}, nativeLockWaitMs: 50 });
+  assert.equal(res.decision, "unavailable");
+  assert.equal(res.kind, "review-in-flight");
+  assert.match(res.reason, /already running/);
+  assert.match(res.reason, /CACHED when it finishes/);
+  assert.match(res.reason, /BENCH_NATIVE_PUSH_BYPASS/);
+  fs.rmSync(lock, { recursive: true, force: true });
+});
+test("in-flight lock: a cached decision for the same push satisfies the retry instantly despite the busy lock", async () => {
+  const { reviewNativePush } = await import("../global-hooks/pre-push-lib.mjs");
+  const { workspaceStateDir } = await import("../global-hooks/config-store.mjs");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "npl-inflight-cache-"));
+  // First pass with no lock: empty update set → allow, decision cached.
+  const first = await reviewNativePush({ cwd, remoteName: "origin", remoteUrl: "https://x/r.git", updates: [], env: {} });
+  assert.equal(first.decision, "allow");
+  // Now a live concurrent holder appears; the retry must serve the cached allow, not "in-flight".
+  const lockRoot = path.join(workspaceStateDir(cwd), "native-push-locks");
+  const crypto = await import("node:crypto");
+  const lockId = crypto.createHash("sha256").update("https://x/r.git").digest("hex");
+  const lock = path.join(lockRoot, `${lockId}.lock`);
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, nonce: "n", createdAt: Date.now() }));
+  const retry = await reviewNativePush({ cwd, remoteName: "origin", remoteUrl: "https://x/r.git", updates: [], env: {}, nativeLockWaitMs: 50 });
+  assert.equal(retry.decision, "allow");
+  assert.equal(retry.cached, true);
+  fs.rmSync(lock, { recursive: true, force: true });
 });
