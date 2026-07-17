@@ -1437,7 +1437,7 @@ test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
 // ===========================================================================
 // GAP FIX: review changes COMMITTED since the last review, not just the working
 // tree. A session that commits (50 things) leaves `git diff HEAD` empty → the
-// old gate skipped and the committed work escaped review entirely (VisualSentinel).
+// old gate skipped and the committed work escaped review entirely (seen in a real client project).
 // ===========================================================================
 
 function gitC(ws, ...args) {

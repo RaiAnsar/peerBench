@@ -297,8 +297,8 @@ function snapshotIdentity(snapshot) {
 // --- reviewed-head marker (helpers live in config-store, shared with the pre-push gate) -------
 // The last HEAD this gate stop-reviewed up to. WITHOUT this, a turn that COMMITS its work leaves
 // an empty `git diff HEAD`, so the gate's no-diff early-return fires and the committed changes
-// escape review entirely — a session that commits 50 things gets ZERO review (the VisualSentinel
-// gap). With it, every change is reviewed exactly once: committed-this-session AND uncommitted.
+// escape review entirely — a session that commits 50 things gets ZERO review (the committed-work
+// gap, caught in a real client project). With it, every change is reviewed exactly once: committed-this-session AND uncommitted.
 // The pre-push gate bootstraps the marker on the first `git` command (before any commit) so even
 // committed-AND-pushed work is reviewed on the first stop (where @{upstream} has already advanced).
 //
