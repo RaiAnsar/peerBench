@@ -19,6 +19,7 @@
   },
   "scripts": {
     "setup": "node scripts/install.mjs",
+    "setup:kimi": "node scripts/install-kimi.mjs",
     "prepush:install": "node scripts/install-prepush.mjs",
     "prepush:uninstall": "node scripts/install-prepush.mjs --uninstall",
     "load-keys": "node scripts/load-keys.mjs",

@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 export const NATIVE_HOOK_MARKER = "# peerBench managed native pre-push dispatcher v1";
 export const LOCAL_HOOK_NAME = "pre-push.local";
+export const NATIVE_PUSH_DISPATCH_ARG = "--peerbench-native-push-dispatch-v1";
 
 function pathEntryExists(target, fsImpl = fs) {
   try { fsImpl.lstatSync(target); return true; }
@@ -48,20 +49,62 @@ export function resolveGitHooksDir(cwd, { gitImpl = git } = {}) {
 export function nativeHookScript(runtimePath, nodePath = process.execPath) {
   const runtime = shellQuote(path.resolve(runtimePath));
   const nodeRuntime = shellQuote(path.resolve(nodePath));
+  const dispatchArg = shellQuote(NATIVE_PUSH_DISPATCH_ARG);
   return `#!/bin/sh
 ${NATIVE_HOOK_MARKER}
 # Git gives pre-push update tuples on stdin. Spool the exact bytes once so an existing user hook
 # and peerBench receive identical input, including a truly empty stream and trailing newlines.
-# mktemp already creates the spool 0600; restore the caller's umask so chained hooks keep their own.
+# The private directory also carries Git's remote arguments in files so credential-bearing URLs do
+# not remain visible in the long-lived Node/reviewer argv. The shell receives them briefly because
+# that is Git's hook ABI; it clears them before replacing itself with a sanitized wrapper.
 prev_umask=$(umask)
 umask 077
-input_file=$(mktemp "\${TMPDIR:-/tmp}/peerbench-pre-push.XXXXXX") || {
-  echo "peerBench: could not create a secure pre-push input buffer; push blocked." >&2
+created_dispatch_dir=$(mktemp -d "\${TMPDIR:-/tmp}/peerbench-native-dispatch.XXXXXX") || {
+  umask "$prev_umask"
+  echo "peerBench: could not create a secure pre-push dispatch buffer; push blocked." >&2
   exit 1
 }
+dispatch_dir=$(
+  CDPATH= cd -P "$created_dispatch_dir" 2>/dev/null && pwd -P
+) || {
+  umask "$prev_umask"
+  rmdir "$created_dispatch_dir" 2>/dev/null || true
+  echo "peerBench: could not validate the secure pre-push dispatch buffer; push blocked." >&2
+  exit 1
+}
+if [ -L "$dispatch_dir" ] || [ ! -d "$dispatch_dir" ] || ! chmod 700 "$dispatch_dir"; then
+  umask "$prev_umask"
+  rmdir "$created_dispatch_dir" 2>/dev/null || true
+  echo "peerBench: could not secure the pre-push dispatch buffer; push blocked." >&2
+  exit 1
+fi
+input_file="$dispatch_dir/input.bin"
+remote_name_file="$dispatch_dir/remote-name.bin"
+remote_url_file="$dispatch_dir/remote-url.bin"
+dispatch_sentinel_file="$dispatch_dir/dispatch-sentinel.json"
+cleanup_dispatch() {
+  rm -f "$input_file" "$remote_name_file" "$remote_url_file" "$dispatch_sentinel_file" 2>/dev/null || true
+  rmdir "$dispatch_dir" 2>/dev/null || true
+}
+trap 'cleanup_dispatch' 0 1 2 3 15
+case "$$" in
+  ''|*[!0-9]*)
+    umask "$prev_umask"
+    echo "peerBench: could not establish a secure pre-push dispatch owner; push blocked." >&2
+    exit 1
+    ;;
+esac
+if ! (umask 077; set -C; printf '{"kind":"peerbench-native-push-dispatch","version":1,"ownerPid":%s}\\n' "$$" > "$dispatch_sentinel_file") || ! chmod 600 "$dispatch_sentinel_file"; then
+  umask "$prev_umask"
+  echo "peerBench: could not write the secure pre-push dispatch sentinel; push blocked." >&2
+  exit 1
+fi
+if ! (umask 077; set -C; cat > "$input_file") || ! chmod 600 "$input_file"; then
+  umask "$prev_umask"
+  echo "peerBench: could not write the secure pre-push input buffer; push blocked." >&2
+  exit 1
+fi
 umask "$prev_umask"
-trap 'rm -f "$input_file"' 0 1 2 3 15
-cat > "$input_file" || exit $?
 local_hook="$(dirname "$0")/${LOCAL_HOOK_NAME}"
 if [ -x "$local_hook" ]; then
   # For common shell hooks, source the renamed file in a fresh matching shell while keeping $0 as
@@ -104,7 +147,54 @@ if [ ! -f "$runtime" ]; then
   echo "peerBench: native pre-push reviewer is missing; push blocked. Run peerbench setup, use BENCH_NATIVE_PUSH_BYPASS=1 git push for a peerBench-only bypass, or use git push --no-verify to bypass every hook." >&2
   exit 1
 fi
-"$node_runtime" "$runtime" "$@" < "$input_file"
+if [ "$#" -ne 2 ]; then
+  echo "peerBench: Git supplied an invalid native pre-push argument set; push blocked." >&2
+  exit 1
+fi
+remote_name=$1
+remote_url=$2
+if ! (umask 077; set -C; printf '%s' "$remote_name" > "$remote_name_file") || ! chmod 600 "$remote_name_file"; then
+  echo "peerBench: could not secure the pre-push remote name; push blocked." >&2
+  exit 1
+fi
+if ! (umask 077; set -C; printf '%s' "$remote_url" > "$remote_url_file") || ! chmod 600 "$remote_url_file"; then
+  echo "peerBench: could not secure the pre-push remote URL; push blocked." >&2
+  exit 1
+fi
+remote_name=
+remote_url=
+set --
+
+# Replace the Git-invoked shell immediately so its original credential-bearing argv disappears.
+# The replacement shell has only sanitized arguments; it stays around to guarantee cleanup even if
+# Node cannot be executed, and Node removes the transient dispatch directory after durable handoff.
+exec /bin/sh -c '
+node_runtime=$1
+runtime=$2
+dispatch_arg=$3
+dispatch_dir=$4
+input_file="$dispatch_dir/input.bin"
+remote_name_file="$dispatch_dir/remote-name.bin"
+remote_url_file="$dispatch_dir/remote-url.bin"
+dispatch_sentinel_file="$dispatch_dir/dispatch-sentinel.json"
+cleanup_dispatch() {
+  rm -f "$input_file" "$remote_name_file" "$remote_url_file" "$dispatch_sentinel_file" 2>/dev/null || true
+  rmdir "$dispatch_dir" 2>/dev/null || true
+}
+trap "cleanup_dispatch" 0 1 2 3 15
+# New runtimes consume the private dispatch directory and deliberately ignore stdin. A runtime from
+# before the dispatch protocol instead treats argv as Git remote arguments and parses stdin; give
+# it a nonempty malformed tuple so an upgrade mismatch fails closed rather than accepting EOF as
+# "nothing to push". Keep the sentinel as a here-document so its creation cannot fail separately.
+"$node_runtime" "$runtime" "$dispatch_arg" "$dispatch_dir" <<PEERBENCH_NATIVE_DISPATCH_SENTINEL
+peerbench-native-dispatch-protocol-v1
+PEERBENCH_NATIVE_DISPATCH_SENTINEL
+status=$?
+if [ "$status" -eq 126 ] || [ "$status" -eq 127 ]; then
+  echo "peerBench: could not start the native pre-push reviewer; push blocked." >&2
+fi
+exit "$status"
+' peerbench-native-dispatch "$node_runtime" "$runtime" ${dispatchArg} "$dispatch_dir"
 `;
 }
 

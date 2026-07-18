@@ -7,6 +7,7 @@ const READ_FILE_MAX = 50_000;     // chars
 const GREP_MAX_LINES = 150;
 const GLOB_MAX = 300;
 const LIST_MAX = 300;
+export const REVIEW_TOOL_GIT_TIMEOUT_MS = 60_000;
 
 function realDir(p) { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } }
 
@@ -88,16 +89,33 @@ function gitPathspecMatcher(pattern) {
   return (file) => rx.test(file);
 }
 
-export function createReviewTools(cwd, { execImpl = spawnSync, treeish = null } = {}) {
+export function createReviewTools(cwd, {
+  execImpl = spawnSync,
+  treeish = null,
+  timeoutMs = REVIEW_TOOL_GIT_TIMEOUT_MS,
+  deadline = null,
+  nowImpl = Date.now
+} = {}) {
   if (treeish != null && !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(String(treeish))) {
     throw new Error("review treeish must be an immutable object id");
   }
-  const git = (argv, maxBuffer = 32 * 1024 * 1024) => execImpl("git", ["-c", "advice.graftFileDeprecated=false", "--no-replace-objects", ...argv], {
-    cwd,
-    encoding: "utf8",
-    maxBuffer,
-    env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_GRAFT_FILE: os.devNull }
-  });
+  const git = (argv, maxBuffer = 32 * 1024 * 1024) => {
+    const configuredTimeout = Number(timeoutMs);
+    const remaining = deadline == null ? Infinity : Number(deadline) - nowImpl();
+    if (remaining <= 0) throw new Error("review tool deadline exhausted before Git could run");
+    const effectiveTimeout = Math.max(1, Math.floor(Math.min(
+      Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : REVIEW_TOOL_GIT_TIMEOUT_MS,
+      remaining
+    )));
+    return execImpl("git", ["-c", "advice.graftFileDeprecated=false", "--no-replace-objects", ...argv], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer,
+      timeout: effectiveTimeout,
+      killSignal: "SIGKILL",
+      env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_GRAFT_FILE: os.devNull }
+    });
+  };
 
   const tools = {
     read_file({ path: p, offset, limit }) {

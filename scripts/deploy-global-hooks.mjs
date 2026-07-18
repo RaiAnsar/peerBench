@@ -1,6 +1,13 @@
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS } from "../global-hooks/spec-review-run.mjs";
+
+export const DEEP_REVIEW_HOOK_MARGIN_MS = 4 * 60 * 1000;
+export const DEEP_REVIEW_HOOK_TIMEOUT_SECONDS = Math.ceil(
+  (MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS + DEEP_REVIEW_HOOK_MARGIN_MS) / 1000
+);
 
 export function ensurePrivateBackupDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -826,11 +833,11 @@ export function syncSettings({ hooksDir, settingsPath }) {
   });
   // The deep-review runner: a SECOND matcher-less Stop entry (register appends it alongside
   // stop-review, each entry keeping its own opts). asyncRewake + exit 2 delivers a HIGH deep-review
-  // block even to an idle agent. timeout 720s = the 10-min gate budget (DEEP_REVIEW_BUDGET_MS) + ~2 min
-  // overhead, so a hung reviewer can't blow past 12 min; the block lands while it's still relevant.
-  // Runs concurrently with stop-review.
+  // block even to an idle agent. Derive the outer timeout from the exported maximum push duration
+  // (shared Git-preparation deadline + bounded panel), with four minutes for runner bookkeeping and
+  // hook shutdown. Internal deadlines still stop every call. Runs concurrently with stop-review.
   register(s.hooks.Stop, undefined, path.join(hooksDir, "deep-review-runner.mjs"), {
-    timeout: 720, asyncRewake: true,
+    timeout: DEEP_REVIEW_HOOK_TIMEOUT_SECONDS, asyncRewake: true,
     statusMessage: "⛩ bench: deep review…",
     rewakeMessage: "⛩ bench deep review found blocking issues. Address them, then continue:",
     rewakeSummary: "⛩ bench deep review"
@@ -900,10 +907,424 @@ export function syncCodexPrompts({
   return { promptsDir, copied, backedUp, states };
 }
 
-function gitOrNull(args, cwd, { timeout = 0 } = {}) {
+function pathIsWithin(root, target) {
+  const rel = path.relative(root, target);
+  return rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`));
+}
+
+// Walk a destination one component at a time and reject links before creating or traversing
+// children. The user's home and OS temp directory are trusted lexical roots (their own ancestors
+// may be platform aliases such as macOS /var -> /private/var); every component below that boundary
+// is checked with lstat. This avoids recursive mkdir/read/remove following an attacker-controlled
+// intermediate link into an unrelated tree.
+export function ensureDirectoryPathNoSymlinks(targetDir, {
+  create = false,
+  label = "directory"
+} = {}) {
+  const target = path.resolve(targetDir);
+  const candidates = [os.homedir(), os.tmpdir()]
+    .map((candidate) => path.resolve(candidate))
+    .filter((candidate) => pathIsWithin(candidate, target))
+    .sort((a, b) => b.length - a.length);
+  const trustedRoot = candidates[0] || path.parse(target).root;
+  let rootStat;
+  try { rootStat = fs.statSync(trustedRoot); } catch { rootStat = null; }
+  if (!rootStat?.isDirectory()) throw new Error(`${label} trusted root is not a directory: ${trustedRoot}`);
+
+  let cursor = trustedRoot;
+  const rel = path.relative(trustedRoot, target);
+  for (const part of rel.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    let stat = lstatOrNull(cursor);
+    if (!stat) {
+      if (!create) return false;
+      try { fs.mkdirSync(cursor, { mode: 0o755 }); }
+      catch (error) { if (error?.code !== "EEXIST") throw error; }
+      stat = lstatOrNull(cursor);
+    }
+    if (!stat?.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`${label} contains a symlink or non-directory component: ${cursor}`);
+    }
+  }
+  return true;
+}
+
+export function shellQuote(value) {
+  return `'${String(value ?? "").replaceAll("'", `'"'"'`)}'`;
+}
+
+export function kimiManagedStatePath(target) {
+  return `${target}.peerbench-state.json`;
+}
+
+export function managedContentSha256(content) {
+  const bytes = Buffer.isBuffer(content) ? content : Buffer.from(String(content ?? ""), "utf8");
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+const KIMI_MANAGED_STATE_SCHEMA = 2;
+const KIMI_SHA256_RE = /^[0-9a-f]{64}$/;
+
+function validKimiMode(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 0o777;
+}
+
+function kimiBackupPath(target) {
+  return `${target}.pre-peerbench.bak`;
+}
+
+function regularKimiFileOrNull(target, label) {
+  const stat = lstatOrNull(target);
+  if (!stat) return null;
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${label} is not a regular file: ${target}`);
+  }
+  return stat;
+}
+
+function normalizeKimiRestore(value, statePath) {
+  if (value == null) return null;
+  if (!value || typeof value !== "object"
+      || !KIMI_SHA256_RE.test(String(value.sha256 || ""))
+      || !validKimiMode(value.mode)) {
+    throw new Error(`Kimi skill managed state has invalid restore metadata: ${statePath}`);
+  }
+  return { sha256: value.sha256, mode: value.mode };
+}
+
+function normalizeKimiPending(value, managedSha256, managedMode, statePath) {
+  if (value == null) return null;
+  if (!value || typeof value !== "object" || typeof value.previousExists !== "boolean"
+      || typeof value.contentBase64 !== "string") {
+    throw new Error(`Kimi skill managed state has invalid pending transaction metadata: ${statePath}`);
+  }
+  const previousSha256 = value.previousSha256 == null ? null : String(value.previousSha256);
+  const previousMode = value.previousMode == null ? null : value.previousMode;
+  if (value.previousExists
+      ? (!KIMI_SHA256_RE.test(previousSha256 || "") || !validKimiMode(previousMode))
+      : (previousSha256 !== null || previousMode !== null)) {
+    throw new Error(`Kimi skill managed state has invalid pending predecessor metadata: ${statePath}`);
+  }
+  const content = Buffer.from(value.contentBase64, "base64");
+  if (content.toString("base64") !== value.contentBase64
+      || managedContentSha256(content) !== managedSha256
+      || !validKimiMode(managedMode)) {
+    throw new Error(`Kimi skill managed state has corrupt pending content: ${statePath}`);
+  }
+  return {
+    previousExists: value.previousExists,
+    previousSha256,
+    previousMode,
+    contentBase64: value.contentBase64
+  };
+}
+
+function committedKimiState(state) {
+  return {
+    schema: KIMI_MANAGED_STATE_SCHEMA,
+    managedSha256: state.managedSha256,
+    managedMode: state.managedMode,
+    restore: state.restore || null
+  };
+}
+
+function writeKimiManagedState(target, state) {
+  const statePath = kimiManagedStatePath(target);
+  atomicWriteFile(statePath, `${JSON.stringify(state, null, 2)}\n`, {
+    mode: 0o600,
+    rejectSymlink: true,
+    label: "Kimi skill managed state"
+  });
+  return statePath;
+}
+
+function validateKimiBackup(target, restore, { createFromTarget = false } = {}) {
+  const backup = kimiBackupPath(target);
+  let backupStat = regularKimiFileOrNull(backup, "Kimi skill backup");
+  if (!restore) {
+    if (backupStat) {
+      throw new Error(`refusing to manage Kimi skill with an unexpected backup: ${backup}`);
+    }
+    return null;
+  }
+  if (!backupStat && createFromTarget) {
+    const targetStat = regularKimiFileOrNull(target, "Kimi skill target");
+    if (!targetStat || managedContentSha256(fs.readFileSync(target)) !== restore.sha256) {
+      throw new Error(`cannot create the Kimi skill backup because the predecessor changed: ${target}`);
+    }
+    atomicCopyFile(target, backup, { mode: restore.mode });
+    backupStat = regularKimiFileOrNull(backup, "Kimi skill backup");
+  }
+  if (!backupStat) throw new Error(`Kimi skill recovery backup is missing: ${backup}`);
+  if (managedContentSha256(fs.readFileSync(backup)) !== restore.sha256) {
+    throw new Error(`Kimi skill recovery backup no longer matches managed state: ${backup}`);
+  }
+  return backupStat;
+}
+
+export function recoverKimiManagedTransaction(target, state) {
+  if (!state?.pending) return state;
+  const targetStat = regularKimiFileOrNull(target, "Kimi skill target");
+  const currentSha256 = targetStat ? managedContentSha256(fs.readFileSync(target)) : null;
+  const currentMode = targetStat ? targetStat.mode & 0o777 : null;
+  const alreadyInstalled = Boolean(targetStat)
+    && currentSha256 === state.managedSha256
+    && currentMode === state.managedMode;
+  const stillAtPredecessor = state.pending.previousExists
+    ? Boolean(targetStat)
+      && currentSha256 === state.pending.previousSha256
+      && currentMode === state.pending.previousMode
+    : !targetStat;
+  if (!alreadyInstalled && !stillAtPredecessor) {
+    throw new Error(`refusing to recover interrupted Kimi install because the target changed: ${target}`);
+  }
+
+  if (stillAtPredecessor) {
+    validateKimiBackup(target, state.restore, { createFromTarget: Boolean(state.restore) });
+    const content = Buffer.from(state.pending.contentBase64, "base64");
+    atomicWriteFile(target, content, {
+      mode: state.managedMode,
+      rejectSymlink: true,
+      label: "Kimi skill"
+    });
+  } else {
+    // The process died after replacing the target but before committing the sidecar. Our write order
+    // guarantees a required backup was completed first, so missing/drifted recovery data is unsafe.
+    validateKimiBackup(target, state.restore);
+  }
+
+  const installed = regularKimiFileOrNull(target, "Kimi skill target");
+  if (!installed
+      || managedContentSha256(fs.readFileSync(target)) !== state.managedSha256
+      || (installed.mode & 0o777) !== state.managedMode) {
+    throw new Error(`Kimi skill transaction did not install the intended bytes: ${target}`);
+  }
+  const committed = committedKimiState(state);
+  const statePath = writeKimiManagedState(target, committed);
+  return { ...committed, statePath };
+}
+
+export function readKimiManagedState(target, { required = false, recoverPending = true } = {}) {
+  const statePath = kimiManagedStatePath(target);
+  const stat = lstatOrNull(statePath);
+  if (!stat) {
+    if (required) throw new Error(`Kimi skill managed state is missing: ${statePath}`);
+    return null;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Kimi skill managed state is not a regular file: ${statePath}`);
+  }
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(statePath, "utf8")); }
+  catch (error) { throw new Error(`Kimi skill managed state is invalid at ${statePath}: ${error?.message || error}`); }
+  if (parsed?.schema === 1 && KIMI_SHA256_RE.test(String(parsed?.managedSha256 || ""))) {
+    // Schema 1 was briefly shipped during development. Its sidecar is still valid ownership proof;
+    // the next successful sync upgrades it to v2 and records backup provenance explicitly.
+    return { schema: 1, managedSha256: parsed.managedSha256, managedMode: null, restore: null, pending: null, statePath };
+  }
+  if (parsed?.schema !== KIMI_MANAGED_STATE_SCHEMA
+      || !KIMI_SHA256_RE.test(String(parsed?.managedSha256 || ""))
+      || !validKimiMode(parsed?.managedMode)) {
+    throw new Error(`Kimi skill managed state has an unsupported shape: ${statePath}`);
+  }
+  const state = {
+    schema: KIMI_MANAGED_STATE_SCHEMA,
+    managedSha256: parsed.managedSha256,
+    managedMode: parsed.managedMode,
+    restore: normalizeKimiRestore(parsed.restore, statePath),
+    pending: normalizeKimiPending(parsed.pending, parsed.managedSha256, parsed.managedMode, statePath),
+    statePath
+  };
+  return state.pending && recoverPending ? recoverKimiManagedTransaction(target, state) : state;
+}
+
+export function renderKimiSkillSource(raw) {
+  const source = String(raw ?? "");
+  if (source.includes("{{BENCH_RUNNER")) {
+    throw new Error("Kimi SKILL.md must not interpolate the checkout path; use the sibling launcher");
+  }
+  return source;
+}
+
+export function renderKimiSourceFile(raw, rel, benchRunnerPath) {
+  const source = String(raw ?? "");
+  if (path.basename(rel) === "SKILL.md") return renderKimiSkillSource(source);
+  if (rel.endsWith(".sh")) {
+    if (source.includes("{{BENCH_RUNNER}}")) {
+      throw new Error("unsafe legacy {{BENCH_RUNNER}} placeholder in Kimi launcher; use {{BENCH_RUNNER_SHELL}}");
+    }
+    return source.replaceAll("{{BENCH_RUNNER_SHELL}}", shellQuote(benchRunnerPath));
+  }
+  if (source.includes("{{BENCH_RUNNER")) {
+    throw new Error(`checkout-path placeholder is only allowed in a Kimi launcher script: ${rel}`);
+  }
+  return source;
+}
+
+export function assertSafeKimiInstalledSkillPath(skillDir) {
+  const resolved = path.resolve(skillDir);
+  // Kimi expands ${KIMI_SKILL_DIR} inside SKILL.md before the shell parses the command. Double
+  // quotes protect ordinary spaces/unicode, but these bytes can terminate or re-enter shell/Kimi
+  // expansion, and backticks also break the Markdown code span. Refuse instead of emitting a
+  // command whose meaning depends on undocumented expansion order.
+  if (/[\u0000-\u001f\u007f"$`\\]/u.test(resolved)) {
+    throw new Error(`Kimi skill install path is unsafe for \${KIMI_SKILL_DIR} substitution: ${resolved}`);
+  }
+  return resolved;
+}
+
+function kimiSourceFiles(srcDir) {
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const from = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(from);
+      else if (entry.isFile()) files.push({ from, rel: path.relative(srcDir, from) });
+    }
+  };
+  walk(srcDir);
+  // Install launchers/assets before SKILL.md so a mid-tree interruption cannot publish instructions
+  // that point at a launcher which has not been installed yet.
+  return files.sort((a, b) => {
+    const aSkill = path.basename(a.rel) === "SKILL.md" ? 1 : 0;
+    const bSkill = path.basename(b.rel) === "SKILL.md" ? 1 : 0;
+    return aSkill - bSkill || a.rel.localeCompare(b.rel);
+  });
+}
+
+function kimiManagedMode(rel) {
+  return rel.endsWith(".sh") ? 0o755 : 0o644;
+}
+
+function beginKimiManagedTransaction(target, content, mode, managedState) {
+  const targetStat = regularKimiFileOrNull(target, "Kimi skill target");
+  const backup = kimiBackupPath(target);
+  const backupStat = regularKimiFileOrNull(backup, "Kimi skill backup");
+  const previousSha256 = targetStat ? managedContentSha256(fs.readFileSync(target)) : null;
+  let restore = null;
+
+  if (managedState) {
+    if (!targetStat) {
+      throw new Error(`refusing to install Kimi skill with managed state but no target: ${managedState.statePath}`);
+    }
+    if (previousSha256 !== managedState.managedSha256) {
+      throw new Error(`refusing to replace user-edited Kimi skill whose managed hash no longer matches: ${target}`);
+    }
+    if (managedState.schema === KIMI_MANAGED_STATE_SCHEMA) {
+      restore = managedState.restore;
+      validateKimiBackup(target, restore);
+    } else if (backupStat) {
+      // Safe schema-1 migration: the sidecar proves target ownership and the existing regular backup
+      // becomes explicit v2 restore metadata before any further mutation.
+      restore = {
+        sha256: managedContentSha256(fs.readFileSync(backup)),
+        mode: backupStat.mode & 0o777
+      };
+    }
+  } else {
+    // No sidecar means no ownership, even when bytes or a marker happen to match our template.
+    // Preserve every pre-existing target and never infer that uninstall may delete it.
+    if (backupStat) {
+      throw new Error(`refusing to replace Kimi skill while its backup already exists: ${backup}`);
+    }
+    if (targetStat) {
+      restore = { sha256: previousSha256, mode: targetStat.mode & 0o777 };
+    }
+  }
+
+  const desired = Buffer.isBuffer(content) ? content : Buffer.from(String(content), "utf8");
+  const pendingState = {
+    schema: KIMI_MANAGED_STATE_SCHEMA,
+    managedSha256: managedContentSha256(desired),
+    managedMode: mode,
+    restore,
+    pending: {
+      previousExists: Boolean(targetStat),
+      previousSha256,
+      previousMode: targetStat ? targetStat.mode & 0o777 : null,
+      contentBase64: desired.toString("base64")
+    }
+  };
+  writeKimiManagedState(target, pendingState);
+  return recoverKimiManagedTransaction(target, {
+    ...pendingState,
+    statePath: kimiManagedStatePath(target)
+  });
+}
+
+// Kimi Code CLI user-level skills ($KIMI_CODE_HOME/skills, default ~/.kimi-code/skills).
+// The source is a skill TREE (kimi/skills/<name>/SKILL.md + sibling launcher), so relative paths are
+// preserved. SKILL.md remains checkout-independent; only the shell launcher receives a POSIX-quoted
+// runner path. A schema-v2 sidecar is the sole ownership proof and makes target/state replacement
+// recoverable when the process dies between the two atomic renames.
+export function syncKimiSkill({
+  srcDir,
+  skillsDir = path.join(os.homedir(), ".kimi-code", "skills"),
+  benchRunnerPath
+}) {
+  if (!benchRunnerPath) throw new Error("syncKimiSkill requires benchRunnerPath");
+  const srcStat = lstatOrNull(srcDir);
+  if (!srcStat?.isDirectory() || srcStat.isSymbolicLink()) {
+    throw new Error(`Kimi skill source is not a regular directory: ${srcDir}`);
+  }
+  ensureDirectoryPathNoSymlinks(skillsDir, { create: true, label: "Kimi skills destination" });
+  const copied = [], backedUp = [], states = [];
+  const ensureDestinationParent = (targetDir) => {
+    const root = path.resolve(skillsDir);
+    const target = path.resolve(targetDir);
+    const rel = path.relative(root, target);
+    if (path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`)) {
+      throw new Error(`Kimi skill path escapes the skills destination: ${target}`);
+    }
+    try { ensureDirectoryPathNoSymlinks(target, { create: true, label: "Kimi skill path" }); }
+    catch (error) {
+      throw new Error(`refusing to install through non-directory Kimi skill path: ${error?.message || error}`);
+    }
+  };
+  const sources = kimiSourceFiles(srcDir).map(({ from, rel }) => {
+    const to = path.join(skillsDir, rel);
+    if (path.basename(rel) === "SKILL.md") assertSafeKimiInstalledSkillPath(path.dirname(to));
+    return {
+      from,
+      rel,
+      to,
+      rendered: renderKimiSourceFile(fs.readFileSync(from, "utf8"), rel, benchRunnerPath),
+      mode: kimiManagedMode(rel)
+    };
+  });
+  for (const { rel, to, rendered, mode } of sources) {
+    ensureDestinationParent(path.dirname(to));
+    const targetStat = lstatOrNull(to);
+    if (targetStat?.isSymbolicLink()) {
+      throw new Error(`refusing to replace symlinked Kimi skill target: ${to}`);
+    }
+    if (targetStat && !targetStat.isFile()) {
+      throw new Error(`refusing to replace non-file Kimi skill target: ${to}`);
+    }
+    const managedState = readKimiManagedState(to);
+    const hadUnmanagedTarget = Boolean(targetStat) && !managedState;
+    beginKimiManagedTransaction(to, rendered, mode, managedState);
+    if (hadUnmanagedTarget) backedUp.push(rel);
+    copied.push(rel);
+    const statePath = kimiManagedStatePath(to);
+    states.push({ name: rel, state: capturePathState(to), managedState: capturePathState(statePath) });
+  }
+  return { skillsDir, copied, backedUp, states };
+}
+
+const INSTALLER_SYNC_GIT_TIMEOUT_MS = 30_000;
+
+function gitOrNull(args, cwd, { timeout = INSTALLER_SYNC_GIT_TIMEOUT_MS } = {}) {
+  const boundedTimeout = Number.isFinite(Number(timeout)) && Number(timeout) > 0
+    ? Math.max(1, Math.ceil(Number(timeout)))
+    : INSTALLER_SYNC_GIT_TIMEOUT_MS;
   try {
     return execFileSync("git", args, {
-      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], ...(timeout > 0 ? { timeout } : {})
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: boundedTimeout,
+      killSignal: "SIGKILL"
     }).trim();
   }
   catch { return null; }
@@ -935,11 +1356,29 @@ export function compareLocalWithOrigin({ cwd, remote = "origin", branch, lsRemot
   };
 }
 
+export function isDeployEntrypoint(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  try {
+    return fs.realpathSync.native(fileURLToPath(metaUrl)) === fs.realpathSync.native(argv1);
+  } catch {
+    return path.resolve(fileURLToPath(metaUrl)) === path.resolve(argv1);
+  }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
+  runDeployEntrypoint();
+} else if (isDeployEntrypoint(import.meta.url)) {
+  runDeployEntrypoint();
+}
+
+function runDeployEntrypoint() {
   // Keep the legacy entrypoint, but route it through the same all-or-nothing transaction as the
   // supported installer. Use a child process rather than a top-level dynamic import: install.mjs
   // statically imports this module, so awaiting that cycle can deadlock module evaluation.
-  const installScript = path.join(path.dirname(process.argv[1]), "install.mjs");
+  // Resolve from this module's real location, not raw argv: direct invocation through a symlink or
+  // a path containing spaces/URL characters must still find the sibling transactional installer.
+  const modulePath = fs.realpathSync.native(fileURLToPath(import.meta.url));
+  const installScript = path.join(path.dirname(modulePath), "install.mjs");
   const child = spawnSync(process.execPath, [installScript, ...process.argv.slice(2)], {
     stdio: "inherit",
     env: process.env

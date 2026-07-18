@@ -7,13 +7,23 @@ process.env.BENCH_ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpd
 
 import {
   runMain, WAKE_WINDOW_MS, MAX_BATCH, MAX_REVIEW_ATTEMPTS, MAX_BLOCK_WAKES,
-  MAX_RUNNER_FOLLOWUP_WAKES, RUNNER_FOLLOWUP_WINDOW_MS
+  MAX_RUNNER_FOLLOWUP_WAKES, RUNNER_FOLLOWUP_WINDOW_MS,
+  RUNNER_BUDGET_MS, RUNNER_BUDGET_MARGIN_MS
 } from "../global-hooks/deep-review-runner.mjs";
+import { MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS } from "../global-hooks/spec-review-run.mjs";
 import { enqueue, listJobs, listBlocked, markBlocked } from "../global-hooks/deep-queue.mjs";
 import { deepKey } from "../global-hooks/deep-review.mjs";
 import { normalizeSessionId, workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 function freshWs() { return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "drr-ws-"))); }
+
+test("runner budget derives from the maximum push duration with explicit margin", () => {
+  assert.equal(
+    RUNNER_BUDGET_MS,
+    MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS + RUNNER_BUDGET_MARGIN_MS
+  );
+  assert.ok(RUNNER_BUDGET_MARGIN_MS >= 30_000);
+});
 
 async function runRunner(ws, overrides = {}) {
   let exit = null; const errs = []; const outs = [];

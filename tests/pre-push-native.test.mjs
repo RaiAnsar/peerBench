@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +12,13 @@ import {
   resolveNativeUpdateRange,
   reviewNativePush
 } from "../global-hooks/pre-push-lib.mjs";
-import { runMain as runNativeHook } from "../global-hooks/git-pre-push-review.mjs";
+import {
+  createNativePushJob,
+  runDispatchMain,
+  runDetachedMain,
+  runMain as runNativeHook,
+  runNativePushWorker
+} from "../global-hooks/git-pre-push-review.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 
 function run(cmd, args, cwd) {
@@ -40,6 +46,16 @@ function history(count = 5) {
 
 function update(localSha, remoteSha, localRef = "refs/heads/main", remoteRef = "refs/heads/main") {
   return { localRef, localSha, remoteRef, remoteSha };
+}
+
+async function waitFor(check, { timeoutMs = 5_000, intervalMs = 20, label = "condition" } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 const allowReview = () => ({
@@ -78,6 +94,16 @@ test("exact existing update uses Git's remote/local object ids; deletions skip",
   assert.equal(resolved.range, `${shas[0]}..${shas[1]}`);
   const deleted = resolveNativeUpdateRange(ws, "origin", update("0".repeat(40), shas[0], "(delete)", "refs/heads/old"));
   assert.equal(deleted.skip, true);
+});
+
+test("unavailable remote-base guidance never echoes a credential-bearing direct-URL remote name", () => {
+  const { ws, shas } = history(1);
+  const remoteName = "https://user:remote-name-secret@example.invalid/private.git";
+  const missingRemoteSha = "f".repeat(shas[0].length);
+  const resolved = resolveNativeUpdateRange(ws, remoteName, update(shas[0], missingRemoteSha));
+  assert.equal(resolved.ok, false);
+  assert.match(resolved.reason, /fetch the remote and retry/);
+  assert.doesNotMatch(resolved.reason, /remote-name-secret|example\.invalid/);
 });
 
 test("new refs ask the repository for its object-format-specific empty tree", () => {
@@ -204,6 +230,25 @@ test("strict evaluation requires quorum and a Codex verdict whenever Codex is co
     { name: "Grok", verdict: "ALLOW", error: null, severity: "none" }
   ] };
   assert.equal(evaluatePushReview(withCodex, ["codex", "grok"], {}).decision, "allow");
+});
+
+test("partial reviewer coverage never counts toward quorum, while its concrete BLOCK still wins", () => {
+  const review = {
+    reviewers: [
+      { name: "Codex", verdict: "ALLOW", error: null, severity: "none" },
+      { name: "Kimi", verdict: "ALLOW", error: null, severity: "none" },
+      { name: "Grok", verdict: "BLOCK", error: null, severity: "high", coverageComplete: false, coverageError: "chunk 3/4 timed out" }
+    ],
+    findingCount: 1,
+    maxSeverity: "high",
+    findings: "[Grok]\nBLOCK: concrete late-chunk bug",
+    summary: "verified bug"
+  };
+  const evaluated = evaluatePushReview(review, ["codex", "grok", "kimi"], {});
+  assert.equal(evaluated.decision, "block");
+  assert.equal(evaluated.incomplete, true, "a partial BLOCK must not be treated as a cacheable complete panel");
+  assert.match(evaluated.unavailableReason, /blocking reviewer coverage incomplete/i);
+  assert.match(evaluated.failedReviewers.join("\n"), /chunk 3\/4 timed out/);
 });
 
 test("quorum counts unique configured reviewers only", () => {
@@ -562,6 +607,59 @@ test("a blocker cannot hide an unavailable reviewer in the same panel", async ()
   assert.equal(calls, 2);
 });
 
+test("a partial chunk BLOCK is surfaced but never cached even when two other reviewers meet quorum", async () => {
+  const { ws, shas, root } = history(2);
+  fs.writeFileSync(path.join(root, "companion.json"), `${JSON.stringify({ reviewers: ["codex", "grok", "kimi"] })}\n`);
+  process.env.BENCH_ROOT = root;
+  let calls = 0;
+  const partialBlock = {
+    reviewers: [
+      { name: "Codex", verdict: "ALLOW", error: null, severity: "none" },
+      { name: "Kimi", verdict: "ALLOW", error: null, severity: "none" },
+      { name: "Grok", verdict: "BLOCK", error: null, severity: "high", coverageComplete: false, coverageError: "chunk 2/3: timeout" }
+    ],
+    findingCount: 1,
+    maxSeverity: "high",
+    summary: "partial reviewer found a concrete bug",
+    findings: "[Grok]\nBLOCK: concrete bug",
+    badge: "Codex✓ Grok✗ Kimi✓"
+  };
+  const completeAllow = {
+    reviewers: [
+      { name: "Codex", verdict: "ALLOW", error: null, severity: "none" },
+      { name: "Grok", verdict: "ALLOW", error: null, severity: "none" },
+      { name: "Kimi", verdict: "ALLOW", error: null, severity: "none" }
+    ],
+    findingCount: 0,
+    maxSeverity: "none",
+    summary: "all complete",
+    badge: "Codex✓ Grok✓ Kimi✓"
+  };
+  const common = {
+    cwd: ws,
+    remoteName: "partial-block",
+    remoteUrl: "file:///partial-block",
+    updates: [update(shas[1], shas[0])],
+    env: {}
+  };
+  const first = await reviewNativePush({
+    ...common,
+    now: 21_000,
+    runPushReviewImpl: async () => { calls++; return partialBlock; }
+  });
+  assert.equal(first.decision, "block");
+  assert.equal(first.partialUnavailable, true);
+
+  const second = await reviewNativePush({
+    ...common,
+    now: 21_001,
+    runPushReviewImpl: async () => { calls++; return completeAllow; }
+  });
+  assert.equal(second.decision, "allow");
+  assert.equal(second.cached, undefined);
+  assert.equal(calls, 2, "the incomplete BLOCK was not written to the exact-range cache");
+});
+
 test("identical multi-ref ranges run once and unchanged completed ranges survive a sibling change", async () => {
   const { ws, shas, root } = history(4);
   process.env.BENCH_ROOT = root;
@@ -820,6 +918,334 @@ test("native hook suppresses Codex self-review for a direct Codex push", async (
   assert.equal(seenEnv.CODEX_THREAD_ID, "thread-123");
 });
 
+test("actual native hook replays a quick detached worker result", () => {
+  const { ws, shas, root } = history(1);
+  const zero = "0".repeat(shas[0].length);
+  const tuple = `(delete) ${zero} refs/heads/old ${shas[0]}\n`;
+  const hook = path.resolve("global-hooks/git-pre-push-review.mjs");
+  const result = spawnSync(process.execPath, [hook, "origin", "file:///quick-detached-review"], {
+    cwd: ws,
+    input: tuple,
+    encoding: "utf8",
+    timeout: 10_000,
+    env: { ...process.env, BENCH_ROOT: root, BENCH_NATIVE_PUSH_BYPASS: "", BENCH_SUPPRESS_HOOKS: "" }
+  });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.match(result.stderr, /native pre-push: ALLOW/);
+});
+
+test("bounded foreground fails closed while its detached review continues", async () => {
+  const { ws, shas, root } = history(1);
+  const zero = "0".repeat(shas[0].length);
+  const tuple = `(delete) ${zero} refs/heads/old ${shas[0]}\n`;
+  let code = null;
+  let output = "";
+  let job = null;
+  await runDetachedMain({
+    cwd: ws,
+    remoteName: "origin",
+    remoteUrl: "file:///bounded-background-review",
+    input: tuple,
+    env: { ...process.env, BENCH_ROOT: root },
+    pollTimeoutMs: 10,
+    pollIntervalMs: 5,
+    workerDelayMs: 200,
+    isBenchDisabledImpl: () => false,
+    onSpawn: ({ runDir, pid }) => { job = { runDir, pid }; },
+    stderr: (message) => { output += message; },
+    exit: (value) => { code = value; }
+  });
+  assert.equal(code, 1);
+  assert.match(output, /review continues in background/);
+  assert.match(output, /Retry the same push/);
+  assert.ok(job?.pid > 0);
+  const persisted = await waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(path.join(job.runDir, "result.json"), "utf8")); }
+    catch { return null; }
+  }, { label: "background worker result" });
+  assert.equal(persisted.code, 0);
+  assert.match(persisted.stderr, /native pre-push: ALLOW/);
+  assert.equal(fs.existsSync(path.join(job.runDir, "request.json")), false, "worker removes credential-bearing request after reading it");
+  assert.equal(fs.existsSync(path.join(job.runDir, "input.bin")), false, "worker removes copied Git tuples after reading them");
+  assert.equal(fs.statSync(path.join(job.runDir, "job-sentinel.json")).mode & 0o777, 0o600);
+  fs.rmSync(job.runDir, { recursive: true, force: true });
+});
+
+test("detached worker argv never contains the credential-bearing remote or Git tuples", async (t) => {
+  const { ws, shas, root } = history(1);
+  const zero = "0".repeat(shas[0].length);
+  const tuple = `(delete) ${zero} refs/heads/old ${shas[0]}\n`;
+  const remoteUrl = "https://alice:super-secret-token@example.invalid/private.git";
+  let spawned = null;
+  let runDir = null;
+  t.after(() => { if (runDir) fs.rmSync(runDir, { recursive: true, force: true }); });
+  await runDetachedMain({
+    cwd: ws,
+    remoteName: "origin",
+    remoteUrl,
+    input: tuple,
+    env: { ...process.env, BENCH_ROOT: root },
+    pollTimeoutMs: 0,
+    isBenchDisabledImpl: () => false,
+    spawnImpl: (command, args, options) => {
+      spawned = { command, args, options };
+      return { pid: 424_242, unref() {} };
+    },
+    onSpawn: (job) => { runDir = job.runDir; },
+    stderr: () => {},
+    exit: () => {}
+  });
+  assert.ok(spawned);
+  assert.equal(spawned.command, process.execPath);
+  assert.equal(spawned.options.detached, true);
+  assert.deepEqual(spawned.options.stdio, ["ignore", "ignore", "ignore"]);
+  assert.equal(spawned.args.some((value) => String(value).includes(remoteUrl)), false);
+  assert.equal(spawned.args.some((value) => String(value).includes("super-secret-token")), false);
+  assert.equal(spawned.args.some((value) => String(value).includes(shas[0])), false);
+
+  const requestPath = path.join(runDir, "request.json");
+  const inputPath = path.join(runDir, "input.bin");
+  const request = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+  assert.equal(request.remoteUrl, remoteUrl);
+  assert.equal(fs.readFileSync(inputPath, "utf8"), tuple);
+  assert.equal(fs.statSync(runDir).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(requestPath).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(inputPath).mode & 0o777, 0o600);
+});
+
+test("private shell dispatch spool is consumed without restoring the remote URL to argv", async (t) => {
+  const { ws, shas, root } = history(1);
+  const zero = "0".repeat(shas[0].length);
+  const tuple = `(delete) ${zero} refs/heads/old ${shas[0]}\n`;
+  const remoteUrl = "https://bob:dispatch-secret@example.invalid/private.git";
+  const dispatchDir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), "peerbench-native-dispatch."));
+  fs.chmodSync(dispatchDir, 0o700);
+  fs.writeFileSync(path.join(dispatchDir, "dispatch-sentinel.json"), `${JSON.stringify({
+    kind: "peerbench-native-push-dispatch",
+    version: 1,
+    ownerPid: process.pid
+  })}\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(dispatchDir, "remote-name.bin"), "origin", { mode: 0o600 });
+  fs.writeFileSync(path.join(dispatchDir, "remote-url.bin"), remoteUrl, { mode: 0o600 });
+  fs.writeFileSync(path.join(dispatchDir, "input.bin"), tuple, { mode: 0o600 });
+  let workerJob = null;
+  let workerArgs = null;
+  t.after(() => {
+    fs.rmSync(dispatchDir, { recursive: true, force: true });
+    if (workerJob?.runDir) fs.rmSync(workerJob.runDir, { recursive: true, force: true });
+  });
+  await runDispatchMain(dispatchDir, {
+    cwd: ws,
+    env: { ...process.env, BENCH_ROOT: root },
+    pollTimeoutMs: 0,
+    isBenchDisabledImpl: () => false,
+    spawnImpl: (_command, args) => {
+      workerArgs = args;
+      return { pid: 313_131, unref() {} };
+    },
+    onSpawn: (job) => { workerJob = job; },
+    stderr: () => {},
+    exit: () => {}
+  });
+  assert.equal(fs.existsSync(dispatchDir), false, "transient dispatcher spool is removed after durable handoff");
+  assert.ok(workerJob?.runDir);
+  assert.equal(workerArgs.some((value) => String(value).includes("dispatch-secret")), false);
+  const durableRequest = JSON.parse(fs.readFileSync(path.join(workerJob.runDir, "request.json"), "utf8"));
+  assert.equal(durableRequest.remoteUrl, remoteUrl);
+  assert.equal(fs.readFileSync(path.join(workerJob.runDir, "input.bin"), "utf8"), tuple);
+});
+
+test("dispatch cleanup preserves unrelated/live spools and reclaims valid dead-owner spools", async (t) => {
+  const tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-dispatch-cleanup-root-")));
+  fs.chmodSync(tempRoot, 0o700);
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+  const makeDispatch = (suffix, ownerPid) => {
+    const dir = path.join(tempRoot, `peerbench-native-dispatch.${suffix}`);
+    fs.mkdirSync(dir, { mode: 0o700 });
+    fs.writeFileSync(path.join(dir, "dispatch-sentinel.json"), `${JSON.stringify({
+      kind: "peerbench-native-push-dispatch",
+      version: 1,
+      ownerPid
+    })}\n`, { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, "remote-name.bin"), "origin", { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, "remote-url.bin"), "https://user:credential@example.invalid/repo", { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, "input.bin"), "", { mode: 0o600 });
+    return dir;
+  };
+
+  const unrelated = path.join(tempRoot, "peerbench-native-dispatch.unrelated");
+  fs.mkdirSync(unrelated, { mode: 0o700 });
+  fs.writeFileSync(path.join(unrelated, "do-not-touch"), "unrelated\n", { mode: 0o600 });
+  fs.utimesSync(unrelated, old, old);
+  const live = makeDispatch("live", process.pid);
+  fs.utimesSync(live, old, old);
+  const dead = makeDispatch("dead", 999_999_999);
+  const current = makeDispatch("current", process.pid);
+
+  await runDispatchMain(current, {
+    cwd: process.cwd(),
+    tempDir: tempRoot,
+    env: process.env,
+    pollTimeoutMs: 0,
+    isBenchDisabledImpl: () => false,
+    spawnImpl: () => ({ pid: 212_121, unref() {} }),
+    stderr: () => {},
+    exit: () => {}
+  });
+  assert.equal(fs.existsSync(unrelated), true, "an unrelated old prefix directory is preserved");
+  assert.equal(fs.existsSync(live), true, "a valid old spool with a live owner is preserved regardless of age");
+  assert.equal(fs.existsSync(dead), false, "a valid old spool with a dead owner is reclaimed with its credential file");
+});
+
+test("detached entry preserves the peerBench-only bypass without spawning a worker", async () => {
+  let code = null;
+  let spawned = false;
+  await runDetachedMain({
+    env: { ...process.env, BENCH_NATIVE_PUSH_BYPASS: "1" },
+    spawnImpl: () => { spawned = true; throw new Error("must not spawn"); },
+    stderr: () => {},
+    exit: (value) => { code = value; }
+  });
+  assert.equal(code, 0);
+  assert.equal(spawned, false);
+});
+
+test("native push worker rejects symlinked private spool files", async () => {
+  const { ws, shas } = history(1);
+  const zero = "0".repeat(shas[0].length);
+  const runDir = createNativePushJob({
+    cwd: ws,
+    remoteName: "origin",
+    remoteUrl: "file:///symlink-spool",
+    input: `(delete) ${zero} refs/heads/old ${shas[0]}\n`
+  });
+  fs.rmSync(path.join(runDir, "input.bin"));
+  fs.symlinkSync("/etc/passwd", path.join(runDir, "input.bin"));
+  const result = await runNativePushWorker(runDir, { env: process.env });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /worker failed/);
+  fs.rmSync(runDir, { recursive: true, force: true });
+});
+
+test("stale spool cleanup requires a valid sentinel and never deletes a live worker", (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-native-cleanup-root-"));
+  fs.chmodSync(tempRoot, 0o700);
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+
+  const decoy = path.join(tempRoot, "peerbench-native-push-unrelated");
+  fs.mkdirSync(decoy, { mode: 0o700 });
+  fs.writeFileSync(path.join(decoy, "unrelated"), "keep\n", { mode: 0o600 });
+  fs.utimesSync(decoy, old, old);
+  createNativePushJob({ cwd: process.cwd(), input: "", tempDir: tempRoot });
+  assert.equal(fs.existsSync(decoy), true, "a prefix-only directory is never recursively deleted");
+
+  const liveJob = createNativePushJob({ cwd: process.cwd(), input: "", tempDir: tempRoot });
+  const sentinel = JSON.parse(fs.readFileSync(path.join(liveJob, "job-sentinel.json"), "utf8"));
+  fs.writeFileSync(path.join(liveJob, "worker-owner.json"), `${JSON.stringify({
+    version: 1,
+    nonce: sentinel.nonce,
+    pid: process.pid
+  })}\n`, { mode: 0o600 });
+  fs.utimesSync(liveJob, old, old);
+  createNativePushJob({ cwd: process.cwd(), input: "", tempDir: tempRoot });
+  assert.equal(fs.existsSync(liveJob), true, "age alone cannot remove a live detached worker");
+
+  fs.rmSync(path.join(liveJob, "worker-owner.json"));
+  fs.utimesSync(liveJob, old, old);
+  createNativePushJob({ cwd: process.cwd(), input: "", tempDir: tempRoot });
+  assert.equal(fs.existsSync(liveJob), false, "a stale valid job without a live owner is reclaimed");
+});
+
+test("detached worker survives termination of the foreground process group and writes cache/result", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("negative process-group signals are POSIX-specific");
+    return;
+  }
+  const { ws, shas, root } = history(1);
+  const zero = "0".repeat(shas[0].length);
+  const tuple = `(delete) ${zero} refs/heads/old ${shas[0]}\n`;
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-native-foreground-"));
+  const driver = path.join(fixtureDir, "foreground.mjs");
+  const marker = path.join(fixtureDir, "worker.json");
+  let foreground = null;
+  let job = null;
+  let workerFinished = false;
+  t.after(() => {
+    if (foreground?.pid) {
+      try { process.kill(-foreground.pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    if (!workerFinished && job?.pid) {
+      try { process.kill(job.pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    if (job?.runDir) fs.rmSync(job.runDir, { recursive: true, force: true });
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+  });
+  const hookUrl = new URL("../global-hooks/git-pre-push-review.mjs", import.meta.url).href;
+  fs.writeFileSync(driver, `
+import fs from "node:fs";
+import { runDetachedMain } from ${JSON.stringify(hookUrl)};
+await runDetachedMain({
+  cwd: process.env.PB_TEST_CWD,
+  remoteName: "origin",
+  remoteUrl: "file:///parent-group-kill",
+  input: process.env.PB_TEST_INPUT,
+  env: process.env,
+  pollTimeoutMs: 10_000,
+  workerDelayMs: 750,
+  isBenchDisabledImpl: () => false,
+  onSpawn: (job) => fs.writeFileSync(process.env.PB_TEST_MARKER, JSON.stringify(job), { mode: 0o600 })
+});
+`, { mode: 0o600 });
+
+  foreground = spawn(process.execPath, [driver], {
+    cwd: ws,
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore"],
+    env: {
+      ...process.env,
+      BENCH_ROOT: root,
+      PB_TEST_CWD: ws,
+      PB_TEST_INPUT: tuple,
+      PB_TEST_MARKER: marker
+    }
+  });
+  assert.ok(foreground.pid > 0);
+  foreground.unref();
+  job = await waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(marker, "utf8")); }
+    catch { return null; }
+  }, { label: "detached worker spawn marker" });
+  assert.ok(job.pid > 0);
+  assert.notEqual(job.pid, foreground.pid);
+
+  process.kill(-foreground.pid, "SIGTERM");
+  await waitFor(() => {
+    try { process.kill(foreground.pid, 0); return false; }
+    catch { return true; }
+  }, { label: "foreground process termination" });
+
+  const persisted = await waitFor(() => {
+    try { return JSON.parse(fs.readFileSync(path.join(job.runDir, "result.json"), "utf8")); }
+    catch { return null; }
+  }, { timeoutMs: 10_000, label: "surviving detached worker result" });
+  workerFinished = true;
+  assert.equal(persisted.code, 0);
+  assert.match(persisted.stderr, /native pre-push: ALLOW/);
+
+  const priorRoot = process.env.BENCH_ROOT;
+  process.env.BENCH_ROOT = root;
+  const cacheDir = path.join(workspaceStateDir(ws), "native-push-cache");
+  if (priorRoot === undefined) delete process.env.BENCH_ROOT;
+  else process.env.BENCH_ROOT = priorRoot;
+  const cacheFiles = fs.readdirSync(cacheDir).filter((name) => name.endsWith(".json"));
+  assert.ok(cacheFiles.length > 0, "the surviving worker persisted the exact whole-push decision cache");
+  const cached = JSON.parse(fs.readFileSync(path.join(cacheDir, cacheFiles[0]), "utf8"));
+  assert.equal(cached.decision, "allow");
+
+});
+
 test("pushPolicyDoomedByCooldowns: required Codex on quota cooldown fails fast with an honest message", async () => {
   const { pushPolicyDoomedByCooldowns } = await import("../global-hooks/pre-push-lib.mjs");
   const { recordReviewerCooldown, clearReviewerCooldowns } = await import("../global-hooks/config-store.mjs");
@@ -852,16 +1278,19 @@ test("in-flight lock: a LIVE concurrent review yields an honest 'review-in-fligh
   const lockRoot = path.join(workspaceStateDir(cwd), "native-push-locks");
   fs.mkdirSync(lockRoot, { recursive: true });
   const crypto = await import("node:crypto");
-  const lockId = crypto.createHash("sha256").update("https://x/r.git").digest("hex");
+  const remoteName = "https://name-user:remote-name-secret@example.invalid/by-name.git";
+  const remoteUrl = "https://url-user:remote-url-secret@example.invalid/by-url.git";
+  const lockId = crypto.createHash("sha256").update(remoteUrl).digest("hex");
   const lock = path.join(lockRoot, `${lockId}.lock`);
   fs.mkdirSync(lock);
   fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, nonce: "n", createdAt: Date.now() - 90_000 }));
-  const res = await reviewNativePush({ cwd, remoteName: "origin", remoteUrl: "https://x/r.git", updates: [], env: {}, nativeLockWaitMs: 50 });
+  const res = await reviewNativePush({ cwd, remoteName, remoteUrl, updates: [], env: {}, nativeLockWaitMs: 50 });
   assert.equal(res.decision, "unavailable");
   assert.equal(res.kind, "review-in-flight");
   assert.match(res.reason, /already running/);
   assert.match(res.reason, /CACHED when it finishes/);
   assert.match(res.reason, /BENCH_NATIVE_PUSH_BYPASS/);
+  assert.doesNotMatch(res.reason, /remote-name-secret|remote-url-secret|example\.invalid/);
   fs.rmSync(lock, { recursive: true, force: true });
 });
 test("in-flight lock: a cached decision for the same push satisfies the retry instantly despite the busy lock", async () => {

@@ -75,7 +75,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/deep-review-runner.mjs\"",
-            "timeout": 720,
+            "timeout": 4620,
             "asyncRewake": true,
             "statusMessage": "⛩ bench: deep review…",
             "rewakeMessage": "⛩ bench deep review found blocking issues. Address them, then continue:",

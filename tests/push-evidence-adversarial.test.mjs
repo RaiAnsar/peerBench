@@ -101,6 +101,45 @@ test("replacement refs cannot change object type or substitute benign push evide
   assert.equal(typeSafe.localCommit, malicious);
 });
 
+test("immutable CLI snapshots recursively materialize ordinary nested pushed files", () => {
+  const cwd = repo();
+  const tip = commitFile(cwd, "src/deep/nested/app.js", "export const nested = true;\n", "nested file");
+  const snapshot = materializeImmutableCommit(cwd, tip);
+  try {
+    assert.equal(
+      fs.readFileSync(path.join(snapshot, "src", "deep", "nested", "app.js"), "utf8"),
+      "export const nested = true;\n"
+    );
+  } finally {
+    fs.rmSync(snapshot, { recursive: true, force: true });
+  }
+});
+
+test("multi-chunk push panel materializes the immutable tip once and forwards every bounded prompt", async () => {
+  const cwd = repo();
+  const base = commitFile(cwd, "src/base.js", "export const base = 1;\n", "base");
+  const tip = commitFile(cwd, "src/nested/feature.js", "export const feature = 2;\n", "feature");
+  let calls = 0;
+  const results = await pushReviewPanel({
+    cwd,
+    range: `${base}..${tip}`,
+    targetCommit: tip,
+    content: "chunk one",
+    contents: ["chunk one", "chunk two"],
+    huntPanelImpl: async ({ cliCwd, treeish, reviewChunks }) => {
+      calls++;
+      assert.equal(treeish, tip);
+      assert.equal(reviewChunks.length, 2);
+      assert.match(reviewChunks[0].user, /chunk one/);
+      assert.match(reviewChunks[1].user, /chunk two/);
+      assert.match(fs.readFileSync(path.join(cliCwd, "src", "nested", "feature.js"), "utf8"), /feature = 2/);
+      return [{ name: "Kimi", findings: "ALLOW: clean\nSEVERITY: none", error: null, coverageComplete: true }];
+    }
+  });
+  assert.equal(calls, 1, "one panel invocation owns one immutable snapshot for the whole sequence");
+  assert.equal(results[0].verdict, "ALLOW");
+});
+
 test("external diff, textconv, and -diff attributes cannot hide raw pushed bytes", async () => {
   const cwd = repo();
   fs.writeFileSync(path.join(cwd, ".gitattributes"), "*.js diff=hide\n*.secret -diff\n");
@@ -204,9 +243,9 @@ test("non-text diff bytes are losslessly represented instead of omitted or lossy
     panelImpl: async ({ content }) => { captured = content; return allow; }
   });
   assert.equal(result.coverageBlocked, undefined);
-  assert.match(captured, /per_commit_deltas[^>]+encoding="byte-escaped"/);
-  assert.match(captured, /raw Git evidence encoded losslessly with \\xHH byte escapes/);
-  assert.match(captured, /diff --git a\/payload\.bin b\/payload\.bin/, "readable diff context is retained around escaped bytes");
+  assert.match(captured, /per_commit_deltas[^>]+encoding="all-byte-hex"/);
+  assert.match(captured, /raw Git evidence encoded losslessly; every source byte is one \\xHH token/);
+  assert.match(captured, /\\x64\\x69\\x66\\x66\\x20\\x2d\\x2d\\x67\\x69\\x74/, "the diff header remains exactly recoverable from unambiguous byte tokens");
   assert.doesNotMatch(captured, /bytes omitted/);
 });
 

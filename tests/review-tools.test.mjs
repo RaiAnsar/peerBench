@@ -95,6 +95,32 @@ test("schemas are well-formed OpenAI tool defs", () => {
   assert.equal(schemas.length, 4);
   for (const s of schemas) { assert.equal(s.type, "function"); assert.ok(s.function.name); assert.equal(s.function.parameters.type, "object"); }
 });
+test("Git-backed tools are bounded by both the tool cap and the review deadline", async () => {
+  const calls = [];
+  const execImpl = (_command, _args, options) => {
+    calls.push(options);
+    return { status: 0, stdout: "tracked.js\n", stderr: "" };
+  };
+  const { execute } = createReviewTools(tmpRepo(), {
+    execImpl,
+    timeoutMs: 60_000,
+    deadline: 10_500,
+    nowImpl: () => 10_000
+  });
+  await execute("glob", { pattern: "*" });
+  assert.equal(calls[0].timeout, 500);
+  assert.equal(calls[0].killSignal, "SIGKILL");
+});
+test("an exhausted review deadline prevents a Git tool subprocess from starting", async () => {
+  let spawned = false;
+  const { execute } = createReviewTools(tmpRepo(), {
+    execImpl: () => { spawned = true; return { status: 0, stdout: "", stderr: "" }; },
+    deadline: 1,
+    nowImpl: () => 2
+  });
+  await assert.rejects(() => execute("glob", { pattern: "*" }), /deadline exhausted/);
+  assert.equal(spawned, false);
+});
 test("read_file: >2MB file without offset/limit returns 'too large' message", async () => {
   const d = tmpRepo();
   // Write a file just over 2MB

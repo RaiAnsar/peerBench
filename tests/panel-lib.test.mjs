@@ -82,8 +82,12 @@ test("runCodexReview suppresses peerBench hooks in the nested Codex reviewer pro
   const companion = path.join(dir, "companion.mjs");
   fs.writeFileSync(companion, [
     "#!/usr/bin/env node",
+    "const [command] = process.argv.slice(2);",
     "const ok = process.env.BENCH_SUPPRESS_HOOKS === '1';",
-    "process.stdout.write(JSON.stringify({ rawOutput: ok ? 'ALLOW: suppressed' : 'BLOCK: unsuppressed' }));",
+    "if (command === 'task') process.stdout.write(JSON.stringify({ jobId: 'review-env', status: 'queued' }));",
+    "else if (command === 'status') process.stdout.write(JSON.stringify({ job: { id: 'review-env', status: 'completed' } }));",
+    "else if (command === 'result') process.stdout.write(JSON.stringify({ storedJob: { result: { rawOutput: ok ? 'ALLOW: suppressed' : 'BLOCK: unsuppressed' } } }));",
+    "else { process.stderr.write('unexpected command'); process.exitCode = 1; }",
     ""
   ].join("\n"));
   const result = await runCodexReview({ companionPath: companion, prompt: "review", cwd: dir, env: {} });
@@ -91,18 +95,122 @@ test("runCodexReview suppresses peerBench hooks in the nested Codex reviewer pro
   assert.match(result.firstLine, /suppressed/);
 });
 
-test("runCodexTask honors a short per-call timeoutMs (the deep-review GATE budget cap)", async () => {
-  // The gate passes budgetMs → runCodexTask timeoutMs so a hung codex can't blow past the budget.
-  // A companion that sleeps far longer than the cap must be killed → status 124 → error (not raw).
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-timeout-"));
-  const companion = path.join(dir, "sleeper.mjs");
-  fs.writeFileSync(companion, "setTimeout(() => process.stdout.write('{}'), 60000);\n");
+test("runCodexTask uses the companion background lifecycle and extracts the stored raw output", async () => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "codex-background-success-")));
+  const commandLog = path.join(dir, "commands.jsonl");
+  const companion = path.join(dir, "companion.mjs");
+  fs.writeFileSync(companion, [
+    "import fs from 'node:fs';",
+    `const commandLog = ${JSON.stringify(commandLog)};`,
+    "const [command, ...args] = process.argv.slice(2);",
+    "fs.appendFileSync(commandLog, JSON.stringify({ command, args, cwd: process.cwd(), suppress: process.env.BENCH_SUPPRESS_HOOKS }) + '\\n');",
+    "if (command === 'task') process.stdout.write(JSON.stringify({ jobId: 'task-success', status: 'queued' }));",
+    "else if (command === 'status') process.stdout.write(JSON.stringify({ job: { id: 'task-success', status: 'completed' }, waitTimedOut: false }));",
+    "else if (command === 'result') process.stdout.write(JSON.stringify({ storedJob: { result: { rawOutput: 'complete findings' } } }));",
+    "else { process.stderr.write(`unexpected command: ${command}`); process.exitCode = 1; }",
+    ""
+  ].join("\n"));
+
+  const result = await runCodexTask({ companionPath: companion, prompt: "inspect", cwd: dir, env: {}, timeoutMs: 2_000 });
+  assert.deepEqual(result, { name: "Codex", raw: "complete findings" });
+  const commands = fs.readFileSync(commandLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(commands.map(({ command }) => command), ["task", "status", "result"]);
+  assert.ok(commands[0].args.includes("--background"));
+  assert.ok(commands[0].args.includes("--json"));
+  assert.ok(commands[1].args.includes("--wait"));
+  assert.ok(commands.every(({ cwd }) => cwd === dir));
+  assert.ok(commands.every(({ suppress }) => suppress === "1"));
+});
+
+test("runCodexTask charges result retrieval to the same absolute deadline and then cancels", async () => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "codex-background-result-timeout-")));
+  const commandLog = path.join(dir, "commands.jsonl");
+  const companion = path.join(dir, "companion.mjs");
+  fs.writeFileSync(companion, [
+    "import fs from 'node:fs';",
+    `const commandLog = ${JSON.stringify(commandLog)};`,
+    "const [command, ...args] = process.argv.slice(2);",
+    "fs.appendFileSync(commandLog, JSON.stringify({ command, args }) + '\\n');",
+    "if (command === 'task') process.stdout.write(JSON.stringify({ jobId: 'task-result-timeout', status: 'queued' }));",
+    "else if (command === 'status') process.stdout.write(JSON.stringify({ job: { id: 'task-result-timeout', status: 'completed' }, waitTimedOut: false }));",
+    "else if (command === 'result') setTimeout(() => process.stdout.write('{}'), 60_000);",
+    "else if (command === 'cancel') process.stdout.write(JSON.stringify({ jobId: 'task-result-timeout', status: 'cancelled' }));",
+    "else { process.stderr.write(`unexpected command: ${command}`); process.exitCode = 1; }",
+    ""
+  ].join("\n"));
+
   const started = Date.now();
-  const result = await runCodexTask({ companionPath: companion, prompt: "x", cwd: dir, env: {}, timeoutMs: 200 });
+  const result = await runCodexTask({ companionPath: companion, prompt: "inspect", cwd: dir, env: {}, timeoutMs: 300 });
   const elapsed = Date.now() - started;
-  assert.ok(result.error, "a reviewer that outruns the budget returns an error, not findings");
+  assert.match(result.error, /timed out/);
+  assert.ok(elapsed < 2_000, `result collection must share the 300ms work deadline (took ${elapsed}ms)`);
+  const commands = fs.readFileSync(commandLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(commands.map(({ command }) => command), ["task", "status", "result", "cancel"]);
+  assert.deepEqual(commands.at(-1).args, ["task-result-timeout", "--json"]);
+});
+
+test("runCodexTask cancels a timed-out background job so its detached worker cannot survive", { skip: process.platform === "win32" }, async (t) => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "codex-background-timeout-")));
+  const sentinel = path.join(dir, "detached-worker-survived");
+  const pidFile = path.join(dir, "worker.pid");
+  const commandLog = path.join(dir, "commands.jsonl");
+  const companion = path.join(dir, "companion.mjs");
+  const workerCode = [
+    "const fs = require('node:fs')",
+    `setTimeout(() => fs.writeFileSync(${JSON.stringify(sentinel)}, 'alive'), 450)`,
+    "setInterval(() => {}, 1000)"
+  ].join(";");
+  fs.writeFileSync(companion, [
+    "import fs from 'node:fs';",
+    "import { spawn } from 'node:child_process';",
+    `const commandLog = ${JSON.stringify(commandLog)};`,
+    `const pidFile = ${JSON.stringify(pidFile)};`,
+    `const workerCode = ${JSON.stringify(workerCode)};`,
+    "const [command, ...args] = process.argv.slice(2);",
+    "fs.appendFileSync(commandLog, JSON.stringify({ command, args, cwd: process.cwd(), suppress: process.env.BENCH_SUPPRESS_HOOKS }) + '\\n');",
+    "if (command === 'task') {",
+    "  const worker = spawn(process.execPath, ['-e', workerCode], { detached: true, stdio: 'ignore' });",
+    "  worker.unref();",
+    "  fs.writeFileSync(pidFile, String(worker.pid));",
+    "  process.stdout.write(JSON.stringify({ jobId: 'task-timeout', status: 'queued' }));",
+    "} else if (command === 'status') {",
+    "  const timeoutAt = args.indexOf('--timeout-ms');",
+    "  const waitMs = Math.max(1, Number(args[timeoutAt + 1]) || 1);",
+    "  setTimeout(() => process.stdout.write(JSON.stringify({ job: { id: 'task-timeout', status: 'running' }, waitTimedOut: true })), waitMs);",
+    "} else if (command === 'cancel') {",
+    "  const pid = Number(fs.readFileSync(pidFile, 'utf8'));",
+    "  try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch {} }",
+    "  process.stdout.write(JSON.stringify({ jobId: 'task-timeout', status: 'cancelled' }));",
+    "} else { process.stderr.write(`unexpected command: ${command}`); process.exitCode = 1; }",
+    ""
+  ].join("\n"));
+  t.after(() => {
+    if (!fs.existsSync(pidFile)) return;
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
+  });
+
+  const started = Date.now();
+  const result = await runCodexTask({ companionPath: companion, prompt: "inspect", cwd: dir, env: {}, timeoutMs: 200 });
+  const elapsed = Date.now() - started;
+  assert.match(result.error, /timed out/);
   assert.equal(result.raw, undefined, "no raw findings when the budget is exceeded");
-  assert.ok(elapsed < 5000, `killed near the 200ms cap, not the 25-min default (took ${elapsed}ms)`);
+  assert.ok(elapsed < 5_000, `cancelled near the 200ms cap, not the 25-min default (took ${elapsed}ms)`);
+
+  const commands = fs.readFileSync(commandLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(commands[0].command, "task");
+  assert.equal(commands.at(-1).command, "cancel");
+  assert.ok(commands.slice(1, -1).every(({ command }) => command === "status"));
+  assert.ok(commands.some(({ command }) => command === "status"));
+  assert.ok(commands.every(({ command }) => command !== "result"));
+  assert.ok(commands[0].args.includes("--background"));
+  assert.ok(commands.filter(({ command }) => command === "status").every(({ args }) => args.includes("--wait")));
+  assert.deepEqual(commands.at(-1).args, ["task-timeout", "--json"]);
+  assert.ok(commands.every(({ cwd }) => cwd === dir));
+  assert.ok(commands.every(({ suppress }) => suppress === "1"));
+
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  assert.equal(fs.existsSync(sentinel), false, "companion cancel must stop the detached worker before it writes or consumes more quota");
 });
 
 test("combinePanel: both allow", () => {
@@ -609,4 +717,54 @@ test("grokStructuredDeepReview reconstitutes canonical parseable review text", a
   assert.equal(extractVerdict(text)?.verdict, "ALLOW");
   assert.equal(grokStructuredDeepReview(JSON.stringify({ structuredOutput: { verdict: "MAYBE" } })), null);
   assert.equal(grokStructuredDeepReview("narration.ALLOW: glued free text"), null);
+});
+
+test("Grok's multi-chunk schema requires bounded synthesis notes and reconstruction preserves them", async () => {
+  const {
+    GROK_PUSH_CHUNK_REVIEW_SCHEMA,
+    MAX_PUSH_SYNTHESIS_NOTES_CHARS,
+    grokStructuredDeepReview
+  } = await import("../global-hooks/panel-lib.mjs");
+  const schema = JSON.parse(GROK_PUSH_CHUNK_REVIEW_SCHEMA);
+  assert.ok(schema.required.includes("synthesisNotes"));
+  assert.equal(schema.properties.synthesisNotes.maxLength, MAX_PUSH_SYNTHESIS_NOTES_CHARS);
+  const text = grokStructuredDeepReview(JSON.stringify({ structuredOutput: {
+    verdict: "ALLOW",
+    severity: "none",
+    findings: "",
+    synthesisNotes: "changed src/a.mjs; checked caller src/b.mjs"
+  } }));
+  assert.match(text, /SYNTHESIS NOTES: changed src\/a\.mjs/);
+  assert.ok(grokStructuredDeepReview(JSON.stringify({ structuredOutput: {
+    verdict: "ALLOW", severity: "none", findings: "", synthesisNotes: "x".repeat(1_878)
+  } })), "the previously rejected Kimi handoff now fits the shared schema/parser contract");
+  assert.equal(grokStructuredDeepReview(JSON.stringify({ structuredOutput: {
+    verdict: "ALLOW", severity: "none", findings: "",
+    synthesisNotes: "x".repeat(MAX_PUSH_SYNTHESIS_NOTES_CHARS + 1)
+  } })), null, "the shared parser still rejects genuinely oversized handoffs");
+});
+
+test("spawnCollect timeout kills reviewer descendants, not only the wrapper", { skip: process.platform === "win32" }, async () => {
+  const { spawnCollect } = await import("../global-hooks/panel-lib.mjs");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "reviewer-process-group-"));
+  const sentinel = path.join(dir, "descendant-survived");
+  const parent = path.join(dir, "parent.mjs");
+  const grandchildCode = [
+    "const fs=require('node:fs')",
+    `setTimeout(()=>fs.writeFileSync(${JSON.stringify(sentinel)},'alive'),400)`,
+    "setInterval(()=>{},1000)"
+  ].join(";");
+  fs.writeFileSync(parent, [
+    "import { spawn } from 'node:child_process';",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchildCode)}], { stdio: 'ignore' });`,
+    "setInterval(() => {}, 1000);"
+  ].join("\n"));
+  const result = await spawnCollect(process.execPath, [parent], {
+    cwd: dir,
+    env: process.env,
+    timeoutMs: 100
+  });
+  assert.equal(result.status, 124);
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  assert.equal(fs.existsSync(sentinel), false, "timed-out reviewer descendants must not survive to write or consume quota");
 });

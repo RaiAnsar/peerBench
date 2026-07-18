@@ -15,7 +15,7 @@ import { runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 
 // Bump whenever the evidence contract changes. Exact-range ALLOW caches from an older evidence
 // implementation must never authorize a push under a stronger policy.
-export const NATIVE_PUSH_REVIEW_VERSION = "native-push-v3-exhaustive-evidence";
+export const NATIVE_PUSH_REVIEW_VERSION = "native-push-v6-expanded-handoff-bounded";
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const DEFAULT_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CYCLE_WINDOW_MS = 2 * 60 * 60 * 1000;
@@ -99,7 +99,7 @@ export function resolveNativeUpdateRange(cwd, remoteName, update, { gitImpl = gi
   if (!isZeroOid(update.remoteSha)) {
     const remote = resolveObjectTarget(cwd, update.remoteSha, gitImpl);
     if (!remote.ok) {
-      return { ok: false, reason: `remote base ${update.remoteSha} is not available or indeterminate; fetch ${remoteName || "the remote"} and retry` };
+      return { ok: false, reason: `remote base ${update.remoteSha} is not available or indeterminate; fetch the remote and retry` };
     }
     if (remote.nonCommitType) {
       const emptyTree = emptyTreeOid(cwd, gitImpl);
@@ -281,7 +281,7 @@ export function evaluatePushReview(review, intendedReviewers, env = process.env)
   const validByName = new Map();
   for (const side of sides) {
     const name = normalizeReviewerName(side?.name);
-    if (!intendedSet.has(name) || side?.error || !["ALLOW", "BLOCK"].includes(String(side?.verdict || "").toUpperCase())) continue;
+    if (!intendedSet.has(name) || side?.error || side?.coverageComplete === false || !["ALLOW", "BLOCK"].includes(String(side?.verdict || "").toUpperCase())) continue;
     if (!validByName.has(name)) validByName.set(name, side);
   }
   const valid = [...validByName.values()];
@@ -298,11 +298,20 @@ export function evaluatePushReview(review, intendedReviewers, env = process.env)
   if (requireCodex && !valid.some((r) => normalizeReviewerName(r.name) === "codex")) {
     unavailableReasons.push("trusted Codex verdict missing");
   }
+  const partialBlockers = sides.filter((side) =>
+    intendedSet.has(normalizeReviewerName(side?.name)) &&
+    side?.coverageComplete === false &&
+    !side?.error &&
+    String(side?.verdict || "").toUpperCase() === "BLOCK"
+  );
+  if (partialBlockers.length) {
+    unavailableReasons.push(`blocking reviewer coverage incomplete (${partialBlockers.map((side) => side.name).join(", ")})`);
+  }
   const failedReviewers = intended.flatMap((name) => {
     const rows = sides.filter((side) => normalizeReviewerName(side?.name) === name);
     if (!rows.length) return [`${name}: missing result`];
     if (validByName.has(name)) return [];
-    return [`${name}: ${rows.map((side) => side?.error || "invalid verdict").join("; ")}`];
+    return [`${name}: ${rows.map((side) => side?.coverageError || side?.error || "invalid verdict").join("; ")}`];
   });
 
   // A concrete blocker remains a blocker, but it must never erase an unavailable quorum/Codex
@@ -310,7 +319,11 @@ export function evaluatePushReview(review, intendedReviewers, env = process.env)
   // range, so a retry can finish the missing review without rerunning other completed ranges.
   // The native push gate is an AND gate. A reviewer's explicit, valid BLOCK vote is authoritative
   // regardless of its severity label; severity controls Stop-hook rewakes, not push authorization.
-  const hasExplicitBlock = valid.some((side) => String(side?.verdict || "").toUpperCase() === "BLOCK");
+  const hasExplicitBlock = sides.some((side) =>
+    intendedSet.has(normalizeReviewerName(side?.name)) &&
+    !side?.error &&
+    String(side?.verdict || "").toUpperCase() === "BLOCK"
+  );
   if (hasExplicitBlock || shouldRewake(review)) {
     return {
       decision: "block",
@@ -444,7 +457,9 @@ async function acquireNativePushLock(cwd, remoteName, remoteUrl, fsImpl = fs, wa
         // command being timed-out/killed (its verdict is cached on completion), so the retry must
         // be told exactly what is happening and that waiting resolves it — not a generic "active".
         const busy = new Error(
-          `another native push review for ${remoteUrl || remoteName || "this remote"} is already running` +
+          // Both Git hook arguments can be URLs for an unnamed remote, and either may contain
+          // embedded credentials. They remain part of the exact identity but never enter output.
+          "another native push review for this remote is already running" +
           `${owner?.pid ? ` (pid ${owner.pid}, ~${Math.max(1, Math.round(ageMs / 60_000))} min in)` : ""}`
         );
         busy.code = "BENCH_PUSH_REVIEW_IN_FLIGHT";
@@ -658,8 +673,8 @@ export async function reviewNativePush(options = {}) {
       kind: "review-in-flight",
       reason:
         `${error.message}. That review keeps working even if the push command that started it timed out, and its ` +
-        "verdict is CACHED when it finishes — wait a minute, then retry the push (give the command a 5–10 min timeout " +
-        "so the inline review can complete). BENCH_NATIVE_PUSH_BYPASS=1 git push is the explicit peerBench-only bypass."
+        "verdict is CACHED when it finishes — wait for the detached worker to complete, then retry the exact push. " +
+        "BENCH_NATIVE_PUSH_BYPASS=1 git push is the explicit peerBench-only bypass."
     };
   }
   try {

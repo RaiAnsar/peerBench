@@ -101,6 +101,14 @@ three distinct blocked revisions, automatic reviews pause permanently for that u
 and replay the consolidated findings; use a new nonce such as
 `BENCH_PUSH_CYCLE_RESET=$(date +%s) git push …` for one fresh verification after fixing them.
 Leaving the same reset value exported cannot repeatedly reopen the loop.
+
+Native reviews run in a detached worker instead of depending on the lifetime of the foreground
+`git push`. The hook waits for a bounded interactive window; if the review is still running, that
+push attempt fails closed with a visible "continues in background" message. Retry the exact push
+after it finishes and the cached verdict is reused without another complete review. Once handed
+off to the detached worker, killing or timing out the original shell no longer discards the review,
+trace, or completed-range cache, and no bypass is needed for a legitimately slow panel.
+
 `BENCH_NATIVE_PUSH_BYPASS=1 git push …` bypasses peerBench once while still running an existing
 chained hook. `git push --no-verify` is the emergency all-hooks bypass; `/bench:off` disables all
 peerBench gates for the workspace.
@@ -370,6 +378,21 @@ CLI-only Codex install:
 ```bash
 codex plugin add bench@aiwithrai
 ```
+
+### Kimi Code
+
+Kimi Code CLI gets peerBench as a user-level Agent Skill. From a local clone:
+
+```bash
+npm run setup:kimi
+```
+
+This installs the `bench` skill into `~/.kimi-code/skills/bench/` (honoring
+`KIMI_CODE_HOME`), pointed at this checkout's `bench-runner.mjs`. Start a new
+Kimi session and ask for a "bench review", "bench hunt", "bench status", and so
+on, or invoke it directly with `/skill:bench`. Re-run `npm run setup:kimi`
+after moving the checkout; `node scripts/install-kimi.mjs --status` reports
+drift and `--uninstall` removes it.
 
 ### Local Clone
 

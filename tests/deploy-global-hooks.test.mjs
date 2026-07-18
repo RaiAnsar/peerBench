@@ -4,7 +4,15 @@ import fs from "node:fs"; import os from "node:os"; import path from "node:path"
 import net from "node:net";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts, migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin, removeClaudeSettingsPeerBenchHooks, removeCodexSettingsPeerBenchHooks, deployPluginRuntime, latestClaudeBenchPluginRoot, latestCodexBenchPluginRoot } from "../scripts/deploy-global-hooks.mjs";
+import {
+  deploy, snapshot, snapshotCodex, syncSettings, syncCodexHooks, syncCodexPrompts,
+  migrateDataDir, syncStatuslineSessionArg, compareLocalWithOrigin,
+  removeClaudeSettingsPeerBenchHooks, removeCodexSettingsPeerBenchHooks,
+  deployPluginRuntime, latestClaudeBenchPluginRoot, latestCodexBenchPluginRoot,
+  DEEP_REVIEW_HOOK_MARGIN_MS, DEEP_REVIEW_HOOK_TIMEOUT_SECONDS
+} from "../scripts/deploy-global-hooks.mjs";
+import { RUNNER_BUDGET_MS } from "../global-hooks/deep-review-runner.mjs";
+import { MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS } from "../global-hooks/spec-review-run.mjs";
 
 function writePluginVersions(root, version) {
   fs.mkdirSync(path.join(root, ".claude-plugin"), { recursive: true });
@@ -440,6 +448,23 @@ test("syncSettings registers native SessionStart and every Claude review hook", 
   }
   assert.equal(byFile("pre-push-review.mjs").if, "Bash(git *)", "pre-push must narrow to git commands via `if`");
   assert.equal(byFile("pre-push-review.mjs").timeout, 30, "Bash hook only arms the native Git gate and must never freeze the session");
+});
+
+test("deep-review hook timeout derives from the maximum push duration with outer margin", () => {
+  assert.equal(
+    DEEP_REVIEW_HOOK_TIMEOUT_SECONDS,
+    Math.ceil((MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS + DEEP_REVIEW_HOOK_MARGIN_MS) / 1000)
+  );
+  assert.ok(DEEP_REVIEW_HOOK_TIMEOUT_SECONDS * 1000 > RUNNER_BUDGET_MS);
+
+  const staticHooks = JSON.parse(fs.readFileSync(
+    fileURLToPath(new URL("../hooks/hooks.json", import.meta.url)),
+    "utf8"
+  ));
+  const deepHook = staticHooks.hooks.Stop
+    .flatMap((entry) => entry.hooks || [])
+    .find((hook) => hook.command.includes("deep-review-runner.mjs"));
+  assert.equal(deepHook.timeout, DEEP_REVIEW_HOOK_TIMEOUT_SECONDS);
 });
 
 test("syncSettings is idempotent: running twice does not duplicate any gate", () => {

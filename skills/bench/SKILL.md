@@ -7,13 +7,18 @@ description: Run peerBench review, hunt, investigate, setup, status, and reviewe
 
 peerBench is a read-only multi-reviewer panel for code review and bug hunts.
 
-Resolve the plugin root as two directories above this skill directory, then run
-`scripts/bench-runner.mjs` with Node from the current workspace. For direct Codex
-sessions, suppress the Codex reviewer so Codex does not review itself:
+Resolve the plugin root as two directories above this skill directory, infer the
+requested subcommand from the user's request and `$ARGUMENTS`, then run exactly
+one matching `scripts/bench-runner.mjs` command from the current workspace. For
+direct Codex sessions, suppress the Codex reviewer so Codex does not review
+itself. Do not append every invocation to a hardcoded `review` command.
 
 ```bash
-BENCH_SUPPRESS_CODEX_REVIEWER=1 BENCH_SESSION_ID="${CODEX_SESSION_ID:-${BENCH_SESSION_ID:-}}" node "<plugin-root>/scripts/bench-runner.mjs" review --json "$ARGUMENTS"
+BENCH_SUPPRESS_CODEX_REVIEWER=1 BENCH_SESSION_ID="${CODEX_SESSION_ID:-${BENCH_SESSION_ID:-}}" node "<plugin-root>/scripts/bench-runner.mjs" <subcommand> [arguments]
 ```
+
+`<plugin-root>`, `<subcommand>`, and `[arguments]` are notation: resolve or
+replace them before execution and never pass those literal tokens to the shell.
 
 Use these subcommands:
 
@@ -26,6 +31,7 @@ Use these subcommands:
 - `reviewers [names...]` — show or set the active reviewer panel.
 - `on [--global]` / `off [--global]` — enable or disable gates.
 - `scorecard` — show reviewer performance stats.
+- `health [--all]` — probe configured reviewer health.
 
 Return command output faithfully. Do not edit files unless the user explicitly
 asks for fixes after seeing the peerBench output.

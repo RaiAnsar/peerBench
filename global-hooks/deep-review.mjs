@@ -83,7 +83,11 @@ export function summarizeSpecReview(results) {
     name: r.name,
     verdict: r.verdict ?? null,
     severity: r.severity ?? null,
-    error: r.error ?? null
+    error: r.error ?? null,
+    ...(r.coverageComplete === false ? {
+      coverageComplete: false,
+      coverageError: r.coverageError || r.error || "incomplete bounded review coverage"
+    } : {})
   }));
   const findingCount = list.reduce((n, r) => n + (Number(r.findingCount) || 0), 0);
   let maxSeverity = "none";

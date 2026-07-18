@@ -16,6 +16,8 @@ export function writeTrace(ws, trace, { now = Date.now() } = {}) {
   // raw path for display; `wsKey` is the ownership identity that survives symlinks/relative paths.
   const record = { id, ts: new Date(now).toISOString(), gate: trace.gate, ws: trace.ws, wsKey: wsKey(ws), sessionKey: sessionKey || undefined, reviewers: trace.reviewers || [],
     systemPrompt: cap(trace.systemPrompt), userPrompt: cap(trace.userPrompt),
+    ...(Array.isArray(trace.chunkManifest) ? { chunkManifest: trace.chunkManifest.slice(0, 64) } : {}),
+    ...(trace.evidenceHashes && typeof trace.evidenceHashes === "object" ? { evidenceHashes: trace.evidenceHashes } : {}),
     rawResponses: Object.fromEntries(Object.entries(trace.rawResponses || {}).map(([k, v]) => [k, cap(v)])) };
   writePrivateFileAtomic(path.join(dir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
   return id;

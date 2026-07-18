@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { agenticReview } from "../global-hooks/agentic-review.mjs";
+import { agenticReview, serializeAgenticRequest } from "../global-hooks/agentic-review.mjs";
 
 const SCHEMAS = [{ type: "function", function: { name: "read_file", description: "", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }];
 
@@ -275,4 +275,27 @@ test("agentic: temperature null → omitted from every request body (K3 contract
   await agenticReview({ ...baseArgs, temperature: null, tools: { schemas: SCHEMAS, execute: async () => "" }, fetchImpl });
   assert.ok(bodies.length > 0);
   for (const b of bodies) assert.equal("temperature" in b, false, "null must mean ABSENT on the agentic path too");
+});
+
+test("serializeAgenticRequest is the exact body used by the live initial provider call", async () => {
+  let captured = "";
+  const args = {
+    ...baseArgs,
+    model: "glm-5.2",
+    system: 's "quoted"',
+    user: "u \\ escaped",
+    temperature: 0.6,
+    thinking: "enabled",
+    tools: { schemas: SCHEMAS, execute: async () => "" },
+    fetchImpl: async (url, options) => { captured = options.body; return sse([{ content: "ALLOW: fine" }]); }
+  };
+  await agenticReview(args);
+  const expected = serializeAgenticRequest({
+    model: args.model,
+    messages: [{ role: "system", content: args.system }, { role: "user", content: args.user }],
+    temperature: args.temperature,
+    tools: SCHEMAS,
+    thinking: args.thinking
+  });
+  assert.equal(captured, expected);
 });

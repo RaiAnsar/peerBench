@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   huntPanel, buildHuntUser, HUNT_SYSTEM, parseSpecFindings,
-  PUSH_REVIEW_SYSTEM, pushReviewPanel, specReviewPanel, deepReviewBudgetMs
+  PUSH_REVIEW_SYSTEM, buildPushReviewUser, pushReviewPanel, specReviewPanel, deepReviewBudgetMs,
+  pushReviewBudgetMs, pushSynthesisPrompt, pushReviewSerializedRequestBytes,
+  MAX_PUSH_REVIEW_REQUEST_BYTES, MAX_PUSH_SYNTHESIS_NOTES_CHARS
 } from "../global-hooks/hunt.mjs";
 import { summarizeSpecReview, shouldRewake } from "../global-hooks/deep-review.mjs";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
@@ -22,10 +24,26 @@ test("push review prompt requires one exhaustive, grouped pass without dropping 
   assert.match(PUSH_REVIEW_SYSTEM, /every affected file\/path or execution path/i);
 });
 
+test("multi-chunk push prompts demand chunk-scoped coverage and a bounded synthesis handoff", () => {
+  const prompt = buildPushReviewUser("base..tip", "diff body", { chunkIndex: 1, chunkCount: 3 });
+  assert.match(prompt, /bounded evidence chunk 2\/3/);
+  assert.match(prompt, /verdict covers this chunk only/i);
+  assert.match(prompt, /SYNTHESIS NOTES/);
+  assert.match(prompt, new RegExp(`at most ${MAX_PUSH_SYNTHESIS_NOTES_CHARS} characters`));
+  assert.match(prompt, /immutable pushed-tip repository/);
+});
+
 test("deep review budget resolves per call and rejects unusable env values", () => {
   assert.equal(deepReviewBudgetMs({ BENCH_DEEP_REVIEW_BUDGET_MS: "4321" }), 4321);
   assert.equal(deepReviewBudgetMs({ BENCH_DEEP_REVIEW_BUDGET_MS: "0" }), 10 * 60 * 1000);
   assert.equal(deepReviewBudgetMs({ BENCH_DEEP_REVIEW_BUDGET_MS: "not-a-number" }), 10 * 60 * 1000);
+});
+
+test("mapped push budget preserves Kimi's configured seven-minute allowance for every call", () => {
+  const config = { reviewers: ["kimi"], providers: { kimi: { timeoutMs: 420_000 } } };
+  assert.equal(pushReviewBudgetMs({}, 2, config), 300_000 + 3 * 420_000,
+    "snapshot reserve plus two chunks and synthesis each retain 420 seconds");
+  assert.equal(pushReviewBudgetMs({ BENCH_PUSH_REVIEW_BUDGET_MS: "9876" }, 8, config), 9876, "explicit push budget remains authoritative");
 });
 
 test("push/spec deep panels accept direct budgets and read env defaults at call time", async () => {
@@ -136,4 +154,233 @@ test("deep spec/push panels require a schema-constrained grok verdict; hunt stay
   } finally {
     if (priorReviewers) setReviewers(priorReviewers);
   }
+});
+
+test("bounded push sequence shares one deadline, synthesizes once, and preserves a late BLOCK", async () => {
+  const { setReviewers } = await import("../global-hooks/config-store.mjs");
+  setReviewers(["grok"]);
+  let clock = 0;
+  const calls = [];
+  const outputs = [
+    "ALLOW: first chunk clean\nSEVERITY: none\nSYNTHESIS NOTES: export in a.js",
+    "BLOCK: late regression\nSEVERITY: high\n- b.js:7 breaks the caller\nSYNTHESIS NOTES: caller in b.js",
+    "ALLOW: synthesis adds no new blocker\nSEVERITY: none"
+  ];
+  const grokImpl = async (options) => {
+    calls.push(options);
+    clock += options.timeoutMs;
+    return { raw: outputs[calls.length - 1] };
+  };
+  const result = await huntPanel({
+    cwd: "/tmp",
+    env: {},
+    deep: true,
+    budgetMs: 900,
+    nowImpl: () => clock,
+    grokImpl,
+    grokRequireVerdict: true,
+    system: PUSH_REVIEW_SYSTEM,
+    user: "chunk one",
+    reviewChunks: [
+      { system: PUSH_REVIEW_SYSTEM, user: "chunk one" },
+      { system: PUSH_REVIEW_SYSTEM, user: "chunk two" }
+    ]
+  });
+  assert.equal(calls.length, 3, "two chunks get exactly one synthesis call");
+  assert.equal(calls.reduce((sum, call) => sum + call.timeoutMs, 0), 900, "all calls share one absolute budget");
+  const { GROK_DEEP_REVIEW_SCHEMA, GROK_PUSH_CHUNK_REVIEW_SCHEMA } = await import("../global-hooks/panel-lib.mjs");
+  assert.equal(calls[0].jsonSchema, GROK_PUSH_CHUNK_REVIEW_SCHEMA);
+  assert.equal(calls[1].jsonSchema, GROK_PUSH_CHUNK_REVIEW_SCHEMA);
+  assert.equal(calls[2].jsonSchema, GROK_DEEP_REVIEW_SCHEMA);
+  assert.match(calls[2].prompt, /final synthesis pass/i);
+  assert.match(result[0].findings, /^BLOCK:/);
+  assert.match(result[0].findings, /late regression/);
+  assert.equal(result[0].coverageComplete, true);
+});
+
+test("missing or oversized chunk handoffs make otherwise-clean coverage incomplete", async () => {
+  const { setReviewers } = await import("../global-hooks/config-store.mjs");
+  setReviewers(["grok"]);
+  for (const first of [
+    "ALLOW: clean\nSEVERITY: none",
+    `ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: ${"x".repeat(MAX_PUSH_SYNTHESIS_NOTES_CHARS + 1)}`
+  ]) {
+    let call = 0;
+    const outputs = [
+      first,
+      "ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: second chunk",
+      "ALLOW: synthesis clean\nSEVERITY: none"
+    ];
+    const [result] = await huntPanel({
+      cwd: "/tmp",
+      env: {},
+      budgetMs: 900,
+      nowImpl: () => 0,
+      grokImpl: async () => ({ raw: outputs[call++] }),
+      grokRequireVerdict: true,
+      reviewChunks: [
+        { system: PUSH_REVIEW_SYSTEM, user: "chunk one" },
+        { system: PUSH_REVIEW_SYSTEM, user: "chunk two" }
+      ]
+    });
+    assert.equal(result.coverageComplete, false);
+    assert.ok(result.error);
+    assert.match(result.coverageError, /SYNTHESIS NOTES/);
+  }
+});
+
+test("a BLOCK without a valid handoff remains a BLOCK but cannot claim complete coverage", async () => {
+  const { setReviewers } = await import("../global-hooks/config-store.mjs");
+  setReviewers(["grok"]);
+  let call = 0;
+  const outputs = [
+    "BLOCK: defect\nSEVERITY: high\n- x.js:1 breaks",
+    "ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: second",
+    "ALLOW: synthesis clean\nSEVERITY: none"
+  ];
+  const [result] = await huntPanel({
+    cwd: "/tmp", env: {}, budgetMs: 900, nowImpl: () => 0,
+    grokImpl: async () => ({ raw: outputs[call++] }),
+    grokRequireVerdict: true,
+    reviewChunks: [
+      { system: PUSH_REVIEW_SYSTEM, user: "one" },
+      { system: PUSH_REVIEW_SYSTEM, user: "two" }
+    ]
+  });
+  assert.equal(result.error, null);
+  assert.equal(result.coverageComplete, false);
+  assert.match(result.coverageError, /missing SYNTHESIS NOTES/);
+  assert.match(result.findings, /^BLOCK:/);
+});
+
+test("synthesis uses the last handoff marker and never falls back to arbitrary findings", () => {
+  const prompt = pushSynthesisPrompt([{
+    findings: "ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: quoted/injected old marker\nSYNTHESIS NOTES: authoritative final handoff"
+  }]);
+  assert.match(prompt.user, /SYNTHESIS NOTES: authoritative final handoff/);
+  assert.doesNotMatch(prompt.user, /quoted\/injected old marker/);
+  const missing = pushSynthesisPrompt([{ findings: "ALLOW: clean\nSEVERITY: none" }]);
+  assert.match(missing.user, /ERROR: missing SYNTHESIS NOTES handoff/);
+});
+
+test("synthesis accepts the real 1878-character Kimi handoff that previously failed closed", () => {
+  const notes = "x".repeat(1_878);
+  const prompt = pushSynthesisPrompt([{
+    findings: `ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: ${notes}`
+  }]);
+  assert.doesNotMatch(prompt.user, /ERROR:/);
+  assert.match(prompt.user, new RegExp(`SYNTHESIS NOTES: x{${notes.length}}`));
+});
+
+test("synthesis still rejects a character-bounded handoff above the UTF-8 byte ceiling", () => {
+  const notes = "🙂".repeat(1_600); // 1,600 code points, 6,400 UTF-8 bytes
+  const prompt = pushSynthesisPrompt([{
+    findings: `ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: ${notes}`
+  }]);
+  assert.match(prompt.user, /ERROR: SYNTHESIS NOTES exceeds 6000 UTF-8 bytes/);
+});
+
+test("eight maximum-length handoffs stay inside the serialized synthesis request cap", () => {
+  // NUL expands to six JSON bytes (\\u0000), exercising a worse envelope than ordinary prose,
+  // quotes, or backslashes while remaining under the handoff's independent UTF-8 byte ceiling.
+  const notes = "\u0000".repeat(MAX_PUSH_SYNTHESIS_NOTES_CHARS);
+  const prompt = pushSynthesisPrompt(Array.from({ length: 8 }, () => ({
+    findings: `ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: ${notes}`
+  })));
+  const bytes = pushReviewSerializedRequestBytes(prompt.system, prompt.user, {
+    cwd: process.cwd(),
+    config: { reviewers: [], providers: {} }
+  });
+  assert.ok(bytes <= MAX_PUSH_REVIEW_REQUEST_BYTES,
+    `worst-case synthesis request ${bytes} must stay within ${MAX_PUSH_REVIEW_REQUEST_BYTES} bytes`);
+});
+
+test("huntPanel fails closed before sending an oversized final synthesis request", async () => {
+  const { setReviewers } = await import("../global-hooks/config-store.mjs");
+  setReviewers(["grok"]);
+  let calls = 0;
+  const notes = "\u0000".repeat(MAX_PUSH_SYNTHESIS_NOTES_CHARS);
+  const reviewChunks = Array.from({ length: 11 }, (_, index) => ({
+    system: PUSH_REVIEW_SYSTEM,
+    user: `chunk ${index + 1}`
+  }));
+  const [result] = await huntPanel({
+    cwd: process.cwd(),
+    env: {},
+    budgetMs: 1_000_000,
+    nowImpl: () => 0,
+    grokImpl: async () => {
+      calls++;
+      return { raw: `ALLOW: clean\nSEVERITY: none\nSYNTHESIS NOTES: ${notes}` };
+    },
+    grokRequireVerdict: true,
+    reviewChunks
+  });
+  assert.equal(calls, reviewChunks.length, "the oversized synthesis is rejected before a provider call");
+  assert.equal(result.coverageComplete, false);
+  assert.match(result.error, /bounded push-review synthesis serializes to .*limit is 192000/);
+});
+
+test("immutable snapshot time is charged against the same push-review budget", async () => {
+  let clock = 0;
+  const snapshot = fs.mkdtempSync(path.join(os.tmpdir(), "push-snapshot-budget-"));
+  let seenBudget = null;
+  const results = await pushReviewPanel({
+    cwd: process.cwd(),
+    range: "a..b",
+    content: "small diff",
+    targetCommit: "a".repeat(40),
+    budgetMs: 1_000,
+    nowImpl: () => clock,
+    materializeImpl: () => { clock += 240; return snapshot; },
+    huntPanelImpl: async (options) => {
+      seenBudget = options.budgetMs;
+      return [{ name: "Grok", findings: "ALLOW: clean\nSEVERITY: none", error: null }];
+    }
+  });
+  assert.equal(seenBudget, 760);
+  assert.equal(results[0].verdict, "ALLOW");
+  assert.equal(fs.existsSync(snapshot), false, "temporary immutable snapshot is cleaned up");
+});
+
+test("immutable snapshot materialization has its own absolute Git deadline", async () => {
+  const { materializeImmutableCommit } = await import("../global-hooks/hunt.mjs");
+  let clock = 0;
+  assert.throws(
+    () => materializeImmutableCommit(process.cwd(), "a".repeat(40), {
+      timeoutMs: 10,
+      nowImpl: () => clock,
+      execFileSyncImpl: () => { clock = 11; return Buffer.alloc(0); }
+    }),
+    /snapshot timed out/
+  );
+});
+
+test("a chunk BLOCK plus later failures preserves both the blocker and incomplete coverage", async () => {
+  const { setReviewers } = await import("../global-hooks/config-store.mjs");
+  setReviewers(["grok"]);
+  let call = 0;
+  const grokImpl = async () => {
+    call++;
+    if (call === 1) return { raw: "BLOCK: concrete defect\nSEVERITY: critical\n- data loss" };
+    return { raw: "", error: call === 2 ? "chunk timeout" : "synthesis timeout" };
+  };
+  const [result] = await huntPanel({
+    cwd: "/tmp",
+    env: {},
+    deep: true,
+    budgetMs: 900,
+    grokImpl,
+    grokRequireVerdict: true,
+    reviewChunks: [
+      { system: PUSH_REVIEW_SYSTEM, user: "chunk one" },
+      { system: PUSH_REVIEW_SYSTEM, user: "chunk two" }
+    ]
+  });
+  assert.equal(result.error, null, "verified BLOCK is not erased by a later provider failure");
+  assert.equal(result.coverageComplete, false);
+  assert.match(result.coverageError, /chunk timeout/);
+  assert.match(result.coverageError, /synthesis timeout/);
+  assert.match(result.findings, /^BLOCK:/);
+  assert.match(result.findings, /data loss/);
 });

@@ -8,7 +8,8 @@ import {
   ensureNativePrePushHook,
   nativePrePushStatus,
   uninstallNativePrePushHook,
-  NATIVE_HOOK_MARKER
+  NATIVE_HOOK_MARKER,
+  NATIVE_PUSH_DISPATCH_ARG
 } from "../global-hooks/native-git-hook.mjs";
 
 function run(cmd, args, cwd) {
@@ -27,8 +28,15 @@ function fakeRuntime(dir) {
   const file = path.join(dir, "runtime.mjs");
   fs.writeFileSync(file, [
     "import fs from 'node:fs';",
-    "const input = fs.readFileSync(0, 'utf8');",
-    "fs.appendFileSync(process.env.CAPTURE, `peerbench:${process.argv.slice(2).join('|')}:${input}`);"
+    "import path from 'node:path';",
+    "const args = process.argv.slice(2);",
+    "if (args[0] !== '--peerbench-native-push-dispatch-v1' || args.length !== 2) process.exit(91);",
+    "const spool = args[1];",
+    "const input = fs.readFileSync(path.join(spool, 'input.bin'), 'utf8');",
+    "const remoteName = fs.readFileSync(path.join(spool, 'remote-name.bin'), 'utf8');",
+    "const remoteUrl = fs.readFileSync(path.join(spool, 'remote-url.bin'), 'utf8');",
+    "fs.appendFileSync(process.env.CAPTURE, `peerbench:${remoteName}|${remoteUrl}:${input}`);",
+    "fs.rmSync(spool, { recursive: true, force: true });"
   ].join("\n"));
   return file;
 }
@@ -37,11 +45,17 @@ function e2eRuntime(dir) {
   const file = path.join(dir, "e2e-runtime.mjs");
   fs.writeFileSync(file, [
     "import fs from 'node:fs';",
+    "import path from 'node:path';",
     "import { spawnSync } from 'node:child_process';",
-    "const input = fs.readFileSync(0, 'utf8');",
+    "const args = process.argv.slice(2);",
+    "const spool = args[1];",
+    "const input = fs.readFileSync(path.join(spool, 'input.bin'), 'utf8');",
+    "const remoteName = fs.readFileSync(path.join(spool, 'remote-name.bin'), 'utf8');",
+    "const remoteUrl = fs.readFileSync(path.join(spool, 'remote-url.bin'), 'utf8');",
     "const localSha = input.trim().split(/\\s+/)[1] || '';",
     "const commitExists = Boolean(localSha) && spawnSync('git', ['cat-file', '-e', `${localSha}^{commit}`]).status === 0;",
-    "fs.writeFileSync(process.env.RUNTIME_CAPTURE, JSON.stringify({ input, args: process.argv.slice(2), localSha, commitExists }));",
+    "fs.writeFileSync(process.env.RUNTIME_CAPTURE, JSON.stringify({ input, args, remoteName, remoteUrl, localSha, commitExists }));",
+    "fs.rmSync(spool, { recursive: true, force: true });",
     "process.exit(Number(process.env.RUNTIME_EXIT || 0));"
   ].join("\n"));
   return file;
@@ -137,7 +151,13 @@ test("dispatcher preserves stdin byte-for-byte for empty and multi-line streams"
   fs.writeFileSync(original, "#!/bin/sh\ncat > \"$LOCAL_BYTES\"\n");
   fs.chmodSync(original, 0o755);
   const runtime = path.join(ws, "bytes-runtime.mjs");
-  fs.writeFileSync(runtime, "import fs from 'node:fs'; fs.writeFileSync(process.env.RUNTIME_BYTES, fs.readFileSync(0));\n");
+  fs.writeFileSync(runtime, [
+    "import fs from 'node:fs';",
+    "import path from 'node:path';",
+    "const spool = process.argv[3];",
+    "fs.writeFileSync(process.env.RUNTIME_BYTES, fs.readFileSync(path.join(spool, 'input.bin')));",
+    "fs.rmSync(spool, { recursive: true, force: true });"
+  ].join("\n"));
   assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime }).ok, true);
 
   for (const input of [Buffer.alloc(0), Buffer.from("one\ntwo\n\n")]) {
@@ -150,11 +170,175 @@ test("dispatcher preserves stdin byte-for-byte for empty and multi-line streams"
   }
 });
 
+test("dispatcher keeps credential URLs out of Node argv and preserves exact private spool bytes through physical paths", () => {
+  const ws = repo();
+  const hooks = path.join(ws, ".git", "hooks");
+  const tmpParent = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench dispatch parent with spaces "));
+  const tmpLink = path.join(ws, "tmp-link");
+  fs.symlinkSync(tmpParent, tmpLink);
+  const capture = path.join(ws, "dispatch-capture.json");
+  const runtime = path.join(ws, "dispatch capture runtime.mjs");
+  fs.writeFileSync(runtime, [
+    "import fs from 'node:fs';",
+    "import path from 'node:path';",
+    "const args = process.argv.slice(2);",
+    "const spool = args[1];",
+    "const names = ['dispatch-sentinel.json', 'input.bin', 'remote-name.bin', 'remote-url.bin'];",
+    "const sentinel = JSON.parse(fs.readFileSync(path.join(spool, 'dispatch-sentinel.json'), 'utf8'));",
+    "let ownerAlive = false;",
+    "try { process.kill(sentinel.ownerPid, 0); ownerAlive = true; } catch {}",
+    "const files = Object.fromEntries(names.map((name) => {",
+    "  const file = path.join(spool, name);",
+    "  return [name, { mode: fs.lstatSync(file).mode & 0o777, bytes: fs.readFileSync(file).toString('base64') }];",
+    "}));",
+    "fs.writeFileSync(process.env.DISPATCH_CAPTURE, JSON.stringify({ args, spool, spoolMode: fs.lstatSync(spool).mode & 0o777, files, sentinel, ownerAlive, runtimePid: process.pid }));",
+    "fs.rmSync(spool, { recursive: true, force: true });"
+  ].join("\n"));
+  assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime }).ok, true);
+
+  const remoteName = "origin name\nsecond line";
+  const remoteUrl = "https://user:top-secret@example.invalid/repo path?x=a&y=b\nfragment";
+  const input = Buffer.from([0, 1, 2, 10, 13, 255, ...Buffer.from("tuple with spaces\n")]);
+  const invoked = spawnSync(path.join(hooks, "pre-push"), [remoteName, remoteUrl], {
+    cwd: ws,
+    input,
+    encoding: "utf8",
+    env: { ...process.env, TMPDIR: tmpLink, DISPATCH_CAPTURE: capture }
+  });
+  assert.equal(invoked.status, 0, invoked.stderr);
+  const seen = JSON.parse(fs.readFileSync(capture, "utf8"));
+  assert.equal(seen.args[0], NATIVE_PUSH_DISPATCH_ARG);
+  assert.equal(seen.args.length, 2);
+  assert.equal(seen.args.join("\n").includes("top-secret"), false);
+  assert.equal(path.dirname(seen.spool), fs.realpathSync.native(tmpParent));
+  assert.equal(seen.spoolMode, 0o700);
+  assert.equal(seen.files["dispatch-sentinel.json"].mode, 0o600);
+  assert.equal(seen.files["input.bin"].mode, 0o600);
+  assert.equal(seen.files["remote-name.bin"].mode, 0o600);
+  assert.equal(seen.files["remote-url.bin"].mode, 0o600);
+  assert.deepEqual(Buffer.from(seen.files["input.bin"].bytes, "base64"), input);
+  assert.deepEqual(Buffer.from(seen.files["remote-name.bin"].bytes, "base64"), Buffer.from(remoteName));
+  assert.deepEqual(Buffer.from(seen.files["remote-url.bin"].bytes, "base64"), Buffer.from(remoteUrl));
+  assert.deepEqual(
+    { kind: seen.sentinel.kind, version: seen.sentinel.version },
+    { kind: "peerbench-native-push-dispatch", version: 1 }
+  );
+  assert.equal(Number.isInteger(seen.sentinel.ownerPid) && seen.sentinel.ownerPid > 0, true);
+  assert.equal(seen.sentinel.ownerPid === seen.runtimePid, false, "the sentinel owner is the sanitized shell, not its Node child");
+  assert.equal(seen.ownerAlive, true, "the dispatch owner must still be alive during handoff");
+  assert.equal(fs.existsSync(seen.spool), false, "the Node owner must remove the transient dispatch spool");
+});
+
+test("dispatcher fails closed when secure spool creation, writing, or chmod fails", () => {
+  for (const utility of ["mktemp", "cat", "chmod"]) {
+    const ws = repo();
+    const bin = path.join(ws, `fail-${utility}`);
+    fs.mkdirSync(bin);
+    const failing = path.join(bin, utility);
+    fs.writeFileSync(failing, "#!/bin/sh\nexit 97\n");
+    fs.chmodSync(failing, 0o755);
+    const capture = path.join(ws, "must-not-run");
+    assert.equal(ensureNativePrePushHook(ws, { runtimePath: fakeRuntime(ws) }).ok, true);
+    const hook = path.join(ws, ".git", "hooks", "pre-push");
+    const invoked = spawnSync(hook, ["origin", "https://user:secret@example.invalid/repo"], {
+      cwd: ws,
+      input: "tuple\n",
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, CAPTURE: capture }
+    });
+    assert.notEqual(invoked.status, 0, `${utility} failure must block`);
+    assert.match(invoked.stderr, /push blocked/i);
+    assert.equal(fs.existsSync(capture), false, `${utility} failure must not invoke Node`);
+  }
+});
+
+test("dispatcher fails closed when Git does not supply exactly two remote arguments", () => {
+  const ws = repo();
+  const capture = path.join(ws, "must-not-run");
+  assert.equal(ensureNativePrePushHook(ws, { runtimePath: fakeRuntime(ws) }).ok, true);
+  const invoked = spawnSync(path.join(ws, ".git", "hooks", "pre-push"), ["origin"], {
+    cwd: ws,
+    input: "",
+    encoding: "utf8",
+    env: { ...process.env, CAPTURE: capture }
+  });
+  assert.notEqual(invoked.status, 0);
+  assert.match(invoked.stderr, /invalid native pre-push argument set/);
+  assert.equal(fs.existsSync(capture), false);
+});
+
+test("dispatcher feeds legacy runtimes a malformed nonempty sentinel instead of fail-open EOF", () => {
+  const ws = repo();
+  const tmpParent = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-legacy-runtime-"));
+  const runtime = path.join(ws, "legacy-runtime.mjs");
+  const capture = path.join(ws, "legacy-capture.json");
+  fs.writeFileSync(runtime, [
+    "import fs from 'node:fs';",
+    "const input = fs.readFileSync(0, 'utf8');",
+    "const fields = input.trim() ? input.trim().split(/\\s+/) : [];",
+    "if (process.env.LEGACY_CAPTURE) fs.writeFileSync(process.env.LEGACY_CAPTURE, JSON.stringify({ input, fields, args: process.argv.slice(2) }));",
+    "process.exit(input.length === 0 ? 0 : (fields.length === 4 ? 0 : 17));"
+  ].join("\n"));
+
+  const legacyEof = spawnSync(process.execPath, [runtime], { input: "", encoding: "utf8" });
+  assert.equal(legacyEof.status, 0, "the legacy fixture models the old fail-open EOF behavior");
+  assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime }).ok, true);
+  const secretUrl = "https://user:legacy-secret@example.invalid/repo";
+  const invoked = spawnSync(path.join(ws, ".git", "hooks", "pre-push"), ["origin", secretUrl], {
+    cwd: ws,
+    input: `refs/heads/main ${"1".repeat(40)} refs/heads/main ${"2".repeat(40)}\n`,
+    encoding: "utf8",
+    env: { ...process.env, TMPDIR: tmpParent, LEGACY_CAPTURE: capture }
+  });
+  assert.equal(invoked.status, 17, "a legacy runtime must reject the malformed dispatch sentinel");
+  const seen = JSON.parse(fs.readFileSync(capture, "utf8"));
+  assert.match(seen.input, /peerbench-native-dispatch-protocol-v1/);
+  assert.notEqual(seen.input.length, 0);
+  assert.notEqual(seen.fields.length, 4, "the sentinel must never parse as a Git update tuple");
+  assert.equal(seen.args.includes(secretUrl), false, "legacy compatibility must not restore credentials to argv");
+  assert.deepEqual(
+    fs.readdirSync(tmpParent).filter((name) => name.startsWith("peerbench-native-dispatch.")),
+    [],
+    "legacy rejection must clean the credential spool"
+  );
+});
+
+test("dispatcher removes the credential spool when exec cannot start Node", () => {
+  const ws = repo();
+  const tmpParent = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-exec-fail-"));
+  const brokenNode = path.join(ws, "broken-node");
+  fs.writeFileSync(brokenNode, "#!/definitely/missing/peerbench-interpreter\n");
+  fs.chmodSync(brokenNode, 0o755);
+  assert.equal(ensureNativePrePushHook(ws, { runtimePath: fakeRuntime(ws), nodePath: brokenNode }).ok, true);
+
+  const invoked = spawnSync(path.join(ws, ".git", "hooks", "pre-push"), [
+    "origin",
+    "https://user:credential@example.invalid/repo"
+  ], {
+    cwd: ws,
+    input: "tuple\n",
+    encoding: "utf8",
+    env: { ...process.env, TMPDIR: tmpParent, CAPTURE: path.join(ws, "must-not-run") }
+  });
+  assert.notEqual(invoked.status, 0);
+  assert.match(invoked.stderr, /push blocked|not found|no such file/i);
+  assert.deepEqual(
+    fs.readdirSync(tmpParent).filter((name) => name.startsWith("peerbench-native-dispatch.")),
+    [],
+    "failed exec must not leave remote credentials in a spool directory"
+  );
+});
+
 test("dispatcher uses the embedded Node executable when hook PATH has no node", () => {
   const ws = repo();
   const runtimeCapture = path.join(ws, "restricted-path-runtime");
   const runtime = path.join(ws, "restricted-runtime.mjs");
-  fs.writeFileSync(runtime, "import fs from 'node:fs'; fs.writeFileSync(process.env.RUNTIME_CAPTURE, 'ran');\n");
+  fs.writeFileSync(runtime, [
+    "import fs from 'node:fs';",
+    "const spool = process.argv[3];",
+    "fs.writeFileSync(process.env.RUNTIME_CAPTURE, 'ran');",
+    "fs.rmSync(spool, { recursive: true, force: true });"
+  ].join("\n"));
   assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime, nodePath: process.execPath }).ok, true);
   const hook = path.join(ws, ".git", "hooks", "pre-push");
   const invoked = spawnSync(hook, ["origin", "file:///remote"], {
@@ -225,7 +409,7 @@ test("dispatcher executes shebang-option hooks directly so their failure semanti
   fs.writeFileSync(original, "#!/bin/sh -e\nfalse\nprintf should-not-run\n");
   fs.chmodSync(original, 0o755);
   const runtime = path.join(ws, "runtime-options.mjs");
-  fs.writeFileSync(runtime, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(runtimeCapture)}, "ran");\n`);
+  fs.writeFileSync(runtime, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(runtimeCapture)}, "ran"); fs.rmSync(process.argv[3], { recursive: true, force: true });\n`);
   assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime }).ok, true);
 
   const invoked = spawnSync(path.join(hooks, "pre-push"), ["origin", "file:///remote"], {
@@ -276,7 +460,11 @@ test("real git push supplies exact post-commit tuples, chains identical stdin, a
   const firstSeen = JSON.parse(fs.readFileSync(firstRuntimeCapture, "utf8"));
   assert.equal(firstSeen.input, firstExpected);
   assert.equal(fs.readFileSync(firstLocalCapture, "utf8"), firstSeen.input);
-  assert.deepEqual(firstSeen.args, ["origin", remote]);
+  assert.equal(firstSeen.args[0], NATIVE_PUSH_DISPATCH_ARG);
+  assert.equal(firstSeen.args.length, 2);
+  assert.equal(firstSeen.remoteName, "origin");
+  assert.equal(firstSeen.remoteUrl, remote);
+  assert.equal(firstSeen.args.includes(remote), false, "the remote URL must not remain in Node argv");
   assert.equal(firstSeen.localSha, firstSha);
   assert.equal(firstSeen.commitExists, true, "the commit must already exist when pre-push runs");
   assert.equal(run("git", ["rev-parse", "refs/heads/main"], remote), firstSha);
@@ -300,7 +488,11 @@ test("real git push supplies exact post-commit tuples, chains identical stdin, a
   const secondSeen = JSON.parse(fs.readFileSync(secondRuntimeCapture, "utf8"));
   assert.equal(secondSeen.input, secondExpected);
   assert.equal(fs.readFileSync(secondLocalCapture, "utf8"), secondSeen.input);
-  assert.deepEqual(secondSeen.args, ["origin", remote]);
+  assert.equal(secondSeen.args[0], NATIVE_PUSH_DISPATCH_ARG);
+  assert.equal(secondSeen.args.length, 2);
+  assert.equal(secondSeen.remoteName, "origin");
+  assert.equal(secondSeen.remoteUrl, remote);
+  assert.equal(secondSeen.args.includes(remote), false, "the remote URL must not remain in Node argv");
   assert.equal(secondSeen.localSha, secondSha);
   assert.equal(secondSeen.commitExists, true, "the rejected commit must exist before review");
   assert.equal(run("git", ["rev-parse", "refs/heads/main"], remote), firstSha, "rejection must leave the remote unchanged");

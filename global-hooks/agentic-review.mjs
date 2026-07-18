@@ -84,6 +84,17 @@ function looksLikeRawToolCall(content) {
   return /<tool_call\b|<function=|<parameter=|<\/function>/i.test(String(content || ""));
 }
 
+export function serializeAgenticRequest({ model, messages, temperature, tools, force = false, thinking }) {
+  return JSON.stringify({
+    model,
+    messages,
+    ...(temperature == null ? {} : { temperature }),
+    stream: true,
+    ...(force ? {} : { tools, tool_choice: "auto" }),
+    ...(thinking === "enabled" || thinking === "disabled" ? { thinking: { type: thinking } } : {})
+  });
+}
+
 export async function agenticReview({
   baseURL, apiKey, model, system, user,
   temperature = 0, headers = {}, tools, thinking,
@@ -122,9 +133,14 @@ export async function agenticReview({
       // On conclude (force): OMIT the tools array entirely — a model can't call tools that aren't
       // offered, so it MUST produce content. (tool_choice:"none" alone is ignored by some models,
       // e.g. kimi-k2.6, which then reads until maxSteps and drops out with "no verdict".)
-      const makeBody = (bodyMessages = messages, bodyTemperature = currentTemperature) => JSON.stringify({ model, messages: bodyMessages, ...(bodyTemperature == null ? {} : { temperature: bodyTemperature }), stream: true,
-        ...(force ? {} : { tools: tools.schemas, tool_choice: "auto" }),
-        ...(thinking === "enabled" || thinking === "disabled" ? { thinking: { type: thinking } } : {}) });
+      const makeBody = (bodyMessages = messages, bodyTemperature = currentTemperature) => serializeAgenticRequest({
+        model,
+        messages: bodyMessages,
+        temperature: bodyTemperature,
+        tools: tools.schemas,
+        force,
+        thinking
+      });
       let body = makeBody();
       lastReqBytes = body.length;
       dlog(`step ${step}: reqKB=${(lastReqBytes / 1024) | 0} toolKB=${(toolBytes / 1024) | 0} msgs=${messages.length}${force ? " [conclude]" : ""}`);

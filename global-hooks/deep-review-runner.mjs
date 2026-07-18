@@ -14,7 +14,11 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { isBenchDisabled as defaultIsBenchDisabled, sessionKeyFromInput, workspaceStateDir } from "./config-store.mjs";
 import { shouldRewake, deepKey } from "./deep-review.mjs";
-import { runSpecReview as defaultRunSpecReview, runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
+import {
+  runSpecReview as defaultRunSpecReview,
+  runPushReview as defaultRunPushReview,
+  MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS
+} from "./spec-review-run.mjs";
 import {
   recoverOrphans, listBlocked, listJobs, claim, requeueForRetry, markBlocked, deleteJob, currentContentKey, GONE
 } from "./deep-queue.mjs";
@@ -23,8 +27,12 @@ export const MAX_BATCH = 3;                     // claim+run at most this many C
                                                 // on concurrent agentic load. Surplus is drained in later batches inside
                                                 // this same hook invocation, so Claude is not re-woken just to process
                                                 // queued clean reviews.
-export const RUNNER_BUDGET_MS = 12 * 60 * 1000; // MUST match the deep-runner Stop hook timeout in hooks/hooks.json (720s).
-                                                // A batch may consume the full per-review budget (~10 min), so starting
+export const RUNNER_BUDGET_MARGIN_MS = 2 * 60 * 1000;
+export const RUNNER_BUDGET_MS = MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS + RUNNER_BUDGET_MARGIN_MS;
+                                                // MUST stay below the derived deep-runner Stop-hook timeout. The largest
+                                                // push gets one shared Git-preparation window followed by the bounded
+                                                // panel; this runner keeps a separate two-minute bookkeeping margin.
+                                                // A batch may consume its full review budget, so starting
                                                 // another one near the end of this window gets the runner KILLED mid-claim —
                                                 // and with no later Stop, the orphaned claims sit unprocessed indefinitely
                                                 // (recovery only runs at the NEXT invocation). The drain loop therefore only
@@ -39,8 +47,14 @@ export const MAX_BLOCK_WAKES = 3;                // completed finding: at most t
 export const MAX_RUNNER_FOLLOWUP_WAKES = 3;      // every deep-runner exit-2 combined: at most three automatic Stops per task/session
 export const RUNNER_FOLLOWUP_WINDOW_MS = 2 * 60 * 60 * 1000; // stale-marker cleanup only; durable work never ages out
 
+const RUNNER_SYNC_GIT_TIMEOUT_MS = 30_000;
+
 function workspaceRoot(cwd) {
-  try { return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim(); }
+  try {
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd, encoding: "utf8", timeout: RUNNER_SYNC_GIT_TIMEOUT_MS, killSignal: "SIGKILL"
+    }).trim();
+  }
   catch { return cwd; }
 }
 
@@ -60,7 +74,13 @@ function workspaceRoot(cwd) {
 function reflogHeadAt(ws, atMs) {
   try {
     const out = execFileSync("git", ["log", "-g", "--date=unix", "--format=%H %gd", "HEAD"],
-      { cwd: ws, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+      {
+        cwd: ws,
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: RUNNER_SYNC_GIT_TIMEOUT_MS,
+        killSignal: "SIGKILL"
+      });
     const entries = out.trim().split("\n").map((l) => {
       const m = l.match(/^([0-9a-f]{40,}) HEAD@\{(\d+)\}$/);
       return m ? { sha: m[1], ts: Number(m[2]) * 1000 } : null;
@@ -475,7 +495,11 @@ async function runMainUnlocked({
     }
     // Every batch after the first must fit its worst case (per-review budget + margin) inside the
     // remaining hook budget, or the hook timeout kills the runner mid-claim.
-    if (seenJobKeys.size && (clock() - startTs) + reviewBudgetMs + 30_000 > runnerBudgetMs) {
+    const nextBatchMayContainPush = queued.some((job) => job.kind === "push" || job.kind === "merge");
+    const nextBatchBudgetMs = nextBatchMayContainPush
+      ? Math.max(reviewBudgetMs, MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS)
+      : reviewBudgetMs;
+    if (seenJobKeys.size && (clock() - startTs) + nextBatchBudgetMs + 30_000 > runnerBudgetMs) {
       deferred = queued.length;
       break;
     }

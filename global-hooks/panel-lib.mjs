@@ -300,13 +300,22 @@ export function spawnCollect(cmd, args, { cwd, env, timeoutMs }) {
     const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
     let child;
     try {
-      child = spawn(cmd, args, { cwd, env });
+      // Reviewer CLIs can launch brokers/children. Give the invocation its own POSIX process group
+      // so a timeout tears down the whole tree instead of leaving descendants consuming quota and
+      // racing the next bounded chunk. Windows has no negative-pid process-group signal, so retain
+      // the direct-child fallback there.
+      child = spawn(cmd, args, { cwd, env, detached: process.platform !== "win32" });
     } catch (error) {
       finish({ status: 127, stdout: "", stderr: String(error) });
       return;
     }
     const timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      try {
+        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      }
       finish({ status: 124, stdout, stderr: "timed out" });
     }, timeoutMs);
     child.stdout.on("data", (d) => { stdout += d; });
@@ -318,19 +327,14 @@ export function spawnCollect(cmd, args, { cwd, env, timeoutMs }) {
 
 const TIMEOUT_MS = 25 * 60 * 1000;
 
-// Codex side: companion task --json -> { rawOutput }
+// Codex side: use the same tracked background lifecycle as deep tasks so a timed-out ordinary
+// review is interrupted in the detached companion broker rather than merely losing its wrapper.
 export async function runCodexReview({ companionPath, prompt, cwd, env }) {
-  const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
-  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env: childEnv, timeoutMs: TIMEOUT_MS });
-  if (r.status !== 0) return { name: "Codex", error: (r.stderr || r.stdout || "codex task failed").trim().slice(0, 300) };
-  try {
-    const raw = String(JSON.parse(r.stdout)?.rawOutput ?? "").trim();
-    const v = parseVerdict(raw);
-    if (!v.verdict) return { name: "Codex", error: "unexpected reviewer output" };
-    return { name: "Codex", ...v };
-  } catch {
-    return { name: "Codex", error: "invalid JSON from codex companion" };
-  }
+  const task = await runCodexTask({ companionPath, prompt, cwd, env, timeoutMs: TIMEOUT_MS });
+  if (task.error) return { name: "Codex", error: task.error };
+  const v = parseVerdict(task.raw);
+  if (!v.verdict) return { name: "Codex", error: "unexpected reviewer output" };
+  return { name: "Codex", ...v };
 }
 
 // Grok side: the local Grok Build CLI (x.ai harness), plan-billed — no API key. Headless single-turn
@@ -378,6 +382,27 @@ export const GROK_DEEP_REVIEW_SCHEMA = JSON.stringify({
   required: ["verdict", "severity", "findings"],
 });
 
+// Multi-chunk push maps need an explicit bounded handoff even when a chunk is clean. Keep this
+// separate from the ordinary deep-review schema so spec reviews and final synthesis calls are not
+// forced to manufacture chunk-only metadata.
+export const MAX_PUSH_SYNTHESIS_NOTES_CHARS = 3_000;
+
+export const GROK_PUSH_CHUNK_REVIEW_SCHEMA = JSON.stringify({
+  type: "object",
+  properties: {
+    verdict: { type: "string", enum: ["ALLOW", "BLOCK"] },
+    severity: { type: "string", enum: ["none", "low", "medium", "high", "critical"] },
+    findings: { type: "string", description: "complete findings as markdown bullets (- file:line — issue); empty string when clean" },
+    synthesisNotes: {
+      type: "string",
+      minLength: 1,
+      maxLength: MAX_PUSH_SYNTHESIS_NOTES_CHARS,
+      description: "changed paths/symbols, callers/contracts inspected, assumptions, and cross-chunk risks"
+    }
+  },
+  required: ["verdict", "severity", "findings", "synthesisNotes"],
+});
+
 const DEEP_SEVERITIES = new Set(["none", "low", "medium", "high", "critical"]);
 
 // Reconstitute the canonical review text (`VERDICT: …\nSEVERITY: …\n\n<findings>`) from a
@@ -391,9 +416,14 @@ export function grokStructuredDeepReview(stdout) {
       && DEEP_SEVERITIES.has(so?.severity)
       && typeof so?.findings === "string") {
       const findings = so.findings.trim();
+      const synthesisNotes = typeof so.synthesisNotes === "string" && so.synthesisNotes.trim()
+        ? so.synthesisNotes.trim()
+        : "";
+      if (synthesisNotes && Array.from(synthesisNotes).length > MAX_PUSH_SYNTHESIS_NOTES_CHARS) return null;
       const summary = (findings.split(/\r?\n/, 1)[0] || "").replace(/^[-*\s]+/, "").slice(0, 200)
         || (so.verdict === "ALLOW" ? "no blocking findings" : "blocking findings below");
-      return `${so.verdict}: ${summary}\nSEVERITY: ${so.severity}${findings ? `\n\n${findings}` : ""}`;
+      return `${so.verdict}: ${summary}\nSEVERITY: ${so.severity}${findings ? `\n\n${findings}` : ""}`
+        + `${synthesisNotes ? `\n\nSYNTHESIS NOTES: ${synthesisNotes}` : ""}`;
     }
   } catch { /* not json */ }
   return null;
@@ -639,14 +669,99 @@ export async function runGrokTask({ prompt, cwd, env, timeoutMs = TIMEOUT_MS, bi
 // cap so a push/spec review lands promptly; hunt/investigate omit it and keep the full 25 min.
 export async function runCodexTask({ companionPath, prompt, cwd, env, timeoutMs = TIMEOUT_MS }) {
   const childEnv = { ...env, BENCH_SUPPRESS_HOOKS: env?.BENCH_SUPPRESS_HOOKS || "1" };
-  const r = await spawnCollect(process.execPath, [companionPath, "task", "--json", prompt], { cwd, env: childEnv, timeoutMs });
-  if (r.status !== 0) return { name: "Codex", error: (r.stderr || r.stdout || "codex task failed").trim().slice(0, 300) };
-  try {
-    const raw = String(JSON.parse(r.stdout)?.rawOutput ?? "").trim();
-    return raw ? { name: "Codex", raw } : { name: "Codex", error: "codex returned empty output" };
-  } catch {
-    return { name: "Codex", error: "invalid JSON from codex companion" };
+  const budgetMs = Math.max(1, Number(timeoutMs) || TIMEOUT_MS);
+  const deadline = Date.now() + budgetMs;
+  const launchTimeoutMs = Math.min(budgetMs, 5_000);
+  const cleanupTimeoutMs = 5_000;
+  let jobId = null;
+
+  const parseJson = (stdout) => {
+    try { return JSON.parse(stdout); } catch { return null; }
+  };
+  const commandError = (r, fallback) => String(r.stderr || r.stdout || fallback).trim().slice(0, 300);
+  const cancelJob = async () => {
+    if (!jobId) return;
+    // The companion's foreground process is only a client of its detached app-server broker.
+    // Cancelling the tracked background job is what interrupts that broker turn and tears down the
+    // detached task worker; killing a status/result wrapper alone cannot guarantee either action.
+    await spawnCollect(process.execPath, [companionPath, "cancel", jobId, "--json"], {
+      cwd,
+      env: childEnv,
+      timeoutMs: cleanupTimeoutMs
+    });
+  };
+  const fail = async (message) => {
+    await cancelJob();
+    return { name: "Codex", error: String(message || "codex task failed").trim().slice(0, 300) };
+  };
+
+  const launch = await spawnCollect(
+    process.execPath,
+    [companionPath, "task", "--background", "--json", prompt],
+    // Background launch is a local control operation, not part of the model's thinking allowance.
+    // Bound it independently while still keeping it inside the caller's absolute deadline.
+    { cwd, env: childEnv, timeoutMs: launchTimeoutMs }
+  );
+  const launchPayload = parseJson(launch.stdout);
+  if (typeof launchPayload?.jobId === "string" && launchPayload.jobId.trim()) jobId = launchPayload.jobId.trim();
+  if (launch.status !== 0) return fail(commandError(launch, "codex task launch failed"));
+  if (!jobId) return fail("invalid JSON from codex companion task launch");
+
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return fail("codex task timed out");
+
+    // Leave a small slice for starting/serialising the control command, then re-check until the
+    // absolute deadline. The outer timeout is always the true remaining work budget, so a slow or
+    // wedged status client cannot defer the cancellation decision beyond the caller's cap.
+    const controlReserveMs = Math.min(250, Math.max(25, Math.ceil(remainingMs / 4)));
+    const waitMs = Math.max(1, remainingMs - controlReserveMs);
+    const statusResult = await spawnCollect(
+      process.execPath,
+      [
+        companionPath,
+        "status",
+        jobId,
+        "--wait",
+        "--timeout-ms",
+        String(waitMs),
+        "--poll-interval-ms",
+        "100",
+        "--json"
+      ],
+      { cwd, env: childEnv, timeoutMs: remainingMs }
+    );
+    if (statusResult.status !== 0) {
+      const fallback = statusResult.status === 124 ? "codex task timed out" : "codex task status failed";
+      return fail(commandError(statusResult, fallback));
+    }
+
+    const statusPayload = parseJson(statusResult.stdout);
+    if (!statusPayload?.job || typeof statusPayload.job.status !== "string") {
+      return fail("invalid JSON from codex companion status");
+    }
+    const jobStatus = statusPayload.job.status;
+    if (jobStatus === "completed") break;
+    if (jobStatus !== "queued" && jobStatus !== "running") {
+      return fail(statusPayload.job.errorMessage || `codex task ${jobStatus}`);
+    }
   }
+
+  const resultRemainingMs = deadline - Date.now();
+  if (resultRemainingMs <= 0) return fail("codex task timed out");
+  const result = await spawnCollect(process.execPath, [companionPath, "result", jobId, "--json"], {
+    cwd,
+    env: childEnv,
+    timeoutMs: resultRemainingMs
+  });
+  if (result.status !== 0) {
+    const fallback = result.status === 124 ? "codex task timed out" : "codex task result failed";
+    return fail(commandError(result, fallback));
+  }
+  const resultPayload = parseJson(result.stdout);
+  if (!resultPayload) return fail("invalid JSON from codex companion result");
+  const raw = String(resultPayload?.storedJob?.result?.rawOutput ?? resultPayload?.rawOutput ?? "").trim();
+  return raw ? { name: "Codex", raw } : fail("codex returned empty output");
 }
 
 // Resolve a reviewer's effective severity: an already-parsed `severity` field (deep-result

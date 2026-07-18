@@ -16,8 +16,24 @@ import {
 } from "../global-hooks/deep-review.mjs";
 import { combinePanel } from "../global-hooks/panel-lib.mjs";
 import { specReviewCommand } from "../scripts/bench-runner.mjs";
-import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mjs";
-import { buildPushReviewUser } from "../global-hooks/hunt.mjs";
+import {
+  buildPushReviewChunks,
+  buildSerializedPushReviewChunks,
+  MAX_PUSH_REVIEW_PAYLOAD_BYTES,
+  MAX_PUSH_REVIEW_CHUNKS,
+  PUSH_GIT_PREPARATION_BUDGET_MS,
+  MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS,
+  promptSafeEvidence,
+  runSpecReview,
+  runPushReview
+} from "../global-hooks/spec-review-run.mjs";
+import {
+  buildPushReviewUser,
+  MAX_AUTO_PUSH_REVIEW_BUDGET_MS,
+  MAX_PUSH_REVIEW_REQUEST_BYTES,
+  PUSH_REVIEW_SYSTEM,
+  pushReviewSerializedRequestBytes
+} from "../global-hooks/hunt.mjs";
 import { listTraces, readTrace } from "../global-hooks/trace-store.mjs";
 import { workspaceStateDir } from "../global-hooks/config-store.mjs";
 
@@ -95,6 +111,26 @@ test("summarizeSpecReview preserves reviewer failures in the structured contract
   assert.deepEqual(s.reviewers, [
     { name: "Kimi", verdict: null, severity: "none", error: "timeout" }
   ]);
+});
+
+test("summarizeSpecReview preserves bounded-coverage failures alongside a partial BLOCK", () => {
+  const summary = summarizeSpecReview([{
+    name: "Grok",
+    verdict: "BLOCK",
+    severity: "high",
+    findingCount: 1,
+    error: null,
+    coverageComplete: false,
+    coverageError: "chunk 2/3 timed out"
+  }]);
+  assert.deepEqual(summary.reviewers[0], {
+    name: "Grok",
+    verdict: "BLOCK",
+    severity: "high",
+    error: null,
+    coverageComplete: false,
+    coverageError: "chunk 2/3 timed out"
+  });
 });
 
 test("shouldRewake fires at/above the rewake severity with findings, else not", () => {
@@ -186,6 +222,121 @@ function gitStub({ commits = "abc123 add feature", diff = "+const x = 1;", head 
   return { impl, calls };
 }
 
+test("runPushReview shares one absolute Git budget, then gives the panel its separately capped budget", async () => {
+  const ws = freshWs();
+  const stub = gitStub();
+  const observedTimeouts = [];
+  let clockMs = 1_000;
+  let panelBudgetMs = null;
+  const env = {
+    ...process.env,
+    BENCH_PUSH_REVIEW_BUDGET_MS: String(MAX_AUTO_PUSH_REVIEW_BUDGET_MS * 10)
+  };
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    env,
+    nowImpl: () => clockMs,
+    gitImpl: (args, cwd, options) => {
+      observedTimeouts.push(options.timeoutMs);
+      clockMs += 10_000;
+      return stub.impl(args, cwd, options);
+    },
+    writeTraceImpl: () => null,
+    panelImpl: async ({ budgetMs }) => {
+      panelBudgetMs = budgetMs;
+      return [{ name: "Kimi", verdict: "ALLOW", findings: "ALLOW: clean", findingCount: 0, severity: "none" }];
+    }
+  });
+
+  assert.equal(result.retry, undefined);
+  assert.equal(observedTimeouts[0], PUSH_GIT_PREPARATION_BUDGET_MS);
+  assert.ok(observedTimeouts.length >= 6, "metadata and evidence calls must all receive a timeout");
+  for (let index = 1; index < observedTimeouts.length; index++) {
+    assert.ok(observedTimeouts[index] < observedTimeouts[index - 1], "sequential Git calls spend one decreasing deadline");
+  }
+  assert.equal(panelBudgetMs, MAX_AUTO_PUSH_REVIEW_BUDGET_MS, "an oversized override cannot exceed the panel maximum");
+  assert.equal(
+    MAX_PUSH_REVIEW_END_TO_END_BUDGET_MS,
+    PUSH_GIT_PREPARATION_BUDGET_MS + MAX_AUTO_PUSH_REVIEW_BUDGET_MS
+  );
+});
+
+test("runPushReview stops metadata when the shared Git deadline is exhausted", async () => {
+  const ws = freshWs();
+  const stub = gitStub();
+  const observedTimeouts = [];
+  let clockMs = 0;
+  let panelCalled = false;
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    nowImpl: () => clockMs,
+    gitImpl: (args, cwd, options) => {
+      observedTimeouts.push(options.timeoutMs);
+      clockMs += 100_000;
+      return stub.impl(args, cwd, options);
+    },
+    panelImpl: async () => { panelCalled = true; return []; },
+    writeTraceImpl: () => null
+  });
+
+  assert.equal(panelCalled, false);
+  assert.equal(result.retry, true);
+  assert.match(result.reason, /shared absolute deadline/);
+  assert.deepEqual(observedTimeouts, [300_000, 200_000, 100_000]);
+});
+
+test("runPushReview bounds an evidence implementation that ignores its timeout", { timeout: 5_000 }, async () => {
+  const ws = freshWs();
+  const git = (args) => {
+    const result = spawnSync("git", args, { cwd: ws, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  };
+  git(["init", "-q"]);
+  git(["config", "user.email", "test@example.com"]);
+  git(["config", "user.name", "Test"]);
+  fs.writeFileSync(path.join(ws, "file.txt"), "one\n");
+  git(["add", "file.txt"]);
+  git(["commit", "-q", "-m", "base"]);
+  fs.writeFileSync(path.join(ws, "file.txt"), "two\n");
+  git(["commit", "-qam", "tip"]);
+
+  let evidenceCalls = 0;
+  let panelCalled = false;
+  const startedAt = Date.now();
+  const result = await runPushReview("HEAD^..HEAD", ws, {
+    gitPreparationBudgetMs: 1_000,
+    gitEvidenceImpl: () => {
+      evidenceCalls++;
+      return new Promise(() => {});
+    },
+    panelImpl: async () => { panelCalled = true; return []; },
+    writeTraceImpl: () => null
+  });
+
+  assert.ok(evidenceCalls >= 2, "commit and delta evidence were launched under the shared deadline");
+  assert.equal(panelCalled, false);
+  assert.equal(result.retry, true);
+  assert.match(result.reason, /shared absolute deadline/);
+  assert.ok(Date.now() - startedAt < 2_500, "an injected hanging evidence source cannot outlive the deadline");
+});
+
+test("runPushReview hard-kills a wedged synchronous Git metadata process", { timeout: 5_000 }, async () => {
+  const ws = freshWs();
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "deep-git-bin-"));
+  const fakeGit = path.join(bin, "git");
+  fs.writeFileSync(fakeGit, "#!/bin/sh\nexec /bin/sleep 30\n", { mode: 0o755 });
+  let panelCalled = false;
+  const startedAt = Date.now();
+  const result = await runPushReview("a..b", ws, {
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH || ""}` },
+    gitPreparationBudgetMs: 100,
+    panelImpl: async () => { panelCalled = true; return []; },
+    writeTraceImpl: () => null
+  });
+
+  assert.equal(panelCalled, false);
+  assert.equal(result.retry, true);
+  assert.ok(Date.now() - startedAt < 2_000, "synchronous Git must not be able to hang the push review");
+});
+
 test("runPushReview writes a gate:'push-review' trace and returns result + findings", async () => {
   const ws = freshWs();
   const stub = gitStub({ commits: "c1 first\nc2 second", diff: "+broken();" });
@@ -205,6 +356,10 @@ test("runPushReview writes a gate:'push-review' trace and returns result + findi
   assert.match(result.findings, /cross-file regression/);
   const [latest] = listTraces(ws, 1);
   assert.equal(latest.gate, "push-review");
+  const trace = readTrace(ws, latest.id);
+  assert.equal(trace.chunkManifest.length, 1);
+  assert.match(trace.chunkManifest[0].sha256, /^[0-9a-f]{64}$/);
+  assert.match(trace.evidenceHashes.rendered, /^[0-9a-f]{64}$/);
 });
 
 test("spec/push deep review panels receive the caller's explicit environment", async () => {
@@ -308,6 +463,97 @@ test("buildPushReviewUser keeps push evidence before assistant context", () => {
   assert.match(user, /claims\/context only|not proof/i);
 });
 
+test("bounded push chunks are deterministic, UTF-8 safe, contiguous, and exhaustive", () => {
+  const source = [
+    "<immutable_push>",
+    "commit " + "a".repeat(40),
+    "diff --git a/nested/emoji.js b/nested/emoji.js",
+    "@@ -1 +1 @@",
+    `-${"old".repeat(30)}🙂`,
+    `+${"new".repeat(90)}🚀`,
+    "</immutable_push>\n"
+  ].join("\n");
+  const options = { maxChunkBytes: 73, maxChunks: 100, base: "b".repeat(40), tip: "c".repeat(40), range: `${"b".repeat(40)}..${"c".repeat(40)}` };
+  const first = buildPushReviewChunks(source, options);
+  const second = buildPushReviewChunks(source, options);
+  assert.equal(first.ok, true);
+  assert.deepEqual(first, second, "same immutable evidence produces byte-identical chunks and hashes");
+  assert.equal(first.payloads.join(""), source, "core payloads reproduce every rendered evidence byte exactly once");
+  assert.equal(first.manifest[0].byteStart, 0);
+  assert.equal(first.manifest.at(-1).byteEnd, Buffer.byteLength(source));
+  for (let index = 0; index < first.manifest.length; index++) {
+    assert.ok(first.manifest[index].bytes <= 73);
+    if (index) assert.equal(first.manifest[index - 1].byteEnd, first.manifest[index].byteStart);
+    assert.doesNotMatch(first.payloads[index], /�/, "no chunk splits a UTF-8 code point");
+  }
+  assert.ok(first.chunks.slice(1).some((chunk) => /repeated_non_authoritative_context/.test(chunk)), "later mid-record chunks repeat labelled diff context");
+});
+
+test("bounded push chunks duplicate edge context so a token split across core payloads stays reviewable", () => {
+  const source = `${"a".repeat(96)}BLOCKER_TOKEN${"z".repeat(120)}`;
+  const chunks = buildPushReviewChunks(source, { maxChunkBytes: 100, maxChunks: 10 });
+  assert.equal(chunks.ok, true);
+  assert.equal(chunks.payloads.join(""), source, "authoritative cores remain exact and non-overlapping");
+  assert.equal(chunks.payloads.some((payload) => payload.includes("BLOCKER_TOKEN")), false, "the core boundary really splits the token");
+  assert.equal(chunks.chunks.some((chunk) => chunk.includes("BLOCKER_TOKEN")), true, "authenticated overlap restores semantic continuity");
+  assert.match(chunks.chunks[0], /duplicated_boundary_context direction="after"/);
+  assert.match(chunks.chunks[1], /duplicated_boundary_context direction="before"/);
+});
+
+test("the serialized initial push request stays below the real cap for a full ordinary core plus context", () => {
+  const header = `diff --git a/${"p".repeat(3500)} b/${"p".repeat(3500)}\n@@ -1 +1 @@\n`;
+  const plan = buildPushReviewChunks(`${header}${"x".repeat(MAX_PUSH_REVIEW_PAYLOAD_BYTES * 2)}`, {
+    base: "b".repeat(40), tip: "c".repeat(40), range: `${"b".repeat(40)}..${"c".repeat(40)}`
+  });
+  assert.equal(plan.ok, true);
+  for (let index = 0; index < plan.chunks.length; index++) {
+    const user = buildPushReviewUser("b..c", plan.chunks[index], {
+      assistantContext: 'claim "with quotes" and \\slashes\n'.repeat(200),
+      chunkIndex: index,
+      chunkCount: plan.chunks.length
+    });
+    assert.ok(
+      pushReviewSerializedRequestBytes(PUSH_REVIEW_SYSTEM, user, { cwd: process.cwd() }) <= MAX_PUSH_REVIEW_REQUEST_BYTES,
+      `chunk ${index + 1} must include JSON escaping and tool schemas inside the ${MAX_PUSH_REVIEW_REQUEST_BYTES}-byte cap`
+    );
+  }
+});
+
+test("JSON-heavy evidence is adaptively re-split instead of rejected after raw-byte chunking", () => {
+  const source = "\\".repeat(MAX_PUSH_REVIEW_PAYLOAD_BYTES);
+  const plan = buildSerializedPushReviewChunks(source, {
+    base: "b".repeat(40),
+    tip: "c".repeat(40),
+    range: `${"b".repeat(40)}..${"c".repeat(40)}`,
+    assistantContext: "context",
+    cwd: process.cwd(),
+    env: {}
+  });
+  assert.equal(plan.ok, true);
+  assert.ok(plan.chunks.length > 1, "JSON escaping forces a smaller core size");
+  assert.ok(plan.chunks.length <= MAX_PUSH_REVIEW_CHUNKS);
+  assert.equal(plan.payloads.join(""), source);
+  assert.ok(plan.requestBytes.every((bytes) => bytes <= MAX_PUSH_REVIEW_REQUEST_BYTES));
+});
+
+test("binary prompt encoding is unambiguous all-byte hex", () => {
+  const a = Buffer.concat([Buffer.from([0xff]), Buffer.from("\\x00"), Buffer.from([0x00])]);
+  const b = Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.from("\\x00")]);
+  const encodedA = promptSafeEvidence(a, 10_000);
+  const encodedB = promptSafeEvidence(b, 10_000);
+  assert.equal(encodedA.renderable, true);
+  assert.equal(encodedA.encoding, "all-byte-hex");
+  assert.notEqual(encodedA.text, encodedB.text, "distinct raw bytes cannot collide through literal backslashes");
+  assert.match(encodedA.text, /\\xff\\x5c\\x78\\x30\\x30\\x00/);
+});
+
+test("bounded push chunks fail closed when combined rendered evidence exceeds the chunk ceiling", () => {
+  const result = buildPushReviewChunks("x".repeat(101), { maxChunkBytes: 10, maxChunks: 10 });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /requires 11 bounded chunks/);
+  assert.match(result.reason, /no omitted evidence can produce an ALLOW/);
+});
+
 test("runPushReview signals retry when git log/diff report ok=false", async () => {
   const ws = freshWs();
   const stub = gitStub({ logOk: false });
@@ -320,21 +566,42 @@ test("runPushReview signals retry when git log/diff report ok=false", async () =
   assert.equal(result.findings, "");
 });
 
-test("runPushReview fully reviews a diff above the old 200KB sampling limit", async () => {
+test("runPushReview maps a diff above the old 200KB limit into bounded exhaustive chunks", async () => {
   const ws = freshWs();
   const stub = gitStub({ diff: "+x".repeat(300_000) });
   let captured = null;
-  const panelImpl = async ({ content }) => { captured = content; return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }]; };
+  const panelImpl = async (input) => { captured = input; return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none", coverageComplete: true }]; };
   const result = await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
   assert.equal(result.coverageBlocked, undefined);
-  assert.match(captured, /<per_commit_deltas[^>]+bytes="600000"[^>]+truncated="false"/);
-  assert.doesNotMatch(captured, /bytes omitted/);
-  assert.match(captured, /\+x\+x\+x\+x$/m, "the tail is present, not authenticated-but-omitted");
+  assert.ok(captured.contents.length > 1, "large evidence is not sent as one monolithic request");
+  assert.ok(captured.contents.length <= MAX_PUSH_REVIEW_CHUNKS);
+  assert.match(captured.contents[0], /<per_commit_deltas[^>]+bytes="600000"[^>]+truncated="false"/);
+  assert.doesNotMatch(captured.contents.join("\n"), /bytes omitted/);
+  assert.match(captured.contents.at(-1), /\+x\+x\+x\+x/, "the diff tail is present in the final core chunk");
+  assert.match(captured.contents.at(-1), /<\/immutable_push>/, "the evidence stream closes after the retained tail");
 });
 
-test("runPushReview caches a deterministic coverage BLOCK when evidence is too large for one bounded pass", async () => {
+test("a legacy panel that only reviews the first bounded chunk cannot authorize a large push", async () => {
   const ws = freshWs();
-  const stub = gitStub({ diff: "+x".repeat(550_000) });
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    gitImpl: gitStub({ diff: "+x".repeat(300_000) }).impl,
+    writeTraceImpl: () => null,
+    panelImpl: async () => [{
+      name: "Kimi",
+      verdict: "ALLOW",
+      findings: "ALLOW: first chunk looked clean",
+      findingCount: 0,
+      severity: "none"
+    }]
+  });
+  assert.equal(result.retry, true);
+  assert.match(result.reason, /did not acknowledge complete coverage/);
+  assert.equal(result.reviewers[0].coverageComplete, false);
+});
+
+test("runPushReview caches a deterministic coverage BLOCK when evidence exceeds all bounded chunks", async () => {
+  const ws = freshWs();
+  const stub = gitStub({ diff: "+x".repeat(800_000) });
   let panelCalled = false;
   const result = await runPushReview("@{u}..HEAD", ws, {
     panelImpl: async () => { panelCalled = true; return []; },
@@ -343,7 +610,7 @@ test("runPushReview caches a deterministic coverage BLOCK when evidence is too l
   assert.equal(panelCalled, false, "omitted bytes must never reach an ALLOW-capable panel");
   assert.equal(result.coverageBlocked, true);
   assert.equal(result.maxSeverity, "high");
-  assert.match(result.reason, /no omitted or lossy-decoded bytes can produce an ALLOW/);
+  assert.match(result.reason, /no omitted or lossy-decoded bytes can produce an ALLOW|no omitted evidence can produce an ALLOW/);
   assert.match(result.hash, /^[0-9a-f]{16}$/);
 });
 
