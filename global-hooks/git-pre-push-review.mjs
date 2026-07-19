@@ -600,7 +600,7 @@ export async function runDetachedMain({
 
   stderr(
     `⛩ peerBench native pre-push: review continues in background (worker pid ${child.pid}); this push is blocked for now. ` +
-    "Retry the same push after the review finishes — its exact verdict, cache, and trace will be reused without rerunning completed work.\n"
+    "Retry the same push after the review finishes. A complete ALLOW/BLOCK is cached and reused; an unavailable panel remains fail-closed and must rerun after the failed reviewer recovers.\n"
   );
   return exit(1);
 }

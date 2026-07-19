@@ -14,6 +14,7 @@ process.env.BENCH_ROOT = TEMP_GCR;
 
 import { runMain, buildPrompt, resolveReviewBase, readReviewedHead, writeReviewedHead, readReviewedWorktree, captureGitSnapshot, reviewPromptChunks, acquireStopGateLock } from "../global-hooks/stop-review.mjs";
 import { normalizeSessionId, setBenchDisabled, workspaceStateDir, wsKey } from "../global-hooks/config-store.mjs";
+import { readSessionUntrackedBaseline, recordSessionUntrackedBaseline } from "../global-hooks/session-untracked-baseline.mjs";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const HOOK = path.join(ROOT, "global-hooks", "stop-review.mjs");
@@ -814,6 +815,240 @@ test("untracked continuation chunks review changed content in the 21st file", as
   assert.match(prompts[4], /TAIL-B/, "the changed tail is actually reviewed in the second continuation");
   assert.match(prompts[5], /TAIL-B/, "the second synthesis call receives the changed continuation evidence");
   assert.notEqual(prompts[4], prompts[1], "a hidden-byte change changes reviewer evidence, not only a local fingerprint");
+});
+
+test("session baseline excludes a greater-than-two-chunk old backlog while reviewing a real new path", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-untracked-backlog-"));
+  process.env.BENCH_ROOT = root;
+  const sessionId = "old-untracked-backlog";
+  for (let i = 0; i < 45; i++) {
+    fs.writeFileSync(path.join(ws, `${String(i).padStart(2, "0")}-old.txt`), `old backlog ${i}\n`);
+  }
+  assert.equal(recordSessionUntrackedBaseline(ws, sessionId).complete, true);
+  fs.writeFileSync(path.join(ws, "zz-real-change.js"), "export const realChange = true;\n");
+
+  let calls = 0;
+  const prompts = [];
+  const reviewer = {
+    name: "Kimi",
+    async run({ user }) {
+      calls += 1;
+      prompts.push(user);
+      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: current change reviewed", raw: "ALLOW: current change reviewed" };
+    }
+  };
+  const { restore } = captureEmit(() => {});
+  let adoptedCount = 0;
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [reviewer],
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, session_id: sessionId }
+    });
+    adoptedCount = readSessionUntrackedBaseline(ws, sessionId)?.adoptedEntries.length ?? 0;
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 1, "the pre-session backlog consumes no review chunks or synthesis call");
+  assert.match(prompts[0], /zz-real-change\.js[\s\S]*realChange/);
+  assert.doesNotMatch(prompts[0], /old backlog/);
+  assert.equal(adoptedCount, 46, "ALLOW adopts the current reviewed identities");
+});
+
+test("modified baseline paths and new paths remain reviewable until an authoritative ALLOW adopts them", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-untracked-modified-"));
+  process.env.BENCH_ROOT = root;
+  const sessionId = "modified-untracked";
+  fs.writeFileSync(path.join(ws, "old.txt"), "old identity\n");
+  assert.equal(recordSessionUntrackedBaseline(ws, sessionId).complete, true);
+  const original = readSessionUntrackedBaseline(ws, sessionId);
+  fs.writeFileSync(path.join(ws, "old.txt"), "modified identity\n");
+  fs.writeFileSync(path.join(ws, "new.txt"), "new identity\n");
+
+  let verdict = "BLOCK";
+  let calls = 0;
+  const prompts = [];
+  const reviewer = {
+    name: "Kimi",
+    async run({ user }) {
+      calls += 1;
+      prompts.push(user);
+      return verdict === "BLOCK"
+        ? { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: injected", raw: "BLOCK: injected" }
+        : { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: fixed", raw: "ALLOW: fixed" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: sessionId },
+    blockHandler: async () => {}
+  };
+  const { restore } = captureEmit(() => {});
+  let adoptedCount = 0;
+  try {
+    await runMain(opts);
+    assert.deepEqual(readSessionUntrackedBaseline(ws, sessionId), original, "BLOCK cannot adopt changed identities");
+    verdict = "ALLOW";
+    await runMain(opts);
+    await runMain(opts);
+    adoptedCount = readSessionUntrackedBaseline(ws, sessionId)?.adoptedEntries.length ?? 0;
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 2, "modified/new paths are reviewed on BLOCK and ALLOW, then excluded as adopted");
+  for (const prompt of prompts) {
+    assert.match(prompt, /old\.txt[\s\S]*modified identity/);
+    assert.match(prompt, /new\.txt[\s\S]*new identity/);
+  }
+  assert.equal(adoptedCount, 2);
+});
+
+test("an adopted untracked identity is reviewed again when the reviewer model policy changes", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-untracked-policy-"));
+  process.env.BENCH_ROOT = root;
+  const sessionId = "untracked-policy-change";
+  assert.equal(recordSessionUntrackedBaseline(ws, sessionId).complete, true);
+  fs.writeFileSync(path.join(ws, "reviewed.txt"), "same bytes\n");
+
+  let model = "model-a";
+  let calls = 0;
+  const prompts = [];
+  const opts = {
+    resolveReviewersImpl: () => [{
+      name: "Kimi",
+      reviewIdentity: { kind: "api", model, baseURL: "https://example.invalid/v1" },
+      async run({ user }) {
+        calls += 1;
+        prompts.push(user);
+        return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: reviewed", raw: "ALLOW: reviewed" };
+      }
+    }],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: sessionId }
+  };
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain(opts);
+    await runMain(opts);
+    model = "model-b";
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 2, "the same model reuses ALLOW, but a model switch invalidates adoption");
+  assert.match(prompts[1], /reviewed\.txt[\s\S]*same bytes/);
+});
+
+test("a tracked BLOCK does not re-review a greater-than-two-chunk unchanged adopted backlog", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-untracked-adopted-block-"));
+  process.env.BENCH_ROOT = root;
+  const sessionId = "adopted-backlog-block";
+  assert.equal(recordSessionUntrackedBaseline(ws, sessionId).complete, true);
+
+  let verdict = "ALLOW";
+  let calls = 0;
+  const blockPrompts = [];
+  const reviewer = {
+    name: "Kimi",
+    async run({ user }) {
+      calls += 1;
+      if (verdict === "BLOCK") blockPrompts.push(user);
+      return verdict === "BLOCK"
+        ? { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: tracked bug", raw: "BLOCK: tracked bug" }
+        : { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: batch reviewed", raw: "ALLOW: batch reviewed" };
+    }
+  };
+  const opts = {
+    resolveReviewersImpl: () => [reviewer],
+    writeTraceImpl: () => {},
+    isBenchDisabledImpl: () => false,
+    env: process.env,
+    input: { cwd: ws, session_id: sessionId },
+    blockHandler: async () => {}
+  };
+
+  const { restore } = captureEmit(() => {});
+  try {
+    for (let batch = 0; batch < 3; batch++) {
+      for (let i = 0; i < 15; i++) {
+        const index = batch * 15 + i;
+        fs.writeFileSync(path.join(ws, `${String(index).padStart(2, "0")}-adopted.txt`), `adopted backlog ${index}\n`);
+      }
+      await runMain(opts);
+    }
+    assert.equal(readSessionUntrackedBaseline(ws, sessionId)?.adoptedEntries.length, 45);
+
+    fs.writeFileSync(path.join(ws, "tracked.js"), "export const trackedBug = true;\n");
+    execFileSync("git", ["add", "tracked.js"], { cwd: ws });
+    verdict = "BLOCK";
+    await runMain(opts);
+    await runMain(opts);
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
+
+  assert.equal(calls, 5, "both tracked BLOCK attempts reach the reviewer instead of failing untracked coverage");
+  assert.equal(blockPrompts.length, 2);
+  for (const prompt of blockPrompts) {
+    assert.match(prompt, /tracked\.js[\s\S]*trackedBug/);
+    assert.doesNotMatch(prompt, /adopted backlog/);
+  }
+});
+
+test("fail-open and incomplete coverage never update the session untracked baseline", async () => {
+  const ws = freshRepo({ withChange: false });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-untracked-fail-safe-"));
+  process.env.BENCH_ROOT = root;
+  const sessionId = "untracked-fail-safe";
+  fs.writeFileSync(path.join(ws, "old.txt"), "old\n");
+  assert.equal(recordSessionUntrackedBaseline(ws, sessionId).complete, true);
+  const original = readSessionUntrackedBaseline(ws, sessionId);
+  fs.writeFileSync(path.join(ws, "new.txt"), "new but unreviewed\n");
+
+  const { restore } = captureEmit(() => {});
+  try {
+    await runMain({
+      resolveReviewersImpl: () => [fakeErrorReviewer("Kimi")],
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, session_id: sessionId }
+    });
+    assert.deepEqual(readSessionUntrackedBaseline(ws, sessionId), original, "fail-open cannot adopt unreviewed identities");
+
+    fs.writeFileSync(path.join(ws, "too-large.txt"), "X".repeat(900_000));
+    await runMain({
+      resolveReviewersImpl: () => { throw new Error("coverage failure must not resolve reviewers"); },
+      writeTraceImpl: () => {},
+      isBenchDisabledImpl: () => false,
+      env: process.env,
+      input: { cwd: ws, session_id: sessionId },
+      blockHandler: async () => {}
+    });
+    assert.deepEqual(readSessionUntrackedBaseline(ws, sessionId), original, "coverage failure cannot adopt partial identities");
+  } finally {
+    restore();
+    process.env.BENCH_ROOT = TEMP_GCR;
+  }
 });
 
 test("a BLOCK in any bounded continuation chunk wins after all chunks are inspected", async () => {

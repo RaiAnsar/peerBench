@@ -35,21 +35,21 @@ test("env vars populate keys; CLAUDE_PLUGIN_DATA does not affect result", () => 
   // so the fallback set must not silently revive it.
   assert.equal(a.providers.glm.baseURL, "https://api.z.ai/api/coding/paas/v4");
   assert.equal(a.providers.glm.model, "glm-5.2");
-  // Default fallback is the two keyed API reviewers of the current panel (CLI reviewers need
-  // their own installed/authed harness, so they are never part of the key-only fallback).
-  assert.deepEqual(a.reviewers, ["kimi", "minimax"]);
+  // Default fallback is the operator-approved panel; losing companion.json must not revive an
+  // expired provider.
+  assert.deepEqual(a.reviewers, ["grok", "mimo"]);
   assert.deepEqual(a, b);
 });
-test("mimo is selectable (KNOWN, integration retained) but NOT in the default set", () => {
-  assert.ok(KNOWN_REVIEWERS.includes("mimo"), "mimo must stay KNOWN/selectable (disabled, not removed)");
-  assert.ok(!resolveConfig({ env: {} }).reviewers.includes("mimo"), "mimo must not be active by default");
+test("mimo is selectable and part of the operator-approved fallback", () => {
+  assert.ok(KNOWN_REVIEWERS.includes("mimo"), "mimo must stay KNOWN/selectable");
+  assert.ok(resolveConfig({ env: {} }).reviewers.includes("mimo"), "mimo must remain active by default");
 });
 test("grok is a KNOWN CLI-backed reviewer (like codex): no API provider entry, plan-billed harness", () => {
   assert.ok(KNOWN_REVIEWERS.includes("grok"), "grok must be KNOWN/selectable");
   assert.ok(!PROVIDER_NAMES.includes("grok"), "grok is CLI-backed — must NOT be an API provider (no key)");
   assert.equal(displayName("grok"), "Grok");
   assert.equal(resolveConfig({ env: {} }).providers.grok, undefined, "no provider config for a CLI reviewer");
-  assert.ok(!resolveConfig({ env: {} }).reviewers.includes("grok"), "grok must not be active by default");
+  assert.ok(resolveConfig({ env: {} }).reviewers.includes("grok"), "grok must remain active by default");
 });
 test("qwen is wired as a KNOWN/selectable provider with its DashScope defaults", () => {
   assert.ok(KNOWN_REVIEWERS.includes("qwen"), "qwen must be KNOWN/selectable");
@@ -101,7 +101,7 @@ test("resolveConfig can suppress the Codex reviewer for direct Codex prompt sess
   const mixed = resolveConfig({ env: { BENCH_SUPPRESS_CODEX_REVIEWER: "1" }, reviewers: ["codex", "kimi", "glm"] });
   assert.deepEqual(mixed.reviewers, ["kimi", "glm"]);
   const codexOnly = resolveConfig({ env: { BENCH_SUPPRESS_CODEX_REVIEWER: "1" }, reviewers: ["codex"] });
-  assert.deepEqual(codexOnly.reviewers, ["kimi", "minimax"], "suppressed-codex fallback = current keyed API panel, never retired GLM");
+  assert.deepEqual(codexOnly.reviewers, ["grok", "mimo"], "suppressed-codex fallback = operator-approved panel, never an expired provider");
 });
 test("unknown reviewer names are filtered out", () => {
   const cfg = resolveConfig({ env: {}, reviewers: ["kimi", "bogus"] });
@@ -207,4 +207,43 @@ test("recording a cooldown prunes expired entries from the map", async () => {
   assert.equal(readReviewerCooldown("kimi", { now: t0 + 30 * 60_000 }), null);
   assert.ok(readReviewerCooldown("minimax", { now: t0 + 31 * 60_000 }));
   clearReviewerCooldowns();
+});
+
+test("reviewer cooldown state redacts new details and self-heals legacy reflected secrets before replay", async () => {
+  const { recordReviewerCooldown, readReviewerCooldown } = await import("../global-hooks/config-store.mjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cooldown-redaction-"));
+  const file = path.join(root, "reviewer-cooldowns.json");
+  const configured = ["configured", "cooldown", "fixture", "value"].join("-");
+  const shaped = ["access", "cooldown", "fixture"].join("-");
+  const env = { KIMI_API_KEY: configured };
+  const now = 1_900_000_000_000;
+
+  const saved = recordReviewerCooldown(
+    "kimi",
+    "quota",
+    `HTTP 402 reflected ${configured}; access_token=${shaped}`,
+    { root, env, now }
+  );
+  assert.equal(saved.detail.includes(configured), false, "returned cache entry is safe");
+  assert.equal(saved.detail.includes(shaped), false, "shape-based secret is removed");
+  assert.equal(fs.readFileSync(file, "utf8").includes(configured), false, "new durable state never receives the configured secret");
+
+  const legacyToken = ["legacy", "bearer", "cooldown", "fixture"].join("-");
+  fs.writeFileSync(file, JSON.stringify({
+    kimi: {
+      kind: "quota",
+      detail: `HTTP 402 reflected ${configured}; Authorization: Bearer ${legacyToken}`,
+      until: now + 60_000,
+      ts: now
+    }
+  }));
+  const replay = readReviewerCooldown("kimi", { root, env, now: now + 1 });
+  assert.equal(replay.detail.includes(configured), false, "legacy configured secret is not replayed");
+  assert.equal(replay.detail.includes(legacyToken), false, "legacy shaped secret is not replayed");
+  const healed = fs.readFileSync(file, "utf8");
+  assert.equal(healed.includes(configured), false, "legacy state is self-healed on disk");
+  assert.equal(healed.includes(legacyToken), false, "legacy auth token is removed from durable state");
+  const replayAgain = readReviewerCooldown("kimi", { root, env, now: now + 2 });
+  assert.equal(replayAgain.detail, replay.detail, "repeated reads do not mutate the redaction sentinel");
+  assert.equal(fs.readFileSync(file, "utf8"), healed, "a safe cooldown is not rewritten on every read");
 });

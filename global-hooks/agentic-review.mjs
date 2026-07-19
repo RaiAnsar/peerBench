@@ -1,6 +1,7 @@
 import { extractVerdict } from "./reviewers.mjs";
 import { allowedTemperatureFromError, isContentInspectionFailure, sanitizeForProviderInspection } from "./provider-compat.mjs";
 import { DEFAULT_USER_AGENT, classifyHttpErrorKind } from "./review-client.mjs";
+import { redactProviderFailure, secretHeaderValues } from "./provider-error-redaction.mjs";
 export { sanitizeForProviderInspection };
 
 // Parse an OpenAI-compatible SSE chat stream into one assembled message.
@@ -109,6 +110,8 @@ export async function agenticReview({
   }
   const doFetch = fetchImpl || globalThis.fetch;
   const safeHeaders = Object.fromEntries(Object.entries(headers || {}).filter(([k]) => !["authorization", "content-type"].includes(k.toLowerCase())));
+  const failureSecrets = [apiKey, ...secretHeaderValues(headers)];
+  const safeFailure = (value, maxChars = 200) => redactProviderFailure(value, { secrets: failureSecrets }).slice(0, maxChars);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const messages = [{ role: "system", content: system }, { role: "user", content: user }];
@@ -174,7 +177,7 @@ export async function agenticReview({
             netErr = e;
             if (e?.name === "AbortError") break;                // timeout (round or total) — don't retry
             if (netAttempt++ < MAX_NET_RETRIES) {
-              dlog(`step ${step}: net attempt ${netAttempt} failed (${e?.cause?.code || e?.message}); retry in ${RETRY_BACKOFF_MS}ms`);
+              dlog(`step ${step}: net attempt ${netAttempt} failed (${safeFailure(e?.cause?.code || e?.message)}); retry in ${RETRY_BACKOFF_MS}ms`);
               await sleepImpl(RETRY_BACKOFF_MS);
               continue;
             }
@@ -197,9 +200,10 @@ export async function agenticReview({
       if (netErr) {
         const kind = netErr?.name === "AbortError" ? "timeout" : "network";
         const cause = netErr?.cause ? ` cause=${netErr.cause.code || netErr.cause.message || String(netErr.cause).slice(0, 80)}` : "";
-        dlog(`step ${step}: FETCH ${kind.toUpperCase()} after ${Date.now() - t0}ms reqKB=${(lastReqBytes / 1024) | 0}: ${netErr?.message}${cause}`);
-        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${netErr?.message}${cause}` });
-        return { ok: false, error: { kind, detail: `${String(netErr?.message || netErr).slice(0, 200)}${cause}` }, diag: diag() };
+        const detail = safeFailure(`${netErr?.message || netErr}${cause}`);
+        dlog(`step ${step}: FETCH ${kind.toUpperCase()} after ${Date.now() - t0}ms reqKB=${(lastReqBytes / 1024) | 0}: ${detail}`);
+        rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${detail}` });
+        return { ok: false, error: { kind, detail }, diag: diag() };
       }
       if (!resp.ok) {
         let b = await resp.text().catch(() => "");
@@ -225,8 +229,9 @@ export async function agenticReview({
           if (netErr) {
             const kind = netErr?.name === "AbortError" ? "timeout" : "network";
             const cause = netErr?.cause ? ` cause=${netErr.cause.code || netErr.cause.message || String(netErr.cause).slice(0, 80)}` : "";
-            rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${netErr?.message}${cause}`, retry: `temperature-${allowedTemperature}` });
-            return { ok: false, error: { kind, detail: `${String(netErr?.message || netErr).slice(0, 200)}${cause}` }, diag: diag() };
+            const detail = safeFailure(`${netErr?.message || netErr}${cause}`);
+            rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${detail}`, retry: `temperature-${allowedTemperature}` });
+            return { ok: false, error: { kind, detail }, diag: diag() };
           }
         }
         if (!resp.ok && !inspectionRetryUsed && isContentInspectionFailure(resp.status, b)) {
@@ -249,20 +254,21 @@ export async function agenticReview({
           if (netErr) {
             const kind = netErr?.name === "AbortError" ? "timeout" : "network";
             const cause = netErr?.cause ? ` cause=${netErr.cause.code || netErr.cause.message || String(netErr.cause).slice(0, 80)}` : "";
-            rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${netErr?.message}${cause}`, retry: "redacted-data-inspection" });
-            return { ok: false, error: { kind, detail: `${String(netErr?.message || netErr).slice(0, 200)}${cause}` }, diag: diag() };
+            const detail = safeFailure(`${netErr?.message || netErr}${cause}`);
+            rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `${kind}: ${detail}`, retry: "redacted-data-inspection" });
+            return { ok: false, error: { kind, detail }, diag: diag() };
           }
           if (!resp.ok) {
             const b2 = await resp.text().catch(() => "");
             dlog(`step ${step}: HTTP ${resp.status} after redacted retry reqKB=${(lastReqBytes / 1024) | 0}`);
             rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}`, retry: "redacted-data-inspection" });
-            return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, b2), detail: `HTTP ${resp.status}: ${b2.slice(0, 200)}` }, diag: diag() };
+            return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, b2), detail: `HTTP ${resp.status}: ${safeFailure(b2)}` }, diag: diag() };
           }
         }
         if (!resp.ok) {
           dlog(`step ${step}: HTTP ${resp.status} reqKB=${(lastReqBytes / 1024) | 0}`);
           rounds.push({ step, ms: Date.now() - t0, reqBytes: lastReqBytes, error: `http ${resp.status}` });
-          return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, b), detail: `HTTP ${resp.status}: ${b.slice(0, 200)}` }, diag: diag() };
+          return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, b), detail: `HTTP ${resp.status}: ${safeFailure(b)}` }, diag: diag() };
         }
       }
       const msg = parsed.message;

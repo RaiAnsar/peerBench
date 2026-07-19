@@ -346,16 +346,13 @@ export async function runCodexReview({ companionPath, prompt, cwd, env }) {
 // --output-format json: grok streams working NARRATION into plain stdout (even mid-sentence around
 // the verdict — broke first-line parsing, seen on Grok's first live review). JSON cleanly separates
 // the final answer (.text) from .thought/narration.
-// Grok's OWN --sandbox read-only is a silent NO-OP (verified live on 0.2.93 AND re-verified on
-// 0.2.101 after xAI open-sourced the harness: with permissions bypassed it wrote breach.txt into the
-// workspace cwd, no warning, exit 0). The OSS source (github.com/xai-org/grok-build) confirms WHY:
-// a real enforcement crate exists (crates/codegen/xai-grok-sandbox, Landlock/Seatbelt via nono) but
-// it isn't wired into shipped builds (its lib.rs opens with #![allow(unreachable_code, dead_code)]).
-// So the HARD read-only guarantee is OURS: wrap grok in macOS Seatbelt (sandbox-exec, the same
-// mechanism codex uses) via grokSpawnSpec below. The grok flags stay as defense-in-depth only —
-// and if their enforcement ever ships, it composes cleanly with ours: their read-only profile's
-// writable set is exactly grok_home()+temp (profiles.rs), which IS our ephemeral tmpdir redirect.
-export const GROK_ARGS = (prompt) => ["-p", prompt, "--verbatim", "--sandbox", "read-only", "--no-leader", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
+// Grok 0.2.101 now wires its own nono/Seatbelt sandbox. On macOS peerBench already applies a
+// stricter outer Seatbelt profile; asking Grok to apply Seatbelt again produces a non-fatal nested
+// `sandbox initialization failed: Operation not permitted` warning. Pass `off` INSIDE that outer
+// sandbox to avoid the double sandbox. Other platforms retain Grok's `read-only` request as
+// defense-in-depth, but peerBench still refuses them by default below because Grok's built-in
+// profiles deliberately continue unsandboxed when kernel enforcement cannot be applied.
+export const GROK_ARGS = (prompt, { sandboxProfile = "read-only" } = {}) => ["-p", prompt, "--verbatim", "--sandbox", sandboxProfile, "--no-leader", "--permission-mode", "plan", "--no-memory", "--no-subagents", "--disable-web-search", "--max-turns", "40", "--output-format", "json"];
 
 // Schema for --json-schema on the REVIEW path: grok's final answer is CONSTRAINED to this shape
 // (server-side structured output — the CLI puts the parsed object in .structuredOutput, live-verified
@@ -438,8 +435,8 @@ export function grokStructuredDeepReview(stdout) {
 // models_cache.json. An enumerated allowlist was still too clever — it kept models_cache.json (a
 // persistent routing surface) writable; the redirect makes the whole question moot: nothing under
 // ~/.grok is writable and the tmpdir is deleted after the run, so NOTHING grok writes persists to the
-// next session. grok's own --sandbox read-only is a VERIFIED NO-OP (wrote into the workspace under
-// bypassPermissions) — never trust it; this OS wrapper + `--no-leader` are the hard guarantee.
+// next session. This OS wrapper + `--no-leader` are the hard guarantee; Grok's inner sandbox is
+// explicitly disabled on macOS to avoid nesting Seatbelt inside Seatbelt.
 // Fail-closed: sandbox-exec refuses a bad profile and our spawn surfaces that as a reviewer error.
 // (Every escalation here was caught by the Codex stop gate.)
 // A path is safe to embed in the profile ONLY if it's an absolute path free of characters that could
@@ -486,11 +483,12 @@ export const GROK_SEATBELT_PROFILE = (tmpDir, authWrite, gateManaged = false) =>
 };
 
 // The single source of how grok is spawned (reviews, hunts, health probe). Pure — unit-testable.
-// darwin → sandbox-exec-wrapped (hard read-only); elsewhere → bare CLI flags. NOTE the bare flags are
-// NOT a net: --sandbox read-only no-ops SILENTLY (no stderr warning — verified live), so off darwin
-// the runners REFUSE by default (BENCH_GROK_UNSANDBOXED=1 opts into plan-mode-only containment).
+// darwin → sandbox-exec-wrapped (hard read-only) + inner `--sandbox off` (no nested Seatbelt);
+// elsewhere → bare CLI + inner `--sandbox read-only`. The bare CLI is not a sufficient hard net:
+// Grok's built-in profile failure path warns and continues unsandboxed, so off darwin the runners
+// still REFUSE by default (BENCH_GROK_UNSANDBOXED=1 explicitly accepts that residual risk).
 export function grokSpawnSpec(prompt, { bin = "grok", platform = process.platform, tmpDir, authWrite, authGateManaged = false, jsonSchema } = {}) {
-  const args = [...GROK_ARGS(prompt), ...(jsonSchema ? ["--json-schema", jsonSchema] : [])];
+  const args = [...GROK_ARGS(prompt, { sandboxProfile: platform === "darwin" ? "off" : "read-only" }), ...(jsonSchema ? ["--json-schema", jsonSchema] : [])];
   if (platform === "darwin") return { cmd: "/usr/bin/sandbox-exec", args: ["-p", GROK_SEATBELT_PROFILE(tmpDir, authWrite, authGateManaged), bin, ...args] };
   return { cmd: bin, args };
 }
@@ -546,9 +544,48 @@ function makeGrokTmpDir() {
 }
 const cleanupTmpDir = (d) => { if (d) try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } };
 
-// grok prints "warning: sandbox could not be applied: …" and can CONTINUE unsandboxed (fail-open).
-// Treat that as fatal on the paths where Seatbelt isn't wrapping.
-const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(String(stderr ?? ""));
+// Grok can print either legacy `sandbox could not be applied` or current
+// `sandbox initialization failed` and CONTINUE unsandboxed (fail-open). Treat both as fatal on
+// paths where peerBench's independent Seatbelt is not wrapping it.
+export const grokSandboxFailedOpen = (stderr) => /sandbox (?:could not be applied|initialization failed)/i.test(String(stderr ?? ""));
+
+const stripAnsi = (text) => String(text ?? "").replace(/\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, "");
+
+// Grok may return a structured error on stdout while stderr begins with harmless startup warnings.
+// Prefer the structured terminal error, then the last actionable stderr line, then the final
+// non-empty line. Redact common credential shapes before anything reaches a trace/statusline.
+export function grokFailureText(r, { maxChars = 300 } = {}) {
+  const redact = (value) => stripAnsi(value)
+    .replace(/(https?:\/\/)[^/@\s]+@/gi, "$1[redacted]@")
+    .replace(/\b(sk|xai)-[A-Za-z0-9_-]{4,}\b/g, "$1-[redacted]")
+    // Structured Grok errors often embed a JSON object inside `message`. Handle quoted keys and
+    // values before the looser plain-text form below; otherwise the closing key quote prevents the
+    // delimiter match and the credential reaches health output/traces verbatim.
+    .replace(/((?:"(?:authorization|access[_ -]?token|refresh[_ -]?token|api[_ -]?key)"|'(?:authorization|access[_ -]?token|refresh[_ -]?token|api[_ -]?key)'|(?:authorization|access[_ -]?token|refresh[_ -]?token|api[_ -]?key))\s*[:=]\s*)"(?:\\.|[^"\\\r\n])*"/gi, '$1"[redacted]"')
+    .replace(/((?:"(?:authorization|access[_ -]?token|refresh[_ -]?token|api[_ -]?key)"|'(?:authorization|access[_ -]?token|refresh[_ -]?token|api[_ -]?key)'|(?:authorization|access[_ -]?token|refresh[_ -]?token|api[_ -]?key))\s*[:=]\s*)'(?:\\.|[^'\\\r\n])*'/gi, "$1'[redacted]'")
+    // Authorization is special: consume the scheme AND credential. A generic value matcher would
+    // otherwise redact only `Basic`/`Bearer` and leave the credential immediately after it.
+    .replace(/((?:"authorization"|'authorization'|authorization)\s*[:=]\s*)(?:(?:basic|bearer)\s+)?[^\s,}\]";]+/gi, "$1[redacted]")
+    .replace(/((?:"(?:access[_ -]?token|refresh[_ -]?token|api[_ -]?key)"|'(?:access[_ -]?token|refresh[_ -]?token|api[_ -]?key)'|(?:access[_ -]?token|refresh[_ -]?token|api[_ -]?key))\s*[:=]\s*)[^\s,}\]";]+/gi, "$1[redacted]")
+    .replace(/\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{4,}/gi, "$1 [redacted]")
+    .trim();
+  const clip = (value) => Array.from(redact(value)).slice(0, Math.max(1, Number(maxChars) || 300)).join("");
+  const stdout = stripAnsi(r?.stdout).trim();
+  try {
+    const parsed = JSON.parse(stdout);
+    const structured = parsed?.type === "error" && typeof parsed.message === "string"
+      ? parsed.message
+      : typeof parsed?.error?.message === "string" ? parsed.error.message : null;
+    if (structured?.trim()) return clip(structured);
+  } catch { /* non-JSON stdout */ }
+
+  const stderrLines = stripAnsi(r?.stderr).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const stdoutLines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const actionable = [...stderrLines].reverse().find((line) =>
+    /\b(?:HTTP\s*\d{3}|status\s*\d{3}|payment required|usage balance exhausted|quota|rate.?limit|unauthorized|invalid_grant|not logged in|login required)\b/i.test(line)
+  );
+  return clip(actionable || stderrLines.at(-1) || stdoutLines.at(-1) || "grok failed");
+}
 
 // Failure text for a non-zero grok exit. On an auth error (401 / invalid_grant) it appends the
 // EFFECTIVE recovery — which depends on the auth SOURCE and the PLATFORM.
@@ -559,7 +596,7 @@ const grokSandboxFailedOpen = (stderr) => /sandbox could not be applied/i.test(S
 // "the sandbox can't create the temp file / unset GROK_AUTH_PATH" guidance would be WRONG (caught by
 // the Codex gate). Default the platform from process.platform for direct/legacy callers.
 export function grokFailureMessage(r, auth, platform = process.platform) {
-  const msg = (r.stderr || r.stdout || "grok failed").trim().slice(0, 300);
+  const msg = grokFailureText(r);
   const isAuthErr = /401|unauthorized|expired credentials|no auth context|invalid_grant/i.test(msg);
   if (!isAuthErr || !auth) return msg;
 
@@ -613,14 +650,14 @@ export function grokStructuredVerdict(stdout) {
   return null;
 }
 
-// Off darwin there is NO OS write-containment: no Seatbelt, and grok's own --sandbox read-only
-// no-ops SILENTLY (no warning to catch — the stderr check below never fires for it). Plan mode is
-// then the ONLY containment, and it's agent-level, not OS-level. Fail CLOSED unless the caller
-// explicitly accepts that with BENCH_GROK_UNSANDBOXED=1 (the panel continues with other reviewers).
+// Off darwin peerBench has no independent OS wrapper. Grok requests its own read-only profile, but
+// built-in profile application is fail-open by design, so it cannot be our sole hard containment.
+// Fail CLOSED unless the caller explicitly accepts that with BENCH_GROK_UNSANDBOXED=1 (the panel
+// continues with other reviewers when Grok is refused).
 const grokPlatformRefusal = (env, platform) => {
   const plat = platform || process.platform;
   if (plat !== "darwin" && env?.BENCH_GROK_UNSANDBOXED !== "1") {
-    return "no OS write-containment for grok on this platform (Seatbelt is darwin-only; grok's own sandbox flags are verified non-enforcing) — refusing. Set BENCH_GROK_UNSANDBOXED=1 to accept plan-mode-only containment";
+    return "no independent OS write-containment for grok on this platform (peerBench's Seatbelt wrapper is darwin-only; Grok's built-in sandbox can fail open) — refusing. Set BENCH_GROK_UNSANDBOXED=1 to accept Grok's built-in read-only profile plus plan mode";
   }
   return null;
 };

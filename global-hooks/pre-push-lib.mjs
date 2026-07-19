@@ -9,13 +9,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveConfig, workspaceStateDir, readReviewerCooldown } from "./config-store.mjs";
+import { resolveReviewers } from "./reviewers.mjs";
 import { shouldRewake } from "./deep-review.mjs";
 import { consumeCycleReset } from "./cycle-reset.mjs";
 import { runPushReview as defaultRunPushReview } from "./spec-review-run.mjs";
 
 // Bump whenever the evidence contract changes. Exact-range ALLOW caches from an older evidence
 // implementation must never authorize a push under a stronger policy.
-export const NATIVE_PUSH_REVIEW_VERSION = "native-push-v6-expanded-handoff-bounded";
+export const NATIVE_PUSH_REVIEW_VERSION = "native-push-v7-runtime-reviewer-identity";
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const DEFAULT_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CYCLE_WINDOW_MS = 2 * 60 * 60 * 1000;
@@ -350,6 +351,14 @@ export function evaluatePushReview(review, intendedReviewers, env = process.env)
 
 function nativePushPolicy(config, env) {
   const intended = config.reviewers.map(normalizeReviewerName);
+  // Cache authorization must follow the actual reviewer runtime, not just the generic `cli`
+  // label. In particular, a Grok CLI upgrade (and its built-in model) or a Codex model switch must
+  // invalidate an exact-range ALLOW. resolveReviewers builds this metadata with plain file reads;
+  // it never starts a reviewer and its reviewIdentity deliberately contains no credentials.
+  const runtimeIdentityByName = new Map(resolveReviewers({ env, reviewers: intended }).map((reviewer) => [
+    normalizeReviewerName(reviewer.name),
+    stableValue(reviewer.reviewIdentity || {})
+  ]));
   const configuredQuorum = Number(env.BENCH_PUSH_REVIEW_QUORUM);
   // Same clamp as evaluatePushReview: an over-large configured quorum means "all reviewers",
   // never an unreachable bar (and it keeps the policy fingerprint identical for equivalent values).
@@ -361,6 +370,7 @@ function nativePushPolicy(config, env) {
     const provider = config.providers?.[name];
     return provider ? {
       name,
+      runtime: runtimeIdentityByName.get(name) || {},
       model: provider.model || "",
       baseURL: provider.baseURL || "",
       thinking: provider.thinking ?? null,
@@ -368,7 +378,7 @@ function nativePushPolicy(config, env) {
       headers: stableValue(provider.headers || {}),
       timeoutMs: provider.timeoutMs ?? null,
       concurrency: provider.concurrency ?? null
-    } : { name, model: "cli" };
+    } : { name, runtime: runtimeIdentityByName.get(name) || { kind: `${name}-cli`, model: "" } };
   }).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   const maxCyclesRaw = Number(env.BENCH_PUSH_MAX_BLOCK_CYCLES);
   // Operators may choose a stricter 1- or 2-cycle gate, but configuration can never turn the
@@ -576,7 +586,10 @@ async function reviewNativePushLocked({
       if (review?.traceId) traceIds.push(review.traceId);
       badge = review?.badge || badge;
       if (evaluated.decision === "unavailable") {
-        unavailable.push(`[${label}] ${evaluated.reason}`);
+        const reviewerDetail = evaluated.failedReviewers?.length
+          ? ` (${evaluated.failedReviewers.join(" | ")})`
+          : "";
+        unavailable.push(`[${label}] ${evaluated.reason}${reviewerDetail}`);
         continue;
       }
       if (evaluated.incomplete) {
@@ -673,7 +686,8 @@ export async function reviewNativePush(options = {}) {
       kind: "review-in-flight",
       reason:
         `${error.message}. That review keeps working even if the push command that started it timed out, and its ` +
-        "verdict is CACHED when it finishes — wait for the detached worker to complete, then retry the exact push. " +
+        "complete ALLOW/BLOCK verdict is cached when it finishes. Wait for the detached worker to complete, then retry the exact push; " +
+        "if the panel finishes unavailable, recover the failed reviewer before retrying because unavailable panels are not authorization and are not cached. " +
         "BENCH_NATIVE_PUSH_BYPASS=1 git push is the explicit peerBench-only bypass."
     };
   }

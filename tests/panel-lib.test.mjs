@@ -386,15 +386,16 @@ test("severity-gate UNCHANGED default: a medium BLOCK with NO blockMinSeverity s
   assert.equal(r.advisories === undefined || r.advisories.length === 0, true, "no advisories without severity-gating");
 });
 
-test("runGrokTask/runGrokReview spawn the grok CLI headless read-only and honor timeoutMs", async () => {
+test("runGrokTask/runGrokReview spawn the grok CLI headless with the platform-safe sandbox mode and honor timeoutMs", async () => {
   const { runGrokTask, runGrokReview } = await import("../global-hooks/panel-lib.mjs");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-cli-"));
   const fake = path.join(dir, "fake-grok.mjs");
-  // Fake grok: asserts headless read-only flags, prints a verdict. args[0] must be -p.
+  const expectedSandbox = process.platform === "darwin" ? "off" : "read-only";
+  // Fake grok: asserts headless flags and the platform-safe inner sandbox, then prints a verdict.
   fs.writeFileSync(fake, [
     "const a = process.argv.slice(2);",
     "if (a[0] !== '-p' || !a.includes('--permission-mode') || a[a.indexOf('--permission-mode')+1] !== 'plan') { console.error('bad flags: '+a.join(' ')); process.exit(3); }",
-    "if (!a.includes('--sandbox') || a[a.indexOf('--sandbox')+1] !== 'read-only') { console.error('missing read-only sandbox: '+a.join(' ')); process.exit(5); }",
+    `if (!a.includes('--sandbox') || a[a.indexOf('--sandbox')+1] !== ${JSON.stringify(expectedSandbox)}) { console.error('wrong inner sandbox: '+a.join(' ')); process.exit(5); }`,
     "if (process.env.BENCH_SUPPRESS_HOOKS !== '1') { console.error('hooks not suppressed'); process.exit(4); }",
     "console.log('ALLOW: grok healthy');",
     ""
@@ -422,12 +423,12 @@ test("runGrokTask reports a missing grok CLI with the install hint", async () =>
   assert.match(r.error, /grok CLI not found/);
 });
 
-test("grok runners REFUSE off darwin by default (no OS containment; the no-op sandbox prints no warning to catch)", async () => {
+test("grok runners REFUSE off darwin by default (no independent OS containment; built-in sandbox can fail open)", async () => {
   const { runGrokReview, runGrokTask } = await import("../global-hooks/panel-lib.mjs");
   for (const run of [runGrokReview, runGrokTask]) {
     const r = await run({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
     assert.equal(r.name, "Grok");
-    assert.match(r.error, /no OS write-containment .* refusing/i, "off darwin must fail CLOSED, not run bare");
+    assert.match(r.error, /no independent OS write-containment .* refusing/i, "off darwin must fail CLOSED, not run bare");
     assert.match(r.error, /BENCH_GROK_UNSANDBOXED=1/, "the refusal must name the explicit opt-in");
   }
   // darwin is never refused on platform grounds (Seatbelt wraps it).
@@ -435,17 +436,19 @@ test("grok runners REFUSE off darwin by default (no OS containment; the no-op sa
   assert.ok(!/no OS write-containment/.test(d.error || ""), "darwin must not hit the platform refusal");
 });
 
-test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-only profile", async () => {
+test("grokSpawnSpec: darwin uses outer Seatbelt + inner sandbox off; non-darwin keeps inner read-only", async () => {
   const { grokSpawnSpec, GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
   const d = grokSpawnSpec("review", { bin: "grok", platform: "darwin", tmpDir: "/private/tmp/grok-bench-x" });
-  assert.equal(d.cmd, "/usr/bin/sandbox-exec", "darwin must be OS-sandboxed — grok's own sandbox is a verified no-op");
+  assert.equal(d.cmd, "/usr/bin/sandbox-exec", "darwin must be OS-sandboxed by peerBench");
   assert.equal(d.args[0], "-p");
   assert.equal(d.args[1], GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x"));
   assert.match(d.args[1], /\(deny file-write\*\)/, "profile denies writes");
   assert.equal(d.args[2], "grok");
   assert.ok(d.args.includes("--no-leader"), "must not attach to a (possibly unsandboxed) shared leader");
+  assert.equal(d.args[d.args.indexOf("--sandbox") + 1], "off", "inner Grok Seatbelt must be off to avoid nested sandbox_init EPERM");
   const l = grokSpawnSpec("review", { bin: "grok", platform: "linux" });
-  assert.equal(l.cmd, "grok", "non-darwin spawns bare (fail-open stderr check is the net)");
+  assert.equal(l.cmd, "grok", "non-darwin spawns the CLI directly (runner policy still refuses by default)");
+  assert.equal(l.args[l.args.indexOf("--sandbox") + 1], "read-only", "non-darwin retains Grok's built-in profile as defense-in-depth");
 });
 
 test("GROK_VERDICT_SCHEMA pins the review verdict shape (ALLOW|BLOCK enum, reason, both required)", async () => {
@@ -581,6 +584,49 @@ test("grokFailureMessage (off darwin / unsandboxed): 401 is just an expired toke
   assert.doesNotMatch(gate, /sandbox|atomic/i, "no sandbox claims off darwin");
 });
 
+test("grokFailureText prefers structured terminal errors, strips startup noise, and redacts credentials", async () => {
+  const { grokFailureText, grokFailureMessage } = await import("../global-hooks/panel-lib.mjs");
+  const reflectedKey = ["sk", "fixture1234"].join("-");
+  const reflectedUrl = new URL("https://example.invalid/v1");
+  reflectedUrl.username = "fixture";
+  reflectedUrl.password = "password";
+  const stdout = JSON.stringify({
+    type: "error",
+    message: `API error (status 402 Payment Required): Grok Build usage balance exhausted; upstream key ${reflectedKey}; ${reflectedUrl.href}`
+  });
+  const result = {
+    status: 1,
+    stdout,
+    stderr: "sandbox initialization failed: Operation not permitted\n\u001b[33mWARN\u001b[0m plugin collision"
+  };
+  const text = grokFailureText(result);
+  assert.match(text, /402 Payment Required.*usage balance exhausted/i, "the actionable provider error wins over startup stderr");
+  assert.doesNotMatch(text, /sandbox initialization failed|plugin collision/i, "non-fatal startup warnings must not mask the terminal error");
+  assert.ok(!text.includes(reflectedKey) && !text.includes("fixture:password"), "credential-shaped values are redacted before surfacing");
+  assert.match(grokFailureMessage(result, null, "darwin"), /402 Payment Required/i, "review runner uses the same extraction");
+
+  const jsonSecret = ["fixture", "json", "secret", "value"].join("-");
+  const structured = grokFailureText({
+    stdout: JSON.stringify({
+      type: "error",
+      message: `upstream: {"access_token":"${jsonSecret}","Authorization":"Bearer ${jsonSecret}"}`
+    })
+  });
+  assert.ok(!structured.includes(jsonSecret), "quoted JSON credential fields are redacted before traces/health output");
+  assert.match(structured, /\[redacted\]/, "structured credential redaction remains visible and diagnosable");
+
+  for (const message of [
+    `access_token: "${jsonSecret}"`,
+    `api_key = '${jsonSecret}'`,
+    `Authorization: Basic ${Buffer.from(`fixture:${jsonSecret}`).toString("base64")}`,
+    `Authorization = "Basic ${Buffer.from(`fixture:${jsonSecret}`).toString("base64")}"`
+  ]) {
+    const redacted = grokFailureText({ stdout: JSON.stringify({ type: "error", message }) });
+    assert.ok(!redacted.includes(jsonSecret), `credential variant must be redacted: ${message.split(/[:=]/, 1)[0]}`);
+    assert.doesNotMatch(redacted, /Zml4dHVyZ/, "a Basic credential must be consumed with its scheme");
+  }
+});
+
 test("GROK_SEATBELT_PROFILE gate-managed auth grants the auth PARENT DIR (atomic OAuth write needs it)", async () => {
   const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
   // gateManaged=true → the bench-controlled ~/.grok-headless: parent-dir grant is safe + needed.
@@ -692,14 +738,19 @@ test("runGrokReview fails CLOSED when the private tmpdir can't be created (no un
   }
 });
 
-test("runGrokTask fail-closes when grok reports its sandbox could not be applied", async () => {
+test("runGrokTask fail-closes on both Grok sandbox failure wordings", async () => {
   const { runGrokTask } = await import("../global-hooks/panel-lib.mjs");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-sbxwarn-"));
   const fake = path.join(dir, "grok");
-  fs.writeFileSync(fake, `#!/bin/sh\necho "warning: sandbox could not be applied: whatever" >&2\necho '{"text":"ALLOW: fine"}'\n`);
-  fs.chmodSync(fake, 0o755);
-  const r = await runGrokTask({ prompt: "x", cwd: dir, env: { BENCH_GROK_UNSANDBOXED: "1" }, bin: fake, platform: "linux" });
-  assert.match(r.error, /sandbox could not be applied/, "an unsandboxed run must be REFUSED, not accepted");
+  for (const warning of [
+    "warning: sandbox could not be applied: whatever",
+    "sandbox initialization failed: Operation not permitted"
+  ]) {
+    fs.writeFileSync(fake, `#!/bin/sh\necho ${JSON.stringify(warning)} >&2\necho '{"text":"ALLOW: fine"}'\n`);
+    fs.chmodSync(fake, 0o755);
+    const r = await runGrokTask({ prompt: "x", cwd: dir, env: { BENCH_GROK_UNSANDBOXED: "1" }, bin: fake, platform: "linux" });
+    assert.match(r.error, /sandbox could not be applied/, `${warning} must be REFUSED, not accepted`);
+  }
 });
 
 test("grokStructuredDeepReview reconstitutes canonical parseable review text", async () => {

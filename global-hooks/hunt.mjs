@@ -1,7 +1,8 @@
-import { resolveConfig, displayName } from "./config-store.mjs";
+import { resolveConfig, displayName, readReviewerCooldown, recordReviewerCooldown, configuredProviderSecrets } from "./config-store.mjs";
 import { agenticReview, serializeAgenticRequest } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
+import { redactProviderFailure, redactProviderFailureData } from "./provider-error-redaction.mjs";
 import {
   runCodexTask,
   runGrokTask,
@@ -9,7 +10,7 @@ import {
   GROK_PUSH_CHUNK_REVIEW_SCHEMA,
   MAX_PUSH_SYNTHESIS_NOTES_CHARS
 } from "./panel-lib.mjs";
-import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
+import { latestCodexRoot, CODEX_DATA, extractVerdict, classifyReviewerFailureText } from "./reviewers.mjs";
 import { parseSeverity, stripThink, severityRank } from "./deep-review.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -583,10 +584,11 @@ export function aggregatePushReviewerSequence(chunkResults, synthesisResult = nu
 
 export async function huntPanel({ cwd, cliCwd = cwd, cliSnapshotError = null, treeish = null, seed, env = process.env, reviewImpl, codexImpl, grokImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user, reviewChunks = null, grokRequireVerdict = false, nowImpl = Date.now }) {
   const cfg = resolveConfig({ env });
+  const providerSecrets = configuredProviderSecrets({ env });
   const userMsg = user || buildHuntUser(seed);
   const debug = !!env.BENCH_DEBUG;
 
-  const runOne = async (name, {
+  const runOneUnchecked = async (name, {
     callSystem = system,
     callUser = userMsg,
     callBudgetMs = budgetMs,
@@ -602,14 +604,14 @@ export async function huntPanel({ cwd, cliCwd = cwd, cliSnapshotError = null, tr
         // runCodexTask keeps the raw findings (a hunt has no ALLOW/BLOCK verdict to parse).
         // budgetMs (gate path only) hard-caps codex's agentic wall-clock; omitted for hunt/investigate.
         const r = await (codexImpl || runCodexTask)({ companionPath: path.join(root, "scripts", "codex-companion.mjs"), prompt: `${callSystem}\n\n${callUser}`, cwd: cliCwd, env: codexEnv, ...(callBudgetMs ? { timeoutMs: callBudgetMs } : {}) });
-        if (debug) console.error(`[hunt codex] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
+        if (debug) console.error(`[hunt codex] raw=${(r.raw || "").length}b error=${redactProviderFailure(r.error || "-", { secrets: providerSecrets })}`);
         return { name: "Codex", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
       }
       if (name === "grok") {
         if (cliSnapshotError) return { name: "Grok", findings: "", error: `immutable pushed-tip snapshot unavailable: ${cliSnapshotError}` };
         // Grok Build CLI — its own agentic harness explores the repo read-only (plan mode), plan-billed.
         const r = await (grokImpl || runGrokTask)({ prompt: `${callSystem}\n\n${callUser}`, cwd: cliCwd, env, ...(grokJsonSchema ? { jsonSchema: grokJsonSchema } : {}), ...(callBudgetMs ? { timeoutMs: callBudgetMs } : {}) });
-        if (debug) console.error(`[hunt grok] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
+        if (debug) console.error(`[hunt grok] raw=${(r.raw || "").length}b error=${redactProviderFailure(r.error || "-", { secrets: providerSecrets })}`);
         return { name: "Grok", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
       }
       const p = cfg.providers[name];
@@ -657,6 +659,37 @@ export async function huntPanel({ cwd, cliCwd = cwd, cliSnapshotError = null, tr
     } catch (e) {
       return { name: display, findings: "", error: String(e?.message || e).slice(0, 300) };
     }
+  };
+
+  const runOne = async (name, options = {}) => {
+    const now = nowImpl();
+    const cooldown = readReviewerCooldown(name, { now, env, secrets: providerSecrets });
+    if (cooldown) {
+      const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - now) / 60_000));
+      return {
+        name: displayName(name),
+        findings: "",
+        errorKind: cooldown.kind,
+        skipped: "cooldown",
+        error: `${cooldown.kind === "auth" ? "auth failed (re-auth needed)" : "out of quota/credits"} — skipped without retry (cooldown ${minutesLeft} min left; ${cooldown.detail})`
+      };
+    }
+    const rawResult = await runOneUnchecked(name, options);
+    const result = rawResult?.error
+      ? redactProviderFailureData(rawResult, { secrets: providerSecrets })
+      : rawResult;
+    if (result?.error) {
+      const kind = result.errorKind || classifyReviewerFailureText(result.error);
+      if (kind === "quota" || kind === "auth") {
+        recordReviewerCooldown(name, kind, result.error, { now: nowImpl(), env, secrets: providerSecrets });
+        return {
+          ...result,
+          errorKind: kind,
+          error: `${kind === "auth" ? "auth failed (re-auth needed)" : "out of quota/credits"} — ${result.error}`
+        };
+      }
+    }
+    return result;
   };
 
   if (Array.isArray(reviewChunks) && reviewChunks.length > 1) {

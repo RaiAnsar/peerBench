@@ -434,23 +434,45 @@ test("healthCommand probes grok via the CLI (stub), reporting plan-billed health
   const sick = await healthCommand({ cfg, grokImpl: () => ({ status: 1, stdout: "", stderr: "not logged in" }) });
   assert.equal(sick.ok, false);
   assert.match(sick.text, /✗ Grok.*not logged in/);
+
+  const quota = await healthCommand({ cfg, grokImpl: () => ({
+    status: 1,
+    stdout: JSON.stringify({ type: "error", message: "API error (status 402 Payment Required): Grok Build usage balance exhausted" }),
+    stderr: "sandbox initialization failed: Operation not permitted"
+  }) });
+  assert.equal(quota.ok, false);
+  assert.match(quota.text, /✗ Grok.*402 Payment Required.*usage balance exhausted/i, "health shows the terminal provider failure");
+  assert.doesNotMatch(quota.text, /sandbox initialization failed/i, "startup warning no longer masks the real outage");
+
+  const failedOpen = await healthCommand({ cfg, grokImpl: () => ({
+    status: 0,
+    stdout: "OK",
+    stderr: "sandbox initialization failed: Operation not permitted"
+  }) });
+  assert.equal(failedOpen.ok, false, "a successful-looking answer cannot hide a failed-open Grok sandbox");
+  assert.match(failedOpen.text, /refusing unsandboxed health probe/i);
+
+  const refused = await healthCommand({ cfg, env: {}, platform: "linux" });
+  assert.equal(refused.ok, false, "the health path preserves the production off-darwin refusal");
+  assert.match(refused.text, /no independent OS write-containment/i);
 });
 
 test("healthCommand redacts the submitted key and sk-* tokens from provider error bodies", async () => {
   const { healthCommand } = await import("../scripts/bench-runner.mjs");
+  const configuredKey = ["kimi", "fixture", "9f8e7d6c5b"].join("-");
   const cfg = {
     reviewers: ["kimi"],
-    providers: { kimi: { apiKey: "kimi-secret-9f8e7d6c5b", baseURL: "https://x/v1", model: "m", headers: {} } }
+    providers: { kimi: { apiKey: configuredKey, baseURL: "https://x/v1", model: "m", headers: {} } }
   };
   // The provider reflects the submitted key back, plus an sk-*-shaped token of its own.
   const echoFetch = async () => ({
     ok: false,
     status: 401,
-    text: async () => '{"error":"Invalid API key: kimi-secret-9f8e7d6c5b; upstream key sk-a1b2c3d4e5f6 rejected"}'
+    text: async () => `{"error":"Invalid API key: ${configuredKey}; upstream key sk-a1b2c3d4e5f6 rejected"}`
   });
   const r = await healthCommand({ cfg, fetchImpl: echoFetch });
   assert.equal(r.ok, false);
-  assert.doesNotMatch(r.text, /kimi-secret-9f8e7d6c5b/, "the configured key must not leak into health output");
+  assert.doesNotMatch(r.text, new RegExp(configuredKey), "the configured key must not leak into health output");
   assert.doesNotMatch(r.text, /sk-a1b2c3d4e5f6/, "sk-*-shaped tokens must be masked");
   assert.match(r.text, /✗ Kimi.*HTTP 401/);
 });

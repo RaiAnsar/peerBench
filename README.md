@@ -41,6 +41,11 @@ new session, or a new one-shot `BENCH_STOP_CYCLE_RESET` nonce starts fresh. Plan
 share the same three slots, so switching surfaces cannot buy extra cycles. Incomplete/oversized
 evidence is tracked separately as **UNREVIEWED** and is never written to reviewed markers.
 
+At `SessionStart` (`startup` or `clear`), peerBench records full-content identities for pre-existing
+untracked files. Stop omits only unchanged identities; new or modified paths remain reviewable, and
+ALLOW adopts them for later turns. Capture races fail safe: an inventory not trusted when Stop began
+cannot exclude paths later.
+
 Transient deep-review jobs retry at most three times. Across completed blockers, deferred queue
 continuations, and changed targets, the deep runner may cause at most three automatic follow-up
 Stops total in one task/session; unresolved durable work never ages into more. It then remains a
@@ -130,14 +135,15 @@ benchmark/debugging tool, and it's deep + slow (minutes) by design.
   API key. Review verdicts are **schema-constrained** (`--json-schema`), so the
   verdict can't be lost to narration. peerBench wraps every run in its own
   **macOS Seatbelt sandbox** with grok's writable state redirected to an
-  ephemeral per-run directory — grok's own `--sandbox read-only` is a verified
-  no-op on shipped builds (the OSS enforcement crate isn't wired in yet), so
-  the hard read-only guarantee is peerBench's, not grok's.
+  ephemeral per-run directory. Grok now wires its own nono/Seatbelt sandbox,
+  so peerBench explicitly passes `--sandbox off` inside its stricter macOS
+  wrapper to avoid nested-Seatbelt `EPERM`; the hard read-only guarantee remains
+  peerBench's outer policy because Grok's built-in profile can fail open.
 - **Kimi** — Moonshot **K3** (`k3`) on the **coding-plan** endpoint
   (`api.kimi.com/coding/v1`). K3 is always-thinking with server-fixed sampling, so
   peerBench omits `temperature` and the K2.x `thinking` param entirely. No Open
   Platform key needed.
-- **GLM** — z.ai `glm-5.2` on the coding endpoint. Default fallback reviewer with Kimi.
+- **GLM** — z.ai `glm-5.2` on the coding endpoint. Selectable, but inactive unless explicitly chosen.
 - **Qwen** — Alibaba MaaS `qwen3.7-max` through the OpenAI-compatible endpoint.
 - **MiMo** — Xiaomi `mimo-v2.5-pro` (`temperature:0`). Uniquely good at
   secret/PII/deploy-hygiene catches.
@@ -156,13 +162,15 @@ The agentic hunt exposes only read tools (read_file / grep / glob / list_dir),
 sandboxed to the repo — there is no write, edit, or shell tool. (A model that tries
 to "fix" a file during review simply can't.)
 
-The CLI reviewers get OS-level containment on top of their flags: Grok runs inside
+The CLI reviewers get OS-level containment: on macOS, Grok runs inside
 a peerBench-built macOS Seatbelt profile (`sandbox-exec`) that denies all writes
 except an ephemeral per-run temp dir its entire state (`GROK_HOME`) is redirected
 into — nothing a review run writes survives it, and all of `~/.grok` (binaries,
-plugins, config, model routing) stays read-only. Its CLI containment flags are
-passed too, but only as defense-in-depth: they're verified non-enforcing on
-current builds.
+plugins, config, model routing) stays read-only. peerBench sets Grok's inner
+`--sandbox off` only under that stricter outer wrapper, avoiding nested-Seatbelt
+`EPERM`. Off macOS it requests Grok's built-in read-only profile but refuses to
+run by default because that profile can fail open; `BENCH_GROK_UNSANDBOXED=1` is
+the explicit operator opt-in.
 
 ## Agentic engine (the hunt loop)
 
@@ -204,8 +212,8 @@ param IS a live toggle (GLM, Qwen) still flip on for deep reviews automatically.
 - `/bench:investigate <problem>` — deep tier: active panel, generous budget, for a
   hard specific problem. Slower than hunt.
 - `/bench:review [--base <ref>]` — on-demand panel review of your current changes.
-- `/bench:reviewers [names…]` — show or set the active panel (e.g. `kimi mimo` or
-  `codex kimi glm qwen`). Selectable: `kimi`, `mimo`, `glm`, `qwen`, `codex`.
+- `/bench:reviewers [names…]` — show or set the active panel (e.g. `grok mimo` or
+  `codex grok mimo`). Selectable: `grok`, `mimo`, `kimi`, `glm`, `qwen`, `minimax`, `codex`.
 - `/bench:status [id]` — recent gate/hunt runs for this workspace; pass a trace id to expand it.
 - `/bench:scorecard` — cross-project reviewer performance: objective stats computed from
   traces plus your TP/FP/miss grades (`bench-runner.mjs grade <traceId> <Reviewer>:<tp|fp|miss>`),
@@ -298,8 +306,9 @@ A compact segment renders the latest gate/hunt for the current workspace and,
 when Claude provides a `session_id`, the current chat —
 `⛩ plan: Codex✓ Grok✓ MiMo✓` (green all-allow, red on block, `!` on error/skip,
 `✓` for hunt findings). Verdicts older than ~45 min dim to `(idle)` so a stale
-result never looks like an active block. If no session id is available, the
-segment falls back to workspace-level trace selection for compatibility.
+result never looks like an active block. A session-aware statusline shows only
+that session's traces; it never falls back to an old unstamped panel. If no
+session id is available, workspace-level trace selection remains for compatibility.
 
 ## Requirements
 
@@ -312,8 +321,9 @@ segment falls back to workspace-level trace selection for compatibility.
   (`curl -fsSL https://x.ai/cli/install.sh | bash`, then sign in once with
   `GROK_HOME=~/.grok-headless grok -p OK` for the gate's dedicated auth) only if
   you enable the `grok` reviewer.
-- At least one provider key in `.keys` / `companion.json` if no CLI reviewer is
-  set up. Fallback defaults are `kimi` + `minimax` (the keyed API reviewers of the current panel; CLI reviewers are never part of the key-only fallback).
+- The enabled reviewers' own credentials: the Grok Build CLI signed in for
+  `grok`, and a MiMo coding-plan key for `mimo`. The fallback panel is exactly
+  `grok` + `mimo`; expired providers are never silently reactivated.
 
 ## Install
 
@@ -356,8 +366,8 @@ reviewers:
 /codex:setup
 ```
 
-Without `openai/codex-plugin-cc`, Claude can still run peerBench with Kimi, GLM,
-Qwen, and MiMo, and Codex can still run peerBench directly. What will not work is
+Without `openai/codex-plugin-cc`, Claude can still run peerBench with Grok, Kimi,
+GLM, Qwen, MiMo, and MiniMax, and Codex can still run peerBench directly. What will not work is
 selecting `codex` as a reviewer from inside Claude.
 
 ### Codex

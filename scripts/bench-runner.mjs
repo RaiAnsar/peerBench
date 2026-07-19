@@ -14,8 +14,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName } from "../global-hooks/config-store.mjs";
-import { combinePanel, untrackedBlock, grokSpawnSpec, grokChildEnv, grokAuthPath, grokText } from "../global-hooks/panel-lib.mjs";
+import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName, configuredProviderSecrets } from "../global-hooks/config-store.mjs";
+import { combinePanel, untrackedBlock, grokText, grokFailureText, grokSandboxFailedOpen, runGrokTask } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
@@ -25,6 +25,7 @@ import { shouldRewake } from "../global-hooks/deep-review.mjs";
 import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
 import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates, enableLegacyCodexStopGateForWorkspace, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
 import { ensureNativePrePushHook, nativePrePushStatus } from "../global-hooks/native-git-hook.mjs";
+import { redactProviderFailure, redactProviderFailureData, secretHeaderValues } from "../global-hooks/provider-error-redaction.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -386,13 +387,13 @@ const HEALTH_API_TIMEOUT_MS = 30_000;
 const HEALTH_CODEX_TIMEOUT_MS = 180_000;
 // Health output is what users paste into issue reports: never echo the submitted key, and mask
 // sk-*-shaped tokens a provider error body might reflect back ("Invalid API key: sk-...").
-function redactHealthSecrets(text, apiKey) {
-  let out = String(text);
-  if (apiKey) out = out.split(String(apiKey)).join("[redacted]");
-  return out.replace(/sk-[A-Za-z0-9_-]{4,}/g, "sk-[redacted]");
+function redactHealthSecrets(text, apiKey, headers) {
+  return redactProviderFailure(text, { secrets: [apiKey, ...secretHeaderValues(headers)] })
+    .replace(/\b(?:sk|xai)-[A-Za-z0-9_-]{4,}\b/g, "[redacted]");
 }
-export async function healthCommand({ all = false, env = process.env, fetchImpl, codexImpl, grokImpl, cfg: cfgOverride } = {}) {
+export async function healthCommand({ all = false, env = process.env, fetchImpl, codexImpl, grokImpl, grokTaskImpl = runGrokTask, platform = process.platform, cfg: cfgOverride } = {}) {
   const cfg = cfgOverride || resolveConfig({ env });
+  const providerSecrets = configuredProviderSecrets({ env });
   const doFetch = fetchImpl || globalThis.fetch;
   const names = all
     ? [...new Set([...cfg.reviewers, ...Object.keys(cfg.providers).filter((n) => cfg.providers[n]?.apiKey)])]
@@ -413,10 +414,12 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
       }).finally(() => clearTimeout(timer));
       const ms = Date.now() - t0;
       if (r.ok) return { name, display: displayName(name), ok: true, note: `${p.model} · ${ms}ms` };
-      const body = redactHealthSecrets((await r.text().catch(() => "")).slice(0, 120), p.apiKey);
+      const body = redactHealthSecrets(await r.text().catch(() => ""), p.apiKey, p.headers).slice(0, 120);
       return { name, display: displayName(name), ok: false, note: `HTTP ${r.status} in ${ms}ms — ${body}` };
     } catch (e) {
-      const kind = e?.name === "AbortError" ? `timeout >${HEALTH_API_TIMEOUT_MS / 1000}s` : String(e?.message || e).slice(0, 100);
+      const kind = e?.name === "AbortError"
+        ? `timeout >${HEALTH_API_TIMEOUT_MS / 1000}s`
+        : redactProviderFailure(e?.message || e, { secrets: [p.apiKey, ...secretHeaderValues(p.headers)] }).slice(0, 100);
       return { name, display: displayName(name), ok: false, note: kind };
     }
   };
@@ -441,33 +444,36 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
     if (r.status === 0 && answered) return { name: "codex", display: "Codex", ok: true, note: `${model || "?"} @ ${effort || "?"} · ${(ms / 1000).toFixed(0)}s` };
     const errLines = out.match(/ERROR.*$/gm) || [];
     const err = errLines.at(-1) || out.trim().split("\n").at(-1) || "failed";
-    return { name: "codex", display: "Codex", ok: false, note: `${model ? `${model} @ ${effort} — ` : ""}${String(err).slice(0, 140)}` };
+    return { name: "codex", display: "Codex", ok: false, note: `${model ? `${model} @ ${effort} — ` : ""}${redactProviderFailure(err, { secrets: providerSecrets }).slice(0, 140)}` };
   };
 
   const probeGrok = async () => {
-    // Same safety contract as production reviews (GROK_ARGS: plan mode, verbatim, no memory/subagents/
-    // web) + suppressed hooks — a probe outside it could write to the workspace while claiming "(plan)".
-    const run = grokImpl || (() => {
-      // Same containment as real reviews: Seatbelt profile + GROK_HOME redirected into a per-run
-      // private tmpdir (so ~/.grok stays read-only), auth read from the real read-only auth.json.
-      let tmpDir = null;
-      try { tmpDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "grok-bench-"))); } catch { /* no tmp grant */ }
-      // Fail CLOSED: no private tmpdir → no containment; report unhealthy instead of probing unsandboxed.
-      if (!tmpDir) return { status: 1, stderr: "grok sandbox tmpdir could not be created" };
-      const auth = grokAuthPath(env);
-      const spec = grokSpawnSpec("Reply with exactly: OK", { tmpDir, ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
-      try {
-        return spawnSync(spec.cmd, spec.args, {
-          env: grokChildEnv(env, tmpDir), encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
-        });
-      } finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
-    });
     const t0 = Date.now();
-    const r = run();
+    // The live probe must use the exact production runner: that is where off-darwin refusal,
+    // private GROK_HOME setup, outer Seatbelt, and built-in-sandbox fail-open detection live.
+    // `grokImpl` remains only as the raw-process test seam and is held to the same success checks.
+    if (!grokImpl) {
+      const result = await grokTaskImpl({
+        prompt: "Reply with exactly: OK",
+        cwd: process.cwd(),
+        env,
+        timeoutMs: HEALTH_CODEX_TIMEOUT_MS,
+        platform
+      });
+      const ms = Date.now() - t0;
+      if (!result?.error && /OK/.test(String(result?.raw || ""))) {
+        return { name: "grok", display: "Grok", ok: true, note: `grok CLI (plan) · ${(ms / 1000).toFixed(1)}s` };
+      }
+      return { name: "grok", display: "Grok", ok: false, note: redactProviderFailure(result?.error || "grok returned unexpected output", { secrets: providerSecrets }).slice(0, 140) };
+    }
+    const r = await grokImpl();
     const ms = Date.now() - t0;
     if (r.error?.code === "ENOENT") return { name: "grok", display: "Grok", ok: false, note: "grok CLI not found (curl -fsSL https://x.ai/cli/install.sh | bash)" };
+    if (r.status === 0 && grokSandboxFailedOpen(r.stderr)) {
+      return { name: "grok", display: "Grok", ok: false, note: "grok sandbox could not be applied — refusing unsandboxed health probe" };
+    }
     if (r.status === 0 && /OK/.test(grokText(r.stdout))) return { name: "grok", display: "Grok", ok: true, note: `grok CLI (plan) · ${(ms / 1000).toFixed(1)}s` };
-    return { name: "grok", display: "Grok", ok: false, note: `${(r.stderr || r.stdout || "failed").trim().slice(0, 140)}` };
+    return { name: "grok", display: "Grok", ok: false, note: redactProviderFailure(grokFailureText(r, { maxChars: 140 }), { secrets: providerSecrets }) };
   };
 
   const results = await Promise.all(names.map((n) => (n === "codex" ? probeCodex() : n === "grok" ? probeGrok() : probeApi(n))));
@@ -490,7 +496,11 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceI
   const key = mode || (deep ? "investigate" : "hunt");           // back-compat: deep:true → investigate
   const m = HUNT_MODES[key] || HUNT_MODES.hunt;
   const sessionKey = sessionKeyFromInput({}, env);
-  const results = await huntImpl({ cwd, seed, deep: m.deep, system: m.system, user: m.buildUser(seed), env });
+  const rawResults = await huntImpl({ cwd, seed, deep: m.deep, system: m.system, user: m.buildUser(seed), env });
+  const providerSecrets = configuredProviderSecrets({ env });
+  const results = rawResults.map((result) => result?.error
+    ? redactProviderFailureData(result, { secrets: providerSecrets })
+    : result);
   // record a trace so `/bench:status <id>` can show the full findings later
   let traceId = null;
   try {

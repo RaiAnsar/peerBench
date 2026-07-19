@@ -1,6 +1,7 @@
 // global-hooks/review-client.mjs
 // OpenAI-compatible reviewer. READ-ONLY by omission: body never has tools/tool_choice.
 import { allowedTemperatureFromError, isContentInspectionFailure, sanitizeForProviderInspection } from "./provider-compat.mjs";
+import { redactProviderFailure, secretHeaderValues } from "./provider-error-redaction.mjs";
 
 const DEFAULT_TIMEOUT_MS = 90_000;
 // Coding-plan endpoints (z.ai, etc.) throttle the bare Node/undici User-Agent with HTTP 429 — they
@@ -46,6 +47,8 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
   // capped key overflows to the next before we back off. apiKey stays supported for single-key callers.
   const keyPool = (Array.isArray(apiKeys) && apiKeys.length ? apiKeys : (apiKey ? [apiKey] : [])).filter(Boolean);
   if (!keyPool.length) return { ok: false, error: { kind: "nokey", detail: "no api key" } };
+  const failureSecrets = [...keyPool, ...secretHeaderValues(headers)];
+  const safeDetail = (value, maxChars) => redactProviderFailure(value, { secrets: failureSecrets }).slice(0, maxChars);
   let keyIdx = keyPool.length > 1 ? Math.floor(keyPick() * keyPool.length) : 0;
   const doFetch = fetchImpl || globalThis.fetch;
   const controller = new AbortController();
@@ -91,7 +94,7 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
     resp = await request(makeBody(system, user, activeTemperature));
   } catch (e) {
     clearTimeout(timer);
-    return { ok: false, error: { kind: e?.name === "AbortError" ? "timeout" : "network", detail: String(e?.message || e).slice(0, 300) } };
+    return { ok: false, error: { kind: e?.name === "AbortError" ? "timeout" : "network", detail: safeDetail(e?.message || e, 300) } };
   }
   let errorBody = "";
   if (!resp.ok) {
@@ -103,7 +106,7 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
         resp = await request(makeBody(system, user, activeTemperature));
       } catch (e) {
         clearTimeout(timer);
-        return { ok: false, error: { kind: e?.name === "AbortError" ? "timeout" : "network", detail: String(e?.message || e).slice(0, 300) } };
+        return { ok: false, error: { kind: e?.name === "AbortError" ? "timeout" : "network", detail: safeDetail(e?.message || e, 300) } };
       }
       errorBody = resp.ok ? "" : await resp.text().catch(() => "");
     }
@@ -114,16 +117,16 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
         resp = await request(makeBody(sanitizeForProviderInspection(system), sanitizeForProviderInspection(user), activeTemperature));
       } catch (e) {
         clearTimeout(timer);
-        return { ok: false, error: { kind: e?.name === "AbortError" ? "timeout" : "network", detail: String(e?.message || e).slice(0, 300) } };
+        return { ok: false, error: { kind: e?.name === "AbortError" ? "timeout" : "network", detail: safeDetail(e?.message || e, 300) } };
       }
       if (!resp.ok) {
         const body2 = await resp.text().catch(() => "");
         clearTimeout(timer);
-        return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, body2), detail: `HTTP ${resp.status}: ${body2.slice(0, 200)}` } };
+        return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, body2), detail: `HTTP ${resp.status}: ${safeDetail(body2, 200)}` } };
       }
     } else {
       clearTimeout(timer);
-      return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, errorBody), detail: `HTTP ${resp.status}: ${errorBody.slice(0, 200)}` } };
+      return { ok: false, error: { kind: classifyHttpErrorKind(resp.status, errorBody), detail: `HTTP ${resp.status}: ${safeDetail(errorBody, 200)}` } };
     }
   }
   clearTimeout(timer);

@@ -7,12 +7,19 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { combinePanel, untrackedSnapshot } from "./panel-lib.mjs";
+import { combinePanel } from "./panel-lib.mjs";
 import { isBenchDisabled as defaultIsBenchDisabled, normalizeSessionId, sessionKeyFromInput, workspaceStateDir, readReviewedHead, writeReviewedHead } from "./config-store.mjs";
 export { readReviewedHead, writeReviewedHead };   // re-exported so tests + siblings share one impl
 import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 import { consumeCycleReset } from "./cycle-reset.mjs";
+import {
+  adoptSessionUntrackedBaseline,
+  markSessionUntrackedStopStarted,
+  prepareSessionUntrackedBaselineForStop,
+  readSessionUntrackedBaseline,
+  sessionUntrackedSnapshot
+} from "./session-untracked-baseline.mjs";
 
 const MAX_DIFF_BYTES = 200_000;
 const MAX_SYNTHESIS_PROMPT_BYTES = 120_000;
@@ -25,7 +32,7 @@ const MAX_STOP_LOOPS = 3;                  // hard cap on CONSECUTIVE automatic 
 // BENCH_STOP_CYCLE_RESET nonce), so a session can burn at most three full repair streaks before
 // the gate downgrades to a non-waking advisory.
 export const MAX_STOP_TOTAL_BLOCKS = 9;
-export const STOP_REVIEW_POLICY_VERSION = "stop-review-v4-total-budget";
+export const STOP_REVIEW_POLICY_VERSION = "stop-review-v5-session-untracked-baseline";
 const STOP_LOCK_STALE_MS = 10 * 60 * 1000;
 const STOP_LOCK_ORPHAN_GRACE_MS = 1_000;
 const STOP_LOCK_POLL_MS = 25;
@@ -638,6 +645,14 @@ async function runMainLocked({
   const ws = lockContext?.ws || workspaceRoot(cwd);
   const sessionKey = lockContext?.sessionKey ?? sessionKeyFromInput(input, env);
 
+  // Fence SessionStart before any awaited evidence capture, including crash/timeout paths.
+  const preparedUntrackedBaseline = await prepareSessionUntrackedBaselineForStop(
+    ws,
+    sessionKey,
+    lockContext?.startedUntrackedBaseline
+  );
+  const trustSessionBaseline = preparedUntrackedBaseline.safe === true;
+
   // (Deep spec/push review delivery now lives in deep-review-runner.mjs — a separate asyncRewake
   // Stop hook — so this gate only reviews the turn's own diff.)
 
@@ -654,8 +669,20 @@ async function runMainLocked({
     try { fs.rmSync(loopFile, { force: true }); } catch { /* explicit reset is best effort */ }
     try { fs.rmSync(coverageFile, { force: true }); } catch { /* explicit reset is best effort */ }
   }
-
-  const statusSnapshot = await captureGitSnapshot(["status", "--short", "--untracked-files=all"], ws);
+  let observedLoopMarker = null;
+  try { observedLoopMarker = JSON.parse(fs.readFileSync(loopFile, "utf8")); } catch { /* no active block */ }
+  const unresolvedReviewerBlock = Number(observedLoopMarker?.count) > 0
+    && observedLoopMarker?.status === "review-blocked";
+  const recordedBlockedUntracked = observedLoopMarker?.blockedUntrackedEntries;
+  const blockedUntrackedEntriesAreValid = Array.isArray(recordedBlockedUntracked)
+    && recordedBlockedUntracked.length <= 40
+    && recordedBlockedUntracked.every((entry) => entry
+      && typeof entry.path === "string"
+      && Buffer.byteLength(entry.path) <= 16 * 1024
+      && typeof entry.identity === "string"
+      && /^[0-9a-f]{64}$/.test(entry.identity));
+  // Untracked full-content evidence is handled separately; this channel stays tracked-only.
+  const statusSnapshot = await captureGitSnapshot(["status", "--short", "--untracked-files=no"], ws);
   const status = promptText(statusSnapshot, "git status");
   const curHead = git(["rev-parse", "HEAD"], ws).trim();   // "" on an unborn HEAD (fresh repo)
   // GAP FIX: review changes COMMITTED since the last review, not just the working tree. A turn that
@@ -680,30 +707,77 @@ async function runMainLocked({
   const committed = promptText(committedSnapshot, "committed diff");
   const diff = promptText(diffSnapshot, "working-tree diff");
   const staged = promptText(stagedSnapshot, "staged diff");
-  const {
-    block: untracked,
-    reviewBlocks: untrackedReviewBlocks = [],
-    fingerprint: untrackedIdentity,
-    count: untrackedCount,
-    coverageComplete: untrackedCoverageComplete = true,
-    coverageReason: untrackedCoverageReason = ""
-  } = untrackedSnapshot(ws);
+  let untrackedState = sessionUntrackedSnapshot(ws, sessionKey, {
+    // Invalidate a BLOCKed adoption; invalid legacy markers invalidate every adoption.
+    includeInitial: trustSessionBaseline,
+    includeAdopted: trustSessionBaseline && (!unresolvedReviewerBlock || blockedUntrackedEntriesAreValid),
+    expectedGeneration: preparedUntrackedBaseline.expectedGeneration,
+    rejectedAdoptedEntries: blockedUntrackedEntriesAreValid ? recordedBlockedUntracked : []
+  });
+  let untracked = untrackedState.block;
+  let untrackedReviewBlocks = untrackedState.reviewBlocks || [];
+  let untrackedIdentity = untrackedState.fingerprint;
+  let untrackedCount = untrackedState.count;
+  let untrackedCoverageComplete = untrackedState.coverageComplete !== false;
+  let untrackedCoverageReason = untrackedState.coverageReason || "";
+  let untrackedInventory = untrackedState.inventory || null;
 
-  const coverageProblems = [];
+  const gitCoverageProblems = [];
   for (const [label, snapshot] of [
     ["git status", statusSnapshot],
     ["committed diff", committedSnapshot],
     ["working-tree diff", diffSnapshot],
     ["staged diff", stagedSnapshot]
   ]) {
-    if (!snapshot.ok) coverageProblems.push(`${label} failed: ${snapshot.error}`);
-    else if (snapshot.truncated) coverageProblems.push(`${label} is ${snapshot.totalBytes} bytes, above the ${MAX_DIFF_BYTES}-byte bounded review limit`);
+    if (!snapshot.ok) gitCoverageProblems.push(`${label} failed: ${snapshot.error}`);
+    else if (snapshot.truncated) gitCoverageProblems.push(`${label} is ${snapshot.totalBytes} bytes, above the ${MAX_DIFF_BYTES}-byte bounded review limit`);
   }
-  if (!untrackedCoverageComplete) coverageProblems.push(untrackedCoverageReason || "untracked content coverage is incomplete");
+  const currentCoverageProblems = () => [
+    ...gitCoverageProblems,
+    ...(!untrackedCoverageComplete ? [untrackedCoverageReason || "untracked content coverage is incomplete"] : [])
+  ];
+  let coverageProblems = currentCoverageProblems();
 
   const hasCommitted = committedSnapshot.totalBytes > 0;
   const hasWorkingTree = diffSnapshot.totalBytes > 0;
   const hasStaged = stagedSnapshot.totalBytes > 0;
+  let reviewers = null;
+  let reviewerIdentities = [];
+  const reviewPolicy = `${STOP_REVIEW_POLICY_VERSION}:${String(agentName || "agent").toLowerCase()}`;
+  let adoptionPolicy = "";
+  const ensureReviewers = () => {
+    if (reviewers) return reviewers;
+    reviewers = resolveReviewersImpl({ env }).filter((r) => String(r.name).toLowerCase() !== "codex");
+    reviewerIdentities = reviewers.map(reviewerIdentity)
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    adoptionPolicy = reviewFingerprint({
+      scope: "untracked-adoption-policy",
+      reviewers: reviewerIdentities,
+      policy: reviewPolicy
+    });
+    return reviewers;
+  };
+
+  // Adopted identities are panel-policy scoped. Recapture without them when policy changes.
+  if (!coverageProblems.length && untrackedState.conditionalAdoptedCount > 0) {
+    ensureReviewers();
+    if (untrackedState.adoptedPolicy !== adoptionPolicy) {
+      untrackedState = sessionUntrackedSnapshot(ws, sessionKey, {
+        includeInitial: trustSessionBaseline,
+        includeAdopted: false,
+        expectedGeneration: preparedUntrackedBaseline.expectedGeneration
+      });
+      untracked = untrackedState.block;
+      untrackedReviewBlocks = untrackedState.reviewBlocks || [];
+      untrackedIdentity = untrackedState.fingerprint;
+      untrackedCount = untrackedState.count;
+      untrackedCoverageComplete = untrackedState.coverageComplete !== false;
+      untrackedCoverageReason = untrackedState.coverageReason || "";
+      untrackedInventory = untrackedState.inventory || null;
+      coverageProblems = currentCoverageProblems();
+    }
+  }
+
   if (!coverageProblems.length && !hasCommitted && !hasWorkingTree && !hasStaged && untrackedCount === 0) {
     // Nothing changed since the last review (status/report-only) — keep an EXISTING baseline
     // current so the NEXT committing turn diffs from here, then skip. Never CREATE the baseline
@@ -723,12 +797,8 @@ async function runMainLocked({
   // direct Codex work is reviewed by the non-Codex bench reviewers configured for this workspace.
   // Coverage failures are independent of panel configuration. Do not even resolve the panel here:
   // a broken reviewer config must not turn a known-unreviewed oversized snapshot into fail-open.
-  const reviewers = coverageProblems.length
-    ? []
-    : resolveReviewersImpl({ env }).filter((r) => String(r.name).toLowerCase() !== "codex");
-  const reviewerIdentities = reviewers.map(reviewerIdentity)
-    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-  const reviewPolicy = `${STOP_REVIEW_POLICY_VERSION}:${String(agentName || "agent").toLowerCase()}`;
+  if (coverageProblems.length) reviewers = [];
+  else ensureReviewers();
 
   // Full review identity for traceability and exact-ALLOW de-duplication. It includes the untruncated
   // committed + working-tree diffs, full-content untracked identity, reviewer model/endpoint, and
@@ -909,7 +979,12 @@ async function runMainLocked({
         ts: Date.now(),
         generation: randomUUID(),
         snapshot: reviewSnapshotFingerprint,
-        status: coverageProblems.length ? "unreviewed-coverage-incomplete" : "review-blocked"
+        status: coverageProblems.length ? "unreviewed-coverage-incomplete" : "review-blocked",
+        blockedUntrackedEntries: coverageProblems.length
+          ? []
+          : (untrackedInventory?.entries || [])
+            .filter((entry) => entry.reviewable)
+            .map(({ path: entryPath, identity }) => ({ path: entryPath, identity }))
       });
     } catch { /* block delivery still proceeds */ }
     if (coverageProblems.length) {
@@ -958,6 +1033,8 @@ async function runMainLocked({
   resetStreakPreservingTotal(loopFile);
   writeReviewedHead(ws, curHead);
   writeReviewedWorktree(ws, worktreeFingerprint, sessionKey);
+  // Only authoritative ALLOW reaches adoption; every other path returned above.
+  adoptSessionUntrackedBaseline(ws, sessionKey, untrackedInventory, adoptionPolicy);
   emit({ systemMessage: `⛩ bench stop: ALLOW [${panel.badge}] — ${panel.summary.slice(0, 220)}` });
 }
 
@@ -979,6 +1056,9 @@ export async function runMain(options = {}) {
   // queued before another invocation committed ALLOW must still review; it cannot silently reuse a
   // marker that did not exist (or was replaced) at its own start.
   const startedReviewedWorktreeGeneration = readReviewedWorktreeRecord(ws, sessionKey)?.generation || null;
+  const startedUntrackedBaseline = readSessionUntrackedBaseline(ws, sessionKey);
+  // Fence before the Stop lock wait so termination while queued cannot bless a late baseline.
+  markSessionUntrackedStopStarted(ws, sessionKey, startedUntrackedBaseline);
   const release = await acquireStopGateLock(ws);
   let outcome;
   try {
@@ -987,7 +1067,13 @@ export async function runMain(options = {}) {
       env,
       input,
       isBenchDisabledImpl,
-      lockContext: { cwd, ws, sessionKey, startedReviewedWorktreeGeneration }
+      lockContext: {
+        cwd,
+        ws,
+        sessionKey,
+        startedReviewedWorktreeGeneration,
+        startedUntrackedBaseline
+      }
     });
   } finally {
     release();

@@ -82,6 +82,93 @@ test("huntPanel runs kimi+mimo agentically and returns findings", async () => {
   assert.deepEqual(out.map((o) => o.name).sort(), ["Kimi", "MiMo"]);
   for (const o of out) assert.match(o.findings, /x\.js:3/);
 });
+
+test("deep Grok quota failures record a cooldown so retries skip the provider immediately", async () => {
+  const { clearReviewerCooldowns, setReviewers } = await import("../global-hooks/config-store.mjs");
+  clearReviewerCooldowns({ name: "grok" });
+  setReviewers(["grok"]);
+  let calls = 0;
+  const first = await huntPanel({
+    cwd: process.cwd(),
+    env: {},
+    grokImpl: async () => {
+      calls += 1;
+      return { raw: "", error: "API error (status 402 Payment Required): Grok Build usage balance exhausted" };
+    }
+  });
+  assert.equal(calls, 1);
+  assert.equal(first[0].errorKind, "quota");
+  assert.match(first[0].error, /out of quota\/credits.*402 Payment Required/i);
+
+  const second = await huntPanel({
+    cwd: process.cwd(),
+    env: {},
+    grokImpl: async () => {
+      calls += 1;
+      return { raw: "ALLOW: should not run" };
+    }
+  });
+  assert.equal(calls, 1, "the next deep/native retry is short-circuited before another Grok process");
+  assert.equal(second[0].skipped, "cooldown");
+  assert.match(second[0].error, /skipped without retry/i);
+  clearReviewerCooldowns({ name: "grok" });
+});
+test("hunt failures redact the first result, persisted cooldown, and cooldown replay", async (t) => {
+  const { clearReviewerCooldowns, setReviewers } = await import("../global-hooks/config-store.mjs");
+  const root = process.env.BENCH_ROOT;
+  const companionFile = path.join(root, "companion.json");
+  const previousCompanion = fs.existsSync(companionFile) ? fs.readFileSync(companionFile) : null;
+  const configured = ["hunt", "configured", "fixture", "value"].join("-");
+  const refresh = ["hunt", "refresh", "fixture", "value"].join("-");
+  const env = { KIMI_API_KEY: configured };
+  t.after(() => {
+    clearReviewerCooldowns({ name: "kimi", env });
+    if (previousCompanion) fs.writeFileSync(companionFile, previousCompanion);
+    else fs.rmSync(companionFile, { force: true });
+  });
+  clearReviewerCooldowns({ name: "kimi", env });
+  setReviewers(["kimi"]);
+
+  let calls = 0;
+  const first = await huntPanel({
+    cwd: process.cwd(),
+    env,
+    nowImpl: () => 2_000_000_000_000,
+    reviewImpl: async () => {
+      calls += 1;
+      return {
+        ok: false,
+        status: 402,
+        headers: { get: () => null },
+        text: async () => `usage balance exhausted; reflected ${configured}; refresh_token=${refresh}`
+      };
+    }
+  });
+  assert.equal(calls, 1);
+  assert.equal(first[0].errorKind, "quota");
+  assert.equal(first[0].error.includes(configured), false, "first hunt result must not expose the configured key");
+  assert.equal(first[0].error.includes(refresh), false, "first hunt result must not expose a shaped token");
+  assert.match(first[0].error, /usage balance exhausted/i, "useful provider context remains visible");
+
+  const cooldownFile = path.join(root, "reviewer-cooldowns.json");
+  const persisted = fs.readFileSync(cooldownFile, "utf8");
+  assert.equal(persisted.includes(configured), false, "cooldown state must not persist the configured key");
+  assert.equal(persisted.includes(refresh), false, "cooldown state must not persist the shaped token");
+
+  const replay = await huntPanel({
+    cwd: process.cwd(),
+    env,
+    nowImpl: () => 2_000_000_000_001,
+    reviewImpl: async () => {
+      calls += 1;
+      throw new Error("cooldown replay must not call the provider");
+    }
+  });
+  assert.equal(calls, 1);
+  assert.equal(replay[0].skipped, "cooldown");
+  assert.equal(replay[0].error.includes(configured), false, "cooldown replay must remain redacted");
+  assert.equal(replay[0].error.includes(refresh), false, "cooldown replay must remain redacted");
+});
 test("huntPanel deep=true flips a TOGGLE provider (GLM) to thinking:enabled but OMITS it for a null provider (K3 kimi)", async () => {
   // Deep must turn thinking ON only where the param is a live toggle (GLM/Qwen: disabled↔enabled).
   // A provider with thinking:null — kimi on K3 (param unsupported), MiMo/MiniMax (always-on) — must

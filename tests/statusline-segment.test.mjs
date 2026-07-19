@@ -181,16 +181,16 @@ test("latestTrace: a legacy trace with NO wsKey is still accepted (back-compat)"
   fs.writeFileSync(path.join(d, "100-aaa.json"), JSON.stringify({ id: "100-aaa", gate: "plan", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
   assert.equal(latestTrace(d, "mine-cafef00d").id, "100-aaa", "unstamped legacy traces are not filtered out");
 });
-test("latestTrace: session filter prefers own session, falls back to legacy, never foreign", () => {
+test("latestTrace: session filter uses only its own trace, never legacy or foreign", () => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "trsess-"));
   const sessionA = normalizeSessionId("chat-A");
   const sessionB = normalizeSessionId("chat-B");
   fs.writeFileSync(path.join(d, "300-ccc.json"), JSON.stringify({ id: "300-ccc", gate: "stop", reviewers: [{ name: "K", verdict: "BLOCK" }] }));  // legacy: newest, UNSTAMPED
   fs.writeFileSync(path.join(d, "200-bbb.json"), JSON.stringify({ id: "200-bbb", sessionKey: sessionB, gate: "plan", reviewers: [{ name: "K", verdict: "BLOCK" }] }));
   fs.writeFileSync(path.join(d, "100-aaa.json"), JSON.stringify({ id: "100-aaa", sessionKey: sessionA, gate: "hunt", reviewers: [{ name: "K", verdict: "ALLOW" }] }));
-  assert.equal(latestTrace(d, null, sessionA).id, "100-aaa", "tier 1: chat A prefers its OWN trace over the newer legacy/foreign ones");
-  assert.equal(latestTrace(d, null, sessionB).id, "200-bbb", "tier 1: chat B prefers its own trace");
-  assert.equal(latestTrace(d, null, normalizeSessionId("chat-C")).id, "300-ccc", "tier 2: a session with no own trace falls back to the newest LEGACY trace (NOT a foreign session's) — no badge regression");
+  assert.equal(latestTrace(d, null, sessionA).id, "100-aaa", "chat A prefers its OWN trace over newer legacy/foreign ones");
+  assert.equal(latestTrace(d, null, sessionB).id, "200-bbb", "chat B prefers its own trace");
+  assert.equal(latestTrace(d, null, normalizeSessionId("chat-C")), null, "an unknown session never inherits a legacy reviewer panel");
   assert.equal(latestTrace(d).id, "300-ccc", "without a session filter, legacy project-level behavior remains");
 
   // foreign-only (no legacy present): an unknown session gets NOTHING — never another chat's stamped trace

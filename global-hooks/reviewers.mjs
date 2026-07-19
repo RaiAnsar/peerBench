@@ -1,8 +1,9 @@
 // global-hooks/reviewers.mjs
 import { parseVerdict, runCodexReview, runGrokReview } from "./panel-lib.mjs";
-import { resolveConfig, displayName, readReviewerCooldown, recordReviewerCooldown } from "./config-store.mjs";
+import { resolveConfig, displayName, readReviewerCooldown, recordReviewerCooldown, configuredProviderSecrets } from "./config-store.mjs";
 import { review as defaultReview } from "./review-client.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
+import { redactProviderFailureData } from "./provider-error-redaction.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,14 +21,15 @@ const unavailableLabel = (kind) => (kind === "auth" ? "auth failed (re-auth need
 // into the same quota/auth taxonomy — conservative word-boundary matches only.
 export function classifyReviewerFailureText(text) {
   const s = String(text || "");
-  if (/\b(quota|usage limit|rate.?limit|insufficient credits?|out of credits|plan limit|credit balance)\b/i.test(s)) return "quota";
+  if (/\b(402|payment required|quota|usage limit|usage balance exhausted|rate.?limit|insufficient credits?|out of credits|plan limit|credit balance)\b/i.test(s)) return "quota";
   if (/\b(401|unauthorized|invalid_grant|not logged in|logged out|sign-?in required|login required|re-?authenticate)\b/i.test(s)) return "auth";
   return null;
 }
 
-function withAvailability(name, display, runImpl, { now = Date.now } = {}) {
+function withAvailability(name, display, runImpl, { now = Date.now, env = process.env } = {}) {
   return async (args) => {
-    const cooldown = readReviewerCooldown(name, { now: now() });
+    const secrets = configuredProviderSecrets({ env });
+    const cooldown = readReviewerCooldown(name, { now: now(), env, secrets });
     if (cooldown) {
       const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - now()) / 60_000));
       return {
@@ -39,11 +41,13 @@ function withAvailability(name, display, runImpl, { now = Date.now } = {}) {
     }
     const result = await runImpl(args);
     if (result?.error) {
-      const kind = result.errorKind || classifyReviewerFailureText(result.error);
+      const safeResult = redactProviderFailureData(result, { secrets });
+      const kind = safeResult.errorKind || classifyReviewerFailureText(safeResult.error);
       if (COOLDOWN_KINDS.has(kind)) {
-        recordReviewerCooldown(name, kind, result.error, { now: now() });
-        return { ...result, error: `${unavailableLabel(kind)} — ${result.error}`, errorKind: kind };
+        recordReviewerCooldown(name, kind, safeResult.error, { now: now(), env, secrets });
+        return { ...safeResult, error: `${unavailableLabel(kind)} — ${safeResult.error}`, errorKind: kind };
       }
+      return safeResult;
     }
     return result;
   };
@@ -126,7 +130,7 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
   // (instant skip with a clear out-of-quota/auth note), classified-failure recording after.
   const wrap = (adapter) => ({
     ...adapter,
-    run: withAvailability(adapter.name, displayName(adapter.name), adapter.run, now ? { now } : {})
+    run: withAvailability(adapter.name, displayName(adapter.name), adapter.run, { ...(now ? { now } : {}), env })
   });
   return cfg.reviewers.map((name) => {
     if (name === "codex") return wrap(codexAdapter(env));

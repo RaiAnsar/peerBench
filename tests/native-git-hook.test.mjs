@@ -18,6 +18,10 @@ function run(cmd, args, cwd) {
   return r.stdout.trim();
 }
 
+function basicAuthFixture(username, password, suffix = "/repo") {
+  return ["https://", username, ":", password, "@example.invalid", suffix].join("");
+}
+
 function repo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-native-hook-"));
   run("git", ["init", "-q"], dir);
@@ -197,7 +201,7 @@ test("dispatcher keeps credential URLs out of Node argv and preserves exact priv
   assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime }).ok, true);
 
   const remoteName = "origin name\nsecond line";
-  const remoteUrl = "https://user:top-secret@example.invalid/repo path?x=a&y=b\nfragment";
+  const remoteUrl = basicAuthFixture("user", "top-secret", "/repo path?x=a&y=b\nfragment");
   const input = Buffer.from([0, 1, 2, 10, 13, 255, ...Buffer.from("tuple with spaces\n")]);
   const invoked = spawnSync(path.join(hooks, "pre-push"), [remoteName, remoteUrl], {
     cwd: ws,
@@ -240,7 +244,7 @@ test("dispatcher fails closed when secure spool creation, writing, or chmod fail
     const capture = path.join(ws, "must-not-run");
     assert.equal(ensureNativePrePushHook(ws, { runtimePath: fakeRuntime(ws) }).ok, true);
     const hook = path.join(ws, ".git", "hooks", "pre-push");
-    const invoked = spawnSync(hook, ["origin", "https://user:secret@example.invalid/repo"], {
+    const invoked = spawnSync(hook, ["origin", basicAuthFixture("user", "secret")], {
       cwd: ws,
       input: "tuple\n",
       encoding: "utf8",
@@ -283,7 +287,7 @@ test("dispatcher feeds legacy runtimes a malformed nonempty sentinel instead of 
   const legacyEof = spawnSync(process.execPath, [runtime], { input: "", encoding: "utf8" });
   assert.equal(legacyEof.status, 0, "the legacy fixture models the old fail-open EOF behavior");
   assert.equal(ensureNativePrePushHook(ws, { runtimePath: runtime }).ok, true);
-  const secretUrl = "https://user:legacy-secret@example.invalid/repo";
+  const secretUrl = basicAuthFixture("user", "legacy-secret");
   const invoked = spawnSync(path.join(ws, ".git", "hooks", "pre-push"), ["origin", secretUrl], {
     cwd: ws,
     input: `refs/heads/main ${"1".repeat(40)} refs/heads/main ${"2".repeat(40)}\n`,
@@ -313,7 +317,7 @@ test("dispatcher removes the credential spool when exec cannot start Node", () =
 
   const invoked = spawnSync(path.join(ws, ".git", "hooks", "pre-push"), [
     "origin",
-    "https://user:credential@example.invalid/repo"
+    basicAuthFixture("user", "credential")
   ], {
     cwd: ws,
     input: "tuple\n",

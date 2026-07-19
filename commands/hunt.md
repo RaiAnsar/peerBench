@@ -1,5 +1,5 @@
 ---
-description: Multi-model agentic bug hunt. The active peerBench panel (Codex/Grok/Kimi/MiniMax, depending on /bench:reviewers) scours the repository READ-ONLY and reports concrete bugs (file:line + mechanism + trigger) side by side. Use when the user wants to find bugs, asks what is broken / wonky / unreliable, investigates a symptom, or wants a thorough multi-reviewer sweep of a codebase. Optionally focus it on an area (auth, payments, a specific symptom). Deep and slow (minutes); never edits files.
+description: Multi-model agentic bug hunt. The active peerBench panel scours the repository READ-ONLY and reports concrete bugs (file:line + mechanism + trigger) side by side. Use when the user wants to find bugs, asks what is broken / wonky / unreliable, investigates a symptom, or wants a thorough multi-reviewer sweep of a codebase. Optionally focus it on an area (auth, payments, a specific symptom). Deep and slow (minutes); never edits files.
 argument-hint: '[symptom/area/question]'
 allowed-tools: Bash(node:*)
 ---

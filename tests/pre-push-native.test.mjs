@@ -27,6 +27,10 @@ function run(cmd, args, cwd) {
   return r.stdout.trim();
 }
 
+function basicAuthFixture(username, password, suffix = "/repo") {
+  return ["https://", username, ":", password, "@example.invalid", suffix].join("");
+}
+
 function history(count = 5) {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-native-push-"));
   run("git", ["init", "-q"], ws);
@@ -98,7 +102,7 @@ test("exact existing update uses Git's remote/local object ids; deletions skip",
 
 test("unavailable remote-base guidance never echoes a credential-bearing direct-URL remote name", () => {
   const { ws, shas } = history(1);
-  const remoteName = "https://user:remote-name-secret@example.invalid/private.git";
+  const remoteName = basicAuthFixture("user", "remote-name-secret", "/private.git");
   const missingRemoteSha = "f".repeat(shas[0].length);
   const resolved = resolveNativeUpdateRange(ws, remoteName, update(shas[0], missingRemoteSha));
   assert.equal(resolved.ok, false);
@@ -317,6 +321,21 @@ test("whole-push identity is canonical across Git tuple order", () => {
   );
 });
 
+test("whole-push identity depends on Git's canonical tuples, not shell command spelling", () => {
+  const pushed = update("1".repeat(40), "2".repeat(40));
+  const common = {
+    remoteName: "origin",
+    remoteUrl: "file:///remote",
+    updates: [pushed],
+    reviewers: ["grok", "mimo"],
+    policy: { quorum: 2 }
+  };
+  assert.equal(
+    nativePushIdentity({ ...common, command: "git push" }),
+    nativePushIdentity({ ...common, command: "git push --verbose" })
+  );
+});
+
 test("whole-push identity canonicalizes nested policy object key order", () => {
   const pushed = update("1".repeat(40), "2".repeat(40), "refs/heads/a", "refs/heads/a");
   const common = { remoteName: "origin", remoteUrl: "file:///remote", updates: [pushed] };
@@ -351,6 +370,38 @@ test("reviewer configuration order does not invalidate an exact cached decision"
   assert.equal(second.decision, "allow");
   assert.equal(second.cached, true);
   assert.equal(calls, 1);
+});
+
+test("a Grok CLI build change invalidates an exact native-push ALLOW", async () => {
+  const { ws, shas, root } = history(2);
+  fs.writeFileSync(path.join(root, "companion.json"), `${JSON.stringify({ reviewers: ["grok"] })}\n`);
+  process.env.BENCH_ROOT = root;
+  const grokHome = fs.mkdtempSync(path.join(os.tmpdir(), "peerbench-grok-identity-"));
+  fs.writeFileSync(path.join(grokHome, "version.json"), `${JSON.stringify({ version: "0.2.101" })}\n`);
+  let calls = 0;
+  const common = {
+    cwd: ws,
+    remoteName: "runtime-identity",
+    remoteUrl: "file:///runtime-identity",
+    updates: [update(shas[1], shas[0])],
+    env: { GROK_HOME: grokHome, BENCH_PUSH_REVIEW_QUORUM: "1" },
+    runPushReviewImpl: async () => {
+      calls++;
+      return {
+        reviewers: [{ name: "Grok", verdict: "ALLOW", error: null, severity: "none" }],
+        findingCount: 0,
+        maxSeverity: "none",
+        summary: "grok clean",
+        badge: "Grok✓"
+      };
+    }
+  };
+  assert.equal((await reviewNativePush({ ...common, now: 120_000 })).decision, "allow");
+  fs.writeFileSync(path.join(grokHome, "version.json"), `${JSON.stringify({ version: "0.2.105" })}\n`);
+  const afterUpgrade = await reviewNativePush({ ...common, now: 120_001 });
+  assert.equal(afterUpgrade.decision, "allow");
+  assert.equal(afterUpgrade.cached, undefined);
+  assert.equal(calls, 2, "a different Grok runtime must never inherit the old build's ALLOW");
 });
 
 test("local source-ref spelling cannot reset the same remote target's three-cycle ceiling", async () => {
@@ -605,6 +656,38 @@ test("a blocker cannot hide an unavailable reviewer in the same panel", async ()
   assert.equal(second.decision, "allow");
   assert.equal(second.cached, undefined, "an incomplete blocking panel must not be cached as complete");
   assert.equal(calls, 2);
+});
+
+test("a clean 1-of-2 unavailable panel names the failed reviewer and remains uncached", async () => {
+  const { ws, shas, root } = history(2);
+  process.env.BENCH_ROOT = root;
+  let calls = 0;
+  const common = {
+    cwd: ws,
+    remoteName: "clean-unavailable",
+    remoteUrl: "file:///clean-unavailable",
+    updates: [update(shas[1], shas[0])],
+    env: {},
+    runPushReviewImpl: async () => {
+      calls++;
+      return {
+        reviewers: [
+          { name: "Grok", verdict: null, error: "sandbox initialization failed: Operation not permitted", severity: "none" },
+          { name: "Kimi", verdict: "ALLOW", error: null, severity: "none" }
+        ],
+        findingCount: 0,
+        maxSeverity: "none",
+        summary: "one reviewer clean",
+        badge: "Grok! Kimi✓"
+      };
+    }
+  };
+  const first = await reviewNativePush({ ...common, now: 22_000 });
+  const second = await reviewNativePush({ ...common, now: 22_001 });
+  assert.equal(first.decision, "unavailable");
+  assert.match(first.reason, /grok: sandbox initialization failed/i);
+  assert.equal(second.cached, undefined);
+  assert.equal(calls, 2, "unavailable is not push authorization and must not be cached as one");
 });
 
 test("a partial chunk BLOCK is surfaced but never cached even when two other reviewers meet quorum", async () => {
@@ -958,6 +1041,7 @@ test("bounded foreground fails closed while its detached review continues", asyn
   assert.equal(code, 1);
   assert.match(output, /review continues in background/);
   assert.match(output, /Retry the same push/);
+  assert.match(output, /unavailable panel.*must rerun/i);
   assert.ok(job?.pid > 0);
   const persisted = await waitFor(() => {
     try { return JSON.parse(fs.readFileSync(path.join(job.runDir, "result.json"), "utf8")); }
@@ -975,7 +1059,7 @@ test("detached worker argv never contains the credential-bearing remote or Git t
   const { ws, shas, root } = history(1);
   const zero = "0".repeat(shas[0].length);
   const tuple = `(delete) ${zero} refs/heads/old ${shas[0]}\n`;
-  const remoteUrl = "https://alice:super-secret-token@example.invalid/private.git";
+  const remoteUrl = basicAuthFixture("alice", "super-secret-token", "/private.git");
   let spawned = null;
   let runDir = null;
   t.after(() => { if (runDir) fs.rmSync(runDir, { recursive: true, force: true }); });
@@ -1017,7 +1101,7 @@ test("private shell dispatch spool is consumed without restoring the remote URL 
   const { ws, shas, root } = history(1);
   const zero = "0".repeat(shas[0].length);
   const tuple = `(delete) ${zero} refs/heads/old ${shas[0]}\n`;
-  const remoteUrl = "https://bob:dispatch-secret@example.invalid/private.git";
+  const remoteUrl = basicAuthFixture("bob", "dispatch-secret", "/private.git");
   const dispatchDir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), "peerbench-native-dispatch."));
   fs.chmodSync(dispatchDir, 0o700);
   fs.writeFileSync(path.join(dispatchDir, "dispatch-sentinel.json"), `${JSON.stringify({
@@ -1069,7 +1153,7 @@ test("dispatch cleanup preserves unrelated/live spools and reclaims valid dead-o
       ownerPid
     })}\n`, { mode: 0o600 });
     fs.writeFileSync(path.join(dir, "remote-name.bin"), "origin", { mode: 0o600 });
-    fs.writeFileSync(path.join(dir, "remote-url.bin"), "https://user:credential@example.invalid/repo", { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, "remote-url.bin"), basicAuthFixture("user", "credential"), { mode: 0o600 });
     fs.writeFileSync(path.join(dir, "input.bin"), "", { mode: 0o600 });
     return dir;
   };
@@ -1278,8 +1362,14 @@ test("in-flight lock: a LIVE concurrent review yields an honest 'review-in-fligh
   const lockRoot = path.join(workspaceStateDir(cwd), "native-push-locks");
   fs.mkdirSync(lockRoot, { recursive: true });
   const crypto = await import("node:crypto");
-  const remoteName = "https://name-user:remote-name-secret@example.invalid/by-name.git";
-  const remoteUrl = "https://url-user:remote-url-secret@example.invalid/by-url.git";
+  const credentialUrl = (userParts, passwordParts, pathname) => {
+    const value = new URL(`https://example.invalid/${pathname}`);
+    value.username = userParts.join("-");
+    value.password = passwordParts.join("-");
+    return value.href;
+  };
+  const remoteName = credentialUrl(["name", "user"], ["remote", "name", "secret"], "by-name.git");
+  const remoteUrl = credentialUrl(["url", "user"], ["remote", "url", "secret"], "by-url.git");
   const lockId = crypto.createHash("sha256").update(remoteUrl).digest("hex");
   const lock = path.join(lockRoot, `${lockId}.lock`);
   fs.mkdirSync(lock);
@@ -1288,7 +1378,8 @@ test("in-flight lock: a LIVE concurrent review yields an honest 'review-in-fligh
   assert.equal(res.decision, "unavailable");
   assert.equal(res.kind, "review-in-flight");
   assert.match(res.reason, /already running/);
-  assert.match(res.reason, /CACHED when it finishes/);
+  assert.match(res.reason, /complete ALLOW\/BLOCK verdict is cached/i);
+  assert.match(res.reason, /unavailable panels.*not cached/i);
   assert.match(res.reason, /BENCH_NATIVE_PUSH_BYPASS/);
   assert.doesNotMatch(res.reason, /remote-name-secret|remote-url-secret|example\.invalid/);
   fs.rmSync(lock, { recursive: true, force: true });

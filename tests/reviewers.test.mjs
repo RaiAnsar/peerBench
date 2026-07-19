@@ -17,18 +17,18 @@ test("extractVerdict ignores ALLOW:/BLOCK: inside fenced code blocks", () => {
 test("run retries once on non-conforming output then succeeds", async () => {
   const calls = [];
   const reviewImpl = async ({ user }) => { calls.push(user); return calls.length === 1 ? { ok: true, text: "I think it's fine", usage: null } : { ok: true, text: "ALLOW: fine on retry", usage: null }; };
-  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl }).filter((r) => r.name === "kimi");
+  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl });
   const res = await kimi.run({ system: "s", user: "u" });
   assert.equal(res.verdict, "ALLOW");
   assert.equal(calls.length, 2);
   assert.match(calls[1], /ALLOW:|BLOCK:/);
 });
 test("no key → error, skipped not crashed", async () => {
-  const r = resolveReviewers({ env: {}, reviewImpl: async () => ({ ok: true, text: "ALLOW: x" }) });
+  const r = resolveReviewers({ env: {}, reviewers: ["kimi"], reviewImpl: async () => ({ ok: true, text: "ALLOW: x" }) });
   assert.equal((await r.find((x) => x.name === "kimi").run({ system: "s", user: "u" })).error, "no api key");
 });
 test("hard error from client → error side", async () => {
-  const r = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl: async () => ({ ok: false, error: { kind: "timeout", detail: "slow" } }) });
+  const r = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: false, error: { kind: "timeout", detail: "slow" } }) });
   const res = await r.find((x) => x.name === "kimi").run({ system: "s", user: "u" });
   assert.match(res.error, /timeout/);
 });
@@ -84,7 +84,7 @@ test("quota failure → friendly out-of-quota error, errorKind, and a recorded c
   clearReviewerCooldowns({ name: "kimi" });
   let calls = 0;
   const failing = async () => { calls++; return { ok: false, error: { kind: "quota", detail: "HTTP 429: rate limit reached" } }; };
-  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl: failing }).filter((r) => r.name === "kimi");
+  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: failing });
   const res = await kimi.run({ system: "s", user: "u" });
   assert.match(res.error, /out of quota/i);
   assert.equal(res.errorKind, "quota");
@@ -92,7 +92,7 @@ test("quota failure → friendly out-of-quota error, errorKind, and a recorded c
 
   // Second resolve: the cooldown must short-circuit BEFORE the (would-succeed) client call.
   const succeeding = async () => { calls++; return { ok: true, text: "ALLOW: fine" }; };
-  const [kimi2] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl: succeeding }).filter((r) => r.name === "kimi");
+  const [kimi2] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: succeeding });
   const res2 = await kimi2.run({ system: "s", user: "u" });
   assert.match(res2.error, /out of quota.*cooldown/is);
   assert.equal(res2.errorKind, "quota");
@@ -100,12 +100,35 @@ test("quota failure → friendly out-of-quota error, errorKind, and a recorded c
   assert.equal(calls, 1, "cooldown must skip without calling the client");
   clearReviewerCooldowns({ name: "kimi" });
 });
+test("fast reviewer failures redact configured and shaped credentials before return or cooldown persistence", async () => {
+  const { clearReviewerCooldowns, readReviewerCooldown } = await import("../global-hooks/config-store.mjs");
+  clearReviewerCooldowns({ name: "qwen" });
+  const configured = ["qwen", "configured", "fixture", "value"].join("-");
+  const bearer = ["qwen", "bearer", "fixture", "value"].join("-");
+  const env = { QWEN_API_KEY: configured };
+  const [qwen] = resolveReviewers({
+    env,
+    reviewers: ["qwen"],
+    reviewImpl: async () => ({
+      ok: false,
+      error: { kind: "quota", detail: `HTTP 402 reflected ${configured}; Authorization: Bearer ${bearer}` }
+    })
+  });
+  const result = await qwen.run({ system: "s", user: "u" });
+  assert.equal(result.error.includes(configured), false, "immediate failure must not return the configured key");
+  assert.equal(result.error.includes(bearer), false, "immediate failure must not return a Bearer credential");
+  assert.match(result.error, /HTTP 402/, "the useful provider status remains visible");
+  const cached = readReviewerCooldown("qwen", { env });
+  assert.equal(cached.detail.includes(configured), false);
+  assert.equal(cached.detail.includes(bearer), false);
+  clearReviewerCooldowns({ name: "qwen", env });
+});
 test("expired cooldown lets the reviewer run again", async () => {
   const { recordReviewerCooldown, clearReviewerCooldowns } = await import("../global-hooks/config-store.mjs");
   clearReviewerCooldowns({ name: "kimi" });
   const t0 = Date.now();
   recordReviewerCooldown("kimi", "quota", "HTTP 429", { now: t0 - 60 * 60_000 });   // recorded an hour ago
-  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl: async () => ({ ok: true, text: "ALLOW: back" }) }).filter((r) => r.name === "kimi");
+  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: true, text: "ALLOW: back" }) });
   const res = await kimi.run({ system: "s", user: "u" });
   assert.equal(res.verdict, "ALLOW");
   clearReviewerCooldowns({ name: "kimi" });
@@ -113,6 +136,7 @@ test("expired cooldown lets the reviewer run again", async () => {
 test("classifyReviewerFailureText sniffs CLI quota/auth failures conservatively", async () => {
   const { classifyReviewerFailureText } = await import("../global-hooks/reviewers.mjs");
   assert.equal(classifyReviewerFailureText("You have reached your usage limit until Jul 23"), "quota");
+  assert.equal(classifyReviewerFailureText("HTTP 402 Payment Required: Grok Build usage balance exhausted"), "quota");
   assert.equal(classifyReviewerFailureText("error: invalid_grant, please re-authenticate"), "auth");
   assert.equal(classifyReviewerFailureText("the author field is required"), null);
   assert.equal(classifyReviewerFailureText("segfault in tokenizer"), null);
@@ -120,7 +144,7 @@ test("classifyReviewerFailureText sniffs CLI quota/auth failures conservatively"
 test("non-availability errors (timeout/parse) do NOT record a cooldown", async () => {
   const { readReviewerCooldown, clearReviewerCooldowns } = await import("../global-hooks/config-store.mjs");
   clearReviewerCooldowns({ name: "kimi" });
-  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewImpl: async () => ({ ok: false, error: { kind: "timeout", detail: "slow" } }) }).filter((r) => r.name === "kimi");
+  const [kimi] = resolveReviewers({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"], reviewImpl: async () => ({ ok: false, error: { kind: "timeout", detail: "slow" } }) });
   const res = await kimi.run({ system: "s", user: "u" });
   assert.match(res.error, /timeout/);
   assert.equal(readReviewerCooldown("kimi"), null, "timeout must not park the reviewer");

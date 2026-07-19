@@ -48,30 +48,23 @@ function fileTs(name) { const m = TRACE_RE.exec(name); return m ? Number(m[1]) :
 // Return the newest trace in `tracesDir` that BELONGS to `expectedWsKey`. The ownership guard skips
 // any trace whose stamped `wsKey` is for a DIFFERENT workspace (a misplaced/leaked trace) so the
 // statusline can never surface another project's gate verdict. Legacy traces (no wsKey) are accepted.
-// If `expectedSessionKey` is present, only traces stamped for that session are accepted; unstamped
-// legacy traces are skipped in that strict mode so one same-project chat cannot show another chat's
-// latest badge.
+// If `expectedSessionKey` is present, only traces stamped for that session are accepted. An
+// unstamped legacy trace cannot be attributed to this window, and may also name reviewers that are
+// no longer active, so it must not appear as this session's `(idle)` panel.
 export function latestTrace(tracesDir, expectedWsKey = null, expectedSessionKey = null) {
   const sessionKey = normalizeSessionId(expectedSessionKey);
   let files;
   try { files = fs.readdirSync(tracesDir); } catch { return null; }
   const newestFirst = files.map((f) => [f, fileTs(f)]).filter(([, ts]) => ts >= 0).sort((a, b) => b[1] - a[1]);
-  // Two-tier when a session filter is active: (1) PREFER this session's own newest trace; (2) if it
-  // has none, fall back to the newest UNSTAMPED (legacy / pre-feature) trace — project-level, so the
-  // per-reviewer badge never just vanishes; (3) NEVER show a trace stamped for a DIFFERENT session.
-  // Strict-skipping legacy made the badge disappear in every project with pre-feature history
-  // (falling back to the old gate-status line) — this restores it without leaking another chat's badge.
-  let legacyFallback = null;
   for (const [name] of newestFirst) {
     let t; try { t = JSON.parse(fs.readFileSync(path.join(tracesDir, name), "utf8")); } catch { continue; }
     if (expectedWsKey && t && t.wsKey && t.wsKey !== expectedWsKey) continue;   // misplaced workspace → skip
     if (!sessionKey) return t;                                                  // no session filter → newest wins (legacy behavior)
     const ts = normalizeSessionId(t?.sessionKey);
-    if (ts === sessionKey) return t;                                            // tier 1: this session's own (newest) — preferred
-    if (!ts && legacyFallback === null) legacyFallback = t;                     // tier 2: remember newest UNSTAMPED legacy
-    // a trace stamped for ANOTHER session → never shown
+    if (ts === sessionKey) return t;                                            // this session's own newest trace
+    // Foreign-session and unstamped legacy traces are both unauthenticated for this window.
   }
-  return legacyFallback;   // no own-session trace → newest legacy (project-level), or null if none
+  return null;
 }
 
 // A trace's own chronological key — the numeric ms prefix of its id (`<ts>-<hex>`).

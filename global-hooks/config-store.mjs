@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { redactProviderFailure, secretHeaderValues } from "./provider-error-redaction.mjs";
 // SINGLE SOURCE OF TRUTH for API-backed reviewers. Adding or swapping a model is ONE entry here
 // (+ its <NAME>_API_KEY in .keys, then `node scripts/load-keys.mjs`). Everything downstream —
 // KNOWN_REVIEWERS, display names, the keys loaded by load-keys, the provider config — is DERIVED
@@ -21,8 +22,8 @@ const DEFAULTS = {
           temperature: null, thinking: null, thinkingEnv: "KIMI_THINKING",
           headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
           timeoutMs: 420_000 },  // 7 min
-  // MiMo (Xiaomi) — currently DISABLED (token plan exhausted) but kept wired so it's a one-word
-  // re-add (`/bench:reviewers ... mimo`). Earned its slot: uniquely caught secret/PII/deploy-hygiene issues.
+  // MiMo (Xiaomi) — retained as an active-capable provider and uniquely good at
+  // secret/PII/deploy-hygiene issues. Whether it runs is controlled only by the active panel.
   mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
           headers: {}, timeoutMs: 180_000 },  // 3 min
@@ -58,11 +59,10 @@ export const PROVIDER_NAMES = Object.keys(DEFAULTS);                 // API-back
 export const KNOWN_REVIEWERS = [...PROVIDER_NAMES, CODEX, GROK];
 const DISPLAY = { ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => [k, v.displayName || k])), [CODEX]: "Codex", [GROK]: "Grok" };
 export function displayName(name) { return DISPLAY[name] || name; }
-// Fallback only — the active set lives in companion.json (currently codex+grok+kimi). The fallback
-// stays API-key-only (CLI reviewers need their own installed/authed harness) and must track the
-// panel Rai actually runs: GLM was retired for Grok, so a lost companion.json degrades to the two
-// keyed API reviewers, never to a retired provider.
-const DEFAULT_REVIEWERS = ["kimi", "minimax"];
+// Fallback only — the active set lives in companion.json. It must match the operator-approved
+// panel so losing/corrupting that file never silently revives an expired provider. Grok uses the
+// installed/authenticated CLI and MiMo uses its configured coding-plan key.
+const DEFAULT_REVIEWERS = ["grok", "mimo"];
 export function sharedRoot() {
   return process.env.BENCH_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
@@ -147,7 +147,51 @@ export function sessionKeyFromInput(input = {}, env = process.env) {
   );
 }
 
-function readFileConfig() { try { return JSON.parse(fs.readFileSync(path.join(sharedRoot(), "companion.json"), "utf8")); } catch { return {}; } }
+function readFileConfig(root = sharedRoot()) { try { return JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8")); } catch { return {}; } }
+
+const SECRET_ENV_NAME = /(?:^|_)(?:api_?key|access_?token|refresh_?token|authorization|auth|token|secret|password)$/i;
+const SECRET_FIELD_NAME = /^(?:api_?key|apiKeys|access_?token|refresh_?token|authorization|auth|token|secret|password)$/i;
+
+function addSecret(out, value, { commaSeparated = false } = {}) {
+  if (typeof value !== "string" || !value) return;
+  out.add(value);
+  if (commaSeparated) for (const part of value.split(",").map((item) => item.trim()).filter(Boolean)) out.add(part);
+  // GROK_AUTH and similar configured values can be JSON containers. Collect only values whose
+  // field names identify them as credentials; arbitrary config strings are not secrets.
+  try {
+    const parsed = JSON.parse(value);
+    const visit = (node) => {
+      if (!node || typeof node !== "object") return;
+      for (const [key, child] of Object.entries(node)) {
+        if (SECRET_FIELD_NAME.test(key)) {
+          if (typeof child === "string") addSecret(out, child);
+          else if (Array.isArray(child)) for (const entry of child) addSecret(out, entry);
+        }
+        if (child && typeof child === "object") visit(child);
+      }
+    };
+    visit(parsed);
+  } catch { /* ordinary scalar credential */ }
+}
+
+// Exact configured values supplement shape-based redaction. The explicit env argument matters for
+// hook/test callers that do not use process.env, while root lets cooldown migration read the same
+// companion file as the state being repaired.
+export function configuredProviderSecrets({ env = process.env, root = sharedRoot() } = {}) {
+  const values = new Set();
+  const file = readFileConfig(root);
+  for (const [name, defaults] of Object.entries(DEFAULTS)) {
+    addSecret(values, env?.[defaults.keyEnv], { commaSeparated: true });
+    const provider = file.providers?.[name] || {};
+    addSecret(values, provider.apiKey);
+    for (const key of Array.isArray(provider.apiKeys) ? provider.apiKeys : []) addSecret(values, key);
+    for (const header of secretHeaderValues(provider.headers)) addSecret(values, header);
+  }
+  for (const [name, value] of Object.entries(env || {})) {
+    if (SECRET_ENV_NAME.test(name)) addSecret(values, value, { commaSeparated: /API_?KEY$/i.test(name) });
+  }
+  return [...values];
+}
 
 function truthy(value) {
   const raw = String(value ?? "").trim().toLowerCase();
@@ -182,31 +226,71 @@ function readCooldownMap(root) {
   try { return JSON.parse(fs.readFileSync(COOLDOWNS(root), "utf8")) || {}; } catch { return {}; }
 }
 
-export function readReviewerCooldown(name, { root, now = Date.now() } = {}) {
-  const entry = readCooldownMap(root)[name];
+function cooldownSecrets({ root, env = process.env, secrets = [] } = {}) {
+  return [...configuredProviderSecrets({ root: root || sharedRoot(), env }), ...(Array.isArray(secrets) ? secrets : [secrets])];
+}
+
+function sanitizeCooldownMap(value, options = {}) {
+  const map = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const exact = cooldownSecrets(options);
+  let changed = false;
+  const sanitized = {};
+  for (const [name, entry] of Object.entries(map)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      sanitized[name] = entry;
+      continue;
+    }
+    const detail = redactProviderFailure(entry.detail || "", { secrets: exact });
+    sanitized[name] = detail === entry.detail ? entry : { ...entry, detail };
+    if (detail !== entry.detail) changed = true;
+  }
+  return { map: sanitized, changed, exact };
+}
+
+function persistCooldownMap(map, root) {
+  writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`);
+}
+
+export function readReviewerCooldown(name, { root, now = Date.now(), env = process.env, secrets = [] } = {}) {
+  // Sanitize on read as well as write so an unsafe entry created by an older runtime is never
+  // replayed, and best-effort self-heal removes the reflected credential from durable state.
+  const safe = sanitizeCooldownMap(readCooldownMap(root), { root, env, secrets });
+  if (safe.changed) try { persistCooldownMap(safe.map, root); } catch { /* best-effort migration */ }
+  const entry = safe.map[name];
   return entry && Number(entry.until) > now ? entry : null;
 }
 
-export function recordReviewerCooldown(name, kind, detail, { root, now = Date.now(), ttlMs } = {}) {
+export function recordReviewerCooldown(name, kind, detail, { root, now = Date.now(), ttlMs, env = process.env, secrets = [] } = {}) {
   const ttl = Number(ttlMs) || COOLDOWN_TTL_MS[kind] || COOLDOWN_TTL_MS.quota;
-  const map = readCooldownMap(root);
-  map[name] = { kind, detail: String(detail || "").slice(0, 200), until: now + ttl, ts: now };
+  const safe = sanitizeCooldownMap(readCooldownMap(root), { root, env, secrets });
+  const map = safe.map;
+  // Redact before clipping: truncating first can leave an unmatched prefix of an exact secret.
+  map[name] = {
+    kind,
+    detail: redactProviderFailure(detail, { secrets: safe.exact }).slice(0, 200),
+    until: now + ttl,
+    ts: now
+  };
   for (const [key, value] of Object.entries(map)) {
     if (!(Number(value?.until) > now)) delete map[key];
   }
-  try { writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`); } catch { /* best-effort cache */ }
+  try { persistCooldownMap(map, root); } catch { /* best-effort cache */ }
   return map[name];
 }
 
-export function clearReviewerCooldowns({ root, name } = {}) {
+export function clearReviewerCooldowns({ root, name, env = process.env, secrets = [] } = {}) {
   if (!name) {
     try { fs.rmSync(COOLDOWNS(root), { force: true }); } catch { /* best-effort */ }
     return;
   }
-  const map = readCooldownMap(root);
-  if (!(name in map)) return;
+  const safe = sanitizeCooldownMap(readCooldownMap(root), { root, env, secrets });
+  const map = safe.map;
+  if (!(name in map)) {
+    if (safe.changed) try { persistCooldownMap(map, root); } catch { /* best-effort migration */ }
+    return;
+  }
   delete map[name];
-  try { writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`); } catch { /* best-effort */ }
+  try { persistCooldownMap(map, root); } catch { /* best-effort */ }
 }
 
 // reviewed-head marker: the last HEAD the stop gate reviewed up to. Shared by the stop gate
