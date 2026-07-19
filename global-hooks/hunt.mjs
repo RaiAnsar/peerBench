@@ -2,10 +2,9 @@ import { resolveConfig, displayName } from "./config-store.mjs";
 import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
-import { runCodexTask, runGrokTask } from "./panel-lib.mjs";
-import { latestCodexRoot, CODEX_DATA, extractVerdict } from "./reviewers.mjs";
+import { runGrokTask } from "./panel-lib.mjs";
+import { extractVerdict, withAvailability } from "./reviewers.mjs";
 import { parseSeverity, stripThink } from "./deep-review.mjs";
-import path from "node:path";
 
 export const HUNT_SYSTEM =
   "You are an expert bug hunter exploring a repository READ-ONLY via the provided tools. " +
@@ -141,20 +140,20 @@ export async function pushReviewPanel({ cwd, range, content, env = process.env, 
 
 // hunt budget is larger than a gate review (open-ended exploration)
 const HUNT_MAX_STEPS = 40;
-const HUNT_TIMEOUT_MS = 12 * 60 * 1000;
+const HUNT_TIMEOUT_MS = 8 * 60 * 1000;
 
 // deep (investigate) budget — thinking ON, more steps, longer timeouts, relaxed per-round watchdog
 const INVESTIGATE_MAX_STEPS = 60;
-const INVESTIGATE_TIMEOUT_MS = 20 * 60 * 1000;
+const INVESTIGATE_TIMEOUT_MS = 15 * 60 * 1000;
 const INVESTIGATE_ROUND_MS = 240_000;     // thinking rounds are slow ON PURPOSE here; relax the 90s watchdog
 
 // deep-review GATE budget (spec/push review on Stop). Distinct from hunt/investigate: a gate must land
 // PROMPTLY or Claude has already moved on and the block is skipped. This is a HARD wall-clock cap on
-// BOTH the codex and API reviewers — deep exploration still happens, just time-boxed. Env-tunable.
+// Both Grok and MiMo get the same bounded exploration contract. Env-tunable.
 // hunt/investigate never pass budgetMs, so their full 12/20/25-min budgets are untouched.
-const DEEP_REVIEW_BUDGET_MS = Number(process.env.BENCH_DEEP_REVIEW_BUDGET_MS) || 10 * 60 * 1000;
+const DEEP_REVIEW_BUDGET_MS = Number(process.env.BENCH_DEEP_REVIEW_BUDGET_MS) || 3 * 60 * 1000;
 
-export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, codexImpl, grokImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user }) {
+export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, grokImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user }) {
   const cfg = resolveConfig({ env });
   const userMsg = user || buildHuntUser(seed);
   const debug = !!env.BENCH_DEBUG;
@@ -162,18 +161,8 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
   const runOne = async (name) => {
     const display = displayName(name);
     try {
-      if (name === "codex") {
-        const root = latestCodexRoot();
-        if (!root) return { name: "Codex", findings: "", error: "codex plugin not found" };
-        const codexEnv = { ...env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA || CODEX_DATA };
-        // runCodexTask keeps the raw findings (a hunt has no ALLOW/BLOCK verdict to parse).
-        // budgetMs (gate path only) hard-caps codex's agentic wall-clock; omitted for hunt/investigate.
-        const r = await (codexImpl || runCodexTask)({ companionPath: path.join(root, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${userMsg}`, cwd, env: codexEnv, ...(budgetMs ? { timeoutMs: budgetMs } : {}) });
-        if (debug) console.error(`[hunt codex] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
-        return { name: "Codex", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
-      }
       if (name === "grok") {
-        // Grok Build CLI — its own agentic harness explores the repo read-only (plan mode), plan-billed.
+        // Grok Build CLI — its agentic harness explores the repo under peerBench's OS write sandbox.
         const r = await (grokImpl || runGrokTask)({ prompt: `${system}\n\n${userMsg}`, cwd, env, ...(budgetMs ? { timeoutMs: budgetMs } : {}) });
         if (debug) console.error(`[hunt grok] raw=${(r.raw || "").length}b error=${r.error || "-"}`);
         return { name: "Grok", findings: r.raw || "", error: r.raw ? null : (r.error || "no output") };
@@ -211,5 +200,10 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, code
     }
   };
 
-  return Promise.all(cfg.reviewers.map(runOne));
+  return Promise.all(cfg.reviewers.map((name) => withAvailability(
+    name,
+    displayName(name),
+    () => runOne(name),
+    { env }
+  )({})));
 }

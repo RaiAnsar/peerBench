@@ -6,8 +6,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/global-hooks/codex-stop-review.mjs\"",
-            "timeout": 900,
-            "statusMessage": "⛩ bench: reviewing turn…"
+            "timeout": 20,
+            "statusMessage": "⛩ bench: quick MiMo advisory…"
           }
         ]
       }

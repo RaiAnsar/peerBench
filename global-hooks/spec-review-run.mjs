@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // global-hooks/spec-review-run.mjs
-// The deep spec/push review functions, called IN-PROCESS by the deep-review-runner (Stop hook).
+// Explicit spec/range review functions called in-process by bench-runner. Nothing here is an
+// automatic Stop hook or background worker.
 //
 // CRITICAL deploy-parity: deployed hooks live FLAT in ~/.claude/hooks/ — only global-hooks/*.mjs
 // are copied there; scripts/ is NEVER deployed. This file imports ONLY global-hooks siblings.
@@ -8,7 +9,7 @@
 // Deep, repo-aware review against the real repo (read-only). Each function runs the panel seeded
 // with the file/push content, writes a gate:"spec-review"/"push-review" trace, and RETURNS the
 // structured result { reviewers, findingCount, maxSeverity, findings, traceId, badge, summary, hash }.
-// They do NOT write a deep-result file — delivery is the runner's exit-2 wake (see the spec).
+// They do not write a deep-result file or wake an agent; the explicit command prints the result.
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -16,14 +17,15 @@ import { specReviewPanel, SPEC_REVIEW_SYSTEM, buildSpecReviewUser, pushReviewPan
 import { panelBadge } from "./panel-lib.mjs";
 import { writeTrace } from "./trace-store.mjs";
 import { summarizeSpecReview, deepKey, DEEP_REWAKE_SEVERITY, aggregateFindings, shouldRewake } from "./deep-review.mjs";
+import { isMainModule } from "./is-main.mjs";
 
-// Cap the reviewed push diff so a huge changeset doesn't blow up the prompt. Mirrors the pre-push gate.
+// Refuse oversized evidence instead of silently reviewing only a prefix and reporting it clean.
 const MAX_PUSH_DIFF_BYTES = 200_000;
 
 // Local git helper — keep imports global-hooks-only (deploy-parity). Returns [out, ok].
 function git(args, cwd) {
   try {
-    const out = execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const out = execFileSync("git", ["--no-replace-objects", ...args], { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     return [out.trim(), true];
   } catch {
     return ["", false];
@@ -87,10 +89,22 @@ export async function runPushReview(range, ws, {
     process.stderr.write(`⛩ push-review: git failed for ${range}; signalling retry (not cleared).\n`);
     return { retry: true, reason: "git error", reviewers: [], findingCount: 0, maxSeverity: "none", findings: "", traceId: null, badge: "", summary: "push review deferred (git error)", hash: null };
   }
-  let diff = diffRaw;
-  if (diff.length > MAX_PUSH_DIFF_BYTES) {
-    diff = diff.slice(0, MAX_PUSH_DIFF_BYTES) + "\n\n[... diff truncated at 200 000 bytes ...]";
+  if (Buffer.byteLength(diffRaw) > MAX_PUSH_DIFF_BYTES) {
+    process.stderr.write(`⛩ push-review: diff exceeds ${MAX_PUSH_DIFF_BYTES} bytes; split the range and retry.\n`);
+    return {
+      retry: true,
+      reason: "evidence too large",
+      reviewers: [],
+      findingCount: 0,
+      maxSeverity: "none",
+      findings: "",
+      traceId: null,
+      badge: "",
+      summary: "push review deferred (evidence too large)",
+      hash: null
+    };
   }
+  const diff = diffRaw;
   const content = [
     "<commits>", commits || "(no commit list available)", "</commits>",
     "", "<diff>", diff || "(no diff available)", "</diff>"
@@ -129,7 +143,7 @@ export async function runPushReview(range, ws, {
 //   spec-review-run.mjs <abs-path> --ws <abs-ws>      → runSpecReview
 //   spec-review-run.mjs --push <range> --ws <abs-ws>  → runPushReview
 // Exits 2 on a HIGH block (so a manual run surfaces it), 0 otherwise. Fails OPEN: any error → exit 0.
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   const rest = process.argv.slice(2);
   let filePath = null, ws = null, pushRange = null;
   for (let i = 0; i < rest.length; i++) {

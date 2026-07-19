@@ -5,7 +5,7 @@ export { sanitizeForProviderInspection };
 // Parse an OpenAI-compatible SSE chat stream into one assembled message.
 // Returns { message: { content, tool_calls }, finish_reason, usage }.
 async function readSSE(resp) {
-  if (!resp.body) throw new Error("response has no body");   // clear error instead of a cryptic null TypeError (found by Kimi's own hunt)
+  if (!resp.body) throw new Error("response has no body");
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buf = "", content = "", finish = null, usage = null;
@@ -58,21 +58,32 @@ const DEFAULT_MAX_STEPS = 24;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_NUDGES = 2;
 const TOOL_RESULT_CAP = 50_000;
-const CONCLUDE_BUDGET = 120_000;   // tool-output bytes after which we force conclusion (kimi over-explores big repos) — conclude round drops the tools array entirely
+const CONCLUDE_BUDGET = 120_000;   // tool-output bytes after which we force a tool-free conclusion
 const MAX_NET_RETRIES = 2;         // retry transient "fetch failed" (connection drops) — NOT genuine timeouts
 const RETRY_BACKOFF_MS = 750;
 const DEFAULT_ROUND_MS = 90_000;   // per-EXPLORATION-round cap: one runaway thinking round can't eat the whole budget
 
 // Overload retry: 429/503 are z.ai's per-key concurrency shedding. Unlike review() (the simple stop-gate
 // path), the AGENTIC path — hunt, investigate, AND the deep spec/push gate — had NO overload retry, so a
-// single 429 killed the whole run (seen in traces: GLM steps:1, "http 429"). Back off (jittered, honoring
+// A single transient overload should not kill an explicit manual investigation. Back off (jittered, honoring
 // Retry-After) and re-fetch the SAME key; the concurrency limiter pins one key per slot, so rotating here
 // would defeat the pinning — we ride out the transient overload instead.
 const RETRYABLE_STATUS = new Set([429, 503]);
-const MAX_OVERLOAD_RETRIES = 5;
+const MAX_OVERLOAD_RETRIES = 1;
+const DEFAULT_USER_AGENT = "claude-cli/1.0.83 (external, cli)";
 const OVERLOAD_BACKOFF_BASE_MS = 500;
 const OVERLOAD_BACKOFF_CAP_MS = 8_000;
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function abortableSleep(ms, signal, sleepImpl) {
+  if (signal.aborted) throw Object.assign(new Error("review timed out"), { name: "AbortError" });
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(Object.assign(new Error("review timed out"), { name: "AbortError" }));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try { await Promise.race([sleepImpl(ms), aborted]); }
+  finally { signal.removeEventListener("abort", onAbort); }
+}
 export function overloadBackoffMs(attempt, retryAfterSec, jitter = Math.random()) {
   if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) return Math.min(retryAfterSec * 1000, 30_000);
   const exp = Math.min(OVERLOAD_BACKOFF_CAP_MS, OVERLOAD_BACKOFF_BASE_MS * 2 ** attempt);
@@ -110,7 +121,7 @@ export async function agenticReview({
     for (let step = 0; step < maxSteps; step++) {
       stepsRun = step + 1;
       // Force conclusion once enough context is gathered or we're near the cap — otherwise some
-      // models (kimi) read files forever and hit maxSteps with no output. tool_choice:"none" makes it answer.
+      // Some models keep reading until maxSteps with no output. tool_choice:"none" makes them answer.
       const force = roundConclude || toolBytes > CONCLUDE_BUDGET || step >= maxSteps - 2;
       if (force && !concludeNudged) {
         concludeNudged = true;
@@ -120,7 +131,7 @@ export async function agenticReview({
       }
       // On conclude (force): OMIT the tools array entirely — a model can't call tools that aren't
       // offered, so it MUST produce content. (tool_choice:"none" alone is ignored by some models,
-      // e.g. kimi-k2.6, which then reads until maxSteps and drops out with "no verdict".)
+      // otherwise the reviewer can read until maxSteps and drop out with no verdict.)
       const makeBody = (bodyMessages = messages, bodyTemperature = currentTemperature) => JSON.stringify({ model, messages: bodyMessages, temperature: bodyTemperature, stream: true,
         ...(force ? {} : { tools: tools.schemas, tool_choice: "auto" }),
         ...(thinking === "enabled" || thinking === "disabled" ? { thinking: { type: thinking } } : {}) });
@@ -140,7 +151,7 @@ export async function agenticReview({
           try {
             resp = await doFetch(`${baseURL}/chat/completions`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              headers: { "Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, Authorization: `Bearer ${apiKey}`, ...safeHeaders },
               body, signal
             });
             netErr = null;
@@ -149,7 +160,7 @@ export async function agenticReview({
             if (RETRYABLE_STATUS.has(resp.status) && overloadRetries < MAX_OVERLOAD_RETRIES && !signal.aborted) {
               const wait = overloadBackoffMs(overloadRetries++, Number(resp.headers?.get?.("retry-after")), rng());
               dlog(`step ${step}: HTTP ${resp.status} overloaded; backoff ${wait}ms (retry ${overloadRetries}/${MAX_OVERLOAD_RETRIES})`);
-              await sleepImpl(wait);
+              await abortableSleep(wait, signal, sleepImpl);
               continue;
             }
             break;
@@ -158,7 +169,7 @@ export async function agenticReview({
             if (e?.name === "AbortError") break;                // timeout (round or total) — don't retry
             if (netAttempt++ < MAX_NET_RETRIES) {
               dlog(`step ${step}: net attempt ${netAttempt} failed (${e?.cause?.code || e?.message}); retry in ${RETRY_BACKOFF_MS}ms`);
-              await sleepImpl(RETRY_BACKOFF_MS);
+              await abortableSleep(RETRY_BACKOFF_MS, signal, sleepImpl);
               continue;
             }
             break;
@@ -197,7 +208,7 @@ export async function agenticReview({
           try {
             resp = await doFetch(`${baseURL}/chat/completions`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              headers: { "Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, Authorization: `Bearer ${apiKey}`, ...safeHeaders },
               body, signal
             });
             if (resp.ok) parsed = await readSSE(resp);
@@ -222,7 +233,7 @@ export async function agenticReview({
           try {
             resp = await doFetch(`${baseURL}/chat/completions`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...safeHeaders },
+              headers: { "Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, Authorization: `Bearer ${apiKey}`, ...safeHeaders },
               body, signal
             });
             if (resp.ok) parsed = await readSSE(resp);

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { parseVerdict, combinePanel, untrackedBlock, runCodexReview, runCodexTask } from "../global-hooks/panel-lib.mjs";
+import { parseVerdict, combinePanel, spawnCollect, untrackedBlock } from "../global-hooks/panel-lib.mjs";
 
 test("untrackedBlock embeds a real untracked file but NEVER follows a symlink out of the workspace", () => {
   const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ub-")));
@@ -25,78 +25,63 @@ test("parseVerdict extracts ALLOW/BLOCK/null", () => {
   assert.equal(parseVerdict("").verdict, null);
 });
 
-test("runCodexReview suppresses peerBench hooks in the nested Codex reviewer process", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-review-env-"));
-  const companion = path.join(dir, "companion.mjs");
-  fs.writeFileSync(companion, [
-    "#!/usr/bin/env node",
-    "const ok = process.env.BENCH_SUPPRESS_HOOKS === '1';",
-    "process.stdout.write(JSON.stringify({ rawOutput: ok ? 'ALLOW: suppressed' : 'BLOCK: unsuppressed' }));",
-    ""
-  ].join("\n"));
-  const result = await runCodexReview({ companionPath: companion, prompt: "review", cwd: dir, env: {} });
-  assert.equal(result.verdict, "ALLOW");
-  assert.match(result.firstLine, /suppressed/);
-});
-
-test("runCodexTask honors a short per-call timeoutMs (the deep-review GATE budget cap)", async () => {
-  // The gate passes budgetMs → runCodexTask timeoutMs so a hung codex can't blow past the budget.
-  // A companion that sleeps far longer than the cap must be killed → status 124 → error (not raw).
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-timeout-"));
-  const companion = path.join(dir, "sleeper.mjs");
-  fs.writeFileSync(companion, "setTimeout(() => process.stdout.write('{}'), 60000);\n");
-  const started = Date.now();
-  const result = await runCodexTask({ companionPath: companion, prompt: "x", cwd: dir, env: {}, timeoutMs: 200 });
-  const elapsed = Date.now() - started;
-  assert.ok(result.error, "a reviewer that outruns the budget returns an error, not findings");
-  assert.equal(result.raw, undefined, "no raw findings when the budget is exceeded");
-  assert.ok(elapsed < 5000, `killed near the 200ms cap, not the 25-min default (took ${elapsed}ms)`);
+test("spawnCollect kills a reviewer that exceeds the bounded output capture", async () => {
+  const result = await spawnCollect(process.execPath, [
+    "-e",
+    "process.stdout.write('x'.repeat(10000)); setInterval(() => {}, 1000)"
+  ], {
+    cwd: os.tmpdir(),
+    env: process.env,
+    timeoutMs: 5_000,
+    maxOutputBytes: 1_024
+  });
+  assert.equal(result.status, 125);
+  assert.match(result.stderr, /bounded capture limit/i);
 });
 
 test("combinePanel: both allow", () => {
   const r = combinePanel([
-    { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: also ok", raw: "ALLOW: also ok" }
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: also ok", raw: "ALLOW: also ok" }
   ]);
   assert.equal(r.decision, "allow");
-  assert.match(r.summary, /Codex.*ok/);
-  assert.match(r.summary, /Kimi.*also ok/);
+  assert.match(r.summary, /Grok.*ok/);
+  assert.match(r.summary, /MiMo.*also ok/);
 });
 
 test("combinePanel: either blocks -> block with labeled findings", () => {
   const r = combinePanel([
-    { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: bad", raw: "BLOCK: bad\n- finding" }
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bad", raw: "BLOCK: bad\n- finding" }
   ]);
   assert.equal(r.decision, "block");
-  assert.match(r.findings, /\[Kimi\]/);
-  assert.doesNotMatch(r.findings, /\[Codex\]/);
+  assert.match(r.findings, /\[MiMo\]/);
+  assert.doesNotMatch(r.findings, /\[Grok\]/);
 });
 
 test("combinePanel: one errored -> working reviewer decides, note attached", () => {
   const r = combinePanel([
-    { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "Kimi", error: "no api key" }
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", error: "no api key" }
   ]);
   assert.equal(r.decision, "allow");
-  assert.match(r.summary, /Kimi review skipped/);
+  assert.match(r.summary, /MiMo review skipped/);
 });
 
 test("combinePanel: both errored -> fail open", () => {
-  const r = combinePanel([{ name: "Codex", error: "quota" }, { name: "Kimi", error: "down" }]);
+  const r = combinePanel([{ name: "Grok", error: "quota" }, { name: "MiMo", error: "down" }]);
   assert.equal(r.decision, "fail-open");
 });
 
 test("combinePanel: single reviewer (array of 1) allows", () => {
-  const r = combinePanel([{ name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: fine", raw: "ALLOW: fine" }]);
+  const r = combinePanel([{ name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: fine", raw: "ALLOW: fine" }]);
   assert.equal(r.decision, "allow");
 });
 
-test("combinePanel: N=3 with one error, one block -> block", () => {
+test("combinePanel: one reviewer errors while the other blocks", () => {
   const r = combinePanel([
-    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: a", raw: "ALLOW: a" },
-    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\n- x" },
-    { name: "Extra", error: "boom" }
+    { name: "Grok", error: "boom" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\n- x" }
   ]);
   assert.equal(r.decision, "block");
   assert.match(r.summary, /MiMo: BLOCK/);
@@ -104,45 +89,39 @@ test("combinePanel: N=3 with one error, one block -> block", () => {
 
 // --- F: verdict badge across all decision branches ---
 
-test("F: combinePanel badge — 4-reviewer ALLOW → Codex✓ Kimi✓ MiMo✓ GLM✓", () => {
+test("F: combinePanel badge — Grok+MiMo ALLOW", () => {
   const r = combinePanel([
-    { name: "Codex", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "GLM", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }
   ]);
   assert.equal(r.decision, "allow");
-  assert.equal(r.badge, "Codex✓ Kimi✓ MiMo✓ GLM✓");
+  assert.equal(r.badge, "Grok✓ MiMo✓");
 });
 
-test("F: combinePanel badge — mixed Kimi-ALLOW/MiMo-BLOCK/GLM-error → Kimi✓ MiMo✗ GLM!", () => {
+test("F: combinePanel badge — mixed Grok-ALLOW/MiMo-BLOCK", () => {
   const r = combinePanel([
-    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\n- x" },
-    { name: "GLM", error: "down" }
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\n- x" }
   ]);
   assert.equal(r.decision, "block");
-  assert.equal(r.badge, "Kimi✓ MiMo✗ GLM!");
+  assert.equal(r.badge, "Grok✓ MiMo✗");
 });
 
 test("F: combinePanel badge — fail-open (all error) → all !", () => {
   const r = combinePanel([
-    { name: "Kimi", error: "quota" },
-    { name: "MiMo", error: "down" },
-    { name: "GLM", error: "timeout" }
+    { name: "Grok", error: "quota" },
+    { name: "MiMo", error: "down" }
   ]);
   assert.equal(r.decision, "fail-open");
-  assert.equal(r.badge, "Kimi! MiMo! GLM!");
+  assert.equal(r.badge, "Grok! MiMo!");
 });
 
-test("F: combinePanel badge — stop-gate (no Codex) omits the Codex glyph", () => {
+test("F: lightweight panel badge contains only Grok+MiMo", () => {
   const r = combinePanel([
-    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
-    { name: "GLM", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "MiMo", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }
   ]);
-  assert.equal(r.badge, "Kimi✓ MiMo✓ GLM✓");
-  assert.doesNotMatch(r.badge, /Codex/);
+  assert.equal(r.badge, "Grok✓ MiMo✓");
 });
 
 // --- Severity-gating: combinePanel({ blockMinSeverity }) ---
@@ -152,7 +131,7 @@ test("F: combinePanel badge — stop-gate (no Codex) omits the Codex glyph", () 
 
 test("severity-gate: a medium-severity BLOCK → decision allow + advisory + badge ~", () => {
   const r = combinePanel([
-    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
     { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: nit", raw: "BLOCK: nit\nSEVERITY: medium\n- a minor nit" }
   ], { blockMinSeverity: "high" });
   assert.equal(r.decision, "allow", "a sub-threshold BLOCK must NOT block");
@@ -160,26 +139,26 @@ test("severity-gate: a medium-severity BLOCK → decision allow + advisory + bad
   assert.match(r.advisories[0], /MiMo/);
   assert.match(r.advisories[0], /medium/);
   assert.match(r.summary, /MiMo/, "advisory surfaces in the summary");
-  assert.equal(r.badge, "Kimi✓ MiMo~", "sub-threshold BLOCK renders as ~");
+  assert.equal(r.badge, "Grok✓ MiMo~", "sub-threshold BLOCK renders as ~");
 });
 
 test("severity-gate: a high-severity BLOCK → decision block + badge ✗", () => {
   const r = combinePanel([
-    { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
+    { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" },
     { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: real bug", raw: "BLOCK: real bug\nSEVERITY: high\n- broken build" }
   ], { blockMinSeverity: "high" });
   assert.equal(r.decision, "block", "a high BLOCK still blocks");
   assert.match(r.findings, /\[MiMo\]/);
-  assert.equal(r.badge, "Kimi✓ MiMo✗", "high BLOCK renders as ✗");
+  assert.equal(r.badge, "Grok✓ MiMo✗", "high BLOCK renders as ✗");
 });
 
 test("severity-gate: a BLOCK with an unknown/corrupt severity → STRICT (block + ✗), never advisory", () => {
   // Defense-in-depth: a non-standard severity must not let a real BLOCK slip through as ~.
   const r = combinePanel([
-    { name: "Codex", verdict: "BLOCK", firstLine: "BLOCK: x", raw: "BLOCK: x", severity: "bogus" }
+    { name: "Grok", verdict: "BLOCK", firstLine: "BLOCK: x", raw: "BLOCK: x", severity: "bogus" }
   ], { blockMinSeverity: "high" });
   assert.equal(r.decision, "block", "unknown severity is treated strictly → blocks");
-  assert.equal(r.badge, "Codex✗", "unknown-severity BLOCK renders as ✗, not ~");
+  assert.equal(r.badge, "Grok✗", "unknown-severity BLOCK renders as ✗, not ~");
 });
 
 test("severity-gate: a critical BLOCK → block (above the high threshold)", () => {
@@ -200,21 +179,21 @@ test("severity-gate: a BLOCK with NO SEVERITY line defaults to high → blocks",
 
 test("severity-gate: mixed — one medium (advisory) + one high (blocks) → block", () => {
   const r = combinePanel([
-    { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: nit", raw: "BLOCK: nit\nSEVERITY: low\n- tiny" },
+    { name: "Grok", verdict: "BLOCK", firstLine: "BLOCK: nit", raw: "BLOCK: nit\nSEVERITY: low\n- tiny" },
     { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: bug", raw: "BLOCK: bug\nSEVERITY: high\n- real" }
   ], { blockMinSeverity: "high" });
   assert.equal(r.decision, "block", "any real (>= high) blocker blocks even with advisories present");
-  assert.equal(r.badge, "Kimi~ MiMo✗", "low BLOCK is ~, high BLOCK is ✗");
+  assert.equal(r.badge, "Grok~ MiMo✗", "low BLOCK is ~, high BLOCK is ✗");
 });
 
 test("severity-gate: all advisory (only sub-threshold BLOCKs) → allow with advisories", () => {
   const r = combinePanel([
-    { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: a", raw: "BLOCK: a\nSEVERITY: low\n- a" },
+    { name: "Grok", verdict: "BLOCK", firstLine: "BLOCK: a", raw: "BLOCK: a\nSEVERITY: low\n- a" },
     { name: "MiMo", verdict: "BLOCK", firstLine: "BLOCK: b", raw: "BLOCK: b\nSEVERITY: medium\n- b" }
   ], { blockMinSeverity: "high" });
   assert.equal(r.decision, "allow");
   assert.equal(r.advisories.length, 2);
-  assert.equal(r.badge, "Kimi~ MiMo~");
+  assert.equal(r.badge, "Grok~ MiMo~");
 });
 
 test("severity-gate UNCHANGED default: a medium BLOCK with NO blockMinSeverity still blocks (stop/pre-push)", () => {
@@ -233,23 +212,28 @@ test("runGrokTask/runGrokReview spawn the grok CLI headless read-only and honor 
   // Fake grok: asserts headless read-only flags, prints a verdict. args[0] must be -p.
   fs.writeFileSync(fake, [
     "const a = process.argv.slice(2);",
-    "if (a[0] !== '-p' || !a.includes('--permission-mode') || a[a.indexOf('--permission-mode')+1] !== 'plan') { console.error('bad flags: '+a.join(' ')); process.exit(3); }",
+    "if (a[0] !== '-p' || !a.includes('--permission-mode') || a[a.indexOf('--permission-mode')+1] !== 'default') { console.error('bad flags: '+a.join(' ')); process.exit(3); }",
     "if (!a.includes('--sandbox') || a[a.indexOf('--sandbox')+1] !== 'read-only') { console.error('missing read-only sandbox: '+a.join(' ')); process.exit(5); }",
     "if (process.env.BENCH_SUPPRESS_HOOKS !== '1') { console.error('hooks not suppressed'); process.exit(4); }",
+    "const compat = ['CLAUDE','CURSOR','CODEX'].flatMap(v => ['SKILLS','RULES','AGENTS','MCPS','HOOKS','SESSIONS'].map(s => `GROK_${v}_${s}_ENABLED`));",
+    "if (compat.some(k => process.env[k] !== 'false') || process.env.GROK_MANAGED_MCPS_ENABLED !== 'false' || process.env.GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED !== 'false') { console.error('vendor compatibility not disabled'); process.exit(6); }",
+    "if (a[1] === 'review this' && (!a.includes('--tools') || !a.includes('--disallowed-tools') || !a.includes('--deny') || process.cwd() === process.env.EXPECTED_REPO_CWD || process.env.HOME !== process.cwd() || process.env.GROK_HOME !== process.cwd())) { console.error('review not tool-free/isolated: '+a.join(' ')); process.exit(7); }",
+    "if (a[1] === 'hunt this' && (a.includes('--tools') || process.cwd() !== process.env.EXPECTED_REPO_CWD)) { console.error('hunt lost repo-aware mode: '+a.join(' ')); process.exit(8); }",
     "console.log('ALLOW: grok healthy');",
     ""
   ].join("\n"));
   const wrap = path.join(dir, "grok");
   fs.writeFileSync(wrap, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`); fs.chmodSync(wrap, 0o755);
-  const rv = await runGrokReview({ prompt: "review this", cwd: dir, env: {}, bin: wrap });
+  const localEnv = { BENCH_GROK_UNSANDBOXED: "1", EXPECTED_REPO_CWD: fs.realpathSync.native(dir) };
+  const rv = await runGrokReview({ prompt: "review this", cwd: dir, env: localEnv, bin: wrap, platform: "linux" });
   assert.equal(rv.verdict, "ALLOW");
-  const rt = await runGrokTask({ prompt: "hunt this", cwd: dir, env: {}, bin: wrap });
+  const rt = await runGrokTask({ prompt: "hunt this", cwd: dir, env: localEnv, bin: wrap, platform: "linux" });
   assert.match(rt.raw, /ALLOW: grok healthy/);
   // timeout: a sleeper wrapper must be killed near the cap
   const sleeper = path.join(dir, "sleeper");
   fs.writeFileSync(sleeper, `#!/bin/sh\nsleep 60\n`); fs.chmodSync(sleeper, 0o755);
   const t0 = Date.now();
-  const rslow = await runGrokTask({ prompt: "x", cwd: dir, env: {}, timeoutMs: 200, bin: sleeper });
+  const rslow = await runGrokTask({ prompt: "x", cwd: dir, env: localEnv, timeoutMs: 200, bin: sleeper, platform: "linux" });
   assert.ok(rslow.error, "timed-out grok returns an error");
   assert.ok(Date.now() - t0 < 5000, "killed near the cap");
 });
@@ -257,8 +241,14 @@ test("runGrokTask/runGrokReview spawn the grok CLI headless read-only and honor 
 test("runGrokTask reports a missing grok CLI with the install hint", async () => {
   const { runGrokTask } = await import("../global-hooks/panel-lib.mjs");
   // platform:"linux" → unwrapped spawn so the ENOENT surfaces as our 127 path (pure, darwin-independent)
-  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "/nonexistent/grok-bin", platform: "linux" });
+  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: { BENCH_GROK_UNSANDBOXED: "1" }, bin: "/nonexistent/grok-bin", platform: "linux" });
   assert.match(r.error, /grok CLI not found/);
+});
+
+test("runGrokTask refuses non-macOS execution unless unsandboxed mode is explicitly enabled", async () => {
+  const { runGrokTask } = await import("../global-hooks/panel-lib.mjs");
+  const r = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "/must-not-run", platform: "linux" });
+  assert.match(r.error, /hard read-only containment is only available on macOS/);
 });
 
 test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-only profile", async () => {
@@ -274,7 +264,42 @@ test("grokSpawnSpec: darwin wraps grok in Seatbelt (sandbox-exec) with the read-
   assert.equal(l.cmd, "grok", "non-darwin spawns bare (fail-open stderr check is the net)");
 });
 
-test("GROK_SEATBELT_PROFILE grants writes ONLY to the ephemeral tmpdir + /dev — all of ~/.grok is read-only (Codex gate)", async () => {
+test("GROK_VERDICT_SCHEMA pins the review verdict shape (ALLOW|BLOCK enum, reason, both required)", async () => {
+  const { GROK_VERDICT_SCHEMA } = await import("../global-hooks/panel-lib.mjs");
+  const s = JSON.parse(GROK_VERDICT_SCHEMA);
+  assert.deepEqual(s.properties.verdict.enum, ["ALLOW", "BLOCK"], "only the two verdicts parseVerdict accepts");
+  assert.deepEqual(s.required.sort(), ["reason", "verdict"], "a verdict without a reason is useless to the gate");
+});
+
+test("grokSpawnSpec: jsonSchema appends --json-schema (review path); absent by default (task path stays free-form)", async () => {
+  const { grokSpawnSpec, GROK_TOOL_FREE_DENY, GROK_VERDICT_SCHEMA } = await import("../global-hooks/panel-lib.mjs");
+  const review = grokSpawnSpec("review", { platform: "darwin", tmpDir: "/tmp/t", toolFree: true, jsonSchema: GROK_VERDICT_SCHEMA });
+  const i = review.args.indexOf("--json-schema");
+  assert.ok(i > 0, "schema flag present when requested");
+  assert.equal(review.args[i + 1], GROK_VERDICT_SCHEMA, "schema value rides along");
+  assert.equal(review.args[review.args.indexOf("--tools") + 1], "todo_write", "allowlist disables default tool injection");
+  assert.equal(review.args[review.args.indexOf("--disallowed-tools") + 1], GROK_TOOL_FREE_DENY, "selected tool and MCP meta-tools are removed");
+  assert.equal(review.args[review.args.indexOf("--deny") + 1], "*", "permission fallback denies any surviving tool");
+  assert.equal(review.args[review.args.indexOf("--max-turns") + 1], "1", "tool-free review is a single model turn");
+  const task = grokSpawnSpec("hunt", { platform: "darwin", tmpDir: "/tmp/t" });
+  assert.ok(!task.args.includes("--json-schema"), "task/hunt runs must NOT be verdict-constrained — their findings are prose");
+  assert.ok(!task.args.includes("--tools"), "explicit repo hunt retains its inspection toolset");
+  assert.equal(task.args[task.args.indexOf("--max-turns") + 1], "40");
+});
+
+test("grokStructuredVerdict: extracts the schema-constrained verdict; null degrades to the text fallback", async () => {
+  const { grokStructuredVerdict } = await import("../global-hooks/panel-lib.mjs");
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: { verdict: "BLOCK", reason: "bug in x" }, text: "ignored" })), "BLOCK: bug in x");
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: { verdict: "ALLOW", reason: "" } })), "ALLOW: ", "empty reason is still a valid verdict");
+  // Constraint failure → CLI emits structuredOutput:null + structuredOutputError — fall back, don't throw.
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: null, structuredOutputError: "boom", text: "ALLOW: ok" })), null);
+  assert.equal(grokStructuredVerdict(JSON.stringify({ text: "ALLOW: ok" })), null, "no structuredOutput → text fallback");
+  assert.equal(grokStructuredVerdict(JSON.stringify({ structuredOutput: { verdict: "MAYBE", reason: "x" } })), null, "unknown verdict never synthesizes a line");
+  assert.equal(grokStructuredVerdict("plain narration, not json"), null);
+  assert.equal(grokStructuredVerdict(undefined), null);
+});
+
+test("GROK_SEATBELT_PROFILE grants writes ONLY to the ephemeral tmpdir + /dev — all of ~/.grok is read-only", async () => {
   const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
   const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x");
   // Default-deny with a SINGLE base deny; grok's writable state is redirected to the tmpdir via
@@ -294,13 +319,24 @@ test("GROK_SEATBELT_PROFILE grants writes ONLY to the ephemeral tmpdir + /dev �
 });
 
 test("grokChildEnv redirects grok's whole state into the ephemeral tmpdir with read-only auth", async () => {
-  const { grokChildEnv } = await import("../global-hooks/panel-lib.mjs");
+  const { grokChildEnv, GROK_VENDOR_COMPAT_DISABLED_ENV } = await import("../global-hooks/panel-lib.mjs");
   const noHeadless = { fsImpl: { existsSync: () => false } };
-  const e = grokChildEnv({ PATH: "/usr/bin" }, "/private/tmp/grok-bench-x", "/Users/u", noHeadless);
+  const e = grokChildEnv({
+    PATH: "/usr/bin",
+    HOME: "/Users/u",
+    BENCH_SUPPRESS_HOOKS: "0",
+    GROK_CLAUDE_SKILLS_ENABLED: "true",
+    GROK_CURSOR_RULES_ENABLED: "true",
+    GROK_CODEX_AGENTS_ENABLED: "true"
+  }, "/private/tmp/grok-bench-x", "/Users/u", noHeadless);
+  assert.equal(e.HOME, "/private/tmp/grok-bench-x", "HOME hides ~/.claude, ~/.cursor, and ~/.agents from reviewer discovery");
   assert.equal(e.GROK_HOME, "/private/tmp/grok-bench-x", "GROK_HOME redirects all writes into the ephemeral tmpdir");
   assert.equal(e.TMPDIR, "/private/tmp/grok-bench-x", "TMPDIR shares the same ephemeral dir");
   assert.equal(e.GROK_AUTH_PATH, "/Users/u/.grok/auth.json", "no gate auth home → falls back to the real (read-only) auth.json");
   assert.equal(e.BENCH_SUPPRESS_HOOKS, "1", "grok must not fire Claude Code hooks");
+  for (const name of Object.keys(GROK_VENDOR_COMPAT_DISABLED_ENV)) {
+    assert.equal(e[name], "false", `${name} cannot be re-enabled by the ambient environment`);
+  }
   assert.equal(e.PATH, "/usr/bin", "passes through the caller env");
   // Gate auth home present → auth points THERE (writable, refresh persists, chain independent of ~/.grok).
   const hasHeadless = { fsImpl: { existsSync: (p) => p === "/Users/u/.grok-headless/auth.json" } };
@@ -309,6 +345,7 @@ test("grokChildEnv redirects grok's whole state into the ephemeral tmpdir with r
   // Without a tmpdir (mkdtemp failed) we must NOT set GROK_HOME to ~/.grok — leave it unset. The
   // runners then refuse (fail-closed); grokChildEnv itself never points GROK_HOME at ~/.grok.
   const e2 = grokChildEnv({}, null, "/Users/u", noHeadless);
+  assert.ok(!("HOME" in e2), "no tmpdir → HOME is not replaced with a nonexistent containment root");
   assert.ok(!("GROK_HOME" in e2), "no tmpdir → GROK_HOME unset (never falls back to ~/.grok writes)");
 });
 
@@ -318,7 +355,7 @@ test("grokAuthPath precedence: inline token > caller path (writable!) > gate aut
   const yesFs = { fsImpl: { existsSync: () => true } };
   assert.equal(grokAuthPath({ GROK_AUTH: "tok" }, "/Users/u", yesFs), null, "inline token → nothing to inject or grant");
   // A caller's custom auth file must be WRITABLE — grok's rotating tokens persist back to it;
-  // respecting the path while denying the write 401s custom-auth users (caught by the Codex gate).
+  // respecting the path while denying the write 401s custom-auth users.
   const caller = grokAuthPath({ GROK_AUTH_PATH: "/c/a.json" }, "/Users/u", yesFs);
   assert.deepEqual(caller, { path: "/c/a.json", writable: true, callerManaged: true }, "custom path → writable, caller-managed");
   const gate = grokAuthPath({}, "/Users/u", yesFs);
@@ -329,30 +366,98 @@ test("grokAuthPath precedence: inline token > caller path (writable!) > gate aut
   assert.deepEqual(fbCustomHome, { path: "/custom/gh/auth.json", writable: false }, "fallback honors the caller's original GROK_HOME");
 });
 
-test("grokFailureMessage: gate-home setup hint ONLY on the read-only FALLBACK (never caller-managed)", async () => {
+test("grokFailureMessage (darwin/sandboxed): every auth-source 401 gets its EFFECTIVE recovery", async () => {
   const { grokFailureMessage } = await import("../global-hooks/panel-lib.mjs");
   const r401 = { stderr: "Error: Unauthorized (401) … no auth context" };
-  const gateHint = /grok gate auth not set up/;
-  const callerHint = /GROK_AUTH_PATH can't be granted sandbox write/;
-  assert.match(grokFailureMessage(r401, { path: "/Users/u/.grok/auth.json", writable: false }), gateHint, "read-only fallback → gate-home hint");
-  assert.doesNotMatch(grokFailureMessage(r401, { path: "/Users/u/.grok-headless/auth.json", writable: true }), gateHint, "gate home 401 = bad creds, not missing setup");
-  // Unsafe caller path is read-only, but the gate-home hint is WRONG for it (their env var wins) —
-  // it must get the caller-specific instruction instead.
-  const callerRo = grokFailureMessage(r401, { path: "/c/a.json", writable: false, callerManaged: true });
-  assert.doesNotMatch(callerRo, gateHint, "caller-managed read-only must NOT get the (ineffective) gate-home hint");
-  assert.match(callerRo, callerHint, "caller-managed read-only gets the fix-your-GROK_AUTH_PATH instruction");
-  assert.doesNotMatch(grokFailureMessage(r401, { path: "/c/a.json", writable: true, callerManaged: true }), gateHint, "caller path (writable) 401 = their creds, no hint");
-  assert.doesNotMatch(grokFailureMessage(r401, null), gateHint, "inline token 401 = bad token, no hint");
-  assert.doesNotMatch(grokFailureMessage({ stderr: "some other crash" }, { writable: false }), gateHint, "non-auth failures never hint");
+  const rGrant = { stderr: "Internal error: invalid_grant (auth_kind=bearer)" };
+  const setupHint = /grok gate auth not set up/;
+  const rotateHint = /UNSET GROK_AUTH_PATH and run/;
+  const dar = (r, auth) => grokFailureMessage(r, auth, "darwin");   // pin platform → deterministic
+
+  // Read-only fallback (no gate home) → set the gate home up.
+  assert.match(dar(r401, { path: "/Users/u/.grok/auth.json", writable: false }), setupHint, "read-only fallback → gate-home setup hint");
+
+  // Caller-managed, SAFE path (writable, literals) → atomic refresh is denied under Seatbelt → MUST get
+  // rotation guidance for the knowingly degraded caller-managed path.
+  const callerWritable = dar(rGrant, { path: "/c/a.json", writable: true, callerManaged: true });
+  assert.match(callerWritable, rotateHint, "writable caller 401 → rotation recovery (unset + gate home)");
+  assert.match(callerWritable, /atomic token-rotation|can't create the temp file/i, "explains WHY rotation fails for a caller path");
+  assert.doesNotMatch(callerWritable, setupHint, "not the bare gate-home setup hint (ineffective while GROK_AUTH_PATH is set)");
+
+  // Caller-managed, UNSAFE path → also steered to unset+gate-home, and explains the path is unsafe.
+  const callerUnsafe = dar(r401, { path: "/c/a.json", writable: false, callerManaged: true });
+  assert.match(callerUnsafe, rotateHint, "unsafe caller 401 → still steered to the gate home (unset first)");
+  assert.match(callerUnsafe, /can't be granted sandbox write access/i, "explains the path is unsafe");
+
+  // Gate home writable but still 401 → its token is dead → re-auth the gate home (not "not set up").
+  const gate401 = dar(r401, { path: "/Users/u/.grok-headless/auth.json", writable: true });
+  assert.match(gate401, /gate.*token expired|Re-auth/i, "gate-home 401 → re-auth, not setup");
+  assert.doesNotMatch(gate401, setupHint, "gate-home 401 is not a 'not set up' case");
+
+  // Inline token / non-auth → no recovery appended.
+  assert.doesNotMatch(dar(r401, null), /→/, "inline token 401 = bad token, no recovery line");
+  assert.doesNotMatch(dar({ stderr: "some other crash" }, { writable: false }), /→/, "non-auth failures never append recovery");
 });
 
-test("GROK_SEATBELT_PROFILE authWrite grants exactly the gate auth file + its lock — nothing else", async () => {
+test("grokFailureMessage (off darwin / unsandboxed): 401 is just an expired token — NO sandbox guidance", async () => {
+  const { grokFailureMessage } = await import("../global-hooks/panel-lib.mjs");
+  const rGrant = { stderr: "Internal error: invalid_grant (auth_kind=bearer)" };
+  const lin = (auth) => grokFailureMessage(rGrant, auth, "linux");
+  // Off darwin grokSpawnSpec runs grok BARE — no write restriction, rotation works. The darwin-only
+  // "sandbox can't create the temp file / unset GROK_AUTH_PATH" guidance would be wrong here.
+  const caller = lin({ path: "/c/a.json", writable: true, callerManaged: true });
+  assert.match(caller, /expired|re-auth/i, "off darwin → generic re-auth");
+  assert.doesNotMatch(caller, /UNSET GROK_AUTH_PATH/, "MUST NOT tell an unsandboxed caller to unset GROK_AUTH_PATH");
+  assert.doesNotMatch(caller, /sandbox|atomic token-rotation|temp file/i, "MUST NOT claim the sandbox blocks rotation (there is none)");
+  // Gate home off darwin → generic re-auth, may point at the gate-home command.
+  const gate = lin({ path: "/Users/u/.grok-headless/auth.json", writable: true });
+  assert.match(gate, /re-auth/i, "off-darwin gate-home 401 → re-auth");
+  assert.doesNotMatch(gate, /sandbox|atomic/i, "no sandbox claims off darwin");
+});
+
+test("GROK_SEATBELT_PROFILE gate-managed auth grants the auth PARENT DIR (atomic OAuth write needs it)", async () => {
   const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
-  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.grok-headless/auth.json");
-  assert.ok(p.includes('(literal "/Users/u/.grok-headless/auth.json")'), "gate auth.json writable (OAuth token rotation must persist)");
-  assert.ok(p.includes('(literal "/Users/u/.grok-headless/auth.json.lock")'), "its lock writable (grok locks to establish auth context)");
-  assert.ok(!p.includes('(subpath "/Users/u/.grok-headless")'), "must be the two literals, never the whole dir");
-  assert.ok(!p.includes('"/Users/u/.grok/'), "the user's interactive ~/.grok stays fully read-only");
+  // gateManaged=true → the bench-controlled ~/.grok-headless: parent-dir grant is safe + needed.
+  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.grok-headless/auth.json", true);
+  // Grok persists tokens via sibling temp + rename. Literal-only grants allow open/write on the
+  // existing file but deny creating auth.json.tmp → "disk write failed: Operation not permitted"
+  // → RT rotates in-memory, disk keeps the dead RT → re-auth loop on every post-expiry gate.
+  assert.ok(!p.includes("(literal "), "literals alone are insufficient; grant is the parent subpath");
+  // Parse the actual subpath grants and check membership EXACTLY, rather than substring-matching the
+  // profile text: a bare `p.includes('/Users/u/.grok')` would false-positive on `.grok-headless`, and a
+  // negative substring assertion is easy to misread even when correct (a reviewer flagged this exact
+  // line as inverted — it is not: the closing quote makes `(subpath ".../.grok")` distinct from
+  // `(subpath ".../.grok-headless")`, verified false — but the structural check removes the ambiguity).
+  const grants = [...p.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]);
+  assert.ok(grants.includes("/Users/u/.grok-headless"), "gate auth home parent is writable so atomic temp+rename can land");
+  assert.ok(!grants.includes("/Users/u/.grok"), "user's interactive ~/.grok is NEVER a write grant — only the gate home");
+  assert.deepEqual(grants.filter((g) => g.includes("/.grok")), ["/Users/u/.grok-headless"], "the only .grok* write surface is the gate home");
+});
+
+test("GROK_SEATBELT_PROFILE caller-managed auth grants ONLY the file literals — never the parent dir (write isolation)", async () => {
+  const { GROK_SEATBELT_PROFILE } = await import("../global-hooks/panel-lib.mjs");
+  // A caller's GROK_AUTH_PATH has an ARBITRARY parent — granting it as a subpath would disable the
+  // sandbox's write isolation. gateManaged=false → exact file + .lock literals, no dir.
+  const p = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", "/Users/u/.config/foo/auth.json", false);
+  assert.ok(p.includes('(literal "/Users/u/.config/foo/auth.json")'), "the caller's exact auth file is writable");
+  assert.ok(p.includes('(literal "/Users/u/.config/foo/auth.json.lock")'), "its lock is writable");
+  const subpaths = [...p.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]);
+  assert.ok(!subpaths.includes("/Users/u/.config/foo"), "the caller's parent dir must NOT be granted as a subpath");
+  // The dangerous cases: a broad parent must never become a write grant.
+  for (const broad of ["/Users/u/auth.json" /* $HOME */, "/auth.json" /* filesystem root */, "/Users/u/.grok/auth.json" /* interactive grok */]) {
+    const prof = GROK_SEATBELT_PROFILE("/private/tmp/grok-bench-x", broad, false);
+    const sp = [...prof.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]);
+    assert.deepEqual(sp, ["/private/tmp/grok-bench-x", "/dev"], `caller auth ${broad} grants no dir subpath — only tmp + /dev`);
+    assert.ok(prof.includes(`(literal "${broad}")`), "the exact caller file is still writable (bounded)");
+  }
+});
+
+test("grokSpawnSpec routes gate auth to a parent-dir grant and caller auth to literals (authGateManaged)", async () => {
+  const { grokSpawnSpec } = await import("../global-hooks/panel-lib.mjs");
+  const gate = grokSpawnSpec("x", { platform: "darwin", tmpDir: "/tmp/t", authWrite: "/Users/u/.grok-headless/auth.json", authGateManaged: true });
+  assert.ok(gate.args[1].includes('(subpath "/Users/u/.grok-headless")'), "gate-managed → parent-dir grant");
+  const caller = grokSpawnSpec("x", { platform: "darwin", tmpDir: "/tmp/t", authWrite: "/home/x/auth.json", authGateManaged: false });
+  assert.ok(caller.args[1].includes('(literal "/home/x/auth.json")') && !caller.args[1].includes('(subpath "/home/x")'), "caller → literals, no parent dir");
 });
 
 test("sbplPathSafe rejects anything that could break out of an SBPL string literal", async () => {
@@ -409,10 +514,11 @@ test("runGrokReview fails CLOSED when the private tmpdir can't be created (no un
   process.env.TMPDIR = "/nonexistent-bench-tmpdir-abc123/nope";  // makeGrokTmpDir → mkdtemp throws → null
   try {
     // platform:"linux" = NO Seatbelt; the refusal is the ONLY thing preventing an unsandboxed grok write.
-    const r = await runGrokReview({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
+    const env = { BENCH_GROK_UNSANDBOXED: "1" };
+    const r = await runGrokReview({ prompt: "x", cwd: process.cwd(), env, bin: "grok", platform: "linux" });
     assert.equal(r.name, "Grok");
     assert.match(r.error, /tmpdir could not be created|refusing unsandboxed/i);
-    const t = await runGrokTask({ prompt: "x", cwd: process.cwd(), env: {}, bin: "grok", platform: "linux" });
+    const t = await runGrokTask({ prompt: "x", cwd: process.cwd(), env, bin: "grok", platform: "linux" });
     assert.match(t.error, /tmpdir could not be created|refusing unsandboxed/i);
   } finally {
     if (prev === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = prev;
@@ -425,6 +531,6 @@ test("runGrokTask fail-closes when grok reports its sandbox could not be applied
   const fake = path.join(dir, "grok");
   fs.writeFileSync(fake, `#!/bin/sh\necho "warning: sandbox could not be applied: whatever" >&2\necho '{"text":"ALLOW: fine"}'\n`);
   fs.chmodSync(fake, 0o755);
-  const r = await runGrokTask({ prompt: "x", cwd: dir, env: {}, bin: fake, platform: "linux" });
+  const r = await runGrokTask({ prompt: "x", cwd: dir, env: { BENCH_GROK_UNSANDBOXED: "1" }, bin: fake, platform: "linux" });
   assert.match(r.error, /sandbox could not be applied/, "an unsandboxed run must be REFUSED, not accepted");
 });

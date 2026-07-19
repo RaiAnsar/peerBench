@@ -20,37 +20,37 @@ function writeTrace(root, wsSlug, id, reviewers, gate = "stop") {
 
 test("autoStatsFromTraces: participation, errors, blocks, and UNIQUE blocks across workspaces", () => {
   const root = freshRoot();
-  // ws1: MiMo blocks alone (unique), others allow
+  // ws1: MiMo blocks alone (unique), Grok allows
   writeTrace(root, "ws1-aaaaaaaaaaaaaaaa", "100-aaa", [
-    { name: "Kimi", verdict: "ALLOW" }, { name: "GLM", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }
+    { name: "Grok", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }
   ]);
-  // ws2: Kimi AND MiMo both block → NOT unique for either
+  // ws2: Grok AND MiMo both block → NOT unique for either
   writeTrace(root, "ws2-bbbbbbbbbbbbbbbb", "200-bbb", [
-    { name: "Kimi", verdict: "BLOCK" }, { name: "MiMo", verdict: "BLOCK" }
+    { name: "Grok", verdict: "BLOCK" }, { name: "MiMo", verdict: "BLOCK" }
   ]);
-  // ws2: Qwen errored (quota)
+  // ws2: Grok errored (quota)
   writeTrace(root, "ws2-bbbbbbbbbbbbbbbb", "300-ccc", [
-    { name: "Kimi", verdict: "ALLOW" }, { name: "Qwen", error: "http: 429 quota" }
+    { name: "MiMo", verdict: "ALLOW" }, { name: "Grok", error: "http: 429 quota" }
   ]);
   const m = autoStatsFromTraces({ root });
-  assert.equal(m.MiMo.participated, 2);
+  assert.equal(m.MiMo.participated, 3);
   assert.equal(m.MiMo.blocks, 2);
   assert.equal(m.MiMo.uniqueBlocks, 1, "MiMo blocked alone once (ws1), shared once (ws2)");
-  assert.equal(m.Kimi.blocks, 1);
-  assert.equal(m.Kimi.uniqueBlocks, 0, "Kimi never blocked alone");
-  assert.equal(m.Qwen.errors, 1);
-  assert.equal(m.Qwen.participated, 1);
+  assert.equal(m.Grok.blocks, 1);
+  assert.equal(m.Grok.uniqueBlocks, 0, "Grok never blocked alone");
+  assert.equal(m.Grok.errors, 1);
+  assert.equal(m.Grok.participated, 3);
 });
 
-test("autoStatsFromTraces canonicalizes reviewer casing (glm + GLM → one row)", () => {
+test("autoStatsFromTraces canonicalizes reviewer casing (grok + Grok → one row)", () => {
   const root = freshRoot();
-  writeTrace(root, "ws1-aaaaaaaaaaaaaaaa", "100-aaa", [{ name: "GLM", verdict: "ALLOW" }]);
-  writeTrace(root, "ws2-bbbbbbbbbbbbbbbb", "200-bbb", [{ name: "glm", verdict: "BLOCK" }]);
+  writeTrace(root, "ws1-aaaaaaaaaaaaaaaa", "100-aaa", [{ name: "Grok", verdict: "ALLOW" }]);
+  writeTrace(root, "ws2-bbbbbbbbbbbbbbbb", "200-bbb", [{ name: "grok", verdict: "BLOCK" }]);
   const m = autoStatsFromTraces({ root });
-  assert.ok(m.GLM, "merged under the canonical display name GLM");
-  assert.equal(m.glm, undefined, "no separate lowercase row");
-  assert.equal(m.GLM.participated, 2);
-  assert.equal(m.GLM.blocks, 1);
+  assert.ok(m.Grok, "merged under the canonical display name Grok");
+  assert.equal(m.grok, undefined, "no separate lowercase row");
+  assert.equal(m.Grok.participated, 2);
+  assert.equal(m.Grok.blocks, 1);
 });
 
 test("recordGrade appends an event; loadScorecard reads it back; rejects bad grade", () => {
@@ -69,7 +69,7 @@ test("recordGrade appends an event; loadScorecard reads it back; rejects bad gra
 test("recordGrade is append-only across calls (distinct ids)", () => {
   const root = freshRoot();
   recordGrade({ traceId: "a", reviewer: "MiMo", grade: "tp" }, { root, now: 10 });
-  recordGrade({ traceId: "b", reviewer: "Kimi", grade: "fp" }, { root, now: 20 });
+  recordGrade({ traceId: "b", reviewer: "Grok", grade: "fp" }, { root, now: 20 });
   const { events } = loadScorecard({ root });
   assert.equal(events.length, 2);
   assert.notEqual(events[0].id, events[1].id);
@@ -78,7 +78,7 @@ test("recordGrade is append-only across calls (distinct ids)", () => {
 test("computeScorecard merges auto + judgment layers; precision from TP/(TP+FP)", () => {
   const root = freshRoot();
   writeTrace(root, "ws1-aaaaaaaaaaaaaaaa", "100-aaa", [
-    { name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }
+    { name: "Grok", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }
   ]);
   recordGrade({ traceId: "100-aaa", reviewer: "MiMo", grade: "tp" }, { root, now: 1 });
   recordGrade({ traceId: "100-aaa", reviewer: "MiMo", grade: "fp" }, { root, now: 2 });
@@ -88,7 +88,7 @@ test("computeScorecard merges auto + judgment layers; precision from TP/(TP+FP)"
   assert.equal(card.models.MiMo.tp, 2);
   assert.equal(card.models.MiMo.fp, 1);
   assert.ok(Math.abs(card.models.MiMo.precision - 2 / 3) < 1e-9, "precision = 2/3");
-  assert.equal(card.models.Kimi.precision, null, "ungraded → null precision");
+  assert.equal(card.models.Grok.precision, null, "ungraded → null precision");
 });
 
 test("computeScorecard tolerates a graded reviewer that never appears in traces", () => {
@@ -108,13 +108,13 @@ test("letterGrade: reliable + high verified precision + unique value → A; flak
 test("renderScorecard returns a table with a header and every model row", () => {
   const root = freshRoot();
   writeTrace(root, "ws1-aaaaaaaaaaaaaaaa", "100-aaa", [
-    { name: "Kimi", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }
+    { name: "Grok", verdict: "ALLOW" }, { name: "MiMo", verdict: "BLOCK" }
   ]);
   recordGrade({ traceId: "100-aaa", reviewer: "MiMo", grade: "tp" }, { root, now: 1 });
   const out = renderScorecard(computeScorecard({ root }));
   assert.match(out, /Reviewer scorecard/);
   assert.match(out, /MiMo/);
-  assert.match(out, /Kimi/);
+  assert.match(out, /Grok/);
   assert.match(out, /grade/);
 });
 

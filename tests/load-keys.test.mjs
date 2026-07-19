@@ -12,10 +12,8 @@ test("load-keys writes configured provider temperatures without printing secrets
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "load-keys-src-"));
   const keys = path.join(dir, ".keys");
   fs.writeFileSync(keys, [
-    "KIMI_API_KEY=k",
-    "KIMI_TEMPERATURE=0.6",
-    "GLM_API_KEY=g",
-    "GLM_TEMPERATURE=0.2",
+    "MIMO_API_KEY=secret-mimo-key",
+    "MIMO_TEMPERATURE=0.2",
     ""
   ].join("\n"));
   const out = execFileSync(process.execPath, [LOAD_KEYS, keys], {
@@ -23,7 +21,9 @@ test("load-keys writes configured provider temperatures without printing secrets
     env: { ...process.env, BENCH_ROOT: root }
   });
   assert.match(out, /key values redacted/);
+  assert.doesNotMatch(out, /secret-mimo-key/);
   const saved = JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8"));
-  assert.equal(saved.providers.kimi.temperature, 0.6);
-  assert.equal(saved.providers.glm.temperature, 0.2);
+  assert.deepEqual(Object.keys(saved.providers), ["mimo"]);
+  assert.equal(saved.providers.mimo.temperature, 0.2);
+  assert.equal(saved.providers.mimo.apiKey, "secret-mimo-key");
 });

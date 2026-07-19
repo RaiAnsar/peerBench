@@ -1,5 +1,5 @@
 ---
-description: On-demand panel review (Codex + Kimi + GLM + Qwen + MiMo). Plain — content-only review of the current working changes (fast). Pass a git RANGE (e.g. origin/main..staging) for a DEEP, repo-aware review of those committed commits with the real diff embedded. User-invoked.
+description: On-demand Grok/MiMo panel review. Plain — content-only review of the current working changes (fast). Pass a git RANGE (e.g. origin/main..staging) for a DEEP, repo-aware review of those committed commits with the real diff embedded. User-invoked.
 argument-hint: '[<range> | --base <ref>]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Bash(git:*)

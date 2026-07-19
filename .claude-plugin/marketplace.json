@@ -8,7 +8,7 @@
     {
       "name": "bench",
       "source": "./",
-      "description": "peerbench — Codex + Kimi + GLM + Qwen + MiMo review panel, agentic read-only code review, and bug hunts for Claude Code. Commands: /bench:*"
+      "description": "peerBench — lightweight Grok + MiMo code review and read-only bug hunts for Claude Code. Commands: /bench:*"
     }
   ]
 }

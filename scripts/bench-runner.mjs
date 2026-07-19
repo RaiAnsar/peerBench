@@ -5,29 +5,28 @@
 //   bench-runner.mjs status
 //   bench-runner.mjs setup
 //
-// Slash-command templates call `review --json "$ARGUMENTS"`, producing mixed
-// argv: standalone flags first, then ONE quoted element that may START with
-// flags. parseArgs() consumes standalone flag elements, lifts leading flag
-// tokens off the front of the first non-flag element.
+// Command templates pass `$ARGUMENTS` as one quoted element. parseArgs() accepts
+// both that form and ordinary standalone flags without rewriting the subcommand.
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName } from "../global-hooks/config-store.mjs";
-import { combinePanel, untrackedBlock, grokSpawnSpec, grokChildEnv, grokAuthPath, grokText } from "../global-hooks/panel-lib.mjs";
-import { resolveReviewers, latestCodexRoot } from "../global-hooks/reviewers.mjs";
+import { configuredProviderSecrets, resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName, KNOWN_REVIEWERS } from "../global-hooks/config-store.mjs";
+import { collectUntrackedEvidence, combinePanel, grokSpawnSpec, grokChildEnv, grokAuthPath, grokPlatformRefusal, grokText } from "../global-hooks/panel-lib.mjs";
+import { resolveReviewers } from "../global-hooks/reviewers.mjs";
 import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
-import { listBlocked } from "../global-hooks/deep-queue.mjs";
 import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mjs";
 import { shouldRewake } from "../global-hooks/deep-review.mjs";
 import { recordGrade, computeScorecard, renderScorecard } from "../global-hooks/scorecard-store.mjs";
-import { disableLegacyCodexStopGateForWorkspace, disableLegacyCodexStopGateStates, enableLegacyCodexStopGateForWorkspace, enableLegacyCodexStopGateStates } from "../global-hooks/legacy-codex-gate.mjs";
+import { redactProviderFailure } from "../global-hooks/provider-error-redaction.mjs";
+import { review as reviewClient } from "../global-hooks/review-client.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
 const MAX_DIFF_BYTES = 200_000;
+const SAFE_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--text", "--no-renames", "--full-index"];
 
 function workspaceRoot(cwd) {
   try {
@@ -35,6 +34,22 @@ function workspaceRoot(cwd) {
   } catch {
     return cwd;
   }
+}
+
+function readBoundedGit(args, cwd, maxBytes = MAX_DIFF_BYTES) {
+  const result = spawnSync("git", ["--no-replace-objects", ...args], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: maxBytes + 4096,
+    env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_GRAFT_FILE: os.devNull },
+    stdio: ["ignore", "pipe", "ignore"]
+  });
+  const out = result.stdout || "";
+  if (result.error?.code === "ENOBUFS" || Buffer.byteLength(out) > maxBytes) {
+    return { ok: false, tooLarge: true, out: "" };
+  }
+  if (result.status !== 0) return { ok: false, tooLarge: false, out: "" };
+  return { ok: true, tooLarge: false, out };
 }
 
 function readJson(pathname) {
@@ -180,13 +195,33 @@ async function main() {
       return;
     }
 
-    const status = spawnSync("git", ["status", "--short", "--untracked-files=all"], { cwd: ws, encoding: "utf8" }).stdout || "";
-    const committed = flags.base
-      ? (spawnSync("git", ["diff", `${flags.base}...HEAD`], { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES)
-      : "";
-    const diff = (spawnSync("git", ["diff", "HEAD"], { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES);
-    const staged = diff.trim() ? "" : (spawnSync("git", ["diff", "--cached"], { cwd: ws, encoding: "utf8" }).stdout || "").slice(0, MAX_DIFF_BYTES);
-    const untracked = untrackedBlock(ws);
+    const statusRead = readBoundedGit(["status", "--short", "--untracked-files=all"], ws);
+    const hasHead = readBoundedGit(["rev-parse", "--verify", "HEAD"], ws, 4_096).ok;
+    const committedRead = flags.base
+      ? readBoundedGit(["diff", ...SAFE_DIFF_FLAGS, `${flags.base}...HEAD`], ws)
+      : { ok: true, tooLarge: false, out: "" };
+    const diffRead = hasHead
+      ? readBoundedGit(["diff", ...SAFE_DIFF_FLAGS, "HEAD"], ws)
+      : { ok: true, tooLarge: false, out: "" };
+    const stagedRead = !hasHead || (diffRead.ok && !diffRead.out.trim())
+      ? readBoundedGit(["diff", ...SAFE_DIFF_FLAGS, "--cached"], ws)
+      : { ok: true, tooLarge: false, out: "" };
+    const untrackedRead = collectUntrackedEvidence(ws);
+    const reads = [statusRead, committedRead, diffRead, stagedRead];
+    if (reads.some((result) => !result.ok) || !untrackedRead.complete) {
+      const reason = reads.some((result) => result.tooLarge) || !untrackedRead.complete
+        ? `evidence exceeds the ${MAX_DIFF_BYTES}-byte bound; split the review`
+        : "Git evidence could not be read";
+      if (flags.json) process.stdout.write(`${JSON.stringify({ decision: "unreviewed", reason })}\n`);
+      else process.stdout.write(`⛩ bench review: UNREVIEWED — ${reason}.\n`);
+      process.exitCode = 1;
+      return;
+    }
+    const status = statusRead.out;
+    const committed = committedRead.out;
+    const diff = diffRead.out;
+    const staged = stagedRead.out;
+    const untracked = untrackedRead.text;
 
     const system = "You are a code reviewer. Review the diff below and respond with ALLOW: <reason> or BLOCK: <reason> on the first line. BLOCK only for concrete bugs, regressions, or unsafe changes. Content-only review — no tools needed.";
     const userParts = ["GIT STATUS:\n" + status];
@@ -195,6 +230,13 @@ async function main() {
     if (staged) userParts.push("STAGED DIFF:\n" + staged);
     if (untracked) userParts.push("UNTRACKED FILES:\n" + untracked);
     const user = userParts.join("\n\n");
+    if (Buffer.byteLength(`${system}\n${user}`) > MAX_DIFF_BYTES) {
+      const reason = `combined evidence exceeds the ${MAX_DIFF_BYTES}-byte bound; split the review`;
+      if (flags.json) process.stdout.write(`${JSON.stringify({ decision: "unreviewed", reason })}\n`);
+      else process.stdout.write(`⛩ bench review: UNREVIEWED — ${reason}.\n`);
+      process.exitCode = 1;
+      return;
+    }
 
     const reviewers = resolveReviewers({ env: process.env });
     const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env: process.env })));
@@ -235,9 +277,7 @@ async function main() {
     return;
   }
 
-  // `health [--all]` — LIVE-ping every active reviewer (real 1-token API call per provider, real
-  // codex exec in the gate home) so "is the panel actually working" is one command, not vibes.
-  // --all checks every keyed provider (active or not) — e.g. verify a new key before activating it.
+  // `health [--all]` — live-probe only the supported Grok + MiMo panel.
   if (sub === "health") {
     const out = await healthCommand({ all: rest.includes("--all") });
     process.stdout.write(`${out.text}\n`);
@@ -248,23 +288,21 @@ async function main() {
   if (sub === "setup") {
     const ws = workspaceRoot(cwd);
     const cfg = resolveConfig({ env: process.env });
-    const codexFound = !!latestCodexRoot();
     const disabled = isBenchDisabled(ws);
     const settingsPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "settings.json");
     const codexHooksPath = path.join(os.homedir(), ".codex", "hooks.json");
     const codexPromptsDir = path.join(os.homedir(), ".codex", "prompts");
     // Report key status for the ACTIVE reviewers only, sourced the way the gates read them
-    // (resolveConfig merges env + companion.json/.keys). Hardcoded KIMI/MIMO env checks were
-    // misleading after the registry change — they named a disabled model and hid GLM/Qwen.
+    // (resolveConfig merges env + companion.json/.keys).
     const keyLines = cfg.reviewers
-      .filter((name) => name !== "codex")
       .map((name) => {
         const p = cfg.providers[name];
-        return `  ${name}: ${p?.apiKey ? "key present" : "key MISSING"} (model ${p?.model || "?"})`;
+        return name === "grok"
+          ? "  grok: local CLI (no API key)"
+          : `  ${name}: ${p?.apiKey ? "key present" : "key MISSING"} (model ${p?.model || "?"})`;
       });
     const lines = [
       `Active reviewers: ${cfg.reviewers.join(", ")}`,
-      `Codex plugin: ${codexFound ? "found" : "not found"}`,
       ...keyLines,
       `Bench disabled: ${disabled ? "yes" : "no"}`,
       setupStatus(settingsPath, { pluginHooksPath: latestClaudeBenchPluginHooksPath() }),
@@ -304,8 +342,7 @@ async function main() {
     const ws = workspaceRoot(cwd);
     let id = rest[0];
     if (!id) {
-      const b = listBlocked(ws).filter((x) => x.traceId).sort((a, c) => (Number(c.firstBlockedTs) || 0) - (Number(a.firstBlockedTs) || 0))[0];
-      id = b?.traceId;
+      id = listTraces(ws).sort((a, b) => String(b.id).localeCompare(String(a.id)))[0]?.id;
     }
     if (!id) { process.stdout.write("usage: show <traceId>  (the id is printed in the block message)\n"); process.exitCode = 1; return; }
     const t = readTrace(ws, id);
@@ -371,17 +408,16 @@ async function main() {
   throw new Error(`Unknown subcommand: ${sub ?? "(none)"} — expected review|status|show|setup|health|reviewers|scorecard|grade|hunt|investigate|debug|spec-review|off|on`);
 }
 
-// LIVE health probe. API providers get a real 1-token chat completion (any 2xx = healthy — proves
-// key + endpoint + model id + our request shape in one shot); codex gets a real `codex exec` in the
-// GATE home (CODEX_HOME=~/.codex-headless) because `codex login status` lies (reports logged-in on a
-// revoked refresh token — seen live). Slow-ish on purpose: honest checks only.
+// LIVE health probe. MiMo gets a real 1-token completion; Grok runs through the same read-only
+// containment as production. Slow-ish on purpose: honest checks only.
 const HEALTH_API_TIMEOUT_MS = 30_000;
-const HEALTH_CODEX_TIMEOUT_MS = 180_000;
-export async function healthCommand({ all = false, env = process.env, fetchImpl, codexImpl, grokImpl, cfg: cfgOverride } = {}) {
+const HEALTH_GROK_TIMEOUT_MS = 180_000;
+export async function healthCommand({ all = false, env = process.env, fetchImpl, grokImpl, reviewImpl = reviewClient, platform = process.platform, cfg: cfgOverride } = {}) {
   const cfg = cfgOverride || resolveConfig({ env });
   const doFetch = fetchImpl || globalThis.fetch;
+  const configuredSecrets = configuredProviderSecrets({ env });
   const names = all
-    ? [...new Set([...cfg.reviewers, ...Object.keys(cfg.providers).filter((n) => cfg.providers[n]?.apiKey)])]
+    ? [...KNOWN_REVIEWERS]
     : cfg.reviewers;
 
   const probeApi = async (name) => {
@@ -389,50 +425,37 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
     if (!p?.apiKey) return { name, display: displayName(name), ok: false, note: "no api key (.keys + load-keys.mjs)" };
     const t0 = Date.now();
     try {
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), HEALTH_API_TIMEOUT_MS);
-      const r = await doFetch(`${p.baseURL}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${p.apiKey}`, ...p.headers },
-        body: JSON.stringify({ model: p.model, messages: [{ role: "user", content: "Reply with exactly: OK" }], max_tokens: 16, stream: false }),
-        signal: ac.signal
-      }).finally(() => clearTimeout(timer));
+      // Use the production client so health and real reviews share header filtering, response-body
+      // deadlines, provider compatibility, and error classification.
+      const r = await reviewImpl({
+        baseURL: p.baseURL,
+        apiKey: p.apiKey,
+        apiKeys: p.apiKeys,
+        model: p.model,
+        system: "This is a one-token peerBench health probe.",
+        user: "Reply with exactly: OK",
+        temperature: p.temperature,
+        headers: p.headers,
+        thinking: p.thinking,
+        timeoutMs: HEALTH_API_TIMEOUT_MS,
+        maxOverloadRetries: 0,
+        fetchImpl: doFetch
+      });
       const ms = Date.now() - t0;
       if (r.ok) return { name, display: displayName(name), ok: true, note: `${p.model} · ${ms}ms` };
-      const body = (await r.text().catch(() => "")).slice(0, 120);
-      return { name, display: displayName(name), ok: false, note: `HTTP ${r.status} in ${ms}ms — ${body}` };
+      const secrets = [...configuredSecrets, ...(p.apiKeys || [p.apiKey]).filter(Boolean)];
+      const detail = redactProviderFailure(r.error?.detail || r.error?.kind || "failed", { secrets }).slice(0, 160);
+      return { name, display: displayName(name), ok: false, note: `${r.error?.kind || "error"} in ${ms}ms — ${detail}` };
     } catch (e) {
       const kind = e?.name === "AbortError" ? `timeout >${HEALTH_API_TIMEOUT_MS / 1000}s` : String(e?.message || e).slice(0, 100);
-      return { name, display: displayName(name), ok: false, note: kind };
+      return { name, display: displayName(name), ok: false, note: redactProviderFailure(kind, { secrets: [...configuredSecrets, ...(p.apiKeys || [p.apiKey]).filter(Boolean)] }) };
     }
   };
 
-  const probeCodex = async () => {
-    const run = codexImpl || (() => {
-      const home = path.join(os.homedir(), ".codex-headless");
-      return spawnSync("codex", ["exec", "--skip-git-repo-check", "-s", "read-only", "Reply with exactly: OK"], {
-        env: { ...env, CODEX_HOME: home }, encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
-      });
-    });
-    const t0 = Date.now();
-    const r = run();
-    const ms = Date.now() - t0;
-    const out = `${r.stdout || ""}\n${r.stderr || ""}`;
-    const model = (out.match(/^model:\s*(\S+)/m) || [])[1];
-    const effort = (out.match(/^reasoning effort:\s*(\S+)/m) || [])[1];
-    // Success = it actually ANSWERED. Exit code + ERROR lines both lie: codex exec exits 0 on an API
-    // 400 (ERROR line, no answer), and prints non-fatal ERROR telemetry (models_manager refresh
-    // timeout) on runs that answer fine. The probe prompt demands "OK", so require it in stdout.
-    const answered = /(^|\n)OK\s*(\n|$)/.test(r.stdout || "");
-    if (r.status === 0 && answered) return { name: "codex", display: "Codex", ok: true, note: `${model || "?"} @ ${effort || "?"} · ${(ms / 1000).toFixed(0)}s` };
-    const errLines = out.match(/ERROR.*$/gm) || [];
-    const err = errLines.at(-1) || out.trim().split("\n").at(-1) || "failed";
-    return { name: "codex", display: "Codex", ok: false, note: `${model ? `${model} @ ${effort} — ` : ""}${String(err).slice(0, 140)}` };
-  };
-
   const probeGrok = async () => {
-    // Same safety contract as production reviews (GROK_ARGS: plan mode, verbatim, no memory/subagents/
-    // web) + suppressed hooks — a probe outside it could write to the workspace while claiming "(plan)".
+    const refusal = grokPlatformRefusal(env, platform);
+    if (refusal) return { name: "grok", display: "Grok", ok: false, note: refusal };
+    // Same tool-free, isolated safety contract as production reviews.
     const run = grokImpl || (() => {
       // Same containment as real reviews: Seatbelt profile + GROK_HOME redirected into a per-run
       // private tmpdir (so ~/.grok stays read-only), auth read from the real read-only auth.json.
@@ -441,10 +464,10 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
       // Fail CLOSED: no private tmpdir → no containment; report unhealthy instead of probing unsandboxed.
       if (!tmpDir) return { status: 1, stderr: "grok sandbox tmpdir could not be created" };
       const auth = grokAuthPath(env);
-      const spec = grokSpawnSpec("Reply with exactly: OK", { tmpDir, ...(auth?.writable ? { authWrite: auth.path } : {}) });
+      const spec = grokSpawnSpec("Reply with exactly: OK", { platform, tmpDir, toolFree: true, ...(auth?.writable ? { authWrite: auth.path, authGateManaged: !auth.callerManaged } : {}) });
       try {
         return spawnSync(spec.cmd, spec.args, {
-          env: grokChildEnv(env, tmpDir), encoding: "utf8", timeout: HEALTH_CODEX_TIMEOUT_MS
+          cwd: tmpDir, env: grokChildEnv(env, tmpDir), encoding: "utf8", timeout: HEALTH_GROK_TIMEOUT_MS
         });
       } finally { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ } }
     });
@@ -452,18 +475,18 @@ export async function healthCommand({ all = false, env = process.env, fetchImpl,
     const r = run();
     const ms = Date.now() - t0;
     if (r.error?.code === "ENOENT") return { name: "grok", display: "Grok", ok: false, note: "grok CLI not found (curl -fsSL https://x.ai/cli/install.sh | bash)" };
-    if (r.status === 0 && /OK/.test(grokText(r.stdout))) return { name: "grok", display: "Grok", ok: true, note: `grok CLI (plan) · ${(ms / 1000).toFixed(1)}s` };
-    return { name: "grok", display: "Grok", ok: false, note: `${(r.stderr || r.stdout || "failed").trim().slice(0, 140)}` };
+    if (r.status === 0 && /OK/.test(grokText(r.stdout))) return { name: "grok", display: "Grok", ok: true, note: `grok CLI (tool-free) · ${(ms / 1000).toFixed(1)}s` };
+      return { name: "grok", display: "Grok", ok: false, note: redactProviderFailure(r.stderr || r.stdout || "failed", { secrets: configuredSecrets }).trim().slice(0, 140) };
   };
 
-  const results = await Promise.all(names.map((n) => (n === "codex" ? probeCodex() : n === "grok" ? probeGrok() : probeApi(n))));
+  const results = await Promise.all(names.map((name) => name === "grok" ? probeGrok() : probeApi(name)));
   const active = new Set(cfg.reviewers);
-  const lines = results.map((r) => `  ${r.ok ? "✓" : "✗"} ${r.display.padEnd(8)} ${active.has(r.name) ? "active " : "keyed  "} ${r.note}`);
+  const lines = results.map((r) => `  ${r.ok ? "✓" : "✗"} ${r.display.padEnd(8)} ${active.has(r.name) ? "active  " : "inactive"} ${r.note}`);
   const ok = results.filter((r) => active.has(r.name)).every((r) => r.ok);
   return {
     ok,
     results,
-    text: `⛩ bench health — live probes (${all ? "all keyed" : "active panel"}):\n${lines.join("\n")}\n${ok ? "All active reviewers healthy." : "ACTIVE reviewer failing — the panel will skip/fail-open on it."}`
+    text: `⛩ bench health — live probes (${all ? "all supported" : "active panel"}):\n${lines.join("\n")}\n${ok ? "All active reviewers healthy." : "ACTIVE reviewer failing — the panel will skip/fail-open on it."}`
   };
 }
 
@@ -503,14 +526,7 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceI
 // as an alias so the `spec-review` subcommand and existing tests keep working.
 export const specReviewCommand = runSpecReview;
 
-export function gateToggleCommand(ws, args, {
-  root,
-  env = process.env,
-  disableLegacyCodexWorkspaceImpl = disableLegacyCodexStopGateForWorkspace,
-  disableLegacyCodexGlobalImpl = disableLegacyCodexStopGateStates,
-  enableLegacyCodexWorkspaceImpl = enableLegacyCodexStopGateForWorkspace,
-  enableLegacyCodexGlobalImpl = enableLegacyCodexStopGateStates
-} = {}) {
+export function gateToggleCommand(ws, args, { root } = {}) {
   const sub = args[0]; // "off" or "on"
   const hasGlobal = args.slice(1).includes("--global");
   const scope = hasGlobal ? "global" : "workspace";
@@ -520,37 +536,13 @@ export function gateToggleCommand(ws, args, {
   if (disabled) {
     return `bench: disabled (${scope}). Gates will no-op until /bench:on.`;
   }
-  // Re-enable: derive the message from a fresh read so we never claim "enabled"
-  // while the OTHER scope's marker is still disabling the gates.
   const stillDisabled = isBenchDisabled(ws, { root });
-  // By DEFAULT peerBench COEXISTS with the Codex stop gate — both review every turn (Codex is A-grade;
-  // silently killing it on bench:on was a real downgrade). Only explicit single-gate mode
-  // (BENCH_SINGLE_GATE=1) makes peerBench the sole reviewer by disabling the Codex gate.
-  const singleGate = env.BENCH_SINGLE_GATE === "1" || env.BENCH_SINGLE_GATE === "true";
-  let legacyNote;
-  if (singleGate) {
-    const legacy = scope === "global"
-      ? disableLegacyCodexGlobalImpl()
-      : disableLegacyCodexWorkspaceImpl(ws);
-    const legacyChanged = typeof legacy?.changed === "number" ? legacy.changed > 0 : Boolean(legacy?.changed);
-    legacyNote = legacyChanged ? " Legacy Codex gate disabled." : "";
-  } else {
-    // Keep-both must actively RESTORE a gate that single-gate mode (or the pre-fix disable) turned
-    // off — merely skipping the disable left such workspaces silently Codex-less (caught by Grok).
-    const restored = scope === "global"
-      ? enableLegacyCodexGlobalImpl()
-      : enableLegacyCodexWorkspaceImpl(ws);
-    const n = typeof restored?.changed === "number" ? restored.changed : (restored?.changed ? 1 : 0);
-    legacyNote = n > 0
-      ? ` Codex gate RESTORED (${n} workspace${n === 1 ? "" : "s"}) — runs alongside peerBench.`
-      : " Codex gate kept — runs alongside peerBench.";
-  }
-  if (!stillDisabled) return `bench: enabled (${scope}).${legacyNote}`;
+  if (!stillDisabled) return `bench: enabled (${scope}).`;
   // The cleared scope didn't fully re-enable — name the remaining source honestly.
   if (scope === "workspace") {
-    return `bench: workspace re-enabled, but STILL DISABLED GLOBALLY — run /bench:on --global to fully re-enable.${legacyNote}`;
+    return "bench: workspace re-enabled, but STILL DISABLED GLOBALLY — run /bench:on --global to fully re-enable.";
   }
-  return `bench: global re-enabled, but STILL DISABLED in this WORKSPACE — run /bench:on to fully re-enable.${legacyNote}`;
+  return "bench: global re-enabled, but STILL DISABLED in this WORKSPACE — run /bench:on to fully re-enable.";
 }
 
 export function reviewersCommand(args) {
@@ -606,14 +598,10 @@ export function gradeCommand(args, { recordImpl = recordGrade } = {}) {
   if (recorded.length) process.stdout.write(`Graded ${traceId}: ${recorded.join(", ")}${note ? ` — ${note}` : ""}\n`);
 }
 
-// The four gates, keyed by event + matcher + hook file (mirror deploy-global-hooks.mjs).
-// matcher === undefined means the Stop hook MUST live in a matcher-less block.
+// Only the bounded advisory Stop hook is automatic. Native pre-push is installed explicitly per
+// repository and is intentionally absent from agent tool-hook manifests.
 const SETUP_GATES = [
-  { event: "PreToolUse", matcher: "ExitPlanMode", file: "plan-review.mjs" },
-  { event: "PostToolUse", matcher: "Write|Edit", file: "plan-file-review.mjs" },
-  { event: "PreToolUse", matcher: "Bash", file: "pre-push-review.mjs" },
-  { event: "Stop", matcher: undefined, file: "stop-review.mjs" },
-  { event: "Stop", matcher: undefined, file: "deep-review-runner.mjs" }
+  { event: "Stop", matcher: undefined, file: "stop-review.mjs" }
 ];
 
 const CODEX_PROMPTS = [

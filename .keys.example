@@ -3,30 +3,10 @@
 #
 # .keys is git-ignored. Do not put real credentials in this example file.
 
-# Default active reviewers are Kimi + GLM. Qwen and MiMo are available when selected
-# with /bench:reviewers (Claude) or /prompts:bench-reviewers (Codex).
-KIMI_API_KEY=
-GLM_API_KEY=
-QWEN_API_KEY=
+# MiMo is the only API-backed reviewer. Grok uses the local CLI.
 MIMO_API_KEY=
 
 # Optional provider overrides. Leave commented to use peerBench defaults.
-# KIMI_BASE_URL=https://api.kimi.com/coding/v1
-# KIMI_MODEL=kimi-k2.6
-# KIMI_TEMPERATURE=0.6
-# KIMI_THINKING=disabled
-#
-# GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
-# GLM_MODEL=glm-5.2
-# GLM_TEMPERATURE=0.6
-# GLM_THINKING=disabled
-#
-# QWEN_BASE_URL=https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
-# QWEN_MODEL=qwen3.7-max
-# QWEN_TEMPERATURE=0.6
-# QWEN_THINKING=disabled
-#
 # MIMO_BASE_URL=https://token-plan-sgp.xiaomimimo.com/v1
 # MIMO_MODEL=mimo-v2.5-pro
-# MIMO_TEMPERATURE=0
 # MIMO_THINKING=

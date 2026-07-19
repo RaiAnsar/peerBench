@@ -1,6 +1,6 @@
 ---
 description: Show or set peerBench active reviewers.
-argument-hint: '[kimi|mimo|codex|glm|qwen ...]'
+argument-hint: '[grok|mimo ...]'
 ---
 
 Run this command from the current workspace:

@@ -1,22 +1,18 @@
 // global-hooks/concurrency-limit.mjs
-// Cross-process counting semaphore. peerBench fires GLM from many independent gate processes (Stop
-// hooks across projects, hunts, etc.); without coordination they burst past z.ai's ~3-concurrent-per-key
-// cap and get shed as 429/529. OpenCode never hits that cap because it is implicitly serialized — one
-// in-flight request per session. This makes peerBench behave the same way: only `slots` calls run at
-// once across ALL processes; the rest wait for a free slot instead of erroring.
+// Cross-process counting semaphore for bounded MiMo/manual calls. Only `slots` calls run at once
+// across processes; the rest wait for a free slot instead of creating a quota-burning burst.
 //
 // Mechanism: atomic mkdir as the lock primitive (POSIX-atomic, works across processes). One dir per
 // slot. A holder that crashes leaves a stale slot; the next acquirer steals it once it is older than
-// staleMs. Fails OPEN — if no slot frees within timeoutMs we run anyway rather than block a review
-// forever (worst case is a 429 the caller already retries).
+// staleMs. Fails OPEN — if no slot frees within timeoutMs the caller gets the provider's own bounded
+// failure/cooldown behavior rather than waiting forever.
 //
-// `fn` receives the acquired slot index (0..slots-1, or null when the limiter is disabled / failed
-// open). Callers map the slot to a specific API key (key = slotIndex ÷ perKeyCap) so the PER-KEY cap
-// is enforced, not just a global one — z.ai sheds per key, so a global cap with random key choice
-// still overloads one key.
+// `fn` receives the acquired slot index (0..slots-1, or null when disabled / failed open). Callers
+// may map a slot to a key in a configured MiMo key pool.
 import fs from "node:fs";
 import path from "node:path";
 import { sharedRoot } from "./config-store.mjs";
+import { isMainModule } from "./is-main.mjs";
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -47,7 +43,7 @@ export async function withConcurrencyLimit(opts, fn) {
 }
 
 // Self-check: assert the limiter never lets more than `slots` run at once. Run: node concurrency-limit.mjs
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   const os = await import("node:os");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "conclim-"));
   let inFlight = 0, peak = 0;

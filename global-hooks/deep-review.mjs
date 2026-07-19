@@ -1,8 +1,7 @@
 // global-hooks/deep-review.mjs
-// Shared PURE helpers for the deep spec/plan/push review — severity parsing, the (path,content)
-// dedup key, result summarization, and the rewake threshold. The delivery mechanism (queue +
-// asyncRewake Stop runner) lives in deep-queue.mjs + deep-review-runner.mjs; the old detached
-// deep-result file channel + debounce markers were retired (they could never wake an idle agent).
+// Shared pure helpers for explicit spec/range reviews and hunts: severity parsing, content keys,
+// result summarization, and the manual command's blocking threshold. The former async Stop queue,
+// detached runner, deep-result file channel, and debounce markers were removed in 0.4.
 import { createHash } from "node:crypto";
 
 // Severity ladder — higher rank is more severe. Unknown/none → 0.

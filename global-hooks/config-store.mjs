@@ -5,57 +5,40 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-// SINGLE SOURCE OF TRUTH for API-backed reviewers. Adding or swapping a model is ONE entry here
-// (+ its <NAME>_API_KEY in .keys, then `node scripts/load-keys.mjs`). Everything downstream —
-// KNOWN_REVIEWERS, display names, the keys loaded by load-keys, the provider config — is DERIVED
-// from this object, so there are no parallel lists to keep in sync. Disable a model by dropping it
-// from the active set (companion.json `reviewers` / `/bench:reviewers`); its config stays here.
+import { redactProviderFailure, secretHeaderValues } from "./provider-error-redaction.mjs";
+
+// Deliberately small reviewer registry. Expired plans do not remain selectable and cannot be
+// resurrected by a stale companion.json. Grok is CLI-backed; MiMo is the only API-backed reviewer.
 const DEFAULTS = {
-  kimi: { displayName: "Kimi", baseURL: "https://api.kimi.com/coding/v1", model: "kimi-k2.6", keyEnv: "KIMI_API_KEY",
-          temperature: 0.6, thinking: "disabled", thinkingEnv: "KIMI_THINKING",
-          headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" },
-          timeoutMs: 300_000 },  // 5 min
-  // MiMo (Xiaomi) — currently DISABLED (token plan exhausted) but kept wired so it's a one-word
-  // re-add (`/bench:reviewers ... mimo`). Earned its slot: uniquely caught secret/PII/deploy-hygiene issues.
   mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
-          headers: {}, timeoutMs: 180_000 },  // 3 min
-  // GLM (z.ai coding plan) — OpenAI-compatible /chat/completions. z.ai sheds 429/1305 above ~3
-  // concurrent PER KEY; measured clean at 2-3, but slot release/re-acquire briefly overlaps under
-  // continuous churn, so we cap at 2/key for margin (bursts queue instead of 429). Override per key
-  // with GLM_CONCURRENCY_PER_KEY or set the total directly with GLM_CONCURRENCY.
-  glm: { displayName: "GLM", baseURL: "https://api.z.ai/api/coding/paas/v4", model: "glm-5.2", keyEnv: "GLM_API_KEY",
-         temperature: 0.6, thinking: "disabled", thinkingEnv: "GLM_THINKING",
-         concurrencyPerKey: 2, headers: {}, timeoutMs: 300_000 },  // 5 min
-  // Qwen (Alibaba MaaS token-plan, ap-southeast-1) — OpenAI-compatible /compatible-mode (NOT the
-  // /apps/anthropic endpoint; our review-client speaks OpenAI /chat/completions). Override
-  // QWEN_BASE_URL / QWEN_MODEL in .keys if your key targets a different plan/workspace or model id.
-  qwen: { displayName: "Qwen", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", model: "qwen3.7-max", keyEnv: "QWEN_API_KEY",
-          temperature: 0.6, thinking: "disabled", thinkingEnv: "QWEN_THINKING",
-          headers: {}, timeoutMs: 300_000 },  // 5 min
-  // MiniMax (flat coding plan, sk-cp- key). OpenAI-compatible /chat/completions works as a drop-in.
-  // M3 is a reasoning model whose thinking can't be disabled and leaks inline as <think>…</think> in
-  // content — review-client strips it. Flat plan → thinking tokens are free (better reviews, no cost).
-  // Tested clean at 6 concurrent, so no per-key concurrency cap needed. temperature 1.0 per MiniMax's
-  // recommended sampling for M-series reasoning models.
-  minimax: { displayName: "MiniMax", baseURL: "https://api.minimax.io/v1", model: "MiniMax-M3", keyEnv: "MINIMAX_API_KEY",
-             temperature: 1.0, thinking: null, thinkingEnv: "MINIMAX_THINKING",
-             headers: {}, timeoutMs: 300_000 }  // 5 min
+          headers: {}, timeoutMs: 45_000 }
 };
-// CLI-backed reviewers have no API-key config, so they live outside DEFAULTS:
-//  - codex shells out to the codex-plugin-cc companion (ChatGPT plan billing).
-//  - grok shells out to the local Grok Build CLI (`grok`, installed via x.ai/cli/install.sh) —
-//    Grok-plan billing, no metered API key. Runs read-only via --permission-mode plan.
-const CODEX = "codex";
 const GROK = "grok";
-export const PROVIDER_NAMES = Object.keys(DEFAULTS);                 // API-backed providers (for load-keys)
-export const KNOWN_REVIEWERS = [...PROVIDER_NAMES, CODEX, GROK];
-const DISPLAY = { ...Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => [k, v.displayName || k])), [CODEX]: "Codex", [GROK]: "Grok" };
+export const PROVIDER_NAMES = Object.keys(DEFAULTS);
+export const KNOWN_REVIEWERS = [GROK, ...PROVIDER_NAMES];
+const DISPLAY = { grok: "Grok", mimo: "MiMo" };
 export function displayName(name) { return DISPLAY[name] || name; }
-const DEFAULT_REVIEWERS = ["kimi", "glm"];   // fallback only (mimo disabled); the active set lives in companion.json
+const DEFAULT_REVIEWERS = ["grok", "mimo"];
 export function sharedRoot() {
   return process.env.BENCH_ROOT
     || path.join(os.homedir(), ".claude", "plugins", "data", "bench-shared");
+}
+
+export function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
+export function writePrivateFileAtomic(file, content) {
+  ensurePrivateDir(path.dirname(file));
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
+  return file;
 }
 // The canonical per-workspace KEY (`<slug>-<hash>`) — the ownership identity of a workspace's
 // state. Slug AND hash both come from the CANONICAL path, so a workspace reached via a
@@ -98,28 +81,121 @@ export function sessionKeyFromInput(input = {}, env = process.env) {
   );
 }
 
-function readFileConfig() { try { return JSON.parse(fs.readFileSync(path.join(sharedRoot(), "companion.json"), "utf8")); } catch { return {}; } }
+function readFileConfig(root = sharedRoot()) { try { return JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8")); } catch { return {}; } }
 
-function truthy(value) {
-  const raw = String(value ?? "").trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+const SECRET_ENV_NAME = /(?:^|_)(?:api_?key|access_?token|refresh_?token|authorization|auth|token|secret|password)$/i;
+const SECRET_FIELD_NAME = /^(?:api_?key|apiKeys|access_?token|refresh_?token|authorization|auth|token|secret|password)$/i;
+
+function addSecret(out, value, { commaSeparated = false } = {}) {
+  if (typeof value !== "string" || !value) return;
+  out.add(value);
+  if (commaSeparated) for (const part of value.split(",").map((item) => item.trim()).filter(Boolean)) out.add(part);
+  try {
+    const visit = (node) => {
+      if (!node || typeof node !== "object") return;
+      for (const [key, child] of Object.entries(node)) {
+        if (SECRET_FIELD_NAME.test(key)) {
+          if (typeof child === "string") addSecret(out, child);
+          else if (Array.isArray(child)) for (const entry of child) addSecret(out, entry);
+        }
+        if (child && typeof child === "object") visit(child);
+      }
+    };
+    visit(JSON.parse(value));
+  } catch { /* scalar credential */ }
+}
+
+export function configuredProviderSecrets({ env = process.env, root = sharedRoot() } = {}) {
+  const values = new Set();
+  const file = readFileConfig(root);
+  for (const [name, defaults] of Object.entries(DEFAULTS)) {
+    addSecret(values, env?.[defaults.keyEnv], { commaSeparated: true });
+    const provider = file.providers?.[name] || {};
+    addSecret(values, provider.apiKey);
+    for (const key of Array.isArray(provider.apiKeys) ? provider.apiKeys : []) addSecret(values, key);
+    for (const header of secretHeaderValues(provider.headers)) addSecret(values, header);
+  }
+  for (const [name, value] of Object.entries(env || {})) {
+    if (SECRET_ENV_NAME.test(name)) addSecret(values, value, { commaSeparated: /API_?KEY$/i.test(name) });
+  }
+  return [...values];
 }
 
 // Persist the active reviewer selection to the env-independent companion.json (atomic).
 export function setReviewers(list, { root = sharedRoot() } = {}) {
   const reviewers = [...new Set((Array.isArray(list) ? list : []).filter((n) => KNOWN_REVIEWERS.includes(n)))];
   if (!reviewers.length) throw new Error(`no valid reviewers in [${list}]; known: ${KNOWN_REVIEWERS.join(", ")}`);
-  fs.mkdirSync(root, { recursive: true });
+  ensurePrivateDir(root);
   const file = path.join(root, "companion.json");
   let cur = {}; try { cur = JSON.parse(fs.readFileSync(file, "utf8")); } catch { cur = {}; }
   cur.reviewers = reviewers;
-  const tmp = path.join(root, `companion.json.tmp.${process.pid}`);
-  fs.writeFileSync(tmp, `${JSON.stringify(cur, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  writePrivateFileAtomic(file, `${JSON.stringify(cur, null, 2)}\n`);
   return reviewers;
 }
 const GLOBAL_DISABLE = (root) => path.join(root || sharedRoot(), "disabled-global");
 const WS_DISABLE = (ws) => path.join(workspaceStateDir(ws), "disabled");
+
+const COOLDOWNS = (root) => path.join(root || sharedRoot(), "reviewer-cooldowns.json");
+const COOLDOWN_TTL_MS = {
+  quota: 24 * 60 * 60_000,
+  auth: 24 * 60 * 60_000,
+  rate: 15 * 60_000,
+  timeout: 5 * 60_000,
+  network: 2 * 60_000
+};
+
+function readCooldownMap(root) {
+  try { return JSON.parse(fs.readFileSync(COOLDOWNS(root), "utf8")) || {}; } catch { return {}; }
+}
+
+function sanitizedCooldownMap(root, env, secrets = []) {
+  const exact = [...configuredProviderSecrets({ root: root || sharedRoot(), env }), ...(Array.isArray(secrets) ? secrets : [secrets])];
+  const source = readCooldownMap(root);
+  const map = {};
+  let changed = false;
+  for (const [name, entry] of Object.entries(source && typeof source === "object" ? source : {})) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const detail = redactProviderFailure(entry.detail || "", { secrets: exact });
+    map[name] = { ...entry, detail };
+    if (detail !== entry.detail) changed = true;
+  }
+  return { map, exact, changed };
+}
+
+function persistCooldownMap(map, root) {
+  writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`);
+}
+
+export function readReviewerCooldown(name, { root, now = Date.now(), env = process.env, secrets = [] } = {}) {
+  const safe = sanitizedCooldownMap(root, env, secrets);
+  if (safe.changed) try { persistCooldownMap(safe.map, root); } catch { /* best effort migration */ }
+  const entry = safe.map[name];
+  return entry && Number(entry.until) > now ? entry : null;
+}
+
+export function recordReviewerCooldown(name, kind, detail, { root, now = Date.now(), ttlMs, retryAfterMs, env = process.env, secrets = [] } = {}) {
+  const safe = sanitizedCooldownMap(root, env, secrets);
+  const ttl = Math.max(1, Number(retryAfterMs) || Number(ttlMs) || COOLDOWN_TTL_MS[kind] || COOLDOWN_TTL_MS.rate);
+  safe.map[name] = {
+    kind,
+    detail: redactProviderFailure(detail, { secrets: safe.exact }).slice(0, 200),
+    until: now + ttl,
+    ts: now
+  };
+  for (const [key, value] of Object.entries(safe.map)) if (!(Number(value?.until) > now)) delete safe.map[key];
+  try { persistCooldownMap(safe.map, root); } catch { /* best effort */ }
+  return safe.map[name];
+}
+
+export function clearReviewerCooldowns({ root, name } = {}) {
+  if (!name) {
+    try { fs.rmSync(COOLDOWNS(root), { force: true }); } catch { /* already absent */ }
+    return;
+  }
+  const map = readCooldownMap(root);
+  delete map[name];
+  try { persistCooldownMap(map, root); } catch { /* best effort */ }
+}
 
 // reviewed-head marker: the last HEAD the stop gate reviewed up to. Shared by the stop gate
 // (advances it on a clean ALLOW; diffs HEAD against it) AND the pre-push gate (bootstraps it on
@@ -146,7 +222,7 @@ export function isBenchDisabled(ws, { root } = {}) {
 // scope: "global" writes/removes the global marker; otherwise the workspace marker.
 export function setBenchDisabled(ws, disabled, { scope = "workspace", root } = {}) {
   const file = scope === "global" ? GLOBAL_DISABLE(root) : WS_DISABLE(ws);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  ensurePrivateDir(path.dirname(file));
   if (disabled) fs.writeFileSync(file, `disabled ${scope}\n`);
   else { try { fs.rmSync(file); } catch { /* already gone */ } }
   return { scope, disabled, file };
@@ -168,7 +244,7 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
     const apiKeys = (envKey ? envKey.split(",").map((s) => s.trim()).filter(Boolean) : null)
       || (Array.isArray(f.apiKeys) && f.apiKeys.length ? f.apiKeys : null)
       || (f.apiKey ? [f.apiKey] : []);
-    // Total in-flight cap = keys × per-key cap (env GLM_CONCURRENCY overrides). 0 → unlimited.
+    // Total in-flight cap = keys × per-key cap. Zero means unlimited.
     const perKey = Number(env[`${name.toUpperCase()}_CONCURRENCY_PER_KEY`]) || f.concurrencyPerKey || d.concurrencyPerKey || 0;
     const concurrency = Number(env[`${name.toUpperCase()}_CONCURRENCY`]) || (perKey ? Math.max(1, apiKeys.length) * perKey : 0);
     providers[name] = {
@@ -187,8 +263,6 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
   const sel = Array.isArray(reviewersOverride) && reviewersOverride.length
     ? reviewersOverride
     : (Array.isArray(file.reviewers) && file.reviewers.length ? file.reviewers : DEFAULT_REVIEWERS);
-  const suppressCodexReviewer = truthy(env.BENCH_SUPPRESS_CODEX_REVIEWER) || truthy(env.PEERBENCH_SUPPRESS_CODEX_REVIEWER);
-  const reviewers = [...new Set(sel.filter((n) => KNOWN_REVIEWERS.includes(n)))]
-    .filter((n) => !(suppressCodexReviewer && n === CODEX));
+  const reviewers = [...new Set(sel.filter((n) => KNOWN_REVIEWERS.includes(n)))];
   return { reviewers: reviewers.length ? reviewers : DEFAULT_REVIEWERS, providers };
 }

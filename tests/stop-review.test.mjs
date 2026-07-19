@@ -1,882 +1,266 @@
-// tests/stop-review.test.mjs
-// Tests for global-hooks/stop-review.mjs.
-// All reviewer calls are injected so NO real API or Codex call happens.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-// Set BENCH_ROOT before importing any module that uses config-store.
-const TEMP_GCR = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-"));
-process.env.BENCH_ROOT = TEMP_GCR;
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-stop-root-"));
+process.env.BENCH_ROOT = ROOT;
 
-import { runMain, buildPrompt, resolveReviewBase, readReviewedHead, writeReviewedHead, readReviewedWorktree } from "../global-hooks/stop-review.mjs";
-import { normalizeSessionId, setBenchDisabled, workspaceStateDir } from "../global-hooks/config-store.mjs";
+import {
+  MAX_STOP_EVIDENCE_BYTES,
+  STOP_TIMEOUT_MS,
+  buildPrompt,
+  readReviewedWorktree,
+  runMain
+} from "../global-hooks/stop-review.mjs";
+import { setBenchDisabled } from "../global-hooks/config-store.mjs";
 
-const ROOT = path.join(import.meta.dirname, "..");
-const HOOK = path.join(ROOT, "global-hooks", "stop-review.mjs");
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Create a temp git repo. withChange=true writes an untracked file so the
- *  diff/untracked check sees a change and does not early-return. */
-function freshRepo({ withChange = true } = {}) {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "sr-ws-"));
+function freshRepo({ dirty = true } = {}) {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "bench-stop-ws-"));
   execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
-  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "init"], { cwd: ws });
-  if (withChange) {
-    fs.writeFileSync(path.join(ws, "changed.js"), "export const x = 1;\n");
-  }
+  fs.writeFileSync(path.join(ws, "tracked.js"), "export const value = 0;\n");
+  execFileSync("git", ["add", "tracked.js"], { cwd: ws });
+  execFileSync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "initial"], { cwd: ws });
+  if (dirty) fs.writeFileSync(path.join(ws, "tracked.js"), "export const value = 1;\n");
   return ws;
 }
 
-/** Build a fake reviewer that always returns the given verdict. */
-function fakeReviewer(name, verdict, firstLine) {
+function emitter() {
+  const payloads = [];
   return {
-    name,
-    async run() {
-      return { name, verdict, firstLine: firstLine ?? `${verdict}: test`, raw: `${verdict}: test` };
+    payloads,
+    hasEmitted: () => payloads.length > 0,
+    emit(payload) { payloads.push(payload); return true; }
+  };
+}
+
+function reviewer(verdict = "ALLOW", calls = []) {
+  return {
+    name: "mimo",
+    reviewIdentity: { kind: "api", model: "fake-mimo" },
+    async run(args) {
+      calls.push(args);
+      return {
+        name: "MiMo",
+        verdict,
+        firstLine: `${verdict}: fake test verdict`,
+        raw: `${verdict}: fake test verdict`
+      };
     }
   };
 }
 
-/** Build a fake reviewer that always returns an error (simulates API failure). */
-function fakeErrorReviewer(name) {
-  return {
-    name,
-    async run() {
-      return { name, error: "injected test error" };
-    }
-  };
-}
-
-/** Fake resolveReviewers factory that returns the given list of reviewer stubs. */
-function stubResolveReviewers(reviewerList) {
-  return () => reviewerList;
-}
-
-/** Capture stdout lines written by emit() in runMain. */
-function captureEmit(fn) {
-  const lines = [];
-  const orig = process.stdout.write.bind(process.stdout);
-  process.stdout.write = (chunk, ...rest) => {
-    if (typeof chunk === "string") lines.push(chunk);
-    return orig(chunk, ...rest);
-  };
-  const restore = () => { process.stdout.write = orig; };
-  return { lines, restore };
-}
-
-// ---------------------------------------------------------------------------
-// Test: no diff → no-op (exit 0, no trace written)
-// ---------------------------------------------------------------------------
-
-test("no diff → runMain returns early without trace or emit", async () => {
-  const ws = freshRepo({ withChange: false });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-nd-"));
-  process.env.BENCH_ROOT = root;
-
-  let traceWritten = false;
-  const writeTraceImpl = () => { traceWritten = true; };
-  let reviewersCalled = false;
-  const resolveReviewersImpl = () => {
-    reviewersCalled = true;
-    return [fakeReviewer("Kimi", "ALLOW")];
-  };
-
-  const { lines, restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl,
-      writeTraceImpl,
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws }
-    });
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.equal(reviewersCalled, false, "reviewers should NOT be called on a no-diff turn");
-  assert.equal(traceWritten, false, "no trace should be written on a no-diff turn");
-  assert.equal(lines.length, 0, "no output should be emitted on a no-diff turn");
+test("clean worktree performs no reviewer or trace work", async () => {
+  const ws = freshRepo({ dirty: false });
+  let resolved = false;
+  let traced = false;
+  const out = emitter();
+  await runMain({
+    input: { cwd: ws },
+    emitter: out,
+    isBenchDisabledImpl: () => false,
+    resolveReviewersImpl: () => { resolved = true; return [reviewer()]; },
+    writeTraceImpl: () => { traced = true; }
+  });
+  assert.equal(resolved, false);
+  assert.equal(traced, false);
+  assert.deepEqual(out.payloads, []);
 });
 
-// ---------------------------------------------------------------------------
-// Test: reviews regardless of the SHARED stop_hook_active flag (must not be
-// starved when another Stop hook — e.g. the codex gate — is looping).
-// ---------------------------------------------------------------------------
-
-test("reviews even when stop_hook_active=true (decoupled from the shared Stop flag)", async () => {
-  const ws = freshRepo({ withChange: true });
-  let called = false;
-  const resolveReviewersImpl = () => { called = true; return [fakeReviewer("Kimi", "ALLOW")]; };
+test("an unborn repository reviews the staged first commit", async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "bench-stop-unborn-"));
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
+  fs.writeFileSync(path.join(ws, "first.js"), "export const first = true;\n");
+  execFileSync("git", ["add", "first.js"], { cwd: ws });
+  const calls = [];
 
   await runMain({
-    resolveReviewersImpl,
-    writeTraceImpl: () => {},
+    input: { cwd: ws },
+    emitter: emitter(),
     isBenchDisabledImpl: () => false,
-    env: process.env,
-    input: { cwd: ws, stop_hook_active: true }
+    resolveReviewersImpl: () => [reviewer("ALLOW", calls)],
+    writeTraceImpl: () => {}
   });
 
-  assert.equal(called, true, "must review even when stop_hook_active is set — the shared flag must not starve this gate");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].user, /<staged_diff>[\s\S]*\+export const first = true;/);
 });
 
-// ---------------------------------------------------------------------------
-// Test: own consecutive-block cap → allows without reviewing after MAX_STOP_LOOPS
-// ---------------------------------------------------------------------------
+test("global disable marker causes Stop to do no work", async () => {
+  const ws = freshRepo();
+  setBenchDisabled(ws, true, { scope: "global", root: ROOT });
+  let resolved = false;
+  const out = emitter();
+  try {
+    await runMain({
+      input: { cwd: ws },
+      emitter: out,
+      resolveReviewersImpl: () => { resolved = true; return [reviewer()]; },
+      writeTraceImpl: () => { throw new Error("trace must not run"); }
+    });
+  } finally {
+    setBenchDisabled(ws, false, { scope: "global", root: ROOT });
+  }
+  assert.equal(resolved, false);
+  assert.deepEqual(out.payloads, []);
+});
 
-test("caps its own consecutive blocks → allows without reviewing once the cap is hit", async () => {
-  const ws = freshRepo({ withChange: true });
-  fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
-  fs.writeFileSync(path.join(workspaceStateDir(ws), "stop-loop"), JSON.stringify({ count: 4, ts: Date.now() }));
-
-  let called = false;
-  const resolveReviewersImpl = () => { called = true; return [fakeReviewer("Kimi", "BLOCK")]; };
-
+test("Stop explicitly resolves only MiMo and passes a 15-second timeout", async () => {
+  const ws = freshRepo();
+  const calls = [];
+  let resolverArgs;
+  let trace;
   await runMain({
-    resolveReviewersImpl,
-    writeTraceImpl: () => {},
+    input: { cwd: ws, session_id: "fake-session" },
+    emitter: emitter(),
     isBenchDisabledImpl: () => false,
-    env: process.env,
-    input: { cwd: ws, stop_hook_active: false }
+    resolveReviewersImpl: (args) => { resolverArgs = args; return [reviewer("ALLOW", calls)]; },
+    writeTraceImpl: (_workspace, value) => { trace = value; },
+    env: { MIMO_API_KEY: "fake-key" }
   });
-
-  assert.equal(called, false, "after MAX_STOP_LOOPS consecutive blocks the gate allows without reviewing (loop broken)");
+  assert.deepEqual(resolverArgs.reviewers, ["mimo"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].timeoutMs, STOP_TIMEOUT_MS);
+  assert.equal(STOP_TIMEOUT_MS, 15_000);
+  assert.equal(trace.gate, "stop");
+  assert.equal(trace.reviewers[0].verdict, "ALLOW");
 });
 
-test("same-project stop-loop cap is session-scoped", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-session-loop-"));
-  process.env.BENCH_ROOT = root;
-  const sessionA = normalizeSessionId("chat-A");
-  fs.mkdirSync(workspaceStateDir(ws), { recursive: true });
-  fs.writeFileSync(path.join(workspaceStateDir(ws), `stop-loop.${sessionA}`), JSON.stringify({ count: 4, ts: Date.now() }));
-
-  let calledB = false;
-  let calledA = false;
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: () => { calledB = true; return [fakeReviewer("Kimi", "ALLOW")]; },
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws, session_id: "chat-B" }
-    });
-    await runMain({
-      resolveReviewersImpl: () => { calledA = true; return [fakeReviewer("Kimi", "ALLOW")]; },
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws, session_id: "chat-A" }
-    });
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.equal(calledB, true, "chat B must not inherit chat A's exhausted stop-loop counter");
-  assert.equal(calledA, false, "chat A still honors its own exhausted stop-loop counter");
+test("BLOCK is advisory, returns normally, and the identical snapshot is not reviewed again", async () => {
+  const ws = freshRepo();
+  const calls = [];
+  const out = emitter();
+  const options = {
+    input: { cwd: ws, last_assistant_message: "made a change" },
+    emitter: out,
+    isBenchDisabledImpl: () => false,
+    resolveReviewersImpl: () => [reviewer("BLOCK", calls)],
+    writeTraceImpl: () => {}
+  };
+  const first = await runMain(options);
+  const marker = readReviewedWorktree(ws);
+  const second = await runMain(options);
+  assert.equal(first, undefined);
+  assert.equal(second, undefined);
+  assert.equal(calls.length, 1, "a BLOCK must still mark identical evidence as reviewed");
+  assert.ok(marker);
+  assert.equal(out.payloads.length, 1);
+  assert.match(out.payloads[0].systemMessage, /advisory/i);
+  assert.match(out.payloads[0].systemMessage, /does not block the turn/i);
 });
 
-// ---------------------------------------------------------------------------
-// Test: disabled workspace → no-op (exit 0)
-// ---------------------------------------------------------------------------
-
-test("disabled workspace → runMain exits 0 without calling reviewers", async () => {
-  const ws = freshRepo({ withChange: true });
-
-  // setBenchDisabled for workspace scope writes to workspaceStateDir(ws) which
-  // uses sharedRoot() → BENCH_ROOT env. We write with TEMP_GCR active
-  // (it was set at module load time) so the subprocess must also see TEMP_GCR.
-  setBenchDisabled(ws, true, { scope: "workspace" });
-
-  try {
-    const result = spawnSync(process.execPath, [HOOK], {
-      input: JSON.stringify({ cwd: ws }),
-      encoding: "utf8",
-      env: { ...process.env, BENCH_ROOT: TEMP_GCR }
-    });
-
-    assert.equal(result.status, 0, "exit code should be 0 when bench is disabled");
-    assert.equal(result.stdout.trim(), "", "no output expected when bench disabled");
-    assert.equal(result.stderr.trim(), "", "no stderr expected when bench disabled");
-  } finally {
-    // Re-enable so this ws doesn't affect other tests sharing TEMP_GCR.
-    setBenchDisabled(ws, false, { scope: "workspace" });
-  }
+test("changing bytes after an advisory triggers one fresh review", async () => {
+  const ws = freshRepo();
+  const calls = [];
+  const options = {
+    input: { cwd: ws },
+    emitter: emitter(),
+    isBenchDisabledImpl: () => false,
+    resolveReviewersImpl: () => [reviewer("BLOCK", calls)],
+    writeTraceImpl: () => {}
+  };
+  await runMain(options);
+  fs.appendFileSync(path.join(ws, "tracked.js"), "export const other = 2;\n");
+  await runMain(options);
+  assert.equal(calls.length, 2);
 });
 
-// ---------------------------------------------------------------------------
-// Test: all ALLOW → systemMessage emitted, exit 0, trace with gate:"stop"
-// ---------------------------------------------------------------------------
-
-test("all ALLOW → systemMessage with ALLOW, trace gate=stop, exit 0", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-al-"));
-  process.env.BENCH_ROOT = root;
-
-  let traceRecord = null;
-  const writeTraceImpl = (_ws, trace) => { traceRecord = trace; };
-
-  const { lines, restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: stubResolveReviewers([
-        fakeReviewer("Kimi", "ALLOW", "ALLOW: looks fine"),
-        fakeReviewer("MiMo", "ALLOW", "ALLOW: no issues")
-      ]),
-      writeTraceImpl,
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws, session_id: "chat-A", last_assistant_message: "wrote some code" }
-    });
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.ok(lines.length > 0, "should emit at least one line");
-  const parsed = JSON.parse(lines[0]);
-  assert.ok(typeof parsed.systemMessage === "string", "systemMessage should be a string");
-  assert.match(parsed.systemMessage, /bench stop.*ALLOW/i, "systemMessage should mention bench stop and ALLOW");
-
-  assert.ok(traceRecord !== null, "trace should be written");
-  assert.equal(traceRecord.gate, "stop", "trace gate should be 'stop'");
-  assert.equal(traceRecord.sessionKey, normalizeSessionId("chat-A"), "trace is stamped with the hook session");
-  assert.ok(traceRecord.ws, "trace should include ws");
-  assert.ok(Array.isArray(traceRecord.reviewers), "trace.reviewers should be an array");
-});
-
-test("dirty ALLOW snapshot is reviewed once, then skipped until the worktree changes", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-once-"));
-  process.env.BENCH_ROOT = root;
-
+test("evidence above 64 KiB calls no reviewer and is deduped", async () => {
+  const ws = freshRepo({ dirty: false });
+  fs.writeFileSync(path.join(ws, "tracked.js"), `export const huge = "${"x".repeat(70 * 1024)}";\n`);
   let calls = 0;
-  let traces = 0;
-  const reviewer = {
-    name: "Kimi",
-    async run() {
-      calls += 1;
-      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
-    }
-  };
-  const opts = {
-    resolveReviewersImpl: () => [reviewer],
-    writeTraceImpl: () => { traces += 1; },
+  const out = emitter();
+  const options = {
+    input: { cwd: ws },
+    emitter: out,
     isBenchDisabledImpl: () => false,
-    env: process.env,
-    input: { cwd: ws, last_assistant_message: "wrote code" }
+    resolveReviewersImpl: () => [{
+      name: "mimo",
+      reviewIdentity: { kind: "api", model: "fake-mimo" },
+      async run() { calls += 1; return { name: "MiMo", verdict: "ALLOW" }; }
+    }],
+    writeTraceImpl: () => {}
   };
-
-  let marker = null;
-  const { lines, restore } = captureEmit(() => {});
-  try {
-    await runMain(opts);
-    await runMain(opts);
-    marker = readReviewedWorktree(ws);
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.equal(calls, 1, "the identical dirty snapshot must not be re-reviewed on the next Stop");
-  assert.equal(traces, 1, "the identical dirty snapshot must not write a second trace");
-  assert.equal(lines.length, 1, "only the first review should emit an ALLOW message");
-  assert.ok(marker, "ALLOW should persist a reviewed-worktree fingerprint");
+  await runMain(options);
+  await runMain(options);
+  assert.equal(MAX_STOP_EVIDENCE_BYTES, 64 * 1024);
+  assert.equal(calls, 0);
+  assert.equal(out.payloads.length, 1);
+  assert.match(out.payloads[0].systemMessage, /UNREVIEWED/);
+  assert.match(out.payloads[0].systemMessage, /65536/);
 });
 
-test("dirty ALLOW snapshot is reviewed again after the worktree content changes", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-change-"));
-  process.env.BENCH_ROOT = root;
+test("missing MiMo is advisory and the snapshot is deduped", async () => {
+  const ws = freshRepo();
+  const out = emitter();
+  let resolves = 0;
+  const options = {
+    input: { cwd: ws },
+    emitter: out,
+    isBenchDisabledImpl: () => false,
+    resolveReviewersImpl: () => { resolves += 1; return []; },
+    writeTraceImpl: () => {}
+  };
+  await runMain(options);
+  await runMain(options);
+  assert.equal(resolves, 2, "resolution happens before identity-aware dedupe when no reviewer exists");
+  assert.equal(out.payloads.length, 1);
+  assert.match(out.payloads[0].systemMessage, /MiMo is not configured/);
+  assert.match(out.payloads[0].systemMessage, /turn allowed/);
+});
 
+test("reviewer errors fail open and still mark the snapshot reviewed", async () => {
+  const ws = freshRepo();
   let calls = 0;
-  const reviewer = {
-    name: "Kimi",
-    async run() {
-      calls += 1;
-      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
-    }
+  const out = emitter();
+  const fake = {
+    name: "mimo",
+    reviewIdentity: { kind: "api", model: "fake-mimo" },
+    async run() { calls += 1; return { name: "MiMo", error: "rate: HTTP 429", errorKind: "rate" }; }
   };
-  const opts = {
-    resolveReviewersImpl: () => [reviewer],
-    writeTraceImpl: () => {},
+  const options = {
+    input: { cwd: ws },
+    emitter: out,
     isBenchDisabledImpl: () => false,
-    env: process.env,
-    input: { cwd: ws, last_assistant_message: "wrote code" }
+    resolveReviewersImpl: () => [fake],
+    writeTraceImpl: () => {}
   };
-
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain(opts);
-    fs.appendFileSync(path.join(ws, "changed.js"), "export const y = 2;\n");
-    await runMain(opts);
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.equal(calls, 2, "a changed dirty snapshot must trigger a fresh review");
+  await runMain(options);
+  await runMain(options);
+  assert.equal(calls, 1);
+  assert.equal(out.payloads.length, 1);
+  assert.match(out.payloads[0].systemMessage, /UNREVIEWED/);
+  assert.match(out.payloads[0].systemMessage, /turn allowed/);
 });
 
-test("dirty ALLOW snapshot is reviewed again when the reviewer panel changes", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-reviewers-"));
-  process.env.BENCH_ROOT = root;
-
-  let kimiCalls = 0;
-  let glmCalls = 0;
-  const kimi = {
-    name: "Kimi",
-    async run() {
-      kimiCalls += 1;
-      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
-    }
-  };
-  const glm = {
-    name: "GLM",
-    async run() {
-      glmCalls += 1;
-      return { name: "GLM", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
-    }
-  };
-  let reviewerList = [kimi];
-  const opts = {
-    resolveReviewersImpl: () => reviewerList,
-    writeTraceImpl: () => {},
-    isBenchDisabledImpl: () => false,
-    env: process.env,
-    input: { cwd: ws, last_assistant_message: "wrote code" }
-  };
-
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain(opts);
-    reviewerList = [kimi, glm];
-    await runMain(opts);
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.equal(kimiCalls, 2, "the existing reviewer should run again when the panel changes");
-  assert.equal(glmCalls, 1, "the newly-added reviewer must review the already-dirty snapshot");
-});
-
-test("dirty BLOCK snapshot is not marked reviewed and repeats until fixed", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-dirty-block-"));
-  process.env.BENCH_ROOT = root;
-
-  let calls = 0;
-  const reviewer = {
-    name: "Kimi",
-    async run() {
-      calls += 1;
-      return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: real bug", raw: "BLOCK: real bug" };
-    }
-  };
-  const opts = {
-    resolveReviewersImpl: () => [reviewer],
-    writeTraceImpl: () => {},
-    isBenchDisabledImpl: () => false,
-    env: process.env,
-    input: { cwd: ws, last_assistant_message: "wrote code" },
-    blockHandler: async () => {}
-  };
-
-  let marker = "unset";
-  try {
-    await runMain(opts);
-    await runMain(opts);
-    marker = readReviewedWorktree(ws);
-  } finally {
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.equal(calls, 2, "BLOCK must not suppress future reviews of the same unsafe snapshot");
-  assert.equal(marker, null, "BLOCK must not write a reviewed-worktree fingerprint");
-});
-
-// ---------------------------------------------------------------------------
-// F: stop-gate ALLOW systemMessage leads with the verdict badge (Codex excluded)
-// ---------------------------------------------------------------------------
-
-test("F: stop ALLOW systemMessage leads with the badge, omitting Codex", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-badge-"));
-  process.env.BENCH_ROOT = root;
-
-  const { lines, restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: stubResolveReviewers([
-        fakeReviewer("Kimi", "ALLOW", "ALLOW: looks fine"),
-        fakeReviewer("MiMo", "ALLOW", "ALLOW: no issues"),
-        fakeReviewer("GLM", "ALLOW", "ALLOW: clean")
-      ]),
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws, last_assistant_message: "wrote some code" }
-    });
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  const parsed = JSON.parse(lines[0]);
-  assert.match(parsed.systemMessage, /\[Kimi✓ MiMo✓ GLM✓\]/, "systemMessage should lead with the badge");
-  assert.doesNotMatch(parsed.systemMessage, /Codex/, "stop badge must not mention Codex");
-});
-
-// ---------------------------------------------------------------------------
-// Test: BLOCK → exit code 2, findings on stderr
-// ---------------------------------------------------------------------------
-
-test("BLOCK → subprocess exits with code 2 and findings on stderr", () => {
-  const ws = freshRepo({ withChange: true });
-
-  // We need a subprocess that imports stop-review.mjs and calls runMain with
-  // a fake reviewer returning BLOCK. Write a small wrapper script.
-  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "sr-blk-"));
-  const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sr-blk-root-"));
-  const wrapperScript = path.join(wrapperDir, "block-wrapper.mjs");
-  const hookPath = path.join(ROOT, "global-hooks", "stop-review.mjs");
-
-  fs.writeFileSync(wrapperScript, `
-import { runMain } from ${JSON.stringify(hookPath)};
-const fakeReviewer = {
-  name: "Kimi",
-  async run() {
-    return { name: "Kimi", verdict: "BLOCK", firstLine: "BLOCK: introduced a bug", raw: "BLOCK: introduced a bug\\n\\nThe function at line 5 has an off-by-one error." };
-  }
-};
-await runMain({
-  resolveReviewersImpl: () => [fakeReviewer],
-  writeTraceImpl: () => {},
-  isBenchDisabledImpl: () => false,
-  env: process.env,
-  input: { cwd: ${JSON.stringify(ws)}, last_assistant_message: "wrote some code" }
-});
-`);
-
-  const result = spawnSync(process.execPath, [wrapperScript], {
-    encoding: "utf8",
-    env: { ...process.env, BENCH_ROOT: wrapperRoot }
-  });
-
-  assert.equal(result.status, 2, `expected exit code 2 on BLOCK, got ${result.status}; stderr: ${result.stderr}`);
-  assert.match(result.stderr, /BLOCK|block|introduced a bug/i, "findings should appear on stderr");
-  assert.equal(result.stdout.trim(), "", "no stdout on BLOCK (asyncRewake uses stderr)");
-});
-
-// ---------------------------------------------------------------------------
-// Test: all reviewers errored → fail-open, systemMessage, exit 0
-// ---------------------------------------------------------------------------
-
-test("all reviewers error → fail-open systemMessage, no exit 2", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fo-"));
-  process.env.BENCH_ROOT = root;
-
-  const { lines, restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: stubResolveReviewers([
-        fakeErrorReviewer("Kimi"),
-        fakeErrorReviewer("MiMo")
-      ]),
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws }
-    });
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.ok(lines.length > 0, "should emit a fail-open message");
-  const parsed = JSON.parse(lines[0]);
-  assert.ok(typeof parsed.systemMessage === "string", "systemMessage should be a string");
-  assert.match(parsed.systemMessage, /bench stop.*review failed.*turn allowed/i, "should indicate fail-open");
-});
-
-// ---------------------------------------------------------------------------
-// Test: buildPrompt — content-only, no tool or repo claim
-// ---------------------------------------------------------------------------
-
-test("buildPrompt: system is content-only with ALLOW:/BLOCK: instruction", () => {
-  const { system, user } = buildPrompt("M changed.js", "diff --git ...", "", "did some work");
-  // Must instruct reviewer to stay content-only (no repo reads, no tools).
-  assert.doesNotMatch(system, /read access|verify.*against.*code/i);
-  assert.match(system, /ALLOW:|BLOCK:/);
-  assert.match(system, /Do NOT use any tools/i);
-  assert.match(system, /never use.*tail message to skip non-empty/i);
-  assert.match(user, /changed\.js|git_status/i);
-  assert.match(user, /did some work/);
-});
-
-test("buildPrompt: diffs appear before the assistant-message context", () => {
-  const { user } = buildPrompt(
-    "M changed.js",
-    "diff --git a/changed.js b/changed.js\n+export const changed = true;",
+test("buildPrompt is content-only, bounded in context, and contains both diff sections", () => {
+  const prompt = buildPrompt(
+    " M tracked.js",
+    "diff --git a/tracked.js b/tracked.js",
     "",
-    "Final status only: done",
+    "a".repeat(2_000),
+    "staged diff",
     "",
-    "diff --git a/committed.js b/committed.js\n+export const committed = true;"
+    { agentName: "Claude" }
   );
-  assert.ok(
-    user.indexOf("<git_status>") < user.indexOf("<previous_assistant_message_context>"),
-    "status and diffs must be primary, before the conversational tail"
-  );
-  assert.ok(
-    user.indexOf("<committed_diff>") < user.indexOf("<previous_assistant_message_context>"),
-    "committed diff must not be buried after the previous assistant message"
-  );
-  assert.match(user, /committed\.js/);
-  assert.match(user, /changed\.js/);
+  assert.match(prompt.system, /Review the uncommitted changes from this Claude turn/);
+  assert.match(prompt.system, /Do not use tools/);
+  assert.match(prompt.system, /ALLOW: <reason>/);
+  assert.match(prompt.user, /<worktree_diff>/);
+  assert.match(prompt.user, /<staged_diff>/);
+  assert.ok(prompt.user.indexOf("<worktree_diff>") < prompt.user.indexOf("<assistant_context>"));
+  assert.doesNotMatch(prompt.user, /a{1001}/);
 });
 
-// ---------------------------------------------------------------------------
-// Task 7 — E1: staged-only change in a fresh repo (no commits) is reviewed,
-// and a normal repo's staged hunk is NOT duplicated in the diff block.
-// ---------------------------------------------------------------------------
-
-/** Fresh repo with NO commits (unborn HEAD). Stage `staged.js`, no untracked. */
-function freshRepoNoCommits() {
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "sr-unborn-"));
-  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
-  fs.writeFileSync(path.join(ws, "staged.js"), "export const fresh = 1;\n");
-  execFileSync("git", ["add", "staged.js"], { cwd: ws });
-  return ws;
-}
-
-test("E1: fresh repo (no commits), staged-only change → reviewed with staged content", async () => {
-  const ws = freshRepoNoCommits();
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-e1-"));
-  process.env.BENCH_ROOT = root;
-
-  let called = false;
-  let seenUser = "";
-  const resolveReviewersImpl = () => [{
-    name: "Kimi",
-    async run({ user }) {
-      called = true;
-      seenUser = user;
-      return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
-    }
-  }];
-
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl,
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws, last_assistant_message: "staged a new file" }
-    });
-  } finally {
-    restore();
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.equal(called, true, "reviewer must be called for a staged-only fresh-repo change");
-  assert.match(seenUser, /staged\.js|fresh = 1/, "reviewed content must include the staged change");
-});
-
-test("E1: normal repo with a staged modification → diff block does NOT duplicate the staged hunk", () => {
-  // Build a repo with a commit, then stage a modification. `git diff HEAD` already
-  // shows the staged change; we must NOT also append `git diff --cached` (would dup it).
-  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "sr-dup-"));
-  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: ws });
-  fs.writeFileSync(path.join(ws, "f.js"), "export const a = 1;\n");
-  execFileSync("git", ["add", "f.js"], { cwd: ws });
-  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: ws });
-  // Stage a modification with a unique marker line.
-  fs.writeFileSync(path.join(ws, "f.js"), "export const a = 1;\nexport const UNIQUE_STAGED_MARKER = 2;\n");
-  execFileSync("git", ["add", "f.js"], { cwd: ws });
-
-  const wrapperDir = fs.mkdtempSync(path.join(os.tmpdir(), "sr-dup-wrap-"));
-  const wrapperRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sr-dup-root-"));
-  const wrapperScript = path.join(wrapperDir, "dup-wrapper.mjs");
-  fs.writeFileSync(wrapperScript, `
-import { runMain } from ${JSON.stringify(HOOK)};
-const fakeReviewer = {
-  name: "Kimi",
-  async run({ user }) {
-    process.stdout.write(JSON.stringify({ user }) + "\\n");
-    return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" };
-  }
-};
-await runMain({
-  resolveReviewersImpl: () => [fakeReviewer],
-  writeTraceImpl: () => {},
-  isBenchDisabledImpl: () => false,
-  env: process.env,
-  input: { cwd: ${JSON.stringify(ws)}, last_assistant_message: "staged a mod" }
-});
-`);
-
-  const result = spawnSync(process.execPath, [wrapperScript], {
-    encoding: "utf8",
-    env: { ...process.env, BENCH_ROOT: wrapperRoot }
-  });
-
-  assert.equal(result.status, 0, `wrapper should exit 0; stderr: ${result.stderr}`);
-  const line = result.stdout.trim().split("\n").find((l) => l.includes("UNIQUE_STAGED_MARKER"));
-  assert.ok(line, `reviewed content should include the staged marker; got: ${result.stdout}`);
-  const { user } = JSON.parse(line);
-  const occurrences = user.split("UNIQUE_STAGED_MARKER").length - 1;
-  assert.equal(occurrences, 1, `staged hunk must appear exactly once (no duplication), saw ${occurrences}`);
-});
-
-// ---------------------------------------------------------------------------
-// Task 7 — E2: visible stderr note on malformed stdin (mirrors pre-push E2)
-// ---------------------------------------------------------------------------
-
-test("E2: malformed stdin → ⛩ stderr note (treated as empty)", () => {
-  // Run in a clean temp dir as cwd so the fallback (process.cwd()) has no diff.
-  const cleanWs = fs.mkdtempSync(path.join(os.tmpdir(), "sr-e2-cwd-"));
-  const result = spawnSync(process.execPath, [HOOK], {
-    input: "{not json",
-    encoding: "utf8",
-    cwd: cleanWs,
-    env: { ...process.env, BENCH_ROOT: TEMP_GCR }
-  });
-  assert.equal(result.status, 0, "malformed stdin must not crash (fail-open)");
-  assert.match(result.stderr, /⛩ bench stop: could not parse hook input/, "should emit a visible ⛩ note");
-});
-
-// ---------------------------------------------------------------------------
-// Task 9 — D3: trace-write failure emits a ⛩ note and still allows (fail-open)
-// ---------------------------------------------------------------------------
-
-test("D3: stop trace write failure emits a ⛩ note and still allows", async () => {
-  const ws = freshRepo({ withChange: true });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-d3-"));
-  process.env.BENCH_ROOT = root;
-
-  const stderrChunks = [];
-  const origErr = process.stderr.write.bind(process.stderr);
-  process.stderr.write = (chunk, ...rest) => { if (typeof chunk === "string") stderrChunks.push(chunk); return origErr(chunk, ...rest); };
-
-  const { lines, restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW", "ALLOW: ok")]),
-      writeTraceImpl: () => { throw new Error("disk full"); },
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws, last_assistant_message: "wrote code" }
-    });
-  } finally {
-    restore();
-    process.stderr.write = origErr;
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-
-  assert.match(stderrChunks.join(""), /⛩ .*trace write failed/i, "expected a ⛩ trace-write-failed note on stderr");
-  assert.ok(lines.length > 0, "must still emit the ALLOW systemMessage despite trace failure");
-  const parsed = JSON.parse(lines[0]);
-  assert.match(parsed.systemMessage, /ALLOW/i, "still allows");
-});
-
-
-test("FIX 5: two separate runMain invocations in one process each emit (no module-level suppression)", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "sr-root-fix5b-"));
-  process.env.BENCH_ROOT = root;
-
-  const run = async () => {
-    const ws = freshRepo({ withChange: true });
-    const { lines, restore } = captureEmit(() => {});
-    try {
-      await runMain({
-        resolveReviewersImpl: stubResolveReviewers([fakeReviewer("Kimi", "ALLOW")]),
-        writeTraceImpl: () => {},
-        isBenchDisabledImpl: () => false,
-        env: process.env,
-        input: { cwd: ws, last_assistant_message: "wrote code" }
-      });
-    } finally {
-      restore();
-    }
-    return lines.filter((l) => { try { return !!JSON.parse(l).systemMessage; } catch { return false; } });
-  };
-
-  try {
-    const first = await run();
-    const second = await run();
-    assert.equal(first.length, 1, "first invocation emits its ALLOW note");
-    assert.equal(second.length, 1, "second invocation also emits — emit-once must be per-invocation, not module-level");
-  } finally {
-    process.env.BENCH_ROOT = TEMP_GCR;
-  }
-});
-
-test("buildPrompt: user does not contain BLOCK guidance; system does", () => {
-  const { system, user } = buildPrompt("M changed.js", "diff --git ...", "new-file.js contents", "did some work");
-  // "BLOCK only" instruction must be in system, NOT in user
-  assert.match(system, /BLOCK only/i, "system must contain BLOCK guidance");
-  assert.doesNotMatch(user, /BLOCK only/i, "user must NOT contain BLOCK-only guidance");
-  // user must contain ONLY the content to review
-  assert.match(user, /did some work/, "user must contain last_assistant_message");
-  assert.match(user, /changed\.js/, "user must contain git status");
-  assert.match(user, /diff --git/, "user must contain diff");
-  assert.match(user, /new-file\.js/, "user must contain untracked file content");
-  // user must not contain format instructions
-  assert.doesNotMatch(user, /first line must be/i, "user must not have format instructions");
-  assert.doesNotMatch(user, /Review the code changes/i, "user must not have review instructions");
-});
-
-// ===========================================================================
-// GAP FIX: review changes COMMITTED since the last review, not just the working
-// tree. A session that commits (50 things) leaves `git diff HEAD` empty → the
-// old gate skipped and the committed work escaped review entirely (VisualSentinel).
-// ===========================================================================
-
-function gitC(ws, ...args) {
-  return execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd: ws, encoding: "utf8" });
-}
-
-test("resolveReviewBase: marker that is an ancestor of HEAD → diff since the marker", () => {
-  const ws = freshRepo({ withChange: false });
-  writeReviewedHead(ws, "MARK");
-  const fakeGit = (args) => (args[0] === "merge-base" && args[1] === "MARK" ? "MARK\n" : "");
-  assert.equal(resolveReviewBase(ws, "HEADSHA", fakeGit), "MARK");
-});
-
-test("resolveReviewBase: marker == HEAD → returns HEAD (only the working tree is reviewed)", () => {
-  const ws = freshRepo({ withChange: false });
-  writeReviewedHead(ws, "SAME");
-  assert.equal(resolveReviewBase(ws, "SAME", () => "boom"), "SAME");
-});
-
-test("resolveReviewBase: no marker but an upstream exists → merge-base with upstream (unpushed commits)", () => {
-  const ws = freshRepo({ withChange: false });   // no marker written
-  const fakeGit = (args) => {
-    if (args[0] === "rev-parse" && args.includes("@{upstream}")) return "UP\n";
-    if (args[0] === "merge-base" && args[1] === "UP") return "UP\n";
-    return "";
-  };
-  assert.equal(resolveReviewBase(ws, "HEADSHA", fakeGit), "UP");
-});
-
-test("resolveReviewBase: no marker, no upstream → HEAD (working tree only, safe default)", () => {
-  const ws = freshRepo({ withChange: false });
-  assert.equal(resolveReviewBase(ws, "HEADSHA", () => ""), "HEADSHA");
-});
-
-test("resolveReviewBase: a stale/orphaned marker (not an ancestor) falls back, never diffs garbage", () => {
-  const ws = freshRepo({ withChange: false });
-  writeReviewedHead(ws, "ORPHAN");
-  const fakeGit = (args) => {
-    if (args[0] === "merge-base" && args[1] === "ORPHAN") return "SOMETHINGELSE\n"; // mb != ORPHAN → not ancestor
-    return "";  // no upstream
-  };
-  assert.equal(resolveReviewBase(ws, "HEADSHA", fakeGit), "HEADSHA");
-});
-
-test("GAP FIX: a turn that COMMITTED its work (clean working tree) is still reviewed", async () => {
-  const ws = freshRepo({ withChange: false });
-  const initial = gitC(ws, "rev-parse", "HEAD").trim();
-  writeReviewedHead(ws, initial);                 // initial commit already reviewed
-  // Commit a change — working tree ends CLEAN (the exact gap: nothing in `git diff HEAD`).
-  fs.writeFileSync(path.join(ws, "feature.js"), "export const danger = eval('1 + 1');\n");
-  gitC(ws, "add", "-A");
-  gitC(ws, "commit", "-qm", "feat: committed work");
-  assert.equal(gitC(ws, "status", "--short").trim(), "", "precondition: working tree is clean");
-
-  const seen = {};
-  const recording = { name: "Kimi", async run({ user }) { seen.user = user; seen.called = true; return { name: "Kimi", verdict: "ALLOW", firstLine: "ALLOW: ok", raw: "ALLOW: ok" }; } };
-  let trace = null;
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: () => [recording],
-      writeTraceImpl: (_ws, t) => { trace = t; },
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws }
-    });
-  } finally { restore(); }
-
-  assert.equal(seen.called, true, "the committed-but-clean-tree turn MUST be reviewed (the gap)");
-  assert.match(seen.user, /feature\.js/, "the committed diff is included in the review prompt");
-  assert.match(seen.user, /<committed_diff>/, "committed changes are surfaced in their own section");
-  assert.ok(trace, "a trace is written for the reviewed committed work");
-});
-
-test("GAP FIX: the marker ADVANCES to HEAD on a clean ALLOW (no re-review next turn)", async () => {
-  const ws = freshRepo({ withChange: false });
-  const initial = gitC(ws, "rev-parse", "HEAD").trim();
-  writeReviewedHead(ws, initial);
-  fs.writeFileSync(path.join(ws, "f.js"), "export const y = 2;\n");
-  gitC(ws, "add", "-A");
-  gitC(ws, "commit", "-qm", "feat");
-  const head = gitC(ws, "rev-parse", "HEAD").trim();
-
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: () => [fakeReviewer("Kimi", "ALLOW")],
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws }
-    });
-  } finally { restore(); }
-
-  assert.equal(readReviewedHead(ws), head, "marker advanced to HEAD after a clean ALLOW");
-});
-
-test("GAP FIX: the marker does NOT advance on fail-open (range is re-reviewed until clean)", async () => {
-  const ws = freshRepo({ withChange: false });
-  const initial = gitC(ws, "rev-parse", "HEAD").trim();
-  writeReviewedHead(ws, initial);
-  fs.writeFileSync(path.join(ws, "g.js"), "export const z = 3;\n");
-  gitC(ws, "add", "-A");
-  gitC(ws, "commit", "-qm", "feat");
-
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: () => [fakeErrorReviewer("Kimi")],   // all error → fail-open
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws }
-    });
-  } finally { restore(); }
-
-  assert.equal(readReviewedHead(ws), initial, "marker stays put on fail-open so the range is re-reviewed");
-});
-
-test("GAP FIX: a genuine no-op turn keeps the baseline current (sets marker to HEAD) and skips", async () => {
-  const ws = freshRepo({ withChange: false });   // clean tree, no marker
-  const head = gitC(ws, "rev-parse", "HEAD").trim();
-  let called = false;
-  const { restore } = captureEmit(() => {});
-  try {
-    await runMain({
-      resolveReviewersImpl: () => { called = true; return [fakeReviewer("Kimi", "ALLOW")]; },
-      writeTraceImpl: () => {},
-      isBenchDisabledImpl: () => false,
-      env: process.env,
-      input: { cwd: ws }
-    });
-  } finally { restore(); }
-  assert.equal(called, false, "no changes → no review");
-  assert.equal(readReviewedHead(ws), head, "baseline marker established at HEAD for the next committing turn");
+test("trace failures are non-critical and never turn an ALLOW into a block", async () => {
+  const ws = freshRepo();
+  await assert.doesNotReject(runMain({
+    input: { cwd: ws },
+    emitter: emitter(),
+    isBenchDisabledImpl: () => false,
+    resolveReviewersImpl: () => [reviewer("ALLOW")],
+    writeTraceImpl: () => { throw new Error("fake disk failure"); }
+  }));
 });

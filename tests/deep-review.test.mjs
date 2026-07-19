@@ -48,7 +48,7 @@ test("FIX 1: parseSeverity is worst-wins — SEVERITY: low BEFORE SEVERITY: crit
 });
 
 test("parseSeverity ignores SEVERITY lines inside <think> reasoning", () => {
-  // Regression: MiniMax wrote SEVERITY: low as its answer but "Severity: high" in its reasoning,
+  // A reviewer may write SEVERITY: low as its answer but "Severity: high" in its reasoning,
   // which used to win worst-wins and fire a false block.
   const raw = "<think>\nThis is bad. Severity: high, multiple issues.\n</think>\n\nALLOW: fine\nSEVERITY: low";
   assert.equal(parseSeverity(raw, "ALLOW"), "low", "think-internal severity must not count");
@@ -76,15 +76,15 @@ test("FIX 1: worst-wins severity propagates to combinePanel — low-then-critica
 
 test("summarizeSpecReview produces the structured contract", () => {
   const s = summarizeSpecReview([
-    { name: "Kimi", verdict: "ALLOW", findingCount: 1, severity: "low" },
+    { name: "Grok", verdict: "ALLOW", findingCount: 1, severity: "low" },
     { name: "MiMo", verdict: "BLOCK", findingCount: 2, severity: "high" }
   ]);
-  assert.deepEqual(s.reviewers, [{ name: "Kimi", verdict: "ALLOW", severity: "low" }, { name: "MiMo", verdict: "BLOCK", severity: "high" }]);
+  assert.deepEqual(s.reviewers, [{ name: "Grok", verdict: "ALLOW", severity: "low" }, { name: "MiMo", verdict: "BLOCK", severity: "high" }]);
   assert.equal(s.findingCount, 3);
   assert.equal(s.maxSeverity, "high");
 });
 
-test("shouldRewake fires at/above the rewake severity with findings, else not", () => {
+test("manual deep review crosses the blocking threshold only with severe findings", () => {
   assert.equal(shouldRewake({ maxSeverity: DEEP_REWAKE_SEVERITY, findingCount: 1 }), true);
   assert.equal(shouldRewake({ maxSeverity: "critical", findingCount: 1 }), true);
   assert.equal(shouldRewake({ maxSeverity: "medium", findingCount: 5 }), false);
@@ -102,24 +102,22 @@ test("FIX 4: deepKey keys on (path, content) so byte-identical content in two fi
 
 test("aggregateFindings joins ONLY blocking reviewers' findings (not via combinePanel raw)", () => {
   const out = aggregateFindings([
-    { name: "Kimi", verdict: "ALLOW", findings: "looks fine" },
-    { name: "MiMo", verdict: "BLOCK", findings: "- null deref at line 5" },
-    { name: "GLM", verdict: "BLOCK", findings: "- missing await" }
+    { name: "Grok", verdict: "ALLOW", findings: "looks fine" },
+    { name: "MiMo", verdict: "BLOCK", findings: "- null deref at line 5" }
   ]);
   assert.match(out, /\[MiMo\]\n- null deref/);
-  assert.match(out, /\[GLM\]\n- missing await/);
   assert.doesNotMatch(out, /looks fine/, "ALLOW reviewers are not included");
-  assert.equal(aggregateFindings([{ name: "Kimi", verdict: "ALLOW", findings: "ok" }]), "", "no blockers → empty string");
+  assert.equal(aggregateFindings([{ name: "Grok", verdict: "ALLOW", findings: "ok" }]), "", "no blockers → empty string");
 });
 
 test("aggregateFindings surfaces a severity-only block (ALLOW verdict + SEVERITY: critical)", () => {
   // Regression: a reviewer that blocks via severity but writes `ALLOW: <none>` used to contribute
   // nothing, so the wake delivered a bare count. It must now surface its findings.
   const out = aggregateFindings([
-    { name: "MiniMax", verdict: "ALLOW", severity: "critical", findings: "- plan references files that do not exist" },
-    { name: "Codex", verdict: "ALLOW", severity: "low", findings: "- minor: mkdir missing" }
+    { name: "Grok", verdict: "ALLOW", severity: "critical", findings: "- plan references files that do not exist" },
+    { name: "MiMo", verdict: "ALLOW", severity: "low", findings: "- minor: mkdir missing" }
   ]);
-  assert.match(out, /\[MiniMax\]\n- plan references/, "critical-severity reviewer included despite ALLOW verdict");
+  assert.match(out, /\[Grok\]\n- plan references/, "critical-severity reviewer included despite ALLOW verdict");
   assert.doesNotMatch(out, /minor: mkdir/, "sub-threshold (low) severity stays excluded");
 });
 
@@ -135,7 +133,7 @@ test("runSpecReview writes a gate:'spec-review' trace and returns the structured
   const panelImpl = async ({ content }) => {
     assert.match(content, /Deep review me/);
     return [
-      { name: "Kimi", verdict: "ALLOW", findings: "no major issues", findingCount: 0, severity: "none" },
+      { name: "Grok", verdict: "ALLOW", findings: "no major issues", findingCount: 0, severity: "none" },
       { name: "MiMo", verdict: "BLOCK", findings: "1. ambiguous step", findingCount: 1, severity: "high" }
     ];
   };
@@ -173,7 +171,7 @@ test("runPushReview writes a gate:'push-review' trace and returns result + findi
   const panelImpl = async ({ cwd, range: r, content }) => {
     seeded = { cwd, range: r, content };
     return [
-      { name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" },
+      { name: "Grok", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" },
       { name: "MiMo", verdict: "BLOCK", findings: "- cross-file regression", findingCount: 1, severity: "high" }
     ];
   };
@@ -193,7 +191,7 @@ test("runPushReview seeds and traces previous assistant context as claims, not p
   let seeded = null;
   const panelImpl = async ({ cwd, range: r, content, assistantContext }) => {
     seeded = { cwd, range: r, content, assistantContext };
-    return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }];
+    return [{ name: "Grok", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }];
   };
   const context = "I populated quantity_on_order for approvals and all paths are covered.";
   await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl, assistantContext: context, now: Date.now() + 1 });
@@ -219,22 +217,47 @@ test("runPushReview signals retry when git log/diff report ok=false", async () =
   const ws = freshWs();
   const stub = gitStub({ logOk: false });
   let panelCalled = false;
-  const panelImpl = async () => { panelCalled = true; return [{ name: "Kimi", verdict: "BLOCK", findings: "x", findingCount: 1, severity: "high" }]; };
+  const panelImpl = async () => { panelCalled = true; return [{ name: "Grok", verdict: "BLOCK", findings: "x", findingCount: 1, severity: "high" }]; };
   const result = await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
   assert.equal(panelCalled, false, "git error → panel not run");
-  assert.equal(result.findingCount, 0, "git error → no-block result");
+  assert.equal(result.retry, true, "git error must be requeued, not reported clean");
+  assert.equal(result.reason, "git error");
+  assert.match(result.summary, /deferred.*git error/i);
+  assert.equal(result.hash, null);
+  assert.equal(result.traceId, null);
+  assert.equal(result.findingCount, 0);
   assert.equal(result.maxSeverity, "none");
   assert.equal(result.findings, "");
 });
 
-test("runPushReview caps the diff at ~200KB", async () => {
+test("runPushReview rejects oversized evidence without truncating or invoking the panel", async () => {
   const ws = freshWs();
   const stub = gitStub({ diff: "+x".repeat(300_000) });
+  let panelCalled = false;
+  const panelImpl = async () => { panelCalled = true; return [{ name: "Grok", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }]; };
+  const result = await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
+  assert.equal(panelCalled, false, "partial evidence must never reach the panel");
+  assert.equal(result.retry, true, "oversized evidence must be retried in smaller ranges");
+  assert.equal(result.reason, "evidence too large");
+  assert.match(result.summary, /deferred.*evidence too large/i);
+  assert.doesNotMatch(result.summary, /clean|no blocking/i, "oversized evidence must not be described as clean");
+  assert.equal(result.hash, null);
+  assert.equal(result.traceId, null);
+});
+
+test("runPushReview sends complete under-limit evidence to the panel", async () => {
+  const ws = freshWs();
+  const diff = `${"+x\n".repeat(60_000)}+TAIL_MARKER\n`;
+  const stub = gitStub({ diff });
   let captured = null;
-  const panelImpl = async ({ content }) => { captured = content; return [{ name: "Kimi", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }]; };
-  await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
-  assert.ok(captured.includes("diff truncated"));
-  assert.ok(captured.length < 220_000);
+  const panelImpl = async ({ content }) => {
+    captured = content;
+    return [{ name: "MiMo", verdict: "ALLOW", findings: "ok", findingCount: 0, severity: "none" }];
+  };
+  const result = await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
+  assert.equal(result.retry, undefined);
+  assert.match(captured, /\+TAIL_MARKER/);
+  assert.doesNotMatch(captured, /truncated/i);
 });
 
 test("runPushReview throws on a missing range", async () => {

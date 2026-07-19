@@ -1,94 +1,139 @@
-// global-hooks/reviewers.mjs
-import { parseVerdict, runCodexReview, runGrokReview } from "./panel-lib.mjs";
-import { resolveConfig, displayName } from "./config-store.mjs";
+import { parseVerdict, runGrokReview } from "./panel-lib.mjs";
+import {
+  configuredProviderSecrets,
+  displayName,
+  readReviewerCooldown,
+  recordReviewerCooldown,
+  resolveConfig
+} from "./config-store.mjs";
 import { review as defaultReview } from "./review-client.mjs";
-import { withConcurrencyLimit } from "./concurrency-limit.mjs";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { redactProviderFailureData } from "./provider-error-redaction.mjs";
 
-const STRICT = "\n\nIMPORTANT: respond with ONLY a first line of `ALLOW: <reason>` or `BLOCK: <reason>`. No preamble, no code fences.";
+const STRICT = "\n\nRespond with only `ALLOW: <reason>` or `BLOCK: <reason>` on the first line.";
+const COOLDOWN_KINDS = new Set(["quota", "auth", "rate", "timeout", "network"]);
 
-const PLUGIN_CACHE = path.join(os.homedir(), ".claude", "plugins", "cache", "openai-codex", "codex");
-export const CODEX_DATA = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex");
-
-export function latestCodexRoot() {
-  let entries; try { entries = fs.readdirSync(PLUGIN_CACHE).filter((d) => /^\d+\.\d+\.\d+/.test(d)); } catch { return null; }
-  entries.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  const latest = entries.at(-1);
-  return latest ? path.join(PLUGIN_CACHE, latest) : null;
+export function classifyReviewerFailureText(text) {
+  const value = String(text || "");
+  if (/\b(402|payment required|usage balance exhausted|insufficient credits?|out of credits|plan limit|credit balance|quota exhausted)\b/i.test(value)) return "quota";
+  if (/\b(401|403|unauthorized|forbidden|invalid_grant|not logged in|logged out|sign-?in required|login required|re-?authenticate)\b/i.test(value)) return "auth";
+  if (/\b(429|rate.?limit|too many requests)\b/i.test(value)) return "rate";
+  if (/\b(timed? out|timeout|operation aborted|deadline exceeded)\b/i.test(value)) return "timeout";
+  if (/\b(503|service (?:temporarily )?unavailable|fetch failed|network(?: error| unavailable)?|connection (?:failed|reset|refused)|dns)\b/i.test(value)) return "network";
+  return null;
 }
 
-function codexAdapter() {
-  return { name: "codex", async run({ system, user, cwd, env = process.env }) {
-    const codexRoot = latestCodexRoot();
-    if (!codexRoot) return { name: "Codex", error: "codex plugin not found" };
-    const codexEnv = { ...env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA || CODEX_DATA };
-    return runCodexReview({ companionPath: path.join(codexRoot, "scripts", "codex-companion.mjs"), prompt: `${system}\n\n${user}`, cwd, env: codexEnv });
-  } };
+const unavailableLabel = (kind) => ({
+  auth: "authentication unavailable",
+  quota: "quota exhausted",
+  rate: "temporarily rate-limited",
+  timeout: "timed out recently",
+  network: "network unavailable"
+}[kind] || "temporarily unavailable");
+
+export function withAvailability(name, display, runImpl, { now = Date.now, env = process.env } = {}) {
+  return async (args) => {
+    const secrets = configuredProviderSecrets({ env });
+    const at = now();
+    const cooldown = readReviewerCooldown(name, { now: at, env, secrets });
+    if (cooldown) {
+      const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - at) / 60_000));
+      return {
+        name: display,
+        error: `${unavailableLabel(cooldown.kind)} — skipped without a model call (${minutesLeft} min remaining)`,
+        errorKind: cooldown.kind,
+        skipped: "cooldown"
+      };
+    }
+
+    let rawResult;
+    try {
+      rawResult = await runImpl(args);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      rawResult = { name: display, error: detail, errorKind: classifyReviewerFailureText(detail) || "runtime" };
+    }
+    const result = redactProviderFailureData(rawResult, { secrets });
+    if (!result?.error) return result;
+    const kind = COOLDOWN_KINDS.has(result.errorKind)
+      ? result.errorKind
+      : (classifyReviewerFailureText(result.error) || result.errorKind);
+    if (COOLDOWN_KINDS.has(kind)) {
+      recordReviewerCooldown(name, kind, result.error, { now: at, env, secrets });
+      return { ...result, error: `${unavailableLabel(kind)} — ${result.error}`, errorKind: kind };
+    }
+    return result;
+  };
 }
 
-// Grok Build CLI (local x.ai harness, plan-billed — no API key). Same shape as codexAdapter:
-// spawn headless, read-only (plan mode), parse the ALLOW/BLOCK verdict from stdout.
-function grokAdapter() {
-  return { name: "grok", async run({ system, user, cwd, env = process.env }) {
-    return runGrokReview({ prompt: `${system}\n\n${user}`, cwd, env });
-  } };
-}
-
-// Scan EVERY line (skip filler / code-fence / blank) for the first ALLOW:/BLOCK: line.
-// Lines inside a ``` fence are ignored so model examples can't trigger a false verdict.
 export function extractVerdict(text) {
-  const s = String(text ?? "").trim();
-  // Fast path: the INSTRUCTED format is the verdict on the first line — accept it directly so no
-  // code-fence tracking (which can mis-toggle on nested/unbalanced fences) can hide it. Found by the hunt.
-  const first = s.split(/\r?\n/, 1)[0]?.trim() ?? "";
-  if (first.startsWith("ALLOW:") || first.startsWith("BLOCK:")) return parseVerdict(s);
+  const value = String(text ?? "").trim();
+  const first = value.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  if (first.startsWith("ALLOW:") || first.startsWith("BLOCK:")) return parseVerdict(value);
   let inFence = false;
-  for (const line of s.split(/\r?\n/)) {
-    const t = line.trim();
-    if (t.startsWith("```")) { inFence = !inFence; continue; }
-    if (inFence) continue;
-    if (t.startsWith("ALLOW:") || t.startsWith("BLOCK:")) return parseVerdict(s.slice(s.indexOf(line)));
+  for (const line of value.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) { inFence = !inFence; continue; }
+    if (!inFence && (trimmed.startsWith("ALLOW:") || trimmed.startsWith("BLOCK:"))) {
+      return parseVerdict(value.slice(value.indexOf(line)));
+    }
   }
   return null;
 }
 
-// NOTE (v1 limitation): parallel provider calls fail-fast on rate limits; no backoff/retry beyond the one verdict-format retry below.
-export function resolveReviewers({ env = process.env, reviewImpl = defaultReview, reviewers } = {}) {
-  const cfg = resolveConfig({ env, reviewers });
-  return cfg.reviewers.map((name) => {
-    if (name === "codex") return codexAdapter();
-    if (name === "grok") return grokAdapter();
-    const p = cfg.providers[name];
-    const display = displayName(name);
-    return {
-      name,
-      async run({ system, user, cwd, env: runEnv }) {
-        if (!p.apiKey) return { name: display, error: "no api key" };
-        // Bound in-flight calls across ALL gate processes (z.ai per-key concurrency cap) so bursts
-        // queue instead of 429-ing — the way OpenCode is naturally serialized. No-op when concurrency=0.
-        // Each slot is pinned to one key (slot i → key i % keyCount) so no single key exceeds its cap;
-        // when the limiter is off / failed open (slotIdx null) we fall back to the whole pool.
-        const pool = p.apiKeys?.length ? p.apiKeys : [p.apiKey];
-        const call = (u) => withConcurrencyLimit(
-          { name, slots: p.concurrency, staleMs: p.timeoutMs, timeoutMs: p.timeoutMs },
-          (slotIdx) => {
-            const keys = slotIdx == null ? pool : [pool[slotIdx % pool.length]];
-            return reviewImpl({ baseURL: p.baseURL, apiKey: keys[0], apiKeys: keys, model: p.model, system, user: u, temperature: p.temperature, headers: p.headers, timeoutMs: p.timeoutMs, thinking: p.thinking });
-          }
-        );
-        let r = await call(user);
-        if (!r.ok) return { name: display, error: `${r.error.kind}: ${r.error.detail}` };
-        let v = extractVerdict(r.text), raw = r.text, usage = r.usage;
-        if (!v) {
-          const r2 = await call(user + STRICT);
-          if (!r2.ok) return { name: display, error: `${r2.error.kind}: ${r2.error.detail}` };
-          v = extractVerdict(r2.text); raw = r2.text; usage = r2.usage;   // bill the retry, not the first call
-        }
-        if (!v) return { name: display, error: "unparseable verdict", raw };
-        return { name: display, verdict: v.verdict, firstLine: v.firstLine, raw, model: p.model, usage: usage ?? null };
+function grokAdapter(env) {
+  return {
+    name: "grok",
+    reviewIdentity: { kind: "grok-cli", model: "grok-build" },
+    async run({ system, user, cwd, env: runEnv = env, timeoutMs = 45_000 }) {
+      return runGrokReview({ prompt: `${system}\n\n${user}`, cwd, env: runEnv, timeoutMs });
+    }
+  };
+}
+
+function mimoAdapter(provider, reviewImpl) {
+  const display = displayName("mimo");
+  return {
+    name: "mimo",
+    reviewIdentity: { kind: "api", model: provider.model || "", baseURL: provider.baseURL || "" },
+    async run({ system, user, timeoutMs = 45_000 }) {
+      if (!provider.apiKey) return { name: display, error: "no API key", errorKind: "auth" };
+      const budget = Math.max(1, Math.min(provider.timeoutMs || timeoutMs, timeoutMs));
+      const deadline = Date.now() + budget;
+      const call = async (prompt) => reviewImpl({
+        baseURL: provider.baseURL,
+        apiKey: provider.apiKey,
+        apiKeys: provider.apiKeys,
+        model: provider.model,
+        system,
+        user: prompt,
+        temperature: provider.temperature,
+        headers: provider.headers,
+        timeoutMs: Math.max(1, deadline - Date.now()),
+        thinking: provider.thinking,
+        maxOverloadRetries: 0
+      });
+      let response = await call(user);
+      if (!response.ok) return { name: display, error: `${response.error.kind}: ${response.error.detail}`, errorKind: response.error.kind };
+      let verdict = extractVerdict(response.text);
+      if (!verdict) {
+        if (Date.now() >= deadline) return { name: display, error: "timeout: verdict-format retry budget exhausted", errorKind: "timeout" };
+        response = await call(user + STRICT);
+        if (!response.ok) return { name: display, error: `${response.error.kind}: ${response.error.detail}`, errorKind: response.error.kind };
+        verdict = extractVerdict(response.text);
       }
-    };
+      if (!verdict) return { name: display, error: "unparseable verdict" };
+      return { name: display, ...verdict, model: provider.model, usage: response.usage ?? null };
+    }
+  };
+}
+
+export function resolveReviewers({ env = process.env, reviewImpl = defaultReview, reviewers, now } = {}) {
+  const cfg = resolveConfig({ env, reviewers });
+  const wrap = (adapter) => ({
+    ...adapter,
+    run: withAvailability(adapter.name, displayName(adapter.name), adapter.run, { env, ...(now ? { now } : {}) })
   });
+  return cfg.reviewers.map((name) => name === "grok"
+    ? wrap(grokAdapter(env))
+    : wrap(mimoAdapter(cfg.providers.mimo, reviewImpl)));
 }

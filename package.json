@@ -1,8 +1,8 @@
 {
   "name": "peerbench",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "peerbench — a multi-model AI review panel (Codex + Kimi + GLM + Qwen + MiMo) for coding agents: gating reviews, agentic read-only code review, and bug hunts. Plugin command prefix: bench (/bench:*).",
+  "description": "peerBench — bounded Grok + MiMo code review and read-only bug hunts for Claude Code and Codex.",
   "license": "MIT",
   "author": "Rai Ansar",
   "repository": {

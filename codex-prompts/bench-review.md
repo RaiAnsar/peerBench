@@ -6,7 +6,7 @@ argument-hint: '[--base <ref>]'
 Run this command from the current workspace:
 
 ```bash
-BENCH_SUPPRESS_CODEX_REVIEWER=1 BENCH_SESSION_ID="${CODEX_SESSION_ID:-${BENCH_SESSION_ID:-}}" node "{{BENCH_RUNNER}}" review --json "$ARGUMENTS"
+BENCH_SESSION_ID="${CODEX_SESSION_ID:-${BENCH_SESSION_ID:-}}" node "{{BENCH_RUNNER}}" review --json "$ARGUMENTS"
 ```
 
 Return each reviewer verdict and the combined result from the JSON output. Do not edit files.
