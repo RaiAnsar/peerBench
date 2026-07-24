@@ -40,34 +40,76 @@ export function benchBadge(trace) {
   return (trace?.reviewers || []).map(reviewerSymbol).join("");
 }
 
-function readTraceRecords(ws, limit = 12) {
+// Selection must SEARCH, never sample a fixed newest-N window: a busy sibling chat in the same
+// checkout writes traces continuously, and any fixed window lets those evict this session's own
+// trace — the badge then disappears while an owned trace sits on disk. So the scan is unbounded but
+// cheap: `wsKey`/`sessionKey` are written BEFORE the (capped, but large) prompt fields, so a head
+// slice containing `"reviewers"` proves we have already seen them. Only a candidate is fully parsed,
+// and the first own-session hit exits immediately.
+const HEAD_BYTES = 8192;
+
+function readHead(file) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const buffer = Buffer.alloc(HEAD_BYTES);
+    const read = fs.readSync(fd, buffer, 0, HEAD_BYTES, 0);
+    return buffer.subarray(0, read).toString("utf8");
+  } finally { fs.closeSync(fd); }
+}
+
+const field = (head, name) => new RegExp(`"${name}"\\s*:\\s*"([^"]*)"`).exec(head)?.[1] ?? null;
+
+function* traceCandidates(ws) {
   const dir = path.join(workspaceStateDir(ws), "traces");
   let files;
-  try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")); } catch { return []; }
-  files.sort().reverse();
-  const records = [];
-  for (const file of files.slice(0, limit)) {
-    try { records.push(JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"))); } catch { /* skip unreadable */ }
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")); } catch { return; }
+  files.sort().reverse();   // ids are `<epochMs>-<hex>` → lexical desc is newest-first
+  for (const name of files) {
+    const file = path.join(dir, name);
+    let meta = null;
+    let record = null;
+    try {
+      const head = readHead(file);
+      if (head.includes("\"reviewers\"")) meta = { wsKey: field(head, "wsKey"), sessionKey: field(head, "sessionKey") };
+      else meta = record = JSON.parse(fs.readFileSync(file, "utf8"));   // head was truncated early — stay correct
+    } catch { continue; }
+    yield { meta, load: () => record || (record = JSON.parse(fs.readFileSync(file, "utf8"))) };
   }
-  return records;
+}
+
+function usable(candidate) {
+  try {
+    const record = candidate.load();
+    return (record?.reviewers || []).length ? record : null;
+  } catch { return null; }
+}
+
+export function selectFrom(candidates, ws, sessionId) {
+  const owner = wsKey(ws);
+  const session = normalizeSessionId(sessionId);
+  let fallback = null;
+  for (const candidate of candidates) {
+    const meta = candidate.meta || {};
+    // Defense in depth: traces are already ws-scoped on disk, but the stamp proves ownership
+    // survives symlink/relative-path aliasing of the same state dir.
+    if (meta.wsKey && meta.wsKey !== owner) continue;
+    if (session && meta.sessionKey === session) {
+      const record = usable(candidate);
+      if (record) return record;          // newest own-session trace wins outright
+      continue;
+    }
+    if (!meta.sessionKey && !fallback) fallback = usable(candidate);
+  }
+  return fallback;                        // newest UNSTAMPED legacy — never another session's
 }
 
 export function selectTrace(records, ws, sessionId) {
-  const owner = wsKey(ws);
-  const session = normalizeSessionId(sessionId);
-  // Defense in depth: traces are already ws-scoped on disk, but the stamp proves ownership survives
-  // symlink/relative-path aliasing of the same state dir.
-  const owned = (records || []).filter((t) => t && (!t.wsKey || t.wsKey === owner) && (t.reviewers || []).length);
-  if (session) {
-    const mine = owned.find((t) => t.sessionKey === session);
-    if (mine) return mine;
-  }
-  return owned.find((t) => !t.sessionKey) || null;
+  return selectFrom((records || []).filter(Boolean).map((r) => ({ meta: r, load: () => r })), ws, sessionId);
 }
 
-export function renderSegment(dir, sessionId, { readTraceRecordsImpl = readTraceRecords, color = true } = {}) {
+export function renderSegment(dir, sessionId, { candidatesImpl = traceCandidates, color = true } = {}) {
   if (!dir) return "";   // no per-window signal → render nothing, never cwd
-  const trace = selectTrace(readTraceRecordsImpl(dir), dir, sessionId);
+  const trace = selectFrom(candidatesImpl(dir), dir, sessionId);
   if (!trace) return "";
   const badge = benchBadge(trace);
   if (!badge) return "";

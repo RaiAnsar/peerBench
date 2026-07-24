@@ -54,6 +54,38 @@ test("falls back to an UNSTAMPED legacy trace so pre-feature projects keep a bad
   assert.equal(renderSegment(WS_B, SESSION, { color: false }), "bench ✓✓");
 });
 
+// A busy sibling chat in the same checkout writes traces continuously. Scanning only a fixed
+// newest-N window lets those evict this session's own trace, so the badge vanishes even though an
+// owned trace exists on disk. Selection must search until it finds one.
+test("finds this session's trace however many newer traces another session wrote", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "bench-ws-busy-"));
+  writeTrace(ws, { gate: "stop", ws, sessionKey: SESSION, reviewers: reviewers(["Grok", "ALLOW"], ["MiMo", "BLOCK"]) }, { now: 1_000 });
+  for (let i = 0; i < 40; i++) {
+    writeTrace(ws, { gate: "stop", ws, sessionKey: OTHER_SESSION, reviewers: reviewers(["Grok", "ALLOW"], ["MiMo", "ALLOW"]) }, { now: 2_000 + i });
+  }
+
+  assert.equal(renderSegment(ws, SESSION, { color: false }), "bench ✓✗",
+    "40 newer traces from a sibling chat must not evict this session's badge");
+});
+
+test("finds the unstamped legacy fallback past any newest-N window", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "bench-ws-legacy-"));
+  writeTrace(ws, { gate: "stop", ws, reviewers: reviewers(["Grok", "ALLOW"], ["MiMo", "ALLOW"]) }, { now: 1_000 });
+  for (let i = 0; i < 40; i++) {
+    writeTrace(ws, { gate: "stop", ws, sessionKey: OTHER_SESSION, reviewers: reviewers(["Grok", "BLOCK"]) }, { now: 2_000 + i });
+  }
+
+  assert.equal(renderSegment(ws, SESSION, { color: false }), "bench ✓✓");
+});
+
+test("an owned trace with no reviewers is skipped for the next real one", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "bench-ws-empty-"));
+  writeTrace(ws, { gate: "stop", ws, sessionKey: SESSION, reviewers: reviewers(["Grok", "ALLOW"]) }, { now: 1_000 });
+  writeTrace(ws, { gate: "stop", ws, sessionKey: SESSION, reviewers: [] }, { now: 2_000 });
+
+  assert.equal(renderSegment(ws, SESSION, { color: false }), "bench ✓");
+});
+
 test("rejects a trace stamped for a different workspace", () => {
   const foreign = { id: "x", ts: "now", wsKey: wsKey(WS_A), sessionKey: SESSION, reviewers: reviewers(["Grok", "ALLOW"]) };
   assert.equal(selectTrace([foreign], WS_B, SESSION), null,
