@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Lightweight Stop review: one MiMo content-only pass over the dirty worktree. Findings are
-// advisory and never wake/re-block the agent. Identical bytes are reviewed at most once.
+// advisory and never wake/re-block the agent. Completed verdicts are deduped by exact bytes;
+// provider failures become eligible again only after their bounded cooldown expires.
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -65,15 +66,28 @@ export function reviewFingerprint({ status = "", diff = "", staged = "", untrack
   return createHash("sha256").update(JSON.stringify({ status, diff, staged, untracked, reviewers })).digest("hex");
 }
 
-export function readReviewedWorktree(ws) {
-  try { return fs.readFileSync(REVIEWED_WORKTREE(ws), "utf8").trim() || null; } catch { return null; }
+export function readReviewedWorktree(ws, { now = Date.now() } = {}) {
+  let raw;
+  try { raw = fs.readFileSync(REVIEWED_WORKTREE(ws), "utf8").trim(); } catch { return null; }
+  if (!raw) return null;
+  if (!raw.startsWith("{")) return raw; // pre-0.4.1 completed-verdict marker
+  try {
+    const marker = JSON.parse(raw);
+    if (!marker?.fingerprint) throw new Error("missing fingerprint");
+    if (Number(marker.retryAfter) > now) return marker.fingerprint;
+  } catch { /* malformed/expired retry marker is not a completed review */ }
+  clearReviewedWorktree(ws);
+  return null;
 }
 
-export function writeReviewedWorktree(ws, fingerprint) {
+export function writeReviewedWorktree(ws, fingerprint, { retryAfter } = {}) {
   if (!fingerprint) return;
   try {
     fs.mkdirSync(workspaceStateDir(ws), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(REVIEWED_WORKTREE(ws), `${fingerprint}\n`, { mode: 0o600 });
+    const value = Number(retryAfter) > 0
+      ? JSON.stringify({ fingerprint, retryAfter: Number(retryAfter) })
+      : fingerprint;
+    fs.writeFileSync(REVIEWED_WORKTREE(ws), `${value}\n`, { mode: 0o600 });
   } catch { /* best effort dedupe */ }
 }
 
@@ -174,10 +188,22 @@ export async function runMain({
   }
 
   const results = await Promise.all(reviewers.map((reviewer) => reviewer.run({
-    system, user, cwd: ws, env, timeoutMs: STOP_TIMEOUT_MS
+    system,
+    user,
+    cwd: ws,
+    env,
+    timeoutMs: STOP_TIMEOUT_MS,
+    cooldownScope: `stop:${ws}`
   })));
   const panel = combinePanel(results);
-  writeReviewedWorktree(ws, fingerprint);
+  // A provider failure is not a review. Suppress duplicate Stop noise only until the provider's
+  // cooldown expires, then make the unchanged snapshot eligible again.
+  if (panel.decision !== "fail-open") {
+    writeReviewedWorktree(ws, fingerprint);
+  } else {
+    const retryAfter = Math.max(0, ...results.map((result) => Number(result.cooldownUntil) || 0));
+    if (retryAfter > Date.now()) writeReviewedWorktree(ws, fingerprint, { retryAfter });
+  }
 
   try {
     writeTraceImpl(ws, {

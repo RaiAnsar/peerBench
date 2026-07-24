@@ -1,4 +1,4 @@
-import { parseVerdict, runGrokReview } from "./panel-lib.mjs";
+import { GROK_REVIEW_EFFORT, GROK_REVIEW_MODEL, parseVerdict, runGrokReview } from "./panel-lib.mjs";
 import {
   configuredProviderSecrets,
   displayName,
@@ -30,18 +30,28 @@ const unavailableLabel = (kind) => ({
   network: "network unavailable"
 }[kind] || "temporarily unavailable");
 
+const failureLabel = (kind) => ({
+  auth: "authentication failed on this run",
+  quota: "quota exhausted on this run",
+  rate: "rate-limited on this run",
+  timeout: "timed out on this run",
+  network: "network failed on this run"
+}[kind] || "review failed on this run");
+
 export function withAvailability(name, display, runImpl, { now = Date.now, env = process.env } = {}) {
   return async (args) => {
     const secrets = configuredProviderSecrets({ env });
-    const at = now();
-    const cooldown = readReviewerCooldown(name, { now: at, env, secrets });
+    const startedAt = now();
+    const cooldownScope = args?.cooldownScope || args?.cwd || "default";
+    const cooldown = readReviewerCooldown(name, { now: startedAt, env, secrets, scope: cooldownScope });
     if (cooldown) {
-      const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - at) / 60_000));
+      const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - startedAt) / 60_000));
       return {
         name: display,
         error: `${unavailableLabel(cooldown.kind)} — skipped without a model call (${minutesLeft} min remaining)`,
         errorKind: cooldown.kind,
-        skipped: "cooldown"
+        skipped: "cooldown",
+        cooldownUntil: cooldown.until
       };
     }
 
@@ -52,14 +62,28 @@ export function withAvailability(name, display, runImpl, { now = Date.now, env =
       const detail = error instanceof Error ? error.message : String(error);
       rawResult = { name: display, error: detail, errorKind: classifyReviewerFailureText(detail) || "runtime" };
     }
-    const result = redactProviderFailureData(rawResult, { secrets });
+    const finishedAt = now();
+    const result = {
+      ...redactProviderFailureData(rawResult, { secrets }),
+      latencyMs: rawResult?.latencyMs ?? Math.max(0, finishedAt - startedAt)
+    };
     if (!result?.error) return result;
     const kind = COOLDOWN_KINDS.has(result.errorKind)
       ? result.errorKind
       : (classifyReviewerFailureText(result.error) || result.errorKind);
     if (COOLDOWN_KINDS.has(kind)) {
-      recordReviewerCooldown(name, kind, result.error, { now: at, env, secrets });
-      return { ...result, error: `${unavailableLabel(kind)} — ${result.error}`, errorKind: kind };
+      const recorded = recordReviewerCooldown(name, kind, result.error, {
+        now: finishedAt,
+        env,
+        secrets,
+        scope: cooldownScope
+      });
+      return {
+        ...result,
+        error: `${failureLabel(kind)} — ${result.error}`,
+        errorKind: kind,
+        cooldownUntil: recorded.until
+      };
     }
     return result;
   };
@@ -83,7 +107,12 @@ export function extractVerdict(text) {
 function grokAdapter(env) {
   return {
     name: "grok",
-    reviewIdentity: { kind: "grok-cli", model: "grok-build" },
+    reviewIdentity: {
+      kind: "grok-cli",
+      model: GROK_REVIEW_MODEL,
+      effort: GROK_REVIEW_EFFORT,
+      mode: "tool-free-no-plan-v1"
+    },
     async run({ system, user, cwd, env: runEnv = env, timeoutMs = 45_000 }) {
       return runGrokReview({ prompt: `${system}\n\n${user}`, cwd, env: runEnv, timeoutMs });
     }

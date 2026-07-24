@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // peerbench runtime CLI.
 // Usage:
-//   bench-runner.mjs review [--json] [--base <ref>]
+//   bench-runner.mjs review [--json] [--strict] [--base <ref> | <range>]
 //   bench-runner.mjs status
 //   bench-runner.mjs setup
 //
@@ -12,10 +12,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { configuredProviderSecrets, resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName, KNOWN_REVIEWERS } from "../global-hooks/config-store.mjs";
+import { clearTransientReviewerCooldowns, configuredProviderSecrets, resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName, KNOWN_REVIEWERS } from "../global-hooks/config-store.mjs";
 import { collectUntrackedEvidence, combinePanel, grokSpawnSpec, grokChildEnv, grokAuthPath, grokPlatformRefusal, grokText } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers } from "../global-hooks/reviewers.mjs";
-import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser } from "../global-hooks/hunt.mjs";
+import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser, LIGHTWEIGHT_REVIEW_TIMEOUT_MS } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
 import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mjs";
 import { shouldRewake } from "../global-hooks/deep-review.mjs";
@@ -26,6 +26,7 @@ import { review as reviewClient } from "../global-hooks/review-client.mjs";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
 const MAX_DIFF_BYTES = 200_000;
+export const EXPLICIT_REVIEW_TIMEOUT_MS = LIGHTWEIGHT_REVIEW_TIMEOUT_MS;
 const SAFE_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--text", "--no-renames", "--full-index"];
 
 function workspaceRoot(cwd) {
@@ -109,12 +110,16 @@ function latestCodexBenchPluginHooksPath({
   return null;
 }
 
-const BOOL_FLAGS = new Set(["--json", "--write"]);
+const BOOL_FLAGS = new Set(["--json", "--write", "--strict"]);
 const VALUE_FLAGS = new Set(["--effort", "--max-turns", "--base"]);
 
 export function parseArgs(argv) {
-  const flags = { json: false, write: false, effort: "medium", maxTurns: null, base: null };
-  const setBool = (t) => { flags[t === "--json" ? "json" : "write"] = true; };
+  const flags = { json: false, write: false, strict: false, effort: "medium", maxTurns: null, base: null };
+  const setBool = (t) => {
+    if (t === "--json") flags.json = true;
+    else if (t === "--strict") flags.strict = true;
+    else flags.write = true;
+  };
   const setValue = (t, v) => {
     if (t === "--effort") flags.effort = v;
     if (t === "--max-turns") flags.maxTurns = Number(v);
@@ -157,6 +162,75 @@ export function parseArgs(argv) {
   return { flags, prompt };
 }
 
+export function reviewExitCode(decision, { strict = false } = {}) {
+  if (decision === "block") return 1;
+  if (decision === "allow") return 0;
+  return strict ? 1 : 0;
+}
+
+const usableReviewVerdict = (result) =>
+  !result?.error && (result?.verdict === "ALLOW" || result?.verdict === "BLOCK");
+
+export function contentReviewResult(results, panel, { strict = false } = {}) {
+  const list = Array.isArray(results) ? results : [];
+  if (panel.decision === "block") {
+    return { ...panel, advisory: false };
+  }
+  const unusable = list.filter((result) => !usableReviewVerdict(result));
+  if (strict && unusable.length > 0) {
+    const reasons = unusable
+      .map((result) => `${result.name}: ${result.error || "no usable verdict"}`)
+      .join(" | ");
+    return {
+      ...panel,
+      decision: "unreviewed",
+      advisory: false,
+      summary: `strict quorum unavailable — ${reasons || "reviewers returned no usable verdict"}`
+    };
+  }
+  return {
+    ...panel,
+    advisory: panel.decision === "fail-open"
+  };
+}
+
+export async function runContentReview({
+  ws,
+  system,
+  user,
+  sessionKey = null,
+  env = process.env,
+  resolveReviewersImpl = resolveReviewers,
+  writeTraceImpl = writeTrace
+}) {
+  const reviewers = resolveReviewersImpl({ env });
+  const results = await Promise.all(reviewers.map((reviewer) => reviewer.run({
+    system,
+    user,
+    cwd: ws,
+    env,
+    timeoutMs: EXPLICIT_REVIEW_TIMEOUT_MS,
+    cooldownScope: `review:${ws}`
+  })));
+  const panel = combinePanel(results);
+
+  try {
+    writeTraceImpl(ws, {
+      gate: "review",
+      ws,
+      sessionKey,
+      reviewers: results.map(({ raw: _raw, ...result }) => result),
+      systemPrompt: system,
+      userPrompt: user,
+      rawResponses: Object.fromEntries(results.map((result) => [result.name, result.raw || result.error || ""]))
+    });
+  } catch (error) {
+    process.stderr.write(`⛩ bench review: trace write failed (${error instanceof Error ? error.message : String(error)}); review continues.\n`);
+  }
+
+  return { results, panel };
+}
+
 async function main() {
   const [sub, ...rest] = process.argv.slice(2);
   const { flags, prompt } = parseArgs(rest);
@@ -166,31 +240,45 @@ async function main() {
     const ws = workspaceRoot(cwd);
     const sessionKey = sessionKeyFromInput({}, process.env);
 
-    // `/bench:review <range>` (e.g. origin/main..staging) → DEEP, repo-aware review of a committed
-    // ref-range with the REAL diff embedded — the thing /bench:hunt structurally cannot do (hunt has no
-    // diff, so reviewers scrape reflog and bail). Reuses the push-review path: git log+diff → repo-aware
-    // panel (reviewers may read the repo to verify) → push-review trace. Plain `/bench:review` (no range)
-    // keeps the fast content-only worktree review below.
-    const rangeArg = rest.find((r) => !r.startsWith("--") && /\.\.\.?/.test(r));
+    // `/bench:review <range>` (e.g. origin/main..staging) → bounded one-shot review of the committed
+    // ref-range with the REAL diff embedded. It deliberately does not launch repository agents:
+    // deeper exploration belongs to /bench:hunt or /bench:investigate and must never hold a release.
+    const rangeArg = String(prompt || "").split(/\s+/).find((value) => /\.\.\.?/.test(value))
+      || rest.find((value) => !value.startsWith("--") && /\.\.\.?/.test(value));
     if (rangeArg) {
       try {
-        const result = await runPushReview(rangeArg, ws, { sessionKey });
+        const result = await runPushReview(rangeArg, ws, {
+          sessionKey,
+          requireAll: flags.strict
+        });
         if (result.retry) {
           const msg = `git couldn't read range ${rangeArg} — check it (e.g. origin/main..HEAD, or fetch first).`;
-          process.stdout.write(flags.json ? JSON.stringify({ range: rangeArg, error: msg }) + "\n" : `⛩ review ${rangeArg}: ${msg}\n`);
-          process.exitCode = 1; return;
+          process.stdout.write(flags.json
+            ? JSON.stringify({ range: rangeArg, decision: "unreviewed", advisory: !flags.strict, error: msg }) + "\n"
+            : `⛩ review ${rangeArg}: UNREVIEWED${flags.strict ? " (strict)" : " (advisory)"} — ${msg}\n`);
+          process.exitCode = reviewExitCode("unreviewed", { strict: flags.strict }); return;
         }
         const blocking = shouldRewake({ maxSeverity: result.maxSeverity, findingCount: result.findingCount });
+        const decision = result.decision || (blocking ? "block" : "allow");
         if (flags.json) {
-          process.stdout.write(JSON.stringify({ range: rangeArg, decision: blocking ? "block" : "allow", badge: result.badge, summary: result.summary, findings: result.findings, traceId: result.traceId, reviewers: result.reviewers }) + "\n");
+          process.stdout.write(JSON.stringify({
+            range: rangeArg,
+            decision,
+            advisory: decision === "unreviewed" && !flags.strict,
+            badge: result.badge,
+            summary: result.summary,
+            findings: result.findings,
+            traceId: result.traceId,
+            reviewers: result.reviewers
+          }) + "\n");
         } else {
           const head = `⛩ review ${rangeArg} [${result.badge || "?"}] — ${result.summary}${result.traceId ? ` (trace ${result.traceId} · /bench:show ${result.traceId})` : ""}`;
           process.stdout.write(`${head}${result.findings ? `\n\n${result.findings}` : ""}\n`);
         }
-        process.exitCode = blocking ? 1 : 0;
+        process.exitCode = reviewExitCode(decision, { strict: flags.strict });
       } catch (e) {
         process.stderr.write(`⛩ review ${rangeArg}: ${e instanceof Error ? e.message : String(e)}\n`);
-        process.exitCode = 1;
+        process.exitCode = reviewExitCode("unreviewed", { strict: flags.strict });
       }
       return;
     }
@@ -212,9 +300,9 @@ async function main() {
       const reason = reads.some((result) => result.tooLarge) || !untrackedRead.complete
         ? `evidence exceeds the ${MAX_DIFF_BYTES}-byte bound; split the review`
         : "Git evidence could not be read";
-      if (flags.json) process.stdout.write(`${JSON.stringify({ decision: "unreviewed", reason })}\n`);
+      if (flags.json) process.stdout.write(`${JSON.stringify({ decision: "unreviewed", advisory: !flags.strict, reason })}\n`);
       else process.stdout.write(`⛩ bench review: UNREVIEWED — ${reason}.\n`);
-      process.exitCode = 1;
+      process.exitCode = reviewExitCode("unreviewed", { strict: flags.strict });
       return;
     }
     const status = statusRead.out;
@@ -232,42 +320,33 @@ async function main() {
     const user = userParts.join("\n\n");
     if (Buffer.byteLength(`${system}\n${user}`) > MAX_DIFF_BYTES) {
       const reason = `combined evidence exceeds the ${MAX_DIFF_BYTES}-byte bound; split the review`;
-      if (flags.json) process.stdout.write(`${JSON.stringify({ decision: "unreviewed", reason })}\n`);
+      if (flags.json) process.stdout.write(`${JSON.stringify({ decision: "unreviewed", advisory: !flags.strict, reason })}\n`);
       else process.stdout.write(`⛩ bench review: UNREVIEWED — ${reason}.\n`);
-      process.exitCode = 1;
+      process.exitCode = reviewExitCode("unreviewed", { strict: flags.strict });
       return;
     }
 
-    const reviewers = resolveReviewers({ env: process.env });
-    const results = await Promise.all(reviewers.map((r) => r.run({ system, user, cwd: ws, env: process.env })));
-    const panel = combinePanel(results);
-
-    try {
-      writeTrace(ws, {
-        gate: "review",
-        ws,
-        sessionKey,
-        reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null })),
-        systemPrompt: system,
-        userPrompt: user.slice(0, 2000),
-        rawResponses: Object.fromEntries(results.map((r) => [r.name, r.raw || r.error || ""]))
-      });
-    } catch (e) {
-      // trace is best-effort — but say so on stderr instead of swallowing (D3); /bench:status needs it.
-      process.stderr.write(`⛩ bench review: trace write failed (${e instanceof Error ? e.message : String(e)}); review continues.\n`);
-    }
+    const { results, panel } = await runContentReview({ ws, system, user, sessionKey });
+    const review = contentReviewResult(results, panel, { strict: flags.strict });
 
     if (flags.json) {
-      process.stdout.write(JSON.stringify({ decision: panel.decision, badge: panel.badge, summary: panel.summary, findings: panel.findings, results }) + "\n");
+      process.stdout.write(JSON.stringify({
+        decision: review.decision,
+        advisory: review.advisory,
+        badge: review.badge,
+        summary: review.summary,
+        findings: review.findings,
+        results
+      }) + "\n");
     } else {
       for (const r of results) {
         const line = r.error ? `${r.name}: skipped (${r.error})` : `${r.name}: ${r.firstLine || r.verdict}`;
         process.stdout.write(line + "\n");
       }
-      process.stdout.write(`\nResult: ${panel.decision.toUpperCase()} [${panel.badge}] — ${panel.summary}\n`);
-      if (panel.findings) process.stdout.write("\n" + panel.findings + "\n");
+      process.stdout.write(`\nResult: ${review.decision.toUpperCase()} [${review.badge}] — ${review.summary}\n`);
+      if (review.findings) process.stdout.write("\n" + review.findings + "\n");
     }
-    process.exitCode = panel.decision === "block" ? 1 : 0;
+    process.exitCode = reviewExitCode(review.decision, { strict: flags.strict });
     return;
   }
 
@@ -526,7 +605,7 @@ export async function huntCommand(cwd, seed, { huntImpl = huntPanel, writeTraceI
 // as an alias so the `spec-review` subcommand and existing tests keep working.
 export const specReviewCommand = runSpecReview;
 
-export function gateToggleCommand(ws, args, { root } = {}) {
+export function gateToggleCommand(ws, args, { root, clearTransientImpl = clearTransientReviewerCooldowns } = {}) {
   const sub = args[0]; // "off" or "on"
   const hasGlobal = args.slice(1).includes("--global");
   const scope = hasGlobal ? "global" : "workspace";
@@ -536,6 +615,7 @@ export function gateToggleCommand(ws, args, { root } = {}) {
   if (disabled) {
     return `bench: disabled (${scope}). Gates will no-op until /bench:on.`;
   }
+  clearTransientImpl({ root });
   const stillDisabled = isBenchDisabled(ws, { root });
   if (!stillDisabled) return `bench: enabled (${scope}).`;
   // The cleared scope didn't fully re-enable — name the remaining source honestly.

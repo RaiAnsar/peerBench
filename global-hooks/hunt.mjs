@@ -3,7 +3,7 @@ import { agenticReview } from "./agentic-review.mjs";
 import { createReviewTools } from "./review-tools.mjs";
 import { withConcurrencyLimit } from "./concurrency-limit.mjs";
 import { runGrokTask } from "./panel-lib.mjs";
-import { extractVerdict, withAvailability } from "./reviewers.mjs";
+import { extractVerdict, resolveReviewers, withAvailability } from "./reviewers.mjs";
 import { parseSeverity, stripThink } from "./deep-review.mjs";
 
 export const HUNT_SYSTEM =
@@ -32,13 +32,12 @@ export function buildDebugUser(seed) {
   return `Debug this specific failure — trace it to the root cause and propose the minimal fix:\n\n${String(seed ?? "").trim() || "(no failure described)"}`;
 }
 
-// Spec-review mode (capability G) — a DEEP, repo-aware review of an implementation
-// plan/spec document. Unlike the fast content-only plan-file gate, the reviewer may
-// read the repo to judge the plan against the real code. Produces a VERDICT line plus
-// a structured findings tail the runner can parse into {findingCount, severity}.
+// Spec-review mode (capability G) — a bounded review of an implementation plan/spec document.
+// The exact document is supplied to a one-shot panel. Produces a VERDICT line plus a structured
+// findings tail the runner can parse into {findingCount, severity}.
 export const SPEC_REVIEW_SYSTEM =
-  "You are reviewing an implementation plan/spec document AGAINST the real repository, READ-ONLY, via the provided tools. " +
-  "Verify the plan's claims (file paths, function names, behaviors, dependencies, ordering) against the actual code. " +
+  "You are reviewing an implementation plan/spec document using only the supplied document. Do not use tools or explore the repository. " +
+  "Check the plan for concrete internal contradictions, unsafe ordering, missing rollback behavior, or claims that would make the implementation fail. " +
   "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>` — BLOCK only for issues that would cause wrong behavior, " +
   "significant rework, or a broken build if executed as written. " +
   "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
@@ -47,7 +46,7 @@ export const SPEC_REVIEW_SYSTEM =
 
 export function buildSpecReviewUser(filePath, content) {
   return `<plan_document file="${filePath}">\n${String(content ?? "")}\n</plan_document>\n\n` +
-    "Review this plan/spec against the repository. Read whatever files you need to verify it.";
+    "Review this exact plan/spec content.";
 }
 
 // Parse a single reviewer's spec-review output into { verdict, severity, findingCount }.
@@ -67,43 +66,78 @@ export function parseSpecFindings(text) {
   return { verdict, severity, findingCount };
 }
 
-// Run the full configured panel deep on a spec, returning per-reviewer
-// { name, verdict, severity, findingCount, findings }. Repo-aware (uses huntPanel's
-// agentic tools) but seeded with the spec text and a verdict-producing system prompt.
-export async function specReviewPanel({ cwd, filePath, content, env = process.env, deep = true } = {}) {
-  const results = await huntPanel({
-    cwd, env, deep, budgetMs: DEEP_REVIEW_BUDGET_MS,
-    system: SPEC_REVIEW_SYSTEM,
-    user: buildSpecReviewUser(filePath, content)
-  });
+// Gate reviews are deliberately single-turn. Multi-turn repository exploration belongs to
+// explicit hunt/investigate commands and must never hold a release transaction open.
+export const LIGHTWEIGHT_REVIEW_TIMEOUT_MS = 60_000;
+
+export async function lightweightVerdictPanel({
+  cwd,
+  system,
+  user,
+  env = process.env,
+  cooldownScope,
+  resolveReviewersImpl = resolveReviewers,
+  timeoutMs = LIGHTWEIGHT_REVIEW_TIMEOUT_MS
+} = {}) {
+  const reviewers = resolveReviewersImpl({ env });
+  const results = await Promise.all(reviewers.map((reviewer) => reviewer.run({
+    system,
+    user,
+    cwd,
+    env,
+    timeoutMs,
+    cooldownScope
+  })));
   return results.map((r) => {
-    const parsed = parseSpecFindings(r.findings);
+    const findings = r.raw || r.findings || r.firstLine || "";
+    const parsed = parseSpecFindings(findings);
     return {
       name: r.name,
       verdict: r.error ? null : parsed.verdict,
       severity: r.error ? "none" : parsed.severity,
       findingCount: r.error ? 0 : parsed.findingCount,
-      findings: r.findings || "",
-      error: r.error || null
+      findings,
+      error: r.error || null,
+      errorKind: r.errorKind || null,
+      skipped: r.skipped || null,
+      latencyMs: r.latencyMs ?? null,
+      cooldownUntil: r.cooldownUntil ?? null
     };
   });
 }
 
-// Push-review mode (capability H) — a DEEP, repo-aware review of the commits ABOUT TO BE
-// PUSHED, given as a commit list + diff. Unlike the fast content-only pre-push gate, the
-// reviewer may read the repo READ-ONLY to catch cross-file bugs / regressions these commits
-// introduce. Same VERDICT+SEVERITY+findings contract as the spec-review so the runner parses
-// it identically via parseSpecFindings.
+export async function specReviewPanel({
+  cwd,
+  filePath,
+  content,
+  env = process.env,
+  resolveReviewersImpl,
+  timeoutMs = LIGHTWEIGHT_REVIEW_TIMEOUT_MS
+} = {}) {
+  return lightweightVerdictPanel({
+    cwd,
+    env,
+    resolveReviewersImpl,
+    timeoutMs,
+    cooldownScope: `spec-review:${cwd}`,
+    system: SPEC_REVIEW_SYSTEM,
+    user: buildSpecReviewUser(filePath, content)
+  });
+}
+
+// Push-review mode (capability H) — a bounded review of the commits ABOUT TO BE PUSHED, given as
+// a commit list + exact diff. Same VERDICT+SEVERITY+findings contract as the spec-review so the
+// runner parses it identically via parseSpecFindings.
 export const PUSH_REVIEW_SYSTEM =
-  "You are reviewing the commits ABOUT TO BE PUSHED, provided as a commit list + diff, AGAINST the real repository, READ-ONLY, via the provided tools. " +
-  "Scour the repo for cross-file bugs, regressions, or unsafe changes these commits introduce — read whatever files you need to confirm a claim. " +
-  "If a previous assistant message is provided, treat it as claims and scope clues only, not proof; compare those claims against the pushed commits and repository. " +
+  "You are reviewing the commits ABOUT TO BE PUSHED using only the supplied commit list and exact diff. Do not use tools or explore the repository. " +
+  "Find concrete bugs, regressions, or unsafe changes visible in this evidence. " +
+  "If a previous assistant message is provided, treat it as claims and scope clues only, not proof; compare those claims against the supplied commits and diff. " +
   "Pay special attention to claimed coverage that may only be implemented on one of several code paths or data sources. " +
   "Your first line must be exactly `ALLOW: <reason>` or `BLOCK: <reason>` — BLOCK only for a concrete bug, regression, security issue, or unsafe change " +
   "that must be fixed before these commits are pushed. " +
   "Then, on its own line, output `SEVERITY: none|low|medium|high|critical` (the worst issue you found; `none` if clean). " +
   "Then list each concrete finding on its own line starting with `- ` (file:line + the precise problem). " +
-  "Ground every claim in code you actually read — no speculation.";
+  "Ground every claim in the supplied evidence — no speculation.";
 
 export function buildPushReviewUser(range, content, { assistantContext = "" } = {}) {
   const context = String(assistantContext ?? "").trim();
@@ -111,30 +145,31 @@ export function buildPushReviewUser(range, content, { assistantContext = "" } = 
     ? `\n\n<previous_assistant_message_context>\n${context}\n</previous_assistant_message_context>`
     : "";
   return `<push range="${range}">\n${String(content ?? "")}\n</push>${contextBlock}\n\n` +
-    "Review these about-to-be-pushed commits against the repository. Read whatever files you need to verify them. " +
+    "Review these exact about-to-be-pushed commits and diff. " +
     "The previous assistant message, when present, is claims/context only; do not treat it as proof.";
 }
 
-// Run the full configured panel deep on a set of pushed commits, returning per-reviewer
-// { name, verdict, severity, findingCount, findings }. Repo-aware (huntPanel's agentic tools)
-// but seeded with the commit list + diff and the push verdict-producing system prompt. The
+// Run one bounded panel call on a set of pushed commits, returning per-reviewer
+// { name, verdict, severity, findingCount, findings }. The exact commit list and diff are embedded.
+// Repository exploration belongs to explicit hunt/investigate commands, never a release gate. The
 // shape mirrors specReviewPanel exactly so spec-review-run can reuse the same summarizer.
-export async function pushReviewPanel({ cwd, range, content, env = process.env, deep = true, assistantContext = "" } = {}) {
-  const results = await huntPanel({
-    cwd, env, deep, budgetMs: DEEP_REVIEW_BUDGET_MS,
+export async function pushReviewPanel({
+  cwd,
+  range,
+  content,
+  env = process.env,
+  assistantContext = "",
+  resolveReviewersImpl,
+  timeoutMs = LIGHTWEIGHT_REVIEW_TIMEOUT_MS
+} = {}) {
+  return lightweightVerdictPanel({
+    cwd,
+    env,
+    resolveReviewersImpl,
+    timeoutMs,
+    cooldownScope: `push-review:${cwd}`,
     system: PUSH_REVIEW_SYSTEM,
     user: buildPushReviewUser(range, content, { assistantContext })
-  });
-  return results.map((r) => {
-    const parsed = parseSpecFindings(r.findings);
-    return {
-      name: r.name,
-      verdict: r.error ? null : parsed.verdict,
-      severity: r.error ? "none" : parsed.severity,
-      findingCount: r.error ? 0 : parsed.findingCount,
-      findings: r.findings || "",
-      error: r.error || null
-    };
   });
 }
 
@@ -147,13 +182,7 @@ const INVESTIGATE_MAX_STEPS = 60;
 const INVESTIGATE_TIMEOUT_MS = 15 * 60 * 1000;
 const INVESTIGATE_ROUND_MS = 240_000;     // thinking rounds are slow ON PURPOSE here; relax the 90s watchdog
 
-// deep-review GATE budget (spec/push review on Stop). Distinct from hunt/investigate: a gate must land
-// PROMPTLY or Claude has already moved on and the block is skipped. This is a HARD wall-clock cap on
-// Both Grok and MiMo get the same bounded exploration contract. Env-tunable.
-// hunt/investigate never pass budgetMs, so their full 12/20/25-min budgets are untouched.
-const DEEP_REVIEW_BUDGET_MS = Number(process.env.BENCH_DEEP_REVIEW_BUDGET_MS) || 3 * 60 * 1000;
-
-export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, grokImpl, deep = false, budgetMs, system = HUNT_SYSTEM, user }) {
+export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, grokImpl, deep = false, budgetMs, cooldownScope = `hunt:${cwd}`, system = HUNT_SYSTEM, user }) {
   const cfg = resolveConfig({ env });
   const userMsg = user || buildHuntUser(seed);
   const debug = !!env.BENCH_DEBUG;
@@ -205,5 +234,5 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, grok
     displayName(name),
     () => runOne(name),
     { env }
-  )({})));
+  )({ cwd, cooldownScope })));
 }

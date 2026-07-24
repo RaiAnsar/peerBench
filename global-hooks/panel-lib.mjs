@@ -145,6 +145,8 @@ const TIMEOUT_MS = 25 * 60 * 1000;
 // and if their enforcement ever ships, it composes cleanly with ours: their read-only profile's
 // writable set is exactly grok_home()+temp (profiles.rs), which IS our ephemeral tmpdir redirect.
 export const GROK_TOOL_FREE_DENY = "todo_write,search_tool,use_tool,Agent";
+export const GROK_REVIEW_MODEL = "grok-4.5";
+export const GROK_REVIEW_EFFORT = "low";
 export const GROK_ARGS = (prompt, { sandboxProfile = "read-only", toolFree = false } = {}) => [
   "-p", prompt,
   "--verbatim",
@@ -154,7 +156,14 @@ export const GROK_ARGS = (prompt, { sandboxProfile = "read-only", toolFree = fal
   "--no-memory",
   "--no-subagents",
   "--disable-web-search",
+  "--no-auto-update",
   ...(toolFree ? [
+    // The user's interactive Grok config may intentionally default to xhigh. A release verdict is
+    // a bounded classification task, not an implementation session: pin its model/effort and skip
+    // plan-mode overhead so one exact-diff review cannot inherit an unbounded interactive profile.
+    "--model", GROK_REVIEW_MODEL,
+    "--reasoning-effort", GROK_REVIEW_EFFORT,
+    "--no-plan",
     // `--tools` disables default injection, but Grok retains MCP meta-tools. Select one harmless
     // built-in, then remove it and both meta-tools; --disallowed-tools wins after --tools.
     "--tools", "todo_write",

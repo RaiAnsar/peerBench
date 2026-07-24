@@ -6,8 +6,8 @@
 // CRITICAL deploy-parity: deployed hooks live FLAT in ~/.claude/hooks/ — only global-hooks/*.mjs
 // are copied there; scripts/ is NEVER deployed. This file imports ONLY global-hooks siblings.
 //
-// Deep, repo-aware review against the real repo (read-only). Each function runs the panel seeded
-// with the file/push content, writes a gate:"spec-review"/"push-review" trace, and RETURNS the
+// Bounded one-shot review of exact file/push evidence. Each function runs the panel seeded with
+// that content, writes a gate:"spec-review"/"push-review" trace, and RETURNS the
 // structured result { reviewers, findingCount, maxSeverity, findings, traceId, badge, summary, hash }.
 // They do not write a deep-result file or wake an agent; the explicit command prints the result.
 import fs from "node:fs";
@@ -21,6 +21,30 @@ import { isMainModule } from "./is-main.mjs";
 
 // Refuse oversized evidence instead of silently reviewing only a prefix and reporting it clean.
 const MAX_PUSH_DIFF_BYTES = 200_000;
+const usableVerdict = (result) => !result?.error && (result?.verdict === "ALLOW" || result?.verdict === "BLOCK");
+
+export function explicitDecision(results, structured, { requireAll = false } = {}) {
+  const usable = results.filter(usableVerdict);
+  if (!usable.length) return "unreviewed";
+  if (shouldRewake(structured)) return "block";
+  if (requireAll && usable.length !== results.length) return "unreviewed";
+  return "allow";
+}
+
+function explicitSummary(results, structured, { requireAll = false } = {}) {
+  const decision = explicitDecision(results, structured, { requireAll });
+  if (decision === "unreviewed") {
+    const unusable = results.filter((result) => !usableVerdict(result));
+    const reasons = unusable.map((result) => `${result.name}: ${result.error || "no usable verdict"}`).join(" | ");
+    const label = requireAll && results.some(usableVerdict) ? "strict quorum unavailable" : "unreviewed";
+    return `${label} — ${reasons || "reviewers returned no usable verdict"}`;
+  }
+  const skipped = results.filter((result) => result.error).map((result) => `${result.name} skipped: ${result.error}`);
+  const base = structured.findingCount > 0
+    ? `${structured.findingCount} finding(s), max severity ${structured.maxSeverity}`
+    : "no blocking findings";
+  return [base, ...skipped].join(" · ");
+}
 
 // Local git helper — keep imports global-hooks-only (deploy-parity). Returns [out, ok].
 function git(args, cwd) {
@@ -36,7 +60,8 @@ export async function runSpecReview(filePath, ws, {
   panelImpl = specReviewPanel,
   writeTraceImpl = writeTrace,
   now = Date.now(),
-  sessionKey = null
+  sessionKey = null,
+  requireAll = false
 } = {}) {
   let content = "";
   try { content = fs.readFileSync(filePath, "utf8"); } catch (e) {
@@ -48,16 +73,15 @@ export async function runSpecReview(filePath, ws, {
   const structured = summarizeSpecReview(results);   // { reviewers, findingCount, maxSeverity }
   const findings = aggregateFindings(results);       // blocking reviewers' findings, joined (NOT via combinePanel)
   const badge = panelBadge(results.map((r) => ({ name: r.name, error: r.error, verdict: r.verdict, severity: r.severity })), { blockMinSeverity: DEEP_REWAKE_SEVERITY });
-  const summary = structured.findingCount > 0
-    ? `${structured.findingCount} finding(s), max severity ${structured.maxSeverity}`
-    : "no blocking findings";
+  const decision = explicitDecision(results, structured, { requireAll });
+  const summary = explicitSummary(results, structured, { requireAll });
 
   let traceId = null;
   try {
     traceId = writeTraceImpl(ws, {
       gate: "spec-review", ws,
       sessionKey,
-      reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null, severity: r.severity, findingCount: r.findingCount })),
+      reviewers: results.map(({ findings: _findings, ...result }) => result),
       systemPrompt: SPEC_REVIEW_SYSTEM,
       userPrompt: buildSpecReviewUser(filePath, content),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
@@ -66,7 +90,7 @@ export async function runSpecReview(filePath, ws, {
     process.stderr.write(`⛩ spec-review: trace write failed (${e instanceof Error ? e.message : String(e)}); result still returned.\n`);
   }
 
-  return { ...structured, findings, traceId, badge, summary, hash };
+  return { ...structured, decision, findings, traceId, badge, summary, hash };
 }
 
 export async function runPushReview(range, ws, {
@@ -75,7 +99,8 @@ export async function runPushReview(range, ws, {
   gitImpl = git,
   now = Date.now(),
   sessionKey = null,
-  assistantContext = ""
+  assistantContext = "",
+  requireAll = false
 } = {}) {
   if (!range) throw new Error("runPushReview: missing range");
 
@@ -118,16 +143,15 @@ export async function runPushReview(range, ws, {
   const structured = summarizeSpecReview(results);
   const findings = aggregateFindings(results);
   const badge = panelBadge(results.map((r) => ({ name: r.name, error: r.error, verdict: r.verdict, severity: r.severity })), { blockMinSeverity: DEEP_REWAKE_SEVERITY });
-  const summary = structured.findingCount > 0
-    ? `${structured.findingCount} finding(s), max severity ${structured.maxSeverity}`
-    : "no blocking findings";
+  const decision = explicitDecision(results, structured, { requireAll });
+  const summary = explicitSummary(results, structured, { requireAll });
 
   let traceId = null;
   try {
     traceId = writeTraceImpl(ws, {
       gate: "push-review", ws,
       sessionKey,
-      reviewers: results.map((r) => ({ name: r.name, verdict: r.verdict || null, error: r.error || null, severity: r.severity, findingCount: r.findingCount })),
+      reviewers: results.map(({ findings: _findings, ...result }) => result),
       systemPrompt: PUSH_REVIEW_SYSTEM,
       userPrompt: buildPushReviewUser(range, content, { assistantContext }),
       rawResponses: Object.fromEntries(results.map((r) => [r.name, r.findings || `(no findings: ${r.error || "empty"})`]))
@@ -136,17 +160,18 @@ export async function runPushReview(range, ws, {
     process.stderr.write(`⛩ push-review: trace write failed (${e instanceof Error ? e.message : String(e)}); result still returned.\n`);
   }
 
-  return { ...structured, findings, traceId, badge, summary, hash };
+  return { ...structured, decision, findings, traceId, badge, summary, hash };
 }
 
 // CLI entry (manual use; NOT hook-spawned any more):
 //   spec-review-run.mjs <abs-path> --ws <abs-ws>      → runSpecReview
 //   spec-review-run.mjs --push <range> --ws <abs-ws>  → runPushReview
-// Exits 2 on a HIGH block (so a manual run surfaces it), 0 otherwise. Fails OPEN: any error → exit 0.
+// Exits 2 on a blocking finding. Infrastructure failure is advisory (0) unless --strict is passed.
 if (isMainModule(import.meta.url)) {
   const rest = process.argv.slice(2);
-  let filePath = null, ws = null, pushRange = null;
+  let filePath = null, ws = null, pushRange = null, strict = false;
   for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--strict") { strict = true; continue; }
     if (rest[i] === "--ws" && i + 1 < rest.length) { ws = rest[++i]; continue; }
     if (rest[i] === "--push" && i + 1 < rest.length) { pushRange = rest[++i]; continue; }
     if (!filePath) filePath = rest[i];
@@ -156,20 +181,24 @@ if (isMainModule(import.meta.url)) {
       let result;
       if (pushRange) {
         if (!ws) ws = process.cwd();
-        result = await runPushReview(pushRange, ws);
+        result = await runPushReview(pushRange, ws, { requireAll: strict });
       } else {
         if (!filePath) { process.stderr.write("⛩ spec-review: missing <abs-path>.\n"); process.exit(0); }
         if (!ws) ws = path.dirname(filePath);
-        result = await runSpecReview(filePath, ws);
+        result = await runSpecReview(filePath, ws, { requireAll: strict });
       }
-      if (shouldRewake({ maxSeverity: result.maxSeverity, findingCount: result.findingCount })) {
+      if (result.decision === "block") {
         process.stderr.write(`⛩ deep review found blocking issues:\n\n${result.findings || result.summary}\n`);
         process.exit(2);
+      }
+      if (result.decision !== "allow") {
+        process.stderr.write(`⛩ review unreviewed (advisory${strict ? ", strict mode" : ""}): ${result.summary}\n`);
+        process.exit(strict ? 1 : 0);
       }
       process.exit(0);
     } catch (e) {
       process.stderr.write(`⛩ ${pushRange ? "push-review" : "spec-review"}: ${e instanceof Error ? e.message : String(e)}\n`);
-      process.exit(0);
+      process.exit(strict ? 1 : 0);
     }
   })();
 }

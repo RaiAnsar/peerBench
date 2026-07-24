@@ -11,6 +11,7 @@ import {
   KNOWN_REVIEWERS,
   PROVIDER_NAMES,
   clearReviewerCooldowns,
+  clearTransientReviewerCooldowns,
   displayName,
   isBenchDisabled,
   normalizeSessionId,
@@ -52,7 +53,7 @@ test("MiMo configuration comes from its environment variables", () => {
   assert.equal(config.providers.mimo.model, "mimo-test");
   assert.equal(config.providers.mimo.baseURL, "https://mimo.invalid/v1");
   assert.equal(config.providers.mimo.thinking, "enabled");
-  assert.equal(config.providers.mimo.timeoutMs, 45_000);
+  assert.equal(config.providers.mimo.timeoutMs, 120_000);
 });
 
 test("expired and unknown reviewers cannot be selected", () => {
@@ -130,4 +131,65 @@ test("cooldown state redacts exact and structured credentials", () => {
   assert.equal(fs.statSync(path.join(root, "reviewer-cooldowns.json")).mode & 0o777, 0o600);
   clearReviewerCooldowns({ root });
   assert.equal(readReviewerCooldown("mimo", { root, now: 2_000 }), null);
+});
+
+test("timeout and network cooldowns are request-scoped while rate cooldowns remain global", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bench-scoped-cooldown-"));
+  recordReviewerCooldown("grok", "timeout", "timed out", {
+    root,
+    now: 1_000,
+    ttlMs: 60_000,
+    scope: "review:/workspace-a",
+    env: {}
+  });
+
+  assert.equal(readReviewerCooldown("grok", {
+    root, now: 2_000, scope: "review:/workspace-a", env: {}
+  })?.kind, "timeout");
+  assert.equal(readReviewerCooldown("grok", {
+    root, now: 2_000, scope: "review:/workspace-b", env: {}
+  }), null);
+
+  recordReviewerCooldown("grok", "rate", "HTTP 429", {
+    root,
+    now: 2_000,
+    ttlMs: 60_000,
+    scope: "review:/workspace-a",
+    env: {}
+  });
+  assert.equal(readReviewerCooldown("grok", {
+    root, now: 3_000, scope: "review:/workspace-b", env: {}
+  })?.kind, "rate");
+});
+
+test("reading cooldowns purges expired and legacy global timeout entries", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bench-cooldown-migration-"));
+  const file = path.join(root, "reviewer-cooldowns.json");
+  fs.writeFileSync(file, JSON.stringify({
+    grok: { kind: "timeout", detail: "legacy", ts: 1_000, until: 100_000 },
+    mimo: { kind: "rate", detail: "expired", ts: 1_000, until: 1_500 }
+  }));
+
+  assert.equal(readReviewerCooldown("grok", {
+    root, now: 2_000, scope: "review:/workspace-a", env: {}
+  }), null);
+  assert.equal(fs.existsSync(file), false, "obsolete cooldown state is removed instead of lingering");
+});
+
+test("clearing transient cooldowns preserves quota, auth, and rate state", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bench-clear-transient-"));
+  recordReviewerCooldown("grok", "timeout", "timed out", {
+    root, now: 1_000, ttlMs: 60_000, scope: "review:/workspace-a", env: {}
+  });
+  recordReviewerCooldown("mimo", "rate", "HTTP 429", {
+    root, now: 1_000, ttlMs: 60_000, env: {}
+  });
+
+  clearTransientReviewerCooldowns({ root });
+  assert.equal(readReviewerCooldown("grok", {
+    root, now: 2_000, scope: "review:/workspace-a", env: {}
+  }), null);
+  assert.equal(readReviewerCooldown("mimo", {
+    root, now: 2_000, scope: "review:/workspace-b", env: {}
+  })?.kind, "rate");
 });

@@ -72,6 +72,12 @@ test("parseArgs consumes standalone and quoted --base forms", () => {
   assert.equal(parseArgs(["--base main"]).flags.base, "main");
 });
 
+test("parseArgs recognizes standalone and quoted strict review mode", () => {
+  assert.equal(parseArgs(["--strict"]).flags.strict, true);
+  assert.equal(parseArgs(["--strict origin/main..HEAD"]).flags.strict, true);
+  assert.equal(parseArgs(["origin/main..HEAD"]).flags.strict, false);
+});
+
 test("setup reports the lightweight Grok + MiMo panel and one Claude Stop hook", () => {
   const { output } = run(["setup"]);
   assert.match(output, /Active reviewers: grok, mimo/);

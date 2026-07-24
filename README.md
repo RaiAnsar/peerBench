@@ -8,18 +8,29 @@ gates, background deep reviews, detached workers, or review queues.
 ## Reviewer policy
 
 - **MiMo** reviews dirty worktrees at Stop. The evidence cap is 64 KiB and the model budget is
-  15 seconds. A finding is advisory: it is shown once for that exact snapshot and never reopens
-  or blocks the session.
+  15 seconds. A finding is advisory: a completed verdict is shown once for that exact snapshot and
+  never reopens or blocks the session. An unreviewed provider failure remains eligible for retry
+  after its transient cooldown.
 - **Grok + MiMo** review an optional native pre-push update in parallel. The evidence cap is
   256 KiB and the entire hook has a 45-second deadline. A concrete model `BLOCK` stops the push;
   quota, authentication, network, timeout, or oversized-evidence failures are clearly reported as
   `UNREVIEWED` and do not trap the push.
 - Grok is reserved for pushes and explicit commands, so routine Stop events do not consume its
   plan allowance.
+- Explicit content and positional Git-range reviews run both reviewers as one-shot, tool-free calls
+  with a one-minute bound. The Grok release-review call pins `grok-4.5`, low reasoning effort,
+  no plan mode, and no CLI auto-update so it cannot inherit a user's slower interactive defaults.
+  Multi-turn repository exploration is reserved for explicit
+  `/bench:hunt` and `/bench:investigate` commands, never a release gate. An all-error panel is
+  reported honestly as `UNREVIEWED` and is advisory by default; pass `--strict` when infrastructure
+  failure should return nonzero. In strict mode every active reviewer must return a usable
+  non-blocking verdict; one approval plus one timeout is `UNREVIEWED`, never `ALLOW`. A concrete
+  reviewer `BLOCK` always returns nonzero.
 - Kimi, Qwen, GLM, MiniMax, and Codex are not reviewer choices in this release.
 
-Quota, authentication, rate-limit, timeout, and network failures enter bounded global cooldowns
-before another model call is attempted.
+Quota, authentication, and rate-limit failures enter bounded global cooldowns. Timeout and network
+failures use shorter workspace-and-surface-scoped cooldowns, so one slow review cannot suppress
+another project. `/bench:on` clears transient timeout/network state.
 Provider diagnostics are redacted before output or durable state. An unchanged successful or
 blocking push verdict is cached by policy, reviewer identity, SHAs, and exact diff hash.
 
@@ -36,7 +47,9 @@ plugin update must never silently add Git hooks to unrelated repositories.
 
 ## Commands
 
-- `/bench:review [--base <ref>]` — review current changes explicitly.
+- `/bench:review [--strict] [--base <ref> | <range>]` — bounded one-shot review of current changes
+  or an exact positional `base..head` range. `--strict` requires a usable verdict from every active
+  reviewer.
 - `/bench:hunt [focus]` — bounded read-only repository bug hunt.
 - `/bench:debug <failure>` — trace a specific failure to a root cause.
 - `/bench:investigate <problem>` — deeper bounded read-only investigation.

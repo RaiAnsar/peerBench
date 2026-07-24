@@ -13,7 +13,8 @@ import {
   STOP_TIMEOUT_MS,
   buildPrompt,
   readReviewedWorktree,
-  runMain
+  runMain,
+  writeReviewedWorktree
 } from "../global-hooks/stop-review.mjs";
 import { setBenchDisabled } from "../global-hooks/config-store.mjs";
 
@@ -124,6 +125,7 @@ test("Stop explicitly resolves only MiMo and passes a 15-second timeout", async 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].timeoutMs, STOP_TIMEOUT_MS);
   assert.equal(STOP_TIMEOUT_MS, 15_000);
+  assert.equal(calls[0].cooldownScope, `stop:${fs.realpathSync(ws)}`);
   assert.equal(trace.gate, "stop");
   assert.equal(trace.reviewers[0].verdict, "ALLOW");
 });
@@ -211,7 +213,7 @@ test("missing MiMo is advisory and the snapshot is deduped", async () => {
   assert.match(out.payloads[0].systemMessage, /turn allowed/);
 });
 
-test("reviewer errors fail open and still mark the snapshot reviewed", async () => {
+test("reviewer errors fail open but leave the snapshot eligible for a later retry", async () => {
   const ws = freshRepo();
   let calls = 0;
   const out = emitter();
@@ -229,10 +231,45 @@ test("reviewer errors fail open and still mark the snapshot reviewed", async () 
   };
   await runMain(options);
   await runMain(options);
-  assert.equal(calls, 1);
-  assert.equal(out.payloads.length, 1);
+  assert.equal(calls, 2);
+  assert.equal(out.payloads.length, 2);
   assert.match(out.payloads[0].systemMessage, /UNREVIEWED/);
   assert.match(out.payloads[0].systemMessage, /turn allowed/);
+});
+
+test("Stop suppresses repeated cooldown noise only until the cooldown expires", async () => {
+  const ws = freshRepo();
+  let calls = 0;
+  const retryAfter = Date.now() + 60_000;
+  const fake = {
+    name: "mimo",
+    reviewIdentity: { kind: "api", model: "fake-mimo" },
+    async run() {
+      calls += 1;
+      return {
+        name: "MiMo",
+        error: "timed out on this run",
+        errorKind: "timeout",
+        cooldownUntil: retryAfter
+      };
+    }
+  };
+  const options = {
+    input: { cwd: ws },
+    emitter: emitter(),
+    isBenchDisabledImpl: () => false,
+    resolveReviewersImpl: () => [fake],
+    writeTraceImpl: () => {}
+  };
+
+  await runMain(options);
+  const fingerprint = readReviewedWorktree(ws);
+  await runMain({ ...options, emitter: emitter() });
+  assert.equal(calls, 1, "the active cooldown marker suppresses duplicate Stop noise");
+
+  writeReviewedWorktree(ws, fingerprint, { retryAfter: Date.now() - 1 });
+  await runMain({ ...options, emitter: emitter() });
+  assert.equal(calls, 2, "the unchanged snapshot is retried after the cooldown marker expires");
 });
 
 test("buildPrompt is content-only, bounded in context, and contains both diff sections", () => {

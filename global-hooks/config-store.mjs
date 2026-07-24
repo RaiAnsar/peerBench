@@ -12,7 +12,7 @@ import { redactProviderFailure, secretHeaderValues } from "./provider-error-reda
 const DEFAULTS = {
   mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
-          headers: {}, timeoutMs: 45_000 }
+          headers: {}, timeoutMs: 120_000 }
 };
 const GROK = "grok";
 export const PROVIDER_NAMES = Object.keys(DEFAULTS);
@@ -140,9 +140,21 @@ const COOLDOWN_TTL_MS = {
   quota: 24 * 60 * 60_000,
   auth: 24 * 60 * 60_000,
   rate: 15 * 60_000,
-  timeout: 5 * 60_000,
+  timeout: 60_000,
   network: 2 * 60_000
 };
+const GLOBAL_COOLDOWN_KINDS = new Set(["quota", "auth", "rate"]);
+const TRANSIENT_COOLDOWN_KINDS = new Set(["timeout", "network"]);
+
+function cooldownScopeHash(scope) {
+  return createHash("sha256").update(String(scope || "default")).digest("hex").slice(0, 16);
+}
+
+function cooldownStorageKey(name, kind, scope) {
+  return GLOBAL_COOLDOWN_KINDS.has(kind)
+    ? name
+    : `${name}::${cooldownScopeHash(scope)}`;
+}
 
 function readCooldownMap(root) {
   try { return JSON.parse(fs.readFileSync(COOLDOWNS(root), "utf8")) || {}; } catch { return {}; }
@@ -163,38 +175,73 @@ function sanitizedCooldownMap(root, env, secrets = []) {
 }
 
 function persistCooldownMap(map, root) {
-  writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`);
-}
-
-export function readReviewerCooldown(name, { root, now = Date.now(), env = process.env, secrets = [] } = {}) {
-  const safe = sanitizedCooldownMap(root, env, secrets);
-  if (safe.changed) try { persistCooldownMap(safe.map, root); } catch { /* best effort migration */ }
-  const entry = safe.map[name];
-  return entry && Number(entry.until) > now ? entry : null;
-}
-
-export function recordReviewerCooldown(name, kind, detail, { root, now = Date.now(), ttlMs, retryAfterMs, env = process.env, secrets = [] } = {}) {
-  const safe = sanitizedCooldownMap(root, env, secrets);
-  const ttl = Math.max(1, Number(retryAfterMs) || Number(ttlMs) || COOLDOWN_TTL_MS[kind] || COOLDOWN_TTL_MS.rate);
-  safe.map[name] = {
-    kind,
-    detail: redactProviderFailure(detail, { secrets: safe.exact }).slice(0, 200),
-    until: now + ttl,
-    ts: now
-  };
-  for (const [key, value] of Object.entries(safe.map)) if (!(Number(value?.until) > now)) delete safe.map[key];
-  try { persistCooldownMap(safe.map, root); } catch { /* best effort */ }
-  return safe.map[name];
-}
-
-export function clearReviewerCooldowns({ root, name } = {}) {
-  if (!name) {
+  if (!Object.keys(map).length) {
     try { fs.rmSync(COOLDOWNS(root), { force: true }); } catch { /* already absent */ }
     return;
   }
-  const map = readCooldownMap(root);
-  delete map[name];
+  writePrivateFileAtomic(COOLDOWNS(root), `${JSON.stringify(map, null, 2)}\n`);
+}
+
+export function readReviewerCooldown(name, { root, now = Date.now(), env = process.env, secrets = [], scope = "default" } = {}) {
+  const safe = sanitizedCooldownMap(root, env, secrets);
+  let changed = safe.changed;
+  for (const [key, value] of Object.entries(safe.map)) {
+    if (!(Number(value?.until) > now)) {
+      delete safe.map[key];
+      changed = true;
+    }
+  }
+
+  // Pre-0.4.1 timeout/network entries were stored under the global reviewer key. Discard that
+  // legacy state instead of allowing one slow review to poison every workspace after an upgrade.
+  const legacy = safe.map[name];
+  if (legacy && TRANSIENT_COOLDOWN_KINDS.has(legacy.kind)) {
+    delete safe.map[name];
+    changed = true;
+  }
+
+  if (changed) try { persistCooldownMap(safe.map, root); } catch { /* best effort migration */ }
+  const globalEntry = safe.map[name];
+  if (globalEntry && Number(globalEntry.until) > now) return globalEntry;
+  const scopedEntry = safe.map[cooldownStorageKey(name, "timeout", scope)];
+  return scopedEntry && Number(scopedEntry.until) > now ? scopedEntry : null;
+}
+
+export function recordReviewerCooldown(name, kind, detail, { root, now = Date.now(), ttlMs, retryAfterMs, env = process.env, secrets = [], scope = "default" } = {}) {
+  const safe = sanitizedCooldownMap(root, env, secrets);
+  const ttl = Math.max(1, Number(retryAfterMs) || Number(ttlMs) || COOLDOWN_TTL_MS[kind] || COOLDOWN_TTL_MS.rate);
+  const key = cooldownStorageKey(name, kind, scope);
+  safe.map[key] = {
+    reviewer: name,
+    kind,
+    detail: redactProviderFailure(detail, { secrets: safe.exact }).slice(0, 200),
+    until: now + ttl,
+    ts: now,
+    ...(GLOBAL_COOLDOWN_KINDS.has(kind) ? { scope: "global" } : { scope: cooldownScopeHash(scope) })
+  };
+  for (const [key, value] of Object.entries(safe.map)) if (!(Number(value?.until) > now)) delete safe.map[key];
+  try { persistCooldownMap(safe.map, root); } catch { /* best effort */ }
+  return safe.map[key];
+}
+
+export function clearReviewerCooldowns({ root, name, kinds, env = process.env, secrets = [] } = {}) {
+  const selectedKinds = kinds ? new Set(Array.isArray(kinds) ? kinds : [kinds]) : null;
+  if (!name && !selectedKinds) {
+    try { fs.rmSync(COOLDOWNS(root), { force: true }); } catch { /* already absent */ }
+    return;
+  }
+  const map = sanitizedCooldownMap(root, env, secrets).map;
+  for (const [key, entry] of Object.entries(map)) {
+    const reviewer = entry?.reviewer || key.split("::", 1)[0];
+    if (name && reviewer !== name) continue;
+    if (selectedKinds && !selectedKinds.has(entry?.kind)) continue;
+    delete map[key];
+  }
   try { persistCooldownMap(map, root); } catch { /* best effort */ }
+}
+
+export function clearTransientReviewerCooldowns({ root, name, env = process.env, secrets = [] } = {}) {
+  clearReviewerCooldowns({ root, name, kinds: [...TRANSIENT_COOLDOWN_KINDS], env, secrets });
 }
 
 // reviewed-head marker: the last HEAD the stop gate reviewed up to. Shared by the stop gate

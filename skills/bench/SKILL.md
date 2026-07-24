@@ -23,7 +23,9 @@ Use these subcommands:
 
 - `setup` — show reviewer keys, hook health, and active reviewers.
 - `status [trace-id]` — show recent traces or expand one trace.
-- `review --json [--base <ref>]` — review the current diff/range.
+- `review --json [--strict] [--base <ref> | <range>]` — bounded one-shot review of current changes
+  or the exact diff for a positional `base..head` range. Provider failure is advisory unless strict;
+  strict requires a usable non-blocking verdict from every active reviewer.
 - `hunt [focus]` — run a read-only multi-reviewer bug hunt.
 - `investigate <problem>` — run a deeper focused investigation.
 - `debug <failure>` — root-cause a specific error or failing behavior.

@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { huntPanel, buildHuntUser, HUNT_SYSTEM, parseSpecFindings } from "../global-hooks/hunt.mjs";
+import {
+  LIGHTWEIGHT_REVIEW_TIMEOUT_MS,
+  PUSH_REVIEW_SYSTEM,
+  buildHuntUser,
+  huntPanel,
+  parseSpecFindings,
+  pushReviewPanel
+} from "../global-hooks/hunt.mjs";
 import { summarizeSpecReview, shouldRewake } from "../global-hooks/deep-review.mjs";
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "gc-hunt-"));
@@ -47,6 +54,46 @@ test("huntPanel deep=true sends thinking:{type:'enabled'} in the request body", 
   for (const t of capturedThinking) {
     assert.deepStrictEqual(t, { type: "enabled" });
   }
+});
+
+test("pushReviewPanel is one-shot, tool-free, and capped at one minute", async () => {
+  const calls = [];
+  const results = await pushReviewPanel({
+    cwd: "/workspace",
+    range: "base..head",
+    content: "<commits>c1</commits>\n<diff>+safe</diff>",
+    resolveReviewersImpl: () => [
+      {
+        name: "grok",
+        async run(args) {
+          calls.push(args);
+          return { name: "Grok", raw: "ALLOW: exact diff is safe" };
+        }
+      },
+      {
+        name: "mimo",
+        async run(args) {
+          calls.push(args);
+          return {
+            name: "MiMo",
+            error: "timed out on this run",
+            errorKind: "timeout",
+            latencyMs: LIGHTWEIGHT_REVIEW_TIMEOUT_MS
+          };
+        }
+      }
+    ]
+  });
+
+  assert.equal(LIGHTWEIGHT_REVIEW_TIMEOUT_MS, 60_000);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((call) => call.timeoutMs === 60_000));
+  assert.ok(calls.every((call) => call.cooldownScope === "push-review:/workspace"));
+  assert.ok(calls.every((call) => call.system === PUSH_REVIEW_SYSTEM));
+  assert.match(calls[0].system, /Do not use tools/i);
+  assert.match(calls[0].user, /<diff>\+safe<\/diff>/);
+  assert.equal(results[0].verdict, "ALLOW");
+  assert.equal(results[1].errorKind, "timeout");
 });
 
 // ── FIX 2 (deep-path consistency): a prose BLOCK (no `- ` bullets) must still rewake ──

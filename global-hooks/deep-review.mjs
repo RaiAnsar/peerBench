@@ -76,7 +76,13 @@ export function summarizeSpecReview(results) {
   const list = Array.isArray(results) ? results : [];
   // Carry per-reviewer severity so the surfaced badge + statusline can render a
   // sub-threshold BLOCK as `~` (advisory) rather than the alarming `✗`.
-  const reviewers = list.map((r) => ({ name: r.name, verdict: r.verdict ?? null, severity: r.severity ?? null }));
+  const reviewers = list.map((r) => {
+    const reviewer = { name: r.name, verdict: r.verdict ?? null, severity: r.severity ?? null };
+    for (const key of ["error", "errorKind", "skipped", "latencyMs", "cooldownUntil"]) {
+      if (r[key] !== undefined && r[key] !== null) reviewer[key] = r[key];
+    }
+    return reviewer;
+  });
   const findingCount = list.reduce((n, r) => n + (Number(r.findingCount) || 0), 0);
   let maxSeverity = "none";
   for (const r of list) {

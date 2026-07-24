@@ -272,17 +272,30 @@ test("GROK_VERDICT_SCHEMA pins the review verdict shape (ALLOW|BLOCK enum, reaso
 });
 
 test("grokSpawnSpec: jsonSchema appends --json-schema (review path); absent by default (task path stays free-form)", async () => {
-  const { grokSpawnSpec, GROK_TOOL_FREE_DENY, GROK_VERDICT_SCHEMA } = await import("../global-hooks/panel-lib.mjs");
+  const {
+    grokSpawnSpec,
+    GROK_REVIEW_EFFORT,
+    GROK_REVIEW_MODEL,
+    GROK_TOOL_FREE_DENY,
+    GROK_VERDICT_SCHEMA
+  } = await import("../global-hooks/panel-lib.mjs");
   const review = grokSpawnSpec("review", { platform: "darwin", tmpDir: "/tmp/t", toolFree: true, jsonSchema: GROK_VERDICT_SCHEMA });
   const i = review.args.indexOf("--json-schema");
   assert.ok(i > 0, "schema flag present when requested");
   assert.equal(review.args[i + 1], GROK_VERDICT_SCHEMA, "schema value rides along");
+  assert.equal(review.args[review.args.indexOf("--model") + 1], GROK_REVIEW_MODEL, "review model is explicit");
+  assert.equal(review.args[review.args.indexOf("--reasoning-effort") + 1], GROK_REVIEW_EFFORT, "review effort cannot inherit an interactive xhigh default");
+  assert.ok(review.args.includes("--no-plan"), "one-shot review skips plan-mode overhead");
+  assert.ok(review.args.includes("--no-auto-update"), "release review never waits on CLI self-update");
   assert.equal(review.args[review.args.indexOf("--tools") + 1], "todo_write", "allowlist disables default tool injection");
   assert.equal(review.args[review.args.indexOf("--disallowed-tools") + 1], GROK_TOOL_FREE_DENY, "selected tool and MCP meta-tools are removed");
   assert.equal(review.args[review.args.indexOf("--deny") + 1], "*", "permission fallback denies any surviving tool");
   assert.equal(review.args[review.args.indexOf("--max-turns") + 1], "1", "tool-free review is a single model turn");
   const task = grokSpawnSpec("hunt", { platform: "darwin", tmpDir: "/tmp/t" });
   assert.ok(!task.args.includes("--json-schema"), "task/hunt runs must NOT be verdict-constrained — their findings are prose");
+  assert.ok(!task.args.includes("--reasoning-effort"), "explicit hunts retain the caller's configured reasoning effort");
+  assert.ok(!task.args.includes("--no-plan"), "explicit hunts retain planning");
+  assert.ok(task.args.includes("--no-auto-update"), "hunts also avoid CLI update stalls");
   assert.ok(!task.args.includes("--tools"), "explicit repo hunt retains its inspection toolset");
   assert.equal(task.args[task.args.indexOf("--max-turns") + 1], "40");
 });

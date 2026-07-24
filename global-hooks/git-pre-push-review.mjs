@@ -334,7 +334,8 @@ export async function reviewUpdate(update, remote, ws, {
       user: evidence.user,
       cwd: ws,
       env,
-      timeoutMs: remaining
+      timeoutMs: remaining,
+      cooldownScope: `push:${ws}`
     })));
     const valid = results.filter(validVerdict);
     if (valid.length) writeCache(ws, fingerprint, { ts: Date.now(), results: valid });

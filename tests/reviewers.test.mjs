@@ -28,6 +28,12 @@ test("extractVerdict ignores fenced examples and finds the real verdict", () => 
 test("default resolver exposes exactly Grok and MiMo", () => {
   const reviewers = resolveReviewers({ env: {} });
   assert.deepEqual(reviewers.map((reviewer) => reviewer.name), ["grok", "mimo"]);
+  assert.deepEqual(reviewers[0].reviewIdentity, {
+    kind: "grok-cli",
+    model: "grok-4.5",
+    effort: "low",
+    mode: "tool-free-no-plan-v1"
+  });
 });
 
 test("MiMo receives the caller's bounded timeout and can retry malformed output once", async () => {
@@ -48,6 +54,28 @@ test("MiMo receives the caller's bounded timeout and can retry malformed output 
   assert.equal(calls.length, 2);
   assert.ok(calls.every((call) => call.timeoutMs > 0 && call.timeoutMs <= 15_000));
   assert.equal(calls[0].maxOverloadRetries, 0);
+});
+
+test("MiMo can use the explicit review's one-minute budget instead of the old 45-second ceiling", async () => {
+  clearReviewerCooldowns({ root: ROOT });
+  const calls = [];
+  const [mimo] = resolveReviewers({
+    env: { MIMO_API_KEY: "fake-mimo-key" },
+    reviewers: ["mimo"],
+    reviewImpl: async (request) => {
+      calls.push(request);
+      return { ok: true, text: "ALLOW: clean", usage: null };
+    }
+  });
+
+  const result = await mimo.run({
+    system: "system",
+    user: "user",
+    timeoutMs: 60_000,
+    cooldownScope: "review:/workspace-a"
+  });
+  assert.equal(result.verdict, "ALLOW");
+  assert.ok(calls[0].timeoutMs > 45_000 && calls[0].timeoutMs <= 60_000);
 });
 
 test("an active cooldown skips the model call", async () => {
@@ -111,7 +139,8 @@ test("generic HTTP 503 adapter failures enter the network cooldown", async () =>
   const first = await run({});
   const second = await run({});
   assert.equal(first.errorKind, "network");
-  assert.match(first.error, /network unavailable/i);
+  assert.match(first.error, /network failed on this run/i);
+  assert.doesNotMatch(first.error, /skipped without a model call/i);
   assert.equal(second.skipped, "cooldown");
   assert.equal(calls, 1, "the unavailable provider is not called again during cooldown");
   assert.equal(readReviewerCooldown("mimo", { root: ROOT, now: 20_001, env: {} }).kind, "network");
@@ -125,8 +154,55 @@ test("a thrown reviewer failure is contained and starts the matching cooldown", 
   }, { now: () => 10_000, env: {} });
   const result = await run({});
   assert.equal(result.errorKind, "network");
-  assert.match(result.error, /network unavailable/i);
+  assert.match(result.error, /network failed on this run/i);
   assert.equal(readReviewerCooldown("mimo", { root: ROOT, now: 10_001, env: {} }).kind, "network");
+  clearReviewerCooldowns({ root: ROOT });
+});
+
+test("a live timeout is labeled as this run and starts its cooldown after the call finishes", async () => {
+  clearReviewerCooldowns({ root: ROOT });
+  const times = [1_000, 46_000];
+  const run = withAvailability("grok", "Grok", async () => ({
+    name: "Grok",
+    error: "timed out",
+    errorKind: "timeout"
+  }), { now: () => times.shift(), env: {} });
+
+  const result = await run({ cwd: "/workspace-a", cooldownScope: "review:/workspace-a" });
+  assert.equal(result.errorKind, "timeout");
+  assert.equal(result.latencyMs, 45_000);
+  assert.match(result.error, /timed out on this run/i);
+  assert.doesNotMatch(result.error, /skipped without a model call/i);
+  const cooldown = readReviewerCooldown("grok", {
+    root: ROOT,
+    now: 46_001,
+    env: {},
+    scope: "review:/workspace-a"
+  });
+  assert.equal(cooldown.ts, 46_000);
+  assert.equal(cooldown.until, 106_000);
+  clearReviewerCooldowns({ root: ROOT });
+});
+
+test("timeout cooldowns are scoped and do not suppress unrelated workspaces", async () => {
+  clearReviewerCooldowns({ root: ROOT });
+  let calls = 0;
+  let clock = 1_000;
+  const run = withAvailability("grok", "Grok", async () => {
+    calls += 1;
+    return calls === 1
+      ? { name: "Grok", error: "timed out", errorKind: "timeout" }
+      : { name: "Grok", verdict: "ALLOW", firstLine: "ALLOW: clean" };
+  }, { now: () => clock++, env: {} });
+
+  const first = await run({ cwd: "/workspace-a", cooldownScope: "review:/workspace-a" });
+  const otherWorkspace = await run({ cwd: "/workspace-b", cooldownScope: "review:/workspace-b" });
+  const sameWorkspace = await run({ cwd: "/workspace-a", cooldownScope: "review:/workspace-a" });
+
+  assert.equal(first.errorKind, "timeout");
+  assert.equal(otherWorkspace.verdict, "ALLOW");
+  assert.equal(sameWorkspace.skipped, "cooldown");
+  assert.equal(calls, 2);
   clearReviewerCooldowns({ root: ROOT });
 });
 

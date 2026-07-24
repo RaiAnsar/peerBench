@@ -7,16 +7,21 @@ import path from "node:path";
 process.env.BENCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bench-runner-root-"));
 
 import {
+  EXPLICIT_REVIEW_TIMEOUT_MS,
   codexPromptStatus,
   codexSetupStatus,
+  contentReviewResult,
+  gateToggleCommand,
   gradeCommand,
   healthCommand,
   huntCommand,
+  reviewExitCode,
   reviewersCommand,
+  runContentReview,
   setupStatus,
   statusCommand
 } from "../scripts/bench-runner.mjs";
-import { resolveConfig } from "../global-hooks/config-store.mjs";
+import { readReviewerCooldown, recordReviewerCooldown, resolveConfig } from "../global-hooks/config-store.mjs";
 import { writeTrace } from "../global-hooks/trace-store.mjs";
 
 function freshWs() {
@@ -79,6 +84,109 @@ test("reviewersCommand accepts the lightweight Grok + MiMo panel", () => {
   } finally {
     process.exitCode = previousExitCode;
   }
+});
+
+test("explicit content review uses a one-minute scoped budget and preserves failure metadata", async () => {
+  const ws = freshWs();
+  const calls = [];
+  let trace;
+  const user = "x".repeat(3_000);
+  const { panel, results } = await runContentReview({
+    ws,
+    system: "review",
+    user,
+    sessionKey: "session-test",
+    env: {},
+    resolveReviewersImpl: () => [{
+      name: "grok",
+      async run(args) {
+        calls.push(args);
+        return {
+          name: "Grok",
+          error: "timed out on this run — timed out",
+          errorKind: "timeout",
+          latencyMs: 45_000,
+          cooldownUntil: 99_000
+        };
+      }
+    }],
+    writeTraceImpl: (_workspace, value) => { trace = value; }
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].timeoutMs, EXPLICIT_REVIEW_TIMEOUT_MS);
+  assert.equal(EXPLICIT_REVIEW_TIMEOUT_MS, 60_000);
+  assert.equal(calls[0].cooldownScope, `review:${ws}`);
+  assert.equal(panel.decision, "fail-open");
+  assert.equal(reviewExitCode(panel.decision), 0, "provider failure is advisory by default");
+  assert.equal(reviewExitCode(panel.decision, { strict: true }), 1);
+  assert.equal(reviewExitCode("allow"), 0);
+  assert.equal(reviewExitCode("block"), 1);
+  assert.equal(trace.userPrompt.length, 3_000, "trace-store, not the caller, owns the 64 KiB cap");
+  assert.equal(trace.reviewers[0].errorKind, "timeout");
+  assert.equal(trace.reviewers[0].latencyMs, 45_000);
+  assert.equal(results[0].cooldownUntil, 99_000);
+});
+
+test("strict content review requires all reviewers while concrete blocks still win", () => {
+  const allow = {
+    name: "MiMo",
+    verdict: "ALLOW",
+    firstLine: "ALLOW: safe",
+    error: null
+  };
+  const timeout = {
+    name: "Grok",
+    verdict: null,
+    error: "timed out on this run",
+    errorKind: "timeout"
+  };
+  const partialPanel = {
+    decision: "allow",
+    badge: "Grok! MiMo✓",
+    summary: "MiMo allowed | Grok skipped",
+    findings: ""
+  };
+
+  const advisory = contentReviewResult([timeout, allow], partialPanel);
+  assert.equal(advisory.decision, "allow");
+  assert.equal(advisory.advisory, false);
+
+  const strict = contentReviewResult([timeout, allow], partialPanel, { strict: true });
+  assert.equal(strict.decision, "unreviewed");
+  assert.equal(strict.advisory, false);
+  assert.match(strict.summary, /^strict quorum unavailable.*Grok.*timed out/i);
+
+  const block = contentReviewResult([
+    timeout,
+    { name: "MiMo", verdict: "BLOCK", error: null }
+  ], {
+    decision: "block",
+    badge: "Grok! MiMo✗",
+    summary: "MiMo blocked",
+    findings: "BLOCK: unsafe"
+  }, { strict: true });
+  assert.equal(block.decision, "block");
+  assert.equal(block.advisory, false);
+});
+
+test("re-enabling clears only transient cooldowns", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bench-toggle-cooldowns-"));
+  const ws = freshWs();
+  recordReviewerCooldown("grok", "timeout", "timed out", {
+    root, now: 1_000, ttlMs: 60_000, scope: `review:${ws}`, env: {}
+  });
+  recordReviewerCooldown("mimo", "rate", "HTTP 429", {
+    root, now: 1_000, ttlMs: 60_000, env: {}
+  });
+
+  assert.match(gateToggleCommand(ws, ["on"], { root }), /enabled/i);
+  assert.equal(readReviewerCooldown("grok", {
+    root, now: 2_000, scope: `review:${ws}`, env: {}
+  }), null);
+  assert.equal(readReviewerCooldown("mimo", {
+    root, now: 2_000, scope: `review:${ws}`, env: {}
+  })?.kind, "rate");
 });
 
 test("statusCommand expands a Grok + MiMo trace", () => {

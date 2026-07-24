@@ -139,6 +139,7 @@ test("runSpecReview writes a gate:'spec-review' trace and returns the structured
   };
 
   const result = await specReviewCommand(file, ws, { panelImpl });
+  assert.equal(result.decision, "block");
   assert.equal(result.findingCount, 1);
   assert.equal(result.maxSeverity, "high");
   assert.match(result.findings, /ambiguous step/, "aggregate findings carry the blocking reviewer's text");
@@ -179,6 +180,7 @@ test("runPushReview writes a gate:'push-review' trace and returns result + findi
   assert.match(seeded.content, /c1 first/);
   assert.match(seeded.content, /\+broken\(\)/);
   assert.equal(result.findingCount, 1);
+  assert.equal(result.decision, "block");
   assert.equal(result.maxSeverity, "high");
   assert.match(result.findings, /cross-file regression/);
   const [latest] = listTraces(ws, 1);
@@ -203,6 +205,138 @@ test("runPushReview seeds and traces previous assistant context as claims, not p
   assert.match(trace.userPrompt, /<previous_assistant_message_context>/);
   assert.match(trace.userPrompt, /quantity_on_order/);
   assert.match(trace.userPrompt, /claims\/context only|not proof/i);
+});
+
+test("runPushReview reports all-reviewer failure as unreviewed and preserves diagnostics", async () => {
+  const ws = freshWs();
+  const stub = gitStub({ commits: "c4 migration", diff: "+create function" });
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    gitImpl: stub.impl,
+    panelImpl: async () => [
+      {
+        name: "Grok",
+        verdict: null,
+        findings: "",
+        findingCount: 0,
+        severity: "none",
+        error: "timed out on this run",
+        errorKind: "timeout",
+        latencyMs: 120_000,
+        cooldownUntil: 200_000
+      },
+      {
+        name: "MiMo",
+        verdict: null,
+        findings: "",
+        findingCount: 0,
+        severity: "none",
+        error: "network failed on this run",
+        errorKind: "network",
+        skipped: null
+      }
+    ]
+  });
+
+  assert.equal(result.decision, "unreviewed");
+  assert.match(result.summary, /unreviewed.*Grok.*MiMo/i);
+  assert.doesNotMatch(result.summary, /no blocking findings/i);
+  assert.equal(result.reviewers[0].errorKind, "timeout");
+  assert.equal(result.reviewers[0].latencyMs, 120_000);
+  const trace = readTrace(ws, listTraces(ws, 1)[0].id);
+  assert.equal(trace.reviewers[0].errorKind, "timeout");
+  assert.equal(trace.reviewers[0].cooldownUntil, 200_000);
+});
+
+test("runPushReview allows one usable verdict when the other reviewer times out", async () => {
+  const ws = freshWs();
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    gitImpl: gitStub({ commits: "c5 migration", diff: "+safe change" }).impl,
+    panelImpl: async () => [
+      {
+        name: "Grok",
+        verdict: "ALLOW",
+        findings: "ALLOW: exact diff is safe",
+        findingCount: 0,
+        severity: "none",
+        error: null
+      },
+      {
+        name: "MiMo",
+        verdict: null,
+        findings: "",
+        findingCount: 0,
+        severity: "none",
+        error: "timed out on this run",
+        errorKind: "timeout",
+        latencyMs: 60_000
+      }
+    ]
+  });
+
+  assert.equal(result.decision, "allow");
+  assert.match(result.summary, /MiMo skipped.*timed out/i);
+  assert.doesNotMatch(result.summary, /^unreviewed/i);
+});
+
+test("runPushReview strict mode requires every configured reviewer to return a usable verdict", async () => {
+  const ws = freshWs();
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    gitImpl: gitStub({ commits: "c6 migration", diff: "+safe change" }).impl,
+    requireAll: true,
+    panelImpl: async () => [
+      {
+        name: "Grok",
+        verdict: null,
+        findings: "",
+        findingCount: 0,
+        severity: "none",
+        error: "timed out on this run",
+        errorKind: "timeout"
+      },
+      {
+        name: "MiMo",
+        verdict: "ALLOW",
+        findings: "ALLOW: exact diff is safe",
+        findingCount: 0,
+        severity: "none",
+        error: null
+      }
+    ]
+  });
+
+  assert.equal(result.decision, "unreviewed");
+  assert.match(result.summary, /^strict quorum unavailable.*Grok.*timed out/i);
+  assert.doesNotMatch(result.summary, /MiMo:/, "the successful reviewer is not presented as a failure reason");
+});
+
+test("runPushReview strict mode preserves a concrete block even when another reviewer fails", async () => {
+  const ws = freshWs();
+  const result = await runPushReview("@{u}..HEAD", ws, {
+    gitImpl: gitStub({ commits: "c7 migration", diff: "+unsafe change" }).impl,
+    requireAll: true,
+    panelImpl: async () => [
+      {
+        name: "Grok",
+        verdict: null,
+        findings: "",
+        findingCount: 0,
+        severity: "none",
+        error: "timed out on this run",
+        errorKind: "timeout"
+      },
+      {
+        name: "MiMo",
+        verdict: "BLOCK",
+        findings: "BLOCK: migration drops data\nSEVERITY: high",
+        findingCount: 1,
+        severity: "high",
+        error: null
+      }
+    ]
+  });
+
+  assert.equal(result.decision, "block");
+  assert.match(result.findings, /migration drops data/i);
 });
 
 test("buildPushReviewUser keeps push evidence before assistant context", () => {
@@ -256,6 +390,7 @@ test("runPushReview sends complete under-limit evidence to the panel", async () 
   };
   const result = await runPushReview("@{u}..HEAD", ws, { panelImpl, gitImpl: stub.impl });
   assert.equal(result.retry, undefined);
+  assert.equal(result.decision, "allow");
   assert.match(captured, /\+TAIL_MARKER/);
   assert.doesNotMatch(captured, /truncated/i);
 });
