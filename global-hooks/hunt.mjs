@@ -192,6 +192,21 @@ const INVESTIGATE_MAX_STEPS = 60;
 const INVESTIGATE_TIMEOUT_MS = 15 * 60 * 1000;
 const INVESTIGATE_ROUND_MS = 240_000;     // thinking rounds are slow ON PURPOSE here; relax the 90s watchdog
 
+// An agentic reviewer can burn its whole budget narrating tool use ("I'll dig into the docs next…")
+// and return that prose with NO error, so the panel renders it as a healthy reviewer and a two-model
+// panel is silently a one-model panel (Grok did exactly this for 468 chars on trace 1784914555751).
+// Every prompt on this path demands file:line citations, so a report carrying none — and not stating
+// a clean/inconclusive result — is narration, not a review. Kept deliberately generous: mislabeling a
+// real report as an error is worse than letting one narration run through.
+const FILE_LINE_RE = /[\w./-]+\.[A-Za-z]{1,6}:\d+/;
+const CONCLUSION_RE = /\b(no (?:concrete |real |actual |obvious |clear )?(?:bugs?|issues?|findings?|problems?|defects?)\b|nothing (?:concrete |obvious )?(?:found|to report)|could not (?:find|identify|reproduce|determine)|unable to (?:find|identify|reproduce|determine))/i;
+
+export function findingsLookSubstantive(text) {
+  const value = String(text ?? "").trim();
+  if (!value) return false;
+  return FILE_LINE_RE.test(value) || CONCLUSION_RE.test(value);
+}
+
 export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, grokImpl, deep = false, budgetMs, cooldownScope = `hunt:${cwd}`, system = HUNT_SYSTEM, user }) {
   const cfg = resolveConfig({ env });
   const userMsg = user || buildHuntUser(seed);
@@ -239,10 +254,19 @@ export async function huntPanel({ cwd, seed, env = process.env, reviewImpl, grok
     }
   };
 
+  // Guard AFTER the run, BEFORE availability wrapping, so a narration-only run is classified like any
+  // other failed run (badge, cooldown, summary) instead of masquerading as findings. The raw text is
+  // preserved so the trace still shows exactly what the reviewer said.
+  const guarded = async (name) => {
+    const result = await runOne(name);
+    if (result.error || findingsLookSubstantive(result.findings)) return result;
+    return { ...result, error: "returned narration without any file:line findings", errorKind: "empty" };
+  };
+
   return Promise.all(cfg.reviewers.map((name) => withAvailability(
     name,
     displayName(name),
-    () => runOne(name),
+    () => guarded(name),
     { env }
   )({ cwd, cooldownScope })));
 }

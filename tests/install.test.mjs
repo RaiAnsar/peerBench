@@ -144,9 +144,12 @@ test("installPeerBench refuses a stale Codex cache before creating transaction s
   fs.writeFileSync(path.join(stale, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "bench", version: "0.3.1" }));
   fs.writeFileSync(path.join(stale, "sentinel.txt"), "stale untouched\n");
 
+  // The refusal must hand over the EXACT recovery, not a generic pointer: `marketplace upgrade`
+  // fails for a directory marketplace, and `plugin add` deletes the old version dir out from under
+  // any live Codex session, which is what makes it report the bench skill path as stale.
   assert.throws(
     () => installPeerBench({ repoRoot: repo, home, claude: false, codex: true, now: () => 100 }),
-    /checkout=0\.4\.0[\s\S]*0\.3\.1[\s\S]*plugin manager/i
+    /checkout=0\.4\.0[\s\S]*0\.3\.1[\s\S]*codex plugin add bench@aiwithrai[\s\S]*--codex-only[\s\S]*stale/i
   );
   assert.equal(fs.existsSync(path.join(home, ".claude", "plugins", "data", "bench-shared")), false, "failure occurs before lock/backup mutation");
   assert.equal(fs.existsSync(path.join(home, ".codex", "hooks")), false);

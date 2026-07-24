@@ -546,6 +546,12 @@ export function removeCodexSettingsPeerBenchHooks({ hooksPath }) {
   const s = readJsonObjectStrict(hooksPath, { label: "Codex hooks config" });
   ensureHooksObject(s, "Codex hooks config");
   const removedEntries = removeHookCommands(s, PEERBENCH_CODEX_HOOKS, [path.join(path.dirname(hooksPath), "hooks")]);
+  // peerBench OWNS this file, so prune every event left with no blocks. A bare `"Stop": []` reads like
+  // a configured-but-broken gate — the live ~/.codex/hooks.json sat at {"hooks":{"Stop":[]}} for days.
+  // Scoped here on purpose: Claude's settings.json is shared with other tools and keeps its empty events.
+  for (const event of Object.keys(s.hooks)) {
+    if (s.hooks[event].length === 0) delete s.hooks[event];
+  }
   writeJsonConfig(hooksPath, s, "Codex hooks config");
   return { removedEntries, pluginManaged: true };
 }

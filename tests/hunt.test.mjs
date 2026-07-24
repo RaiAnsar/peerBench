@@ -5,6 +5,7 @@ import {
   LIGHTWEIGHT_REVIEW_TIMEOUT_MS,
   PUSH_REVIEW_SYSTEM,
   buildHuntUser,
+  findingsLookSubstantive,
   huntPanel,
   parseSpecFindings,
   pushReviewPanel
@@ -55,6 +56,37 @@ test("huntPanel deep=true sends thinking:{type:'enabled'} in the request body", 
   for (const t of capturedThinking) {
     assert.deepStrictEqual(t, { type: "enabled" });
   }
+});
+
+// Grok once burned a full 8-minute agentic hunt returning 468 chars of pure tool narration
+// ("I'll dig into the gate reliability docs next…") with NO error field, so it rendered as a
+// healthy reviewer and a 2-model panel was really a 1-model panel (trace 1784914555751).
+test("findingsLookSubstantive separates real reports and clean runs from pure narration", () => {
+  assert.equal(findingsLookSubstantive("- global-hooks/hunt.mjs:71 the budget is too small"), true);
+  assert.equal(findingsLookSubstantive("The bug is in stop-review.mjs:158 where the list is fixed"), true);
+  assert.equal(findingsLookSubstantive("No concrete bugs found in the reviewed paths."), true);
+  assert.equal(findingsLookSubstantive("I could not identify a root cause with the evidence available."), true);
+
+  assert.equal(findingsLookSubstantive(
+    "I'll hunt for concrete gate bugs by reading the relevant code paths."
+    + "I'll dig into the gate reliability docs and the core review implementations next."
+    + "Reading the core gate modules next: stop-review, pre-push, panel/combine, config cooldowns."), false);
+  assert.equal(findingsLookSubstantive(""), false);
+  assert.equal(findingsLookSubstantive("   "), false);
+});
+
+test("huntPanel marks a narration-only reviewer as failed instead of passing it off as findings", async () => {
+  const root = process.env.BENCH_ROOT;
+  fs.writeFileSync(path.join(root, "companion.json"), JSON.stringify({ reviewers: ["grok"], providers: {} }));
+  const grokImpl = async () => ({
+    name: "Grok",
+    raw: "I'll examine the review pipeline now.Reading the core modules next.Looking at reviewer resolution."
+  });
+
+  const [grok] = await huntPanel({ cwd: process.cwd(), seed: "gaps", grokImpl });
+  assert.equal(grok.name, "Grok");
+  assert.match(String(grok.error), /narration|no findings/i,
+    "a findings-free, citation-free run must surface as an error, not as a silent healthy reviewer");
 });
 
 test("pushReviewPanel is one-shot, tool-free, uses the explicit five-minute budget, and bypasses transient cooldowns", async () => {

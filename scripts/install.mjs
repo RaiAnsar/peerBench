@@ -561,8 +561,14 @@ export function installPeerBench({
     const versions = codexRoots.map((root) => path.basename(root)).sort().join(", ");
     throw new Error([
       `peerBench Codex plugin cache version mismatch: checkout=${checkoutVersion}; installed cache version(s)=${versions}.`,
-      "Refusing to overlay a different version in place.",
-      "Upgrade peerBench through the Codex plugin manager (`codex plugin marketplace upgrade aiwithrai`), fully restart Codex, then rerun setup."
+      "Refusing to overlay a different version in place. Install the new version first, then rerun:",
+      "",
+      `  CODEX_HOME=~/.codex codex plugin add ${CLAUDE_PLUGIN_NAME}@${marketplaceName}`,
+      "  node scripts/install.mjs --codex-only",
+      "",
+      "(`codex plugin marketplace upgrade` does NOT work here — this marketplace is a directory, not a Git remote.)",
+      `NOTE: \`plugin add\` REPLACES ${versions} instead of keeping it, so any Codex session already open still`,
+      "points at the old path and will report the bench skill as missing/stale. Restart those sessions."
     ].join("\n"));
   }
 
@@ -853,6 +859,13 @@ export function renderInstallSummary(result) {
     lines.push("Keys: .keys not found. Copy .keys.example to .keys, fill API keys, then run: node scripts/load-keys.mjs");
   }
   lines.push("Restart Claude Code and open a fresh Codex session for hook/prompt changes to be picked up.");
+  if (result.codex?.pluginDeploy) {
+    // Codex resolves the bench skill through a VERSIONED cache path captured at session start, and
+    // `codex plugin add` deletes the previous version dir (Claude keeps every version, so it never
+    // hits this). Any Codex session open across a version bump reports the skill path as stale.
+    lines.push(`⚠ Codex sessions started before this deploy still reference the OLD ${CLAUDE_PLUGIN_NAME} version path`);
+    lines.push("  and will report the bench skill as stale/missing. Restart them — reloading is not enough.");
+  }
   return `${lines.join("\n")}\n`;
 }
 

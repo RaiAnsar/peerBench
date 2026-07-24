@@ -11,6 +11,7 @@ process.env.BENCH_ROOT = BENCH_ROOT;
 
 const {
   MAX_PUSH_EVIDENCE_BYTES,
+  PUSH_DEADLINE_MS,
   buildPushEvidence,
   parseUpdates,
   resolveUpdateBase,
@@ -249,9 +250,36 @@ test("an exhausted total budget stops before Git preparation or reviewer calls",
   });
 
   assert.equal(result.decision, "unreviewed");
-  assert.match(result.note, /45-second budget reached/i);
+  assert.match(result.note, new RegExp(`${PUSH_DEADLINE_MS / 1000}-second budget reached`, "i"));
   assert.equal(resolved, false);
   assert.deepEqual(fake.calls, []);
+});
+
+// The 45s budget could not fit the panel: MiMo exceeded 42s on 5 of 6 successful real push reviews
+// (40.8s–114.8s, traces 2026-07-24), so the gate timed MiMo out and silently degraded to Grok-only.
+test("the push budget fits a real MiMo review and every budget message derives from the constant", async () => {
+  assert.ok(PUSH_DEADLINE_MS >= 120_000,
+    `push budget ${PUSH_DEADLINE_MS}ms cannot fit an observed 114.8s MiMo review`);
+
+  const source = fs.readFileSync(new URL("../global-hooks/git-pre-push-review.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /\d+-second/,
+    "budget messages must interpolate PUSH_DEADLINE_MS, never hardcode a stale duration");
+});
+
+test("the push gate honors the configured reviewer panel instead of hardcoding grok+mimo", async () => {
+  const { ws, remote, remoteSha } = freshRemoteWithMain();
+  const localSha = commitFile(ws, "cfg.txt", "configured panel\n", "configured panel");
+  const fake = reviewers({ MiMo: "ALLOW" });
+  const requests = [];
+
+  const result = await reviewUpdate(updateFor({ localSha, remoteSha }), remote, ws, {
+    resolveReviewersImpl: (args) => { requests.push(args); return fake.resolveReviewersImpl(args); }
+  });
+
+  assert.equal(result.decision, "allow");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].reviewers, undefined,
+    "a hardcoded list overrides companion.json, so /bench:reviewers is ignored on push");
 });
 
 test("a non-fast-forward rewind is explicitly unreviewed without model calls", async () => {

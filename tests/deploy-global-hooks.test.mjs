@@ -274,6 +274,25 @@ test("removeCodexSettingsPeerBenchHooks removes only the peerBench Codex wrapper
   assert.match(commands, /unrelated-stop\.mjs/);
 });
 
+// Removing the last peerBench command used to leave `{"hooks":{"Stop":[]}}` behind — a vestigial
+// empty event that reads like a configured-but-broken gate. Found in the live ~/.codex/hooks.json.
+test("removeCodexSettingsPeerBenchHooks prunes event arrays it empties", () => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-plugin-prune-"));
+  const hooksPath = path.join(configDir, "hooks.json");
+  const hooksDir = path.join(configDir, "hooks");
+  fs.writeFileSync(hooksPath, JSON.stringify({
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: `node "${path.join(hooksDir, "codex-stop-review.mjs")}"` }] }],
+      SessionStart: [{ hooks: [{ type: "command", command: 'node "/x/keep-me.mjs"' }] }]
+    }
+  }, null, 2));
+
+  removeCodexSettingsPeerBenchHooks({ hooksPath });
+  const saved = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
+  assert.equal(saved.hooks.Stop, undefined, "an emptied event array must be pruned, not left as []");
+  assert.match(JSON.stringify(saved.hooks), /keep-me\.mjs/, "untouched events survive");
+});
+
 test("plugin root discovery can select the checkout's exact Codex cache version", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "pb-plugin-roots-"));
   const claudeRoot = path.join(home, ".claude", "plugins", "cache", "aiwithrai", "bench", "0.3.0");

@@ -14,7 +14,13 @@ import { writeTrace } from "./trace-store.mjs";
 
 export const PUSH_POLICY_VERSION = "lightweight-v2-exhaustive-commits";
 export const MAX_PUSH_EVIDENCE_BYTES = 256 * 1024;
-export const PUSH_DEADLINE_MS = 45_000;
+// The panel must actually fit inside this. At 45s it did not: MiMo exceeded 42s on 5 of 6
+// successful real push reviews (40.8s–114.8s, traces 2026-07-24), so the gate timed MiMo out and
+// silently degraded to Grok-only or "unreviewed". `git push` waits on this (a normal, Ctrl-C-able
+// terminal wait — NOT the old PreToolUse freeze that made the session unusable).
+export const PUSH_DEADLINE_MS = 150_000;
+// Every budget message derives from the constant; a hardcoded duration goes stale the moment it moves.
+const BUDGET = `${Math.round(PUSH_DEADLINE_MS / 1000)}-second`;
 const ZERO_RE = /^0+$/;
 
 function boundedTimeout(deadline, cap) {
@@ -82,7 +88,7 @@ export function advertisedHeads(remote, cwd, { gitImpl = git, deadline = Number.
 }
 
 export function resolveUpdateBase(update, remote, cwd, { advertisedHeadsImpl = advertisedHeads, deadline = Number.POSITIVE_INFINITY } = {}) {
-  if (Date.now() >= deadline) return { ok: false, reason: "45-second budget reached before range resolution" };
+  if (Date.now() >= deadline) return { ok: false, reason: `${BUDGET} budget reached before range resolution` };
   if (ZERO_RE.test(update.localSha)) return { ok: false, deleteOnly: true };
   const localCommit = commitForObject(update.localSha, cwd, deadline);
   if (!localCommit) return { ok: false, reason: "local update target does not resolve to a commit; no code review was attempted" };
@@ -102,7 +108,7 @@ export function resolveUpdateBase(update, remote, cwd, { advertisedHeadsImpl = a
   const candidates = [];
   let missing = 0;
   for (const sha of advertised.shas) {
-    if (Date.now() >= deadline) return { ok: false, reason: "45-second budget reached while resolving advertised heads" };
+    if (Date.now() >= deadline) return { ok: false, reason: `${BUDGET} budget reached while resolving advertised heads` };
     if (!objectExists(sha, cwd, deadline)) { missing += 1; continue; }
     if (ancestor(sha, localCommit, cwd, deadline)) {
       candidates.push({ sha, distance: distance(sha, localCommit, cwd, deadline) });
@@ -122,7 +128,7 @@ export function resolveUpdateBase(update, remote, cwd, { advertisedHeadsImpl = a
 }
 
 export function buildPushEvidence(update, base, cwd, { deadline = Number.POSITIVE_INFINITY } = {}) {
-  if (Date.now() >= deadline) return { ok: false, reason: "45-second budget reached before evidence collection" };
+  if (Date.now() >= deadline) return { ok: false, reason: `${BUDGET} budget reached before evidence collection` };
   // Review every outgoing commit's patch, not only the base-to-tip net diff. A file introduced in
   // one commit and removed in the next is still transferred to the remote object database and must
   // remain visible to the reviewers. These flags also bypass attributes, textconv, external diff,
@@ -278,15 +284,18 @@ export async function reviewUpdate(update, remote, ws, {
   env = process.env,
   deadline = Date.now() + PUSH_DEADLINE_MS
 } = {}) {
-  if (Date.now() >= deadline) return { decision: "unreviewed", note: "45-second budget reached before range resolution" };
+  if (Date.now() >= deadline) return { decision: "unreviewed", note: `${BUDGET} budget reached before range resolution` };
   const resolved = resolveUpdateBaseImpl(update, remote, ws, { deadline });
   if (resolved.deleteOnly) return { decision: "allow", note: "branch deletion; no outgoing code" };
   if (!resolved.ok) return { decision: "unreviewed", note: resolved.reason };
-  if (Date.now() >= deadline) return { decision: "unreviewed", note: "45-second budget reached before evidence collection" };
+  if (Date.now() >= deadline) return { decision: "unreviewed", note: `${BUDGET} budget reached before evidence collection` };
   const evidence = buildPushEvidenceImpl({ ...update, localCommit: resolved.localCommit }, resolved.base, ws, { deadline });
   if (!evidence.ok) return { decision: "unreviewed", note: evidence.tooLarge ? "evidence too large; split the push or run /bench:review manually" : evidence.reason };
 
-  const reviewers = resolveReviewersImpl({ env, reviewers: ["grok", "mimo"] });
+  // Use the CONFIGURED panel. A hardcoded list took precedence over companion.json in resolveConfig,
+  // so `/bench:reviewers mimo` still invoked Grok on every push — spending time (and failing loudly
+  // off darwin, where the Grok runners refuse) on a reviewer the user had deliberately switched off.
+  const reviewers = resolveReviewersImpl({ env });
   const fingerprint = fingerprintFor(update, resolved.base, evidence, reviewers, remote);
   const cached = readCache(ws, fingerprint);
   const cachedResults = Array.isArray(cached?.results) ? cached.results.filter(validVerdict) : [];
@@ -310,7 +319,7 @@ export async function reviewUpdate(update, remote, ws, {
       decision: "unreviewed",
       note: waited.completed
         ? "identical review finished without a usable verdict; duplicate model calls skipped"
-        : "45-second budget reached while waiting for the identical review; duplicate model calls skipped",
+        : `${BUDGET} budget reached while waiting for the identical review; duplicate model calls skipped`,
       fingerprint
     };
   }
@@ -328,7 +337,7 @@ export async function reviewUpdate(update, remote, ws, {
     }
 
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return { decision: "unreviewed", note: "45-second review budget already exhausted", fingerprint };
+    if (remaining <= 0) return { decision: "unreviewed", note: `${BUDGET} review budget already exhausted`, fingerprint };
     const results = await Promise.all(reviewers.map((reviewer) => reviewer.run({
       system: evidence.system,
       user: evidence.user,
@@ -376,7 +385,7 @@ export async function runMain({
   }
   for (const update of parsed.updates) {
     if (Date.now() >= deadline) {
-      process.stderr.write("peerBench UNREVIEWED: 45-second total budget reached; remaining updates were not reviewed. Push allowed.\n");
+      process.stderr.write(`peerBench UNREVIEWED: ${BUDGET} total budget reached; remaining updates were not reviewed. Push allowed.\n`);
       return 0;
     }
     const result = await reviewUpdateImpl(update, remote, ws, { env, deadline });
@@ -390,7 +399,7 @@ export async function runMain({
       process.stderr.write(`peerBench ALLOW [${result.panel.badge}]${result.cached ? " (cached)" : ""}.\n`);
     }
     if (Date.now() >= deadline) {
-      process.stderr.write("peerBench UNREVIEWED: 45-second total budget reached; remaining updates were not reviewed. Push allowed.\n");
+      process.stderr.write(`peerBench UNREVIEWED: ${BUDGET} total budget reached; remaining updates were not reviewed. Push allowed.\n`);
       return 0;
     }
   }
