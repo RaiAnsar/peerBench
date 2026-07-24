@@ -93,6 +93,37 @@ test("an active cooldown skips the model call", async () => {
   clearReviewerCooldowns({ root: ROOT });
 });
 
+test("ignoreTransientCooldowns bypasses a timeout cooldown but still honors quota/auth/rate", async () => {
+  clearReviewerCooldowns({ root: ROOT });
+  const scope = "push-review:/workspace-a";
+  recordReviewerCooldown("mimo", "timeout", "timed out", { root: ROOT, now: 1_000, env: {}, scope });
+  let calls = 0;
+  const run = withAvailability("mimo", "MiMo", async () => {
+    calls += 1;
+    return { name: "MiMo", verdict: "ALLOW" };
+  }, { now: () => 2_000, env: {} });
+
+  // A prior timeout must not skip an explicitly requested review — the whole point is a fresh call.
+  const bypassed = await run({ cooldownScope: scope, ignoreTransientCooldowns: true });
+  assert.equal(calls, 1);
+  assert.equal(bypassed.verdict, "ALLOW");
+  assert.equal(bypassed.skipped, undefined);
+
+  // Without the flag the same cooldown still fast-skips (stop-gate noise suppression depends on it).
+  const skipped = await run({ cooldownScope: scope });
+  assert.equal(calls, 1);
+  assert.equal(skipped.skipped, "cooldown");
+
+  // Hard availability failures are NOT transient: quota still skips even for explicit reviews.
+  clearReviewerCooldowns({ root: ROOT });
+  recordReviewerCooldown("mimo", "quota", "HTTP 402", { root: ROOT, now: 1_000, env: {}, scope });
+  const quotaSkipped = await run({ cooldownScope: scope, ignoreTransientCooldowns: true });
+  assert.equal(calls, 1);
+  assert.equal(quotaSkipped.skipped, "cooldown");
+  assert.equal(quotaSkipped.errorKind, "quota");
+  clearReviewerCooldowns({ root: ROOT });
+});
+
 test("quota failures start a cooldown and redact diagnostics before returning or persisting", async () => {
   clearReviewerCooldowns({ root: ROOT });
   const secret = "fake_mimo_secret_456";

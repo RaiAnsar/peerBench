@@ -1,5 +1,6 @@
 import { GROK_REVIEW_EFFORT, GROK_REVIEW_MODEL, parseVerdict, runGrokReview } from "./panel-lib.mjs";
 import {
+  TRANSIENT_COOLDOWN_KINDS,
   configuredProviderSecrets,
   displayName,
   readReviewerCooldown,
@@ -44,7 +45,10 @@ export function withAvailability(name, display, runImpl, { now = Date.now, env =
     const startedAt = now();
     const cooldownScope = args?.cooldownScope || args?.cwd || "default";
     const cooldown = readReviewerCooldown(name, { now: startedAt, env, secrets, scope: cooldownScope });
-    if (cooldown) {
+    // Explicit reviews set ignoreTransientCooldowns: a recorded timeout/network blip must not turn
+    // a deliberately requested review into "skipped without a model call". Quota/auth/rate still skip.
+    const bypassed = cooldown && args?.ignoreTransientCooldowns && TRANSIENT_COOLDOWN_KINDS.has(cooldown.kind);
+    if (cooldown && !bypassed) {
       const minutesLeft = Math.max(1, Math.ceil((Number(cooldown.until) - startedAt) / 60_000));
       return {
         name: display,

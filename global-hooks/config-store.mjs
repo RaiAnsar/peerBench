@@ -12,7 +12,7 @@ import { redactProviderFailure, secretHeaderValues } from "./provider-error-reda
 const DEFAULTS = {
   mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
-          headers: {}, timeoutMs: 120_000 }
+          headers: {}, timeoutMs: 300_000 }  // 5 min ceiling — must not clamp the explicit review budget (real push reviews run 47–110s+)
 };
 const GROK = "grok";
 export const PROVIDER_NAMES = Object.keys(DEFAULTS);
@@ -144,7 +144,9 @@ const COOLDOWN_TTL_MS = {
   network: 2 * 60_000
 };
 const GLOBAL_COOLDOWN_KINDS = new Set(["quota", "auth", "rate"]);
-const TRANSIENT_COOLDOWN_KINDS = new Set(["timeout", "network"]);
+// Exported so explicit reviews can bypass exactly these kinds: a past timeout says nothing about
+// a fresh, deliberately requested call, while quota/auth/rate are hard availability facts.
+export const TRANSIENT_COOLDOWN_KINDS = new Set(["timeout", "network"]);
 
 function cooldownScopeHash(scope) {
   return createHash("sha256").update(String(scope || "default")).digest("hex").slice(0, 16);

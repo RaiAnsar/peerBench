@@ -53,7 +53,9 @@ test("MiMo configuration comes from its environment variables", () => {
   assert.equal(config.providers.mimo.model, "mimo-test");
   assert.equal(config.providers.mimo.baseURL, "https://mimo.invalid/v1");
   assert.equal(config.providers.mimo.thinking, "enabled");
-  assert.equal(config.providers.mimo.timeoutMs, 120_000);
+  // 300s: MiMo's provider ceiling must not clamp the explicit five-minute review budget
+  // (120s did, and 60s panel caps timed out on every real push diff — 2026-07-24).
+  assert.equal(config.providers.mimo.timeoutMs, 300_000);
 });
 
 test("expired and unknown reviewers cannot be selected", () => {

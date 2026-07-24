@@ -86,7 +86,7 @@ test("reviewersCommand accepts the lightweight Grok + MiMo panel", () => {
   }
 });
 
-test("explicit content review uses a one-minute scoped budget and preserves failure metadata", async () => {
+test("explicit content review uses the five-minute explicit budget and preserves failure metadata", async () => {
   const ws = freshWs();
   const calls = [];
   let trace;
@@ -115,7 +115,9 @@ test("explicit content review uses a one-minute scoped budget and preserves fail
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].timeoutMs, EXPLICIT_REVIEW_TIMEOUT_MS);
-  assert.equal(EXPLICIT_REVIEW_TIMEOUT_MS, 60_000);
+  assert.equal(EXPLICIT_REVIEW_TIMEOUT_MS, 300_000);
+  assert.equal(calls[0].ignoreTransientCooldowns, true,
+    "an explicit /bench:review must call the model even after a recent timeout blip");
   assert.equal(calls[0].cooldownScope, `review:${ws}`);
   assert.equal(panel.decision, "fail-open");
   assert.equal(reviewExitCode(panel.decision), 0, "provider failure is advisory by default");

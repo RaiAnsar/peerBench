@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  EXPLICIT_REVIEW_TIMEOUT_MS,
   LIGHTWEIGHT_REVIEW_TIMEOUT_MS,
   PUSH_REVIEW_SYSTEM,
   buildHuntUser,
@@ -56,7 +57,7 @@ test("huntPanel deep=true sends thinking:{type:'enabled'} in the request body", 
   }
 });
 
-test("pushReviewPanel is one-shot, tool-free, and capped at one minute", async () => {
+test("pushReviewPanel is one-shot, tool-free, uses the explicit five-minute budget, and bypasses transient cooldowns", async () => {
   const calls = [];
   const results = await pushReviewPanel({
     cwd: "/workspace",
@@ -86,8 +87,13 @@ test("pushReviewPanel is one-shot, tool-free, and capped at one minute", async (
   });
 
   assert.equal(LIGHTWEIGHT_REVIEW_TIMEOUT_MS, 60_000);
+  // Explicit reviews (/bench:review, spec/push review runs) are deliberate multi-minute asks:
+  // 60s reliably timed out on real push diffs (MiMo needs 47–110s, Grok more) — 2026-07-24.
+  assert.equal(EXPLICIT_REVIEW_TIMEOUT_MS, 300_000);
   assert.equal(calls.length, 2);
-  assert.ok(calls.every((call) => call.timeoutMs === 60_000));
+  assert.ok(calls.every((call) => call.timeoutMs === 300_000));
+  assert.ok(calls.every((call) => call.ignoreTransientCooldowns === true),
+    "an explicitly requested review must never be skipped because an earlier run timed out");
   assert.ok(calls.every((call) => call.cooldownScope === "push-review:/workspace"));
   assert.ok(calls.every((call) => call.system === PUSH_REVIEW_SYSTEM));
   assert.match(calls[0].system, /Do not use tools/i);

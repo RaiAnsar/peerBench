@@ -70,6 +70,12 @@ export function parseSpecFindings(text) {
 // explicit hunt/investigate commands and must never hold a release transaction open.
 export const LIGHTWEIGHT_REVIEW_TIMEOUT_MS = 60_000;
 
+// Explicit reviews (/bench:review, runSpecReview/runPushReview) are deliberate asks where minutes
+// are acceptable — nothing is frozen waiting on them. 60s reliably timed out on real push diffs
+// (MiMo needs 47–110s, Grok more; verified in traces 2026-07-24), leaving every substantial push
+// "unreviewed". Hook-driven gates keep their own tight budgets by passing timeoutMs explicitly.
+export const EXPLICIT_REVIEW_TIMEOUT_MS = 300_000;
+
 export async function lightweightVerdictPanel({
   cwd,
   system,
@@ -77,7 +83,8 @@ export async function lightweightVerdictPanel({
   env = process.env,
   cooldownScope,
   resolveReviewersImpl = resolveReviewers,
-  timeoutMs = LIGHTWEIGHT_REVIEW_TIMEOUT_MS
+  timeoutMs = LIGHTWEIGHT_REVIEW_TIMEOUT_MS,
+  ignoreTransientCooldowns = false
 } = {}) {
   const reviewers = resolveReviewersImpl({ env });
   const results = await Promise.all(reviewers.map((reviewer) => reviewer.run({
@@ -86,7 +93,8 @@ export async function lightweightVerdictPanel({
     cwd,
     env,
     timeoutMs,
-    cooldownScope
+    cooldownScope,
+    ignoreTransientCooldowns
   })));
   return results.map((r) => {
     const findings = r.raw || r.findings || r.firstLine || "";
@@ -112,13 +120,14 @@ export async function specReviewPanel({
   content,
   env = process.env,
   resolveReviewersImpl,
-  timeoutMs = LIGHTWEIGHT_REVIEW_TIMEOUT_MS
+  timeoutMs = EXPLICIT_REVIEW_TIMEOUT_MS
 } = {}) {
   return lightweightVerdictPanel({
     cwd,
     env,
     resolveReviewersImpl,
     timeoutMs,
+    ignoreTransientCooldowns: true,
     cooldownScope: `spec-review:${cwd}`,
     system: SPEC_REVIEW_SYSTEM,
     user: buildSpecReviewUser(filePath, content)
@@ -160,13 +169,14 @@ export async function pushReviewPanel({
   env = process.env,
   assistantContext = "",
   resolveReviewersImpl,
-  timeoutMs = LIGHTWEIGHT_REVIEW_TIMEOUT_MS
+  timeoutMs = EXPLICIT_REVIEW_TIMEOUT_MS
 } = {}) {
   return lightweightVerdictPanel({
     cwd,
     env,
     resolveReviewersImpl,
     timeoutMs,
+    ignoreTransientCooldowns: true,
     cooldownScope: `push-review:${cwd}`,
     system: PUSH_REVIEW_SYSTEM,
     user: buildPushReviewUser(range, content, { assistantContext })

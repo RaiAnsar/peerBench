@@ -1,6 +1,6 @@
 {
   "name": "bench",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "peerBench is a bounded Grok + MiMo review helper for Codex.",
   "author": {
     "name": "Rai Ansar",

@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { clearTransientReviewerCooldowns, configuredProviderSecrets, resolveConfig, isBenchDisabled, setBenchDisabled, setReviewers, sessionKeyFromInput, displayName, KNOWN_REVIEWERS } from "../global-hooks/config-store.mjs";
 import { collectUntrackedEvidence, combinePanel, grokSpawnSpec, grokChildEnv, grokAuthPath, grokPlatformRefusal, grokText } from "../global-hooks/panel-lib.mjs";
 import { resolveReviewers } from "../global-hooks/reviewers.mjs";
-import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser, LIGHTWEIGHT_REVIEW_TIMEOUT_MS } from "../global-hooks/hunt.mjs";
+import { huntPanel, HUNT_SYSTEM, buildHuntUser, DEBUG_SYSTEM, buildDebugUser, EXPLICIT_REVIEW_TIMEOUT_MS as HUNT_EXPLICIT_REVIEW_TIMEOUT_MS } from "../global-hooks/hunt.mjs";
 import { writeTrace, readTrace, listTraces } from "../global-hooks/trace-store.mjs";
 import { runSpecReview, runPushReview } from "../global-hooks/spec-review-run.mjs";
 import { shouldRewake } from "../global-hooks/deep-review.mjs";
@@ -26,7 +26,7 @@ import { review as reviewClient } from "../global-hooks/review-client.mjs";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "..");
 const MAX_DIFF_BYTES = 200_000;
-export const EXPLICIT_REVIEW_TIMEOUT_MS = LIGHTWEIGHT_REVIEW_TIMEOUT_MS;
+export const EXPLICIT_REVIEW_TIMEOUT_MS = HUNT_EXPLICIT_REVIEW_TIMEOUT_MS;
 const SAFE_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--text", "--no-renames", "--full-index"];
 
 function workspaceRoot(cwd) {
@@ -210,6 +210,7 @@ export async function runContentReview({
     cwd: ws,
     env,
     timeoutMs: EXPLICIT_REVIEW_TIMEOUT_MS,
+    ignoreTransientCooldowns: true,
     cooldownScope: `review:${ws}`
   })));
   const panel = combinePanel(results);
