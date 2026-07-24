@@ -12,7 +12,7 @@ import {
   syncCodexHooks,
   syncCodexPrompts,
   migrateDataDir,
-  removePeerBenchStatuslineSegment,
+  ensurePeerBenchStatuslineSegment,
   compareLocalWithOrigin,
   removeClaudeSettingsPeerBenchHooks,
   removeCodexSettingsPeerBenchHooks,
@@ -68,7 +68,7 @@ test("migrateDataDir: already-migrated bench-shared is NOT clobbered; fresh inst
 test("deploy copies modules flat and backs up a differing existing file", () => {
   const src = fs.mkdtempSync(path.join(os.tmpdir(), "src-")), dest = fs.mkdtempSync(path.join(os.tmpdir(), "dst-"));
   fs.writeFileSync(path.join(src, "panel-lib.mjs"), "export const v=2;\n");
-  fs.writeFileSync(path.join(src, "statusline-segment.mjs"), "// stale source must not be redeployed\n");
+  fs.writeFileSync(path.join(src, "statusline-segment.mjs"), "// bench badge renderer\n");
   fs.writeFileSync(path.join(dest, "panel-lib.mjs"), "export const v=1;\n");
   for (const name of RETIRED_RUNTIME_FILES) fs.writeFileSync(path.join(dest, name), "// retired\n");
   const r = deploy({ src, dest });
@@ -105,51 +105,51 @@ test("snapshotCodex captures existing Codex hooks + hooks.json", () => {
   assert.ok(fs.existsSync(path.join(backup, "b1", "hooks.json")));
 });
 
-test("removePeerBenchStatuslineSegment disables only the retired segment and preserves custom fallbacks", () => {
+test("ensurePeerBenchStatuslineSegment wires the bench badge in beside the Codex gate", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slcmd-"));
   const statuslinePath = path.join(dir, "statusline-command.sh");
+  const hooksDir = path.join(dir, "hooks");
   fs.writeFileSync(statuslinePath, [
     "#!/bin/bash",
     "set -u",
     "input=$(cat)",
     "dir=$(echo \"$input\" | jq -r '.workspace.current_dir // .cwd // empty')",
     "gate_dir=\"$dir\"",
-    "# comment mentioning statusline-segment.mjs must not be patched",
+    "# comment mentioning statusline-segment.mjs must not count as integration",
     "codex_gate=$(python3 ~/.claude/gate-status.py \"$gate_dir\" 2>/dev/null)",
-    "bench_session_id=$(printf '%s' \"$input\" | jq -r '.session_id // .sessionId // .workspace.session_id // .workspace.sessionId // empty')",
-    "gc_gate=$(node ~/.claude/hooks/statusline-segment.mjs \"$gate_dir\" \"$bench_session_id\" 2>/dev/null)",
-    "gate_seg=\"${gc_gate:-$codex_gate}\"",
+    "gate_seg=\"$codex_gate\"",
     "echo \"custom:${gate_seg}\"",
     ""
   ].join("\n"), { mode: 0o750 });
 
-  const first = removePeerBenchStatuslineSegment({ statuslinePath });
+  const first = ensurePeerBenchStatuslineSegment({ statuslinePath, hooksDir });
   assert.equal(first.updated, true);
-  assert.equal(first.removedInvocations, 1);
-  assert.equal(first.removedSessionHelper, true);
+  assert.equal(first.gateVar, "codex_gate");
+  assert.equal(first.renderVar, "gate_seg");
   const once = fs.readFileSync(statuslinePath, "utf8");
-  assert.match(once, /^gc_gate=""$/m, "the retired process is replaced by an empty, set-u-safe value");
-  assert.doesNotMatch(once, /^\s*bench_session_id=/m, "the exact installer-owned helper is removed when unused");
-  assert.match(once, /codex_gate=\$\(python3 ~\/\.claude\/gate-status\.py/, "independent Codex gate is preserved");
-  assert.match(once, /gate_seg="\$\{gc_gate:-\$codex_gate\}"/, "the user's fallback composition is preserved");
-  assert.match(once, /echo "custom:\$\{gate_seg\}"/, "unrelated custom statusline content is preserved");
+  assert.match(once, /bench_gate=\$\(node .*statusline-segment\.mjs" "\$gate_dir" "\$bench_session_id"/,
+    "the badge reuses the gate line's own per-window dir expression — never $PWD (gotcha #8)");
+  assert.match(once, /^\s*bench_session_id=/m, "session id is forwarded so chats stay isolated (gotcha #9)");
+  assert.match(once, /if \[ -n "\$bench_gate" \]; then gate_seg=/, "the badge is actually rendered");
+  assert.match(once, /codex_gate=\$\(python3 ~\/\.claude\/gate-status\.py/, "the independent Codex gate is preserved");
+  assert.match(once, /echo "custom:\$\{gate_seg\}"/, "unrelated custom content is preserved");
   assert.equal(fs.statSync(statuslinePath).mode & 0o777, 0o750);
 
-  const second = removePeerBenchStatuslineSegment({ statuslinePath });
+  const second = ensurePeerBenchStatuslineSegment({ statuslinePath, hooksDir });
   assert.equal(second.updated, false);
-  assert.equal(second.reason, "no peerbench statusline segment");
-  assert.equal(fs.readFileSync(statuslinePath, "utf8"), once, "cleanup is idempotent");
+  assert.equal(second.reason, "already integrated");
+  assert.equal(fs.readFileSync(statuslinePath, "utf8"), once, "wiring is idempotent");
 });
 
-test("removePeerBenchStatuslineSegment no-ops when there is no peerBench segment", () => {
+test("ensurePeerBenchStatuslineSegment refuses to half-wire a wrapper it cannot anchor", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slcmd-none-"));
   const statuslinePath = path.join(dir, "statusline-command.sh");
   fs.writeFileSync(statuslinePath, "#!/bin/bash\necho ok\n");
   const before = fs.readFileSync(statuslinePath, "utf8");
-  const result = removePeerBenchStatuslineSegment({ statuslinePath });
+  const result = ensurePeerBenchStatuslineSegment({ statuslinePath, hooksDir: dir });
   assert.equal(result.updated, false);
-  assert.equal(result.reason, "no peerbench statusline segment");
-  assert.equal(fs.readFileSync(statuslinePath, "utf8"), before);
+  assert.equal(result.reason, "no gate anchor");
+  assert.equal(fs.readFileSync(statuslinePath, "utf8"), before, "an un-anchorable wrapper is left untouched");
 });
 
 test("syncCodexHooks registers only the Codex wrapper stop hook and is idempotent", () => {
@@ -324,7 +324,7 @@ test("deployPluginRuntime refreshes hook/runtime files in an installed plugin ca
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
   fs.mkdirSync(path.join(repo, "hooks"), { recursive: true });
   fs.writeFileSync(path.join(repo, "global-hooks", "stop-review.mjs"), "new stop\n");
-  fs.writeFileSync(path.join(repo, "global-hooks", "statusline-segment.mjs"), "stale source\n");
+  fs.writeFileSync(path.join(repo, "global-hooks", "statusline-segment.mjs"), "bench badge renderer\n");
   fs.writeFileSync(path.join(repo, "scripts", "bench-runner.mjs"), "new runner\n");
   fs.writeFileSync(path.join(repo, "hooks", "hooks.json"), "{\"hooks\":{}}\n");
   fs.writeFileSync(path.join(repo, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "bench", version: "0.4.0" }));
@@ -339,7 +339,7 @@ test("deployPluginRuntime refreshes hook/runtime files in an installed plugin ca
   assert.equal(fs.readFileSync(path.join(pluginRoot, "scripts", "bench-runner.mjs"), "utf8"), "new runner\n");
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8")), { name: "bench", version: "0.4.0" });
   assert.equal(fs.existsSync(path.join(pluginRoot, "global-hooks", "deep-review-runner.mjs")), false, "staged directory replacement prunes retired runtime files");
-  assert.equal(fs.existsSync(path.join(pluginRoot, "global-hooks", "statusline-segment.mjs")), false, "retired statusline runtime is not copied from a stale checkout source");
+  assert.equal(fs.readFileSync(path.join(pluginRoot, "global-hooks", "statusline-segment.mjs"), "utf8"), "bench badge renderer\n", "the bench badge renderer ships with the plugin runtime");
 });
 
 test("deployPluginRuntime refuses mismatched cache versions before copying", () => {

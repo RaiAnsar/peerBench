@@ -30,7 +30,7 @@ import {
   readJsonObjectStrict,
   RETIRED_RUNTIME_FILES,
   syncSettings,
-  removePeerBenchStatuslineSegment
+  ensurePeerBenchStatuslineSegment
 } from "./deploy-global-hooks.mjs";
 import { rollback } from "./rollback.mjs";
 
@@ -743,7 +743,7 @@ export function installPeerBench({
         : removeClaudeSettingsPeerBenchHooks({ settingsPath: claudeSettingsPath });
       transactionClaude.settingsAfterState = capturePathState(claudeSettingsPath);
       persistTransaction();
-      const statusline = removePeerBenchStatuslineSegment({ statuslinePath });
+      const statusline = ensurePeerBenchStatuslineSegment({ statuslinePath, hooksDir });
       transactionClaude.statuslineUpdated = statusline.updated;
       transactionClaude.statuslineAfterState = statusline.updated ? capturePathState(statuslinePath) : null;
       persistTransaction();
@@ -840,7 +840,7 @@ export function renderInstallSummary(result) {
     if (!c.sync.pluginManaged && (c.sync.removedEntries || c.sync.removedFiles?.length)) {
       lines.push(`Claude hooks: removed legacy entries ${c.sync.removedEntries}, files ${c.sync.removedFiles.join(", ") || "(none)"}`);
     }
-    lines.push(`Claude statusline: ${c.statusline.updated ? `removed ${c.statusline.removedInvocations} retired peerBench invocation(s)` : `no change (${c.statusline.reason || "already clean"})`}`);
+    lines.push(`Claude statusline: ${c.statusline.updated ? "peerBench bench badge wired in" : `no change (${c.statusline.reason || "already integrated"})`}`);
   }
   if (result.codex) {
     const c = result.codex;

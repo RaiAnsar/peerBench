@@ -13,7 +13,6 @@ export const RETIRED_RUNTIME_FILES = [
   "plan-review.mjs",
   "pre-merge-review.mjs",
   "pre-push-review.mjs",
-  "statusline-segment.mjs"
 ];
 
 export function ensurePrivateBackupDir(dir) {
@@ -361,14 +360,17 @@ export function snapshotCodex({ hooksDir, hooksPath, backupDir, promptsDir = nul
   };
 }
 
-const RETIRED_STATUSLINE_SESSION_LINE =
+const STATUSLINE_SESSION_LINE =
   `bench_session_id=$(printf '%s' "$input" | jq -r '.session_id // .sessionId // .workspace.session_id // .workspace.sessionId // empty')`;
 
-// peerBench 0.4 has no statusline integration. Remove only the retired peerBench process invocation
-// from a user's wrapper. An assignment is kept as an empty value so custom fallback expressions such
-// as `${gc_gate:-$codex_gate}` and wrappers using `set -u` continue to work unchanged.
-export function removePeerBenchStatuslineSegment({
-  statuslinePath = path.join(os.homedir(), ".claude", "statusline-command.sh")
+// Wire the compact `bench ✓✓` badge into a user's statusline wrapper, next to whatever the Codex
+// gate already renders. Anchored on the EXISTING gate line rather than on any fixed layout: we reuse
+// that line's own directory expression, so the badge inherits the wrapper's per-window project
+// resolution instead of re-deriving it (a $PWD fallback here is the cross-project mixup, gotcha #8).
+// Refuses — never half-wires — when either anchor is missing.
+export function ensurePeerBenchStatuslineSegment({
+  statuslinePath = path.join(os.homedir(), ".claude", "statusline-command.sh"),
+  hooksDir = path.join(os.homedir(), ".claude", "hooks")
 } = {}) {
   const stat = lstatOrNull(statuslinePath);
   if (stat?.isSymbolicLink()) throw new Error(`statusline is a symlink; refusing to follow or overwrite ${statuslinePath}`);
@@ -378,55 +380,41 @@ export function removePeerBenchStatuslineSegment({
   catch { return { statuslinePath, updated: false, reason: "missing" }; }
 
   const lines = text.split("\n");
-  const retiredAssignments = [];
-  const unsafe = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (!lines[i].includes("statusline-segment.mjs") || /^\s*#/.test(lines[i])) continue;
-    const assignment = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\$\((.*statusline-segment\.mjs.*?)\)\s*(#.*)?$/.exec(lines[i]);
-    if (!assignment) {
-      unsafe.push(i + 1);
-      continue;
-    }
-    const [, indent, variable, , comment] = assignment;
-    lines[i] = `${indent}${variable}=""${comment ? ` ${comment}` : ""}`;
-    retiredAssignments.push(variable);
-  }
-  if (unsafe.length) {
-    throw new Error(`could not safely remove peerBench statusline invocation at ${statuslinePath}:${unsafe.join(",")}`);
-  }
-  if (!retiredAssignments.length) {
-    return { statuslinePath, updated: false, reason: "no peerbench statusline segment" };
+  const live = (line) => !/^\s*#/.test(line);
+  if (lines.some((line) => live(line) && line.includes("statusline-segment.mjs"))) {
+    return { statuslinePath, updated: false, reason: "already integrated" };
   }
 
-  // This exact helper line was inserted by older peerBench installers. Remove it only when the
-  // retired invocation was found and no other active wrapper line still consumes the value.
-  const sessionIdStillUsed = lines.some((line) =>
-    !/^\s*#/.test(line)
-      && line.trim() !== RETIRED_STATUSLINE_SESSION_LINE
-      && line.includes("$bench_session_id")
-  );
-  let removedSessionHelper = false;
-  if (!sessionIdStillUsed) {
-    const helperIndex = lines.findIndex((line) => line.trim() === RETIRED_STATUSLINE_SESSION_LINE);
-    if (helperIndex >= 0) {
-      lines.splice(helperIndex, 1);
-      removedSessionHelper = true;
-    }
-  }
+  // Anchor 1: the existing gate assignment, e.g. `codex_gate=$(python3 ~/.claude/gate-status.py "$gate_dir" …)`
+  const gateIndex = lines.findIndex((line) => live(line) && line.includes("gate-status.py") && /^\s*[A-Za-z_][A-Za-z0-9_]*=\$\(/.test(line));
+  if (gateIndex < 0) return { statuslinePath, updated: false, reason: "no gate anchor" };
+  const gateVar = /^\s*([A-Za-z_][A-Za-z0-9_]*)=/.exec(lines[gateIndex])[1];
+  const dirArg = /gate-status\.py\s+("(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)")/.exec(lines[gateIndex])?.[1];
+  if (!dirArg) return { statuslinePath, updated: false, reason: "no project-dir expression on the gate line" };
+
+  // Anchor 2: where that value is rendered, e.g. `gate_seg="$codex_gate"`.
+  const renderRe = new RegExp(`^(\\s*)([A-Za-z_][A-Za-z0-9_]*)="\\$(?:\\{)?${gateVar}(?:\\})?"\\s*$`);
+  const renderIndex = lines.findIndex((line) => live(line) && renderRe.test(line));
+  if (renderIndex < 0) return { statuslinePath, updated: false, reason: "no render anchor" };
+  const [, indent, renderVar] = renderRe.exec(lines[renderIndex]);
+
+  const inserted = [];
+  if (!lines.some((line) => live(line) && line.trim() === STATUSLINE_SESSION_LINE)) inserted.push(STATUSLINE_SESSION_LINE);
+  inserted.push(`bench_gate=$(node ${JSON.stringify(path.join(hooksDir, "statusline-segment.mjs"))} ${dirArg} "$bench_session_id" 2>/dev/null)`);
+
+  // Render second so the earlier splice cannot shift this index.
+  lines.splice(renderIndex + 1, 0,
+    `${indent}if [ -n "$bench_gate" ]; then ${renderVar}="\${${renderVar}:+$${renderVar} · }$bench_gate"; fi`);
+  lines.splice(gateIndex + 1, 0, ...inserted);
 
   atomicWriteFile(statuslinePath, lines.join("\n"), {
     mode: stat?.mode & 0o777,
     rejectSymlink: true,
     label: "statusline"
   });
-  return {
-    statuslinePath,
-    updated: true,
-    removedInvocations: retiredAssignments.length,
-    retiredAssignments,
-    removedSessionHelper
-  };
+  return { statuslinePath, updated: true, addedInvocations: 1, gateVar, renderVar };
 }
+
 
 const LEGACY = ["codex-plan-review.mjs", "codex-plan-file-review.mjs"];
 // Do not mutate the independent openai/codex-plugin-cc stop gate. Its per-workspace state belongs

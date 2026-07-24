@@ -127,12 +127,15 @@ test("installPeerBench preserves the independent codex-plugin-cc gate and its st
   assert.equal(peerBenchStop.timeout, 20);
   assert.equal(peerBenchStop.asyncRewake, undefined);
   const statusline = fs.readFileSync(statuslinePath, "utf8");
-  assert.doesNotMatch(statusline, /^\s*[^#\n]*statusline-segment\.mjs/m, "retired peerBench statusline process is removed");
-  assert.match(statusline, /^gc_gate=""$/m, "custom fallback remains set-u safe");
+  // A wrapper that ALREADY invokes the segment is left exactly as the user wrote it — including a
+  // custom `${gc_gate:-$codex_gate}` composition. Wiring is only added when it is absent.
+  assert.match(statusline, /gc_gate=\$\(node ~\/\.claude\/hooks\/statusline-segment\.mjs/, "the user's own bench invocation is preserved");
+  assert.match(statusline, /gate_seg="\$\{gc_gate:-\$codex_gate\}"/, "custom fallback composition is untouched");
   assert.match(statusline, /codex_gate=\$\(python3 ~\/\.claude\/gate-status\.py/, "independent Codex gate remains intact");
   assert.match(statusline, /printf 'custom %s\\n'/, "unrelated custom statusline content remains intact");
   assert.equal(fs.statSync(statuslinePath).mode & 0o777, 0o751);
-  assert.equal(installed.claude.statusline.removedInvocations, 1);
+  assert.equal(installed.claude.statusline.updated, false);
+  assert.equal(installed.claude.statusline.reason, "already integrated");
 });
 
 test("installPeerBench refuses a stale Codex cache before creating transaction state", () => {

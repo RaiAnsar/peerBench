@@ -1,6 +1,6 @@
 {
   "name": "peerbench",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "type": "module",
   "description": "peerBench — bounded Grok + MiMo code review and read-only bug hunts for Claude Code and Codex.",
   "license": "MIT",
