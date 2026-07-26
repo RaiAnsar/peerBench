@@ -7,8 +7,8 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/global-hooks/stop-review.mjs\"",
-            "timeout": 20,
-            "statusMessage": "⛩ bench: quick MiMo advisory…"
+            "timeout": 60,
+            "statusMessage": "\u26e9 bench: quick MiMo advisory\u2026"
           }
         ]
       }

@@ -21,7 +21,7 @@ import { resolveReviewers as defaultResolveReviewers } from "./reviewers.mjs";
 import { writeTrace as defaultWriteTrace } from "./trace-store.mjs";
 
 export const MAX_STOP_EVIDENCE_BYTES = 64 * 1024;
-export const STOP_TIMEOUT_MS = 15_000;
+export const STOP_TIMEOUT_MS = 45_000;
 const REVIEWED_WORKTREE = (ws) => path.join(workspaceStateDir(ws), "reviewed-worktree");
 const SAFE_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--text", "--no-renames", "--full-index"];
 

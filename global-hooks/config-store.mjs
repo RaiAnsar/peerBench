@@ -12,12 +12,17 @@ import { redactProviderFailure, secretHeaderValues } from "./provider-error-reda
 const DEFAULTS = {
   mimo: { displayName: "MiMo", baseURL: "https://token-plan-sgp.xiaomimimo.com/v1", model: "mimo-v2.5-pro", keyEnv: "MIMO_API_KEY",
           temperature: 0, thinking: null, thinkingEnv: "MIMO_THINKING",
-          headers: {}, timeoutMs: 300_000 }  // 5 min ceiling — must not clamp the explicit review budget (real push reviews run 47–110s+)
+          headers: {}, timeoutMs: 300_000 },  // 5 min ceiling — must not clamp the explicit review budget (real push reviews run 47–110s+)
+  // K3 request contract: temperature/top_p are FIXED server-side and the legacy `thinking` param is
+  // unsupported — BOTH must stay null so the request omits them entirely rather than sending a value.
+  kimi: { displayName: "Kimi", baseURL: "https://api.kimi.com/coding/v1", model: "k3", keyEnv: "KIMI_API_KEY",
+          temperature: null, thinking: null,
+          headers: { "User-Agent": "claude-cli/1.0.83 (external, cli)" }, timeoutMs: 300_000 }
 };
 const GROK = "grok";
 export const PROVIDER_NAMES = Object.keys(DEFAULTS);
 export const KNOWN_REVIEWERS = [GROK, ...PROVIDER_NAMES];
-const DISPLAY = { grok: "Grok", mimo: "MiMo" };
+const DISPLAY = { grok: "Grok", mimo: "MiMo", kimi: "Kimi" };
 export function displayName(name) { return DISPLAY[name] || name; }
 const DEFAULT_REVIEWERS = ["grok", "mimo"];
 export function sharedRoot() {
@@ -286,7 +291,8 @@ export function resolveConfig({ env = process.env, reviewers: reviewersOverride 
     const rawThinking = f.thinking !== undefined ? f.thinking : (envThinking !== undefined ? envThinking : (d.thinking || null));
     const thinking = rawThinking === "" ? null : rawThinking;
     const model = env[`${name.toUpperCase()}_MODEL`] || f.model || d.model;
-    const temperature = typeof f.temperature === "number" ? f.temperature : (d.temperature ?? 0);
+    // `?? 0` would coerce a deliberate NULL default (K3: omit the field) into a sent 0 — preserve null.
+    const temperature = typeof f.temperature === "number" ? f.temperature : (d.temperature === undefined ? 0 : d.temperature);
     // Key POOL: env var (comma-separated) > companion apiKeys[] > companion single apiKey. apiKey
     // stays the first key for back-compat; review-client rotates the pool on a 429 (per-key cap).
     const envKey = env[d.keyEnv];

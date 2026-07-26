@@ -25,9 +25,9 @@ import {
   workspaceStateDir
 } from "../global-hooks/config-store.mjs";
 
-test("the reviewer registry contains only Grok and MiMo", () => {
-  assert.deepEqual(PROVIDER_NAMES, ["mimo"]);
-  assert.deepEqual(KNOWN_REVIEWERS, ["grok", "mimo"]);
+test("the reviewer registry holds Grok, MiMo and Kimi", () => {
+  assert.deepEqual(PROVIDER_NAMES, ["mimo", "kimi"]);
+  assert.deepEqual(KNOWN_REVIEWERS, ["grok", "mimo", "kimi"]);
   assert.equal(displayName("grok"), "Grok");
   assert.equal(displayName("mimo"), "MiMo");
   assert.equal(displayName("unknown"), "unknown");
@@ -35,8 +35,8 @@ test("the reviewer registry contains only Grok and MiMo", () => {
 
 test("Grok and MiMo are the default panel", () => {
   const config = resolveConfig({ env: {} });
-  assert.deepEqual(config.reviewers, ["grok", "mimo"]);
-  assert.deepEqual(Object.keys(config.providers), ["mimo"]);
+  assert.deepEqual(config.reviewers, ["grok", "mimo"], "Kimi is selectable but not on by default");
+  assert.deepEqual(Object.keys(config.providers), ["mimo", "kimi"]);
 });
 
 test("MiMo configuration comes from its environment variables", () => {
@@ -58,21 +58,21 @@ test("MiMo configuration comes from its environment variables", () => {
   assert.equal(config.providers.mimo.timeoutMs, 300_000);
 });
 
-test("expired and unknown reviewers cannot be selected", () => {
+test("retired and unknown reviewers cannot be selected, but Kimi can", () => {
   const config = resolveConfig({
     env: {},
     reviewers: ["kimi", "qwen", "glm", "minimax", "codex", "grok", "mimo", "bogus"]
   });
-  assert.deepEqual(config.reviewers, ["grok", "mimo"]);
+  assert.deepEqual(config.reviewers, ["kimi", "grok", "mimo"]);
 });
 
-test("setReviewers persists only Grok and MiMo and de-duplicates", () => {
+test("setReviewers persists known reviewers and de-duplicates", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bench-reviewers-"));
   const selected = setReviewers(["grok", "grok", "kimi", "mimo"], { root });
-  assert.deepEqual(selected, ["grok", "mimo"]);
+  assert.deepEqual(selected, ["grok", "kimi", "mimo"]);
   const saved = JSON.parse(fs.readFileSync(path.join(root, "companion.json"), "utf8"));
-  assert.deepEqual(saved.reviewers, ["grok", "mimo"]);
-  assert.throws(() => setReviewers(["kimi", "glm"], { root }), /no valid reviewers/);
+  assert.deepEqual(saved.reviewers, ["grok", "kimi", "mimo"]);
+  assert.throws(() => setReviewers(["glm", "qwen"], { root }), /no valid reviewers/);
 });
 
 test("workspace state uses the shared root and canonicalizes symlinks", () => {

@@ -49,12 +49,13 @@ function captureStdout(fn) {
   }
 }
 
-test("reviewer registry ignores stale providers and keeps only Grok + MiMo", () => {
+test("reviewer registry keeps Grok + MiMo + Kimi and still drops retired providers", () => {
   fs.writeFileSync(path.join(process.env.BENCH_ROOT, "companion.json"), JSON.stringify({
     reviewers: ["codex", "kimi", "glm", "qwen", "minimax", "grok", "mimo"]
   }));
 
-  assert.deepEqual(resolveConfig({ env: {} }).reviewers, ["grok", "mimo"]);
+  // Kimi is selectable again (Rai re-activated the plan 2026-07-26); codex/glm/qwen/minimax stay retired.
+  assert.deepEqual(resolveConfig({ env: {} }).reviewers, ["kimi", "grok", "mimo"]);
 });
 
 test("reviewersCommand rejects removed reviewer names without changing the panel", () => {
@@ -62,9 +63,9 @@ test("reviewersCommand rejects removed reviewer names without changing the panel
   const previousExitCode = process.exitCode;
   process.exitCode = 0;
   try {
-    const { output } = captureStdout(() => reviewersCommand(["kimi"]));
+    const { output } = captureStdout(() => reviewersCommand(["glm"]));
     assert.match(output, /Error:/);
-    assert.match(output, /known: grok, mimo/i);
+    assert.match(output, /known: grok, mimo, kimi/i);
     assert.equal(process.exitCode, 1);
     assert.deepEqual(resolveConfig().reviewers, before);
   } finally {
@@ -386,7 +387,9 @@ test("healthCommand --all probes inactive supported reviewers, including Grok", 
   });
 
   assert.deepEqual(calls.sort(), ["grok", "mimo"]);
-  assert.deepEqual(result.results.map((entry) => entry.name), ["grok", "mimo"]);
+  // --all REPORTS every supported reviewer (Kimi included, as unconfigured) but only CALLS the
+  // ones with credentials — an un-keyed reviewer must never burn a probe.
+  assert.deepEqual(result.results.map((entry) => entry.name), ["grok", "mimo", "kimi"]);
   assert.match(result.text, /all supported/i);
   assert.match(result.text, /Grok\s+inactive/i);
   assert.equal(result.ok, true, "an inactive reviewer does not fail active-panel health");

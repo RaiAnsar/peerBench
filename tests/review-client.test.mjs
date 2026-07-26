@@ -195,3 +195,18 @@ test("malformed success responses return parse errors", async () => {
   assert.equal(nonJson.error.kind, "parse");
   assert.equal(noContent.error.kind, "parse");
 });
+
+// K3 fixes temperature server-side; sending the field at all is a contract violation. A null
+// temperature must OMIT the key, not serialize as `"temperature": null`.
+test("a null temperature is omitted from the request body entirely", async () => {
+  const bodies = [];
+  const fetchImpl = async (_url, opts) => {
+    bodies.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: ok" } }] }), text: async () => "" };
+  };
+  await review({ baseURL: "https://x.invalid/v1", apiKey: "k", model: "k3", system: "s", user: "u", temperature: null, fetchImpl });
+  assert.equal("temperature" in bodies[0], false, "K3 rejects the field; null must mean absent");
+
+  await review({ baseURL: "https://x.invalid/v1", apiKey: "k", model: "m", system: "s", user: "u", temperature: 0, fetchImpl });
+  assert.equal(bodies[1].temperature, 0, "an explicit 0 is still sent");
+});

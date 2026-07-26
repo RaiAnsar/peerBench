@@ -78,14 +78,15 @@ test("parseArgs recognizes standalone and quoted strict review mode", () => {
   assert.equal(parseArgs(["origin/main..HEAD"]).flags.strict, false);
 });
 
-test("setup reports the lightweight Grok + MiMo panel and one Claude Stop hook", () => {
+test("setup reports the Grok + MiMo + Kimi panel and one Claude Stop hook", () => {
   const { output } = run(["setup"]);
-  assert.match(output, /Active reviewers: grok, mimo/);
+  assert.match(output, /Active reviewers: kimi, grok, mimo/);
   assert.match(output, /grok: local CLI \(no API key\)/i);
   assert.match(output, /mimo: key present.*mimo-v2\.5-pro/i);
   assert.match(output, /Bench disabled: no/i);
   assert.doesNotMatch(output, /Codex plugin:/i);
-  assert.doesNotMatch(output, /Kimi|GLM|Qwen|MiniMax/);
+  assert.match(output, /kimi: key MISSING/i, "Kimi is selectable again; a missing key is reported, not hidden");
+  assert.doesNotMatch(output, /GLM|Qwen|MiniMax/);
 
   const claudeStopLines = output.split("\n").filter((line) => /→ stop-review\.mjs:/.test(line));
   assert.equal(claudeStopLines.length, 1);

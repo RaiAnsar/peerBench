@@ -82,7 +82,9 @@ export async function review({ baseURL, apiKey, apiKeys, model, system, user, ti
   const makeBody = (systemContent = system, userContent = user, bodyTemperature = temperature) => JSON.stringify({
     model,
     messages: [{ role: "system", content: systemContent }, { role: "user", content: userContent }],
-    temperature: bodyTemperature,
+    // A NULL temperature means OMIT the field: Kimi K3 fixes temperature/top_p server-side and
+    // rejects the parameter. `"temperature": null` is still sending it, so guard rather than spread 0.
+    ...(bodyTemperature === null || bodyTemperature === undefined ? {} : { temperature: bodyTemperature }),
     stream: false,
     ...(thinking === "disabled" || thinking === "enabled" ? { thinking: { type: thinking } } : {})
   });

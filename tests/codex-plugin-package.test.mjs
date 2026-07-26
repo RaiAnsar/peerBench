@@ -29,7 +29,7 @@ test("Codex marketplace entry resolves to a plugin with an explicit Codex hook f
   assert.doesNotMatch(commands, /global-hooks\/deep-review-runner\.mjs/);
   const stop = hooks.hooks.Stop.flatMap((block) => block.hooks || []);
   assert.equal(stop.length, 1);
-  assert.equal(stop[0].timeout, 20);
+  assert.equal(stop[0].timeout, 60);   // must exceed STOP_TIMEOUT_MS (45s) with margin
   assert.equal(stop[0].asyncRewake, undefined);
   assert.equal(stop[0].rewakeMessage, undefined);
   assert.equal(stop[0].rewakeSummary, undefined);
@@ -41,7 +41,7 @@ test("Claude plugin exposes only the lightweight Stop hook", () => {
   const stop = hooks.hooks.Stop.flatMap((block) => block.hooks || []);
   assert.equal(stop.length, 1);
   assert.match(stop[0].command, /\$\{CLAUDE_PLUGIN_ROOT\}\/global-hooks\/stop-review\.mjs/);
-  assert.equal(stop[0].timeout, 20);
+  assert.equal(stop[0].timeout, 60);   // must exceed STOP_TIMEOUT_MS (45s) with margin
   assert.equal(stop[0].asyncRewake, undefined);
   assert.equal(stop[0].rewakeMessage, undefined);
   assert.equal(stop[0].rewakeSummary, undefined);

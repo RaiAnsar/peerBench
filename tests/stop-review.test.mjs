@@ -108,7 +108,7 @@ test("global disable marker causes Stop to do no work", async () => {
   assert.deepEqual(out.payloads, []);
 });
 
-test("Stop explicitly resolves only MiMo and passes a 15-second timeout", async () => {
+test("Stop explicitly resolves only MiMo and passes the stop review budget", async () => {
   const ws = freshRepo();
   const calls = [];
   let resolverArgs;
@@ -124,7 +124,9 @@ test("Stop explicitly resolves only MiMo and passes a 15-second timeout", async 
   assert.deepEqual(resolverArgs.reviewers, ["mimo"]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].timeoutMs, STOP_TIMEOUT_MS);
-  assert.equal(STOP_TIMEOUT_MS, 15_000);
+  // 15s timed out 4 of 6 real stop runs (all at exactly 15006ms) — MiMo is bimodal on stop
+  // evidence: ~3s or well past 15s. Raised on Rai's call, accepting the turn-end latency.
+  assert.equal(STOP_TIMEOUT_MS, 45_000);
   assert.equal(calls[0].cooldownScope, `stop:${fs.realpathSync(ws)}`);
   assert.equal(trace.gate, "stop");
   assert.equal(trace.reviewers[0].verdict, "ALLOW");
@@ -300,4 +302,15 @@ test("trace failures are non-critical and never turn an ALLOW into a block", asy
     resolveReviewersImpl: () => [reviewer("ALLOW")],
     writeTraceImpl: () => { throw new Error("fake disk failure"); }
   }));
+});
+
+// The review budget and the HOOK timeout must move together: a review budget at or above the hook
+// timeout means Claude Code kills the hook mid-review, which reads as an infra failure rather than
+// a slow reviewer. This is the invariant that made 15s/20s look fine while it silently starved.
+test("the Stop hook timeout leaves headroom above the review budget", () => {
+  const hooks = JSON.parse(fs.readFileSync(new URL("../hooks/hooks.json", import.meta.url), "utf8"));
+  const stopHook = hooks.hooks.Stop[0].hooks[0];
+  assert.ok(stopHook.command.includes("stop-review.mjs"));
+  assert.ok(stopHook.timeout * 1000 >= STOP_TIMEOUT_MS + 10_000,
+    `hook timeout ${stopHook.timeout}s must exceed the ${STOP_TIMEOUT_MS / 1000}s review budget with margin`);
 });

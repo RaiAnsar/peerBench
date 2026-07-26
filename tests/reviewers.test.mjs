@@ -14,9 +14,11 @@ import {
   withAvailability
 } from "../global-hooks/reviewers.mjs";
 import {
+  KNOWN_REVIEWERS,
   clearReviewerCooldowns,
   readReviewerCooldown,
-  recordReviewerCooldown
+  recordReviewerCooldown,
+  resolveConfig
 } from "../global-hooks/config-store.mjs";
 
 test("extractVerdict ignores fenced examples and finds the real verdict", () => {
@@ -250,4 +252,34 @@ test("MiMo without a key fails locally without invoking the HTTP client", async 
   assert.equal(result.errorKind, "auth");
   assert.match(result.error, /authentication unavailable|no API key/i);
   clearReviewerCooldowns({ root: ROOT });
+});
+
+// resolveReviewers sent EVERY non-Grok reviewer to MiMo's provider, so a second API reviewer would
+// have silently queried MiMo's endpoint under Kimi's name. Latent while the registry held one API
+// reviewer; a correctness bug the moment Kimi came back.
+test("each API reviewer uses its OWN provider, not MiMo's", async () => {
+  clearReviewerCooldowns({ root: ROOT });
+  const calls = [];
+  const [kimi] = resolveReviewers({
+    env: { KIMI_API_KEY: "fake-kimi-key", MIMO_API_KEY: "fake-mimo-key" },
+    reviewers: ["kimi"],
+    reviewImpl: async (request) => { calls.push(request); return { ok: true, text: "ALLOW: clean", usage: null }; }
+  });
+
+  const result = await kimi.run({ system: "s", user: "u", timeoutMs: 30_000, cooldownScope: "review:/ws" });
+  assert.equal(result.name, "Kimi");
+  assert.equal(result.verdict, "ALLOW");
+  assert.match(calls[0].baseURL, /api\.kimi\.com/, "must hit Kimi's endpoint");
+  assert.equal(calls[0].model, "k3");
+  assert.equal(calls[0].apiKey, "fake-kimi-key");
+});
+
+test("Kimi is selectable again and carries the K3 request contract", () => {
+  assert.ok(KNOWN_REVIEWERS.includes("kimi"), "registry must offer kimi for /bench:reviewers");
+  const cfg = resolveConfig({ env: { KIMI_API_KEY: "k" }, reviewers: ["kimi"] });
+  // K3 fixes temperature/top_p server-side and rejects the legacy `thinking` param: both must be
+  // NULL in config so the request omits them entirely rather than sending a value.
+  assert.equal(cfg.providers.kimi.temperature, null);
+  assert.equal(cfg.providers.kimi.thinking, null);
+  assert.match(cfg.providers.kimi.baseURL, /api\.kimi\.com/);
 });

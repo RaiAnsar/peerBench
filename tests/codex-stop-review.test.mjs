@@ -43,7 +43,7 @@ function cleanEnv() {
 }
 
 test("Codex Stop uses the bounded lightweight contract", () => {
-  assert.equal(STOP_TIMEOUT_MS, 15_000);
+  assert.equal(STOP_TIMEOUT_MS, 45_000);
   assert.equal(MAX_STOP_EVIDENCE_BYTES, 64 * 1024);
 });
 
@@ -92,7 +92,7 @@ test("runCodexStop honors the global disable before resolving reviewers", async 
   assert.equal(cap.stdout, "");
 });
 
-test("runCodexStop selects only MiMo and passes a 15 second timeout", async () => {
+test("runCodexStop selects only MiMo and passes the shared stop budget", async () => {
   const ws = freshRepo();
   const cap = captureEmitter();
   let requestedReviewers;
@@ -122,7 +122,7 @@ test("runCodexStop selects only MiMo and passes a 15 second timeout", async () =
   });
 
   assert.deepEqual(requestedReviewers, ["mimo"]);
-  assert.equal(runArgs.timeoutMs, 15_000);
+  assert.equal(runArgs.timeoutMs, 45_000);
   assert.match(runArgs.system, /using only the supplied evidence/i);
   assert.match(runArgs.system, /Do not use tools/i);
 

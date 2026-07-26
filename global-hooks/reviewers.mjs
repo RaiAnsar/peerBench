@@ -123,10 +123,13 @@ function grokAdapter(env) {
   };
 }
 
-function mimoAdapter(provider, reviewImpl) {
-  const display = displayName("mimo");
+// One adapter for every API-backed reviewer, bound to ITS OWN provider. This used to be
+// mimo-specific and every non-Grok reviewer was handed MiMo's provider — harmless while MiMo was
+// the only API reviewer, a silent wrong-endpoint call the moment a second one existed.
+function apiAdapter(name, provider, reviewImpl) {
+  const display = displayName(name);
   return {
-    name: "mimo",
+    name,
     reviewIdentity: { kind: "api", model: provider.model || "", baseURL: provider.baseURL || "" },
     async run({ system, user, timeoutMs = 45_000 }) {
       if (!provider.apiKey) return { name: display, error: "no API key", errorKind: "auth" };
@@ -168,5 +171,5 @@ export function resolveReviewers({ env = process.env, reviewImpl = defaultReview
   });
   return cfg.reviewers.map((name) => name === "grok"
     ? wrap(grokAdapter(env))
-    : wrap(mimoAdapter(cfg.providers.mimo, reviewImpl)));
+    : wrap(apiAdapter(name, cfg.providers[name], reviewImpl)));
 }
