@@ -210,6 +210,7 @@ export async function runMain({
       gate: "stop",
       ws,
       sessionKey: sessionKeyFromInput(input, env),
+      evidenceBytes,
       reviewers: results.map(({ raw: _raw, ...result }) => result),
       rawResponses: Object.fromEntries(results.map((result) => [result.name, result.firstLine || result.error || ""]))
     });

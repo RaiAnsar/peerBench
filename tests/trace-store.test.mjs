@@ -27,3 +27,15 @@ test("writeTrace persists a normalized sessionKey when provided", () => {
   const id = writeTrace(ws, { gate: "stop", ws, sessionKey: "chat-A", reviewers: [{ name: "kimi", verdict: "ALLOW" }] });
   assert.equal(readTrace(ws, id).sessionKey, normalizeSessionId("chat-A"));
 });
+
+// The stop gate deliberately does NOT persist its prompts (they are the user's whole dirty diff),
+// which left no way to ask afterwards whether slow reviews correlate with large evidence — the
+// exact question the 15s stop timeouts raised (4 of 6 runs, 2026-07-26). Size is cheap and safe.
+test("writeTrace persists evidenceBytes when a gate reports it, and omits it otherwise", () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "trace-evidence-"));
+  const withSize = readTrace(ws, writeTrace(ws, { gate: "stop", ws, evidenceBytes: 4096, reviewers: [{ name: "MiMo", verdict: "ALLOW" }] }));
+  assert.equal(withSize.evidenceBytes, 4096);
+
+  const without = readTrace(ws, writeTrace(ws, { gate: "stop", ws, reviewers: [{ name: "MiMo", verdict: "ALLOW" }] }));
+  assert.equal(without.evidenceBytes, undefined, "no invented zero for gates that do not measure it");
+});

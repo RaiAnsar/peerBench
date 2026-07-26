@@ -12,7 +12,11 @@ export function writeTrace(ws, trace, { now = Date.now() } = {}) {
   // Stamp the canonical owning workspace KEY into the record so a surfacing path can verify the
   // trace belongs to the workspace it's being shown for (cross-project mixup guard). `ws` keeps the
   // raw path for display; `wsKey` is the ownership identity that survives symlinks/relative paths.
-  const record = { id, ts: new Date(now).toISOString(), gate: trace.gate, ws: trace.ws, wsKey: wsKey(ws), sessionKey: sessionKey || undefined, reviewers: trace.reviewers || [],
+  // evidenceBytes lets a later investigation ask "was the slow run a big diff?" for gates that do
+  // not persist their prompts (the stop gate reviews the user's whole dirty tree and deliberately
+  // stores none of it). Omitted entirely when the gate did not measure it — never invented as 0.
+  const record = { id, ts: new Date(now).toISOString(), gate: trace.gate, ws: trace.ws, wsKey: wsKey(ws), sessionKey: sessionKey || undefined,
+    evidenceBytes: Number.isFinite(trace.evidenceBytes) ? trace.evidenceBytes : undefined, reviewers: trace.reviewers || [],
     systemPrompt: cap(trace.systemPrompt), userPrompt: cap(trace.userPrompt),
     rawResponses: Object.fromEntries(Object.entries(trace.rawResponses || {}).map(([k, v]) => [k, cap(v)])) };
   fs.writeFileSync(path.join(dir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`);
