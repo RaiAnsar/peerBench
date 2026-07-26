@@ -23,6 +23,7 @@ import { isMainModule } from "./is-main.mjs";
 const GREEN = "[38;5;48m";
 const RED = "[38;5;196m";
 const AMBER = "[38;5;208m";
+const DIM = "[38;5;43m";     // the same muted tone gate-status.py uses for its armed `·`
 const RESET = "[0m";
 
 // Same vocabulary as panel-lib's panelBadge, minus the reviewer names: ✓ allow, ✗ block,
@@ -107,15 +108,24 @@ export function selectTrace(records, ws, sessionId) {
   return selectFrom((records || []).filter(Boolean).map((r) => ({ meta: r, load: () => r })), ws, sessionId);
 }
 
-export function renderSegment(dir, sessionId, { candidatesImpl = traceCandidates, color = true } = {}) {
+// Decay old verdicts to `·` on the SAME 2h window gate-status.py uses, so the two segments read
+// alike. A verdict outlives its truth: VisualSentinel kept rendering `bench !✓` for a WEEK off a
+// single 2026-07-19 Grok sandbox failure, which read as a live outage sitting beside an already-decayed
+// `⛩ codex ·`. Decaying (rather than blanking) still says peerBench is wired up here, just idle.
+export const STALE_MS = 2 * 60 * 60_000;
+
+export function renderSegment(dir, sessionId, { candidatesImpl = traceCandidates, color = true, now = Date.now() } = {}) {
   if (!dir) return "";   // no per-window signal → render nothing, never cwd
   const trace = selectFrom(candidatesImpl(dir), dir, sessionId);
   if (!trace) return "";
   const badge = benchBadge(trace);
   if (!badge) return "";
-  const text = `bench ${badge}`;
+  // An unreadable ts must not blank a real verdict — show it rather than silently hide a finding.
+  const at = Date.parse(trace.ts ?? "");
+  const stale = Number.isFinite(at) && now - at > STALE_MS;
+  const text = `bench ${stale ? "·" : badge}`;
   if (!color) return text;
-  const tone = badge.includes("✗") ? RED : badge.includes("!") || badge.includes("~") ? AMBER : GREEN;
+  const tone = stale ? DIM : badge.includes("✗") ? RED : badge.includes("!") || badge.includes("~") ? AMBER : GREEN;
   return `${tone}${text}${RESET}`;
 }
 
